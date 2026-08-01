@@ -1,0 +1,4 @@
+interface:
+  display_name: "Void Project Documentation"
+  short_description: "Maintain Void specs, alignment decisions, and evidence"
+  default_prompt: "Use $void-project-documentation to read the project contract, preserve the user's learning pace, and update the relevant spec Markdown with decisions and verification evidence."
