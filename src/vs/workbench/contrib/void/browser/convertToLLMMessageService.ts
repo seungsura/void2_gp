@@ -606,7 +606,6 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		const simpleLLMMessages: SimpleLLMMessage[] = []
 
 		for (const m of chatMessages) {
-			if (m.role === 'checkpoint') continue
 			if (m.role === 'interrupted_streaming_tool') continue
 			if (m.role === 'assistant') {
 				simpleLLMMessages.push({
@@ -763,6 +762,5 @@ gemini response:
 	}
 }
 */
-
 
 

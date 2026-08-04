@@ -757,17 +757,6 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		return { onFinishEdit }
 	}
 
-
-	public getVoidFileSnapshot(uri: URI) {
-		return this._getCurrentVoidFileSnapshot(uri)
-	}
-
-
-	public restoreVoidFileSnapshot(uri: URI, snapshot: VoidFileSnapshot): void {
-		this._restoreVoidFileSnapshot(uri, snapshot)
-	}
-
-
 	// delete diffOfId and diffArea._diffOfId
 	private _deleteDiff(diff: Diff) {
 		const diffArea = this.diffAreaOfId[diff.diffareaid]
@@ -1282,7 +1271,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		let originalCode = model.getValueInRange(range, EndOfLinePreference.LF)
 
 
-		// add to history as a checkpoint, before we start modifying
+		// Capture an editor undo memento before modifying.
 		const { onFinishEdit } = this._addToHistory(uri, { onWillUndo })
 
 		// clear diffZones so no conflict
@@ -2458,8 +2447,6 @@ class AcceptRejectInlineWidget extends Widget implements IOverlayWidget {
 	}
 
 }
-
-
 
 
 

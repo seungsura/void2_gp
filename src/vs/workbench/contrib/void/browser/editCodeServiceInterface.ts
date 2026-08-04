@@ -73,6 +73,4 @@ export interface IEditCodeService {
 	interruptURIStreaming(opts: { uri: URI }): void;
 
 	// testDiffs(): void;
-	getVoidFileSnapshot(uri: URI): VoidFileSnapshot;
-	restoreVoidFileSnapshot(uri: URI, snapshot: VoidFileSnapshot): void;
 }

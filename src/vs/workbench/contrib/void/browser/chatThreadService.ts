@@ -20,14 +20,12 @@ import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, ToolCallParams, T
 import { IToolsService } from './toolsService.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { ILanguageFeaturesService } from '../../../../editor/common/services/languageFeatures.js';
-import { ChatMessage, CheckpointEntry, CodespanLocationLink, StagingSelectionItem, ToolMessage } from '../common/chatThreadServiceTypes.js';
+import { ChatMessage, CodespanLocationLink, StagingSelectionItem, ToolMessage } from '../common/chatThreadServiceTypes.js';
 import { Position } from '../../../../editor/common/core/position.js';
 import { IMetricsService } from '../common/metricsService.js';
 import { shorten } from '../../../../base/common/labels.js';
 import { IVoidModelService } from '../common/voidModelService.js';
-import { findLast, findLastIdx } from '../../../../base/common/arraysFind.js';
-import { IEditCodeService } from './editCodeServiceInterface.js';
-import { VoidFileSnapshot } from '../common/editCodeServiceTypes.js';
+import { findLast } from '../../../../base/common/arraysFind.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { truncate } from '../../../../base/common/strings.js';
 import { THREAD_STORAGE_KEY } from '../common/storageKeys.js';
@@ -73,28 +71,6 @@ const findStagingSelectionIndex = (currentSelections: StagingSelectionItem[] | u
 }
 
 
-/*
-
-Store a checkpoint of all "before" files on each x.
-x's show up before user messages and LLM edit tool calls.
-
-x     A          (edited A -> A')
-(... user modified changes ...)
-User message
-
-x     A' B C     (edited A'->A'', B->B', C->C')
-LLM Edit
-x
-LLM Edit
-x
-LLM Edit
-
-
-INVARIANT:
-A checkpoint appears before every LLM message, and before every user message (before user really means directly after LLM is done).
-*/
-
-
 type UserMessageType = ChatMessage & { role: 'user' }
 type UserMessageState = UserMessageType['state']
 const defaultMessageState: UserMessageState = {
@@ -121,8 +97,6 @@ export type ThreadType = {
 
 	// this doesn't need to go in a state object, but feels right
 	state: {
-		currCheckpointIdx: number | null; // the latest checkpoint we're at (null if not at a particular checkpoint, like if the chat is streaming, or chat just finished and we haven't clicked on a checkpt)
-
 		stagingSelections: StagingSelectionItem[];
 		focusedMessageIdx: number | undefined; // index of the user message that is being edited (undefined if none)
 
@@ -213,7 +187,6 @@ const newThreadObject = () => {
 		lastModified: now,
 		messages: [],
 		state: {
-			currCheckpointIdx: null,
 			stagingSelections: [],
 			focusedMessageIdx: undefined,
 			linksOfMessageIdx: {},
@@ -286,9 +259,6 @@ export interface IChatThreadService {
 	approveLatestToolRequest(threadId: string): void;
 	rejectLatestToolRequest(threadId: string): void;
 
-	// jump to history
-	jumpToCheckpointBeforeMessageIdx(opts: { threadId: string, messageIdx: number, jumpToUserModified: boolean }): void;
-
 	focusCurrentChat: () => Promise<void>
 	blurCurrentChat: () => Promise<void>
 }
@@ -307,11 +277,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	readonly streamState: ThreadStreamState = {}
 	state: ThreadsState // allThreads is persisted, currentThread is not
 
-	// used in checkpointing
-	// private readonly _userModifiedFilesToCheckInCheckpoints = new LRUCache<string, null>(50)
-
-
-
 	constructor(
 		@IStorageService private readonly _storageService: IStorageService,
 		@IVoidModelService private readonly _voidModelService: IVoidModelService,
@@ -320,7 +285,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		@IVoidSettingsService private readonly _settingsService: IVoidSettingsService,
 		@ILanguageFeaturesService private readonly _languageFeaturesService: ILanguageFeaturesService,
 		@IMetricsService private readonly _metricsService: IMetricsService,
-		@IEditCodeService private readonly _editCodeService: IEditCodeService,
 		@INotificationService private readonly _notificationService: INotificationService,
 		@IConvertToLLMMessageService private readonly _convertToLLMMessagesService: IConvertToLLMMessageService,
 		@IWorkspaceContextService private readonly _workspaceContextService: IWorkspaceContextService,
@@ -341,22 +305,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		// always be in a thread
 		this.openNewThread()
-
-
-		// keep track of user-modified files
-		// const disposablesOfModelId: { [modelId: string]: IDisposable[] } = {}
-		// this._register(
-		// 	this._modelService.onModelAdded(e => {
-		// 		if (!(e.id in disposablesOfModelId)) disposablesOfModelId[e.id] = []
-		// 		disposablesOfModelId[e.id].push(
-		// 			e.onDidChangeContent(() => { this._userModifiedFilesToCheckInCheckpoints.set(e.uri.fsPath, null) })
-		// 		)
-		// 	})
-		// )
-		// this._register(this._modelService.onModelRemoved(e => {
-		// 	if (!(e.id in disposablesOfModelId)) return
-		// 	disposablesOfModelId[e.id].forEach(d => d.dispose())
-		// }))
 
 	}
 
@@ -394,12 +342,24 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	// !!! this is important for properly restoring URIs from storage
 	// should probably re-use code from void/src/vs/base/common/marshalling.ts instead. but this is simple enough
 	private _convertThreadDataFromStorage(threadsStr: string): ChatThreads {
-		return JSON.parse(threadsStr, (key, value) => {
+		const threads = JSON.parse(threadsStr, (key, value) => {
 			if (value && typeof value === 'object' && value.$mid === 1) { // $mid is the MarshalledId. $mid === 1 means it is a URI
 				return URI.from(value); // TODO URI.revive instead of this?
 			}
 			return value;
 		});
+
+		for (const thread of Object.values(threads)) {
+			if (!thread) continue
+			const legacyThread = thread as ThreadType & {
+				messages: Array<ChatMessage | { role: 'checkpoint' }>;
+				state: ThreadType['state'] & { currCheckpointIdx?: number | null };
+			};
+			legacyThread.messages = legacyThread.messages.filter((message): message is ChatMessage => message.role !== 'checkpoint');
+			delete legacyThread.state.currCheckpointIdx;
+		}
+
+		return threads;
 	}
 
 	private _readAllThreads(): ChatThreads | null {
@@ -408,7 +368,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			return null
 		}
 		const threads = this._convertThreadDataFromStorage(threadsStr);
-
+		this._storeAllThreads(threads);
 		return threads
 	}
 
@@ -578,8 +538,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			// do nothing
 		}
 
-		this._addUserCheckpoint({ threadId })
-
 		// interrupt any effects
 		const interrupt = await this.streamState[threadId]?.interrupt
 		if (typeof interrupt === 'function')
@@ -680,8 +638,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				if (toolName === 'write_file') {
 					preparedWrite = await this._toolsService.prepareWriteFile(toolParams as BuiltinToolCallParams['write_file'])
 					if (!preparedWrite) throw new Error('Internal error: write_file did not produce a receipt.')
-					// Receipt exists only after semantic planning; checkpoint and mutation share it.
-					this._addToolEditCheckpoint({ threadId, uri: preparedWrite.uri, allowAbsent: (toolParams as BuiltinToolCallParams['write_file']).operation === 'create' })
 				}
 				const call = preparedWrite
 					? { result: preparedWrite.execute() }
@@ -771,8 +727,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			const { interrupted } = await this._runToolCall(threadId, callThisToolFirst.name, callThisToolFirst.id, callThisToolFirst.mcpServerName, { preapproved: true, unvalidatedToolParams: callThisToolFirst.rawParams, validatedParams: callThisToolFirst.params })
 			if (interrupted) {
 				this._setStreamState(threadId, undefined)
-				this._addUserCheckpoint({ threadId })
-
 			}
 		}
 		this._setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' })  // just decorative, for clarity
@@ -880,7 +834,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 						if (toolCallSoFar) this._addMessageToThread(threadId, { role: 'interrupted_streaming_tool', name: toolCallSoFar.name, mcpServerName: this._computeMCPServerOfToolName(toolCallSoFar.name) })
 
 						this._setStreamState(threadId, { isRunning: undefined, error })
-						this._addUserCheckpoint({ threadId })
 						return
 					}
 				}
@@ -914,23 +867,9 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// if awaiting user approval, keep isRunning true, else end isRunning
 		this._setStreamState(threadId, { isRunning: isRunningWhenEnd })
 
-		// add checkpoint before the next user message
-		if (!isRunningWhenEnd) this._addUserCheckpoint({ threadId })
-
 		// capture number of messages sent
 		this._metricsService.capture('Agent Loop Done', { nMessagesSent, chatMode })
 	}
-
-
-	private _addCheckpoint(threadId: string, checkpoint: CheckpointEntry) {
-		this._addMessageToThread(threadId, checkpoint)
-		// // update latest checkpoint idx to the one we just added
-		// const newThread = this.state.allThreads[threadId]
-		// if (!newThread) return // should never happen
-		// const currCheckpointIdx = newThread.messages.length - 1
-		// this._setThreadState(threadId, { currCheckpointIdx: currCheckpointIdx })
-	}
-
 
 
 	private _editMessageInThread(threadId: string, messageIdx: number, newMessage: ChatMessage,) {
@@ -952,247 +891,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}
 		this._storeAllThreads(newThreads)
 		this._setState({ allThreads: newThreads }) // the current thread just changed (it had a message added to it)
-	}
-
-
-	private _getCheckpointInfo = (checkpointMessage: ChatMessage & { role: 'checkpoint' }, fsPath: string, opts: { includeUserModifiedChanges: boolean }) => {
-		const voidFileSnapshot = checkpointMessage.voidFileSnapshotOfURI ? checkpointMessage.voidFileSnapshotOfURI[fsPath] ?? null : null
-		if (!opts.includeUserModifiedChanges) { return { voidFileSnapshot, } }
-
-		const userModifiedVoidFileSnapshot = fsPath in checkpointMessage.userModifications.voidFileSnapshotOfURI ? checkpointMessage.userModifications.voidFileSnapshotOfURI[fsPath] ?? null : null
-		return { voidFileSnapshot: userModifiedVoidFileSnapshot ?? voidFileSnapshot, }
-	}
-
-	private _computeNewCheckpointInfo({ threadId }: { threadId: string }) {
-		const thread = this.state.allThreads[threadId]
-		if (!thread) return
-
-		const lastCheckpointIdx = findLastIdx(thread.messages, (m) => m.role === 'checkpoint') ?? -1
-		if (lastCheckpointIdx === -1) return
-
-		const voidFileSnapshotOfURI: { [fsPath: string]: VoidFileSnapshot | undefined } = {}
-
-		// add a change for all the URIs in the checkpoint history
-		const { lastIdxOfURI } = this._getCheckpointsBetween({ threadId, loIdx: 0, hiIdx: lastCheckpointIdx, }) ?? {}
-		for (const fsPath in lastIdxOfURI ?? {}) {
-			const { model } = this._voidModelService.getModelFromFsPath(fsPath)
-			if (!model) continue
-			const checkpoint2 = thread.messages[lastIdxOfURI[fsPath]] || null
-			if (!checkpoint2) continue
-			if (checkpoint2.role !== 'checkpoint') continue
-			const res = this._getCheckpointInfo(checkpoint2, fsPath, { includeUserModifiedChanges: false })
-			if (!res) continue
-			const { voidFileSnapshot: oldVoidFileSnapshot } = res
-
-			// if there was any change to the str or diffAreaSnapshot, update. rough approximation of equality, oldDiffAreasSnapshot === diffAreasSnapshot is not perfect
-			const voidFileSnapshot = this._editCodeService.getVoidFileSnapshot(URI.file(fsPath))
-			if (oldVoidFileSnapshot === voidFileSnapshot) continue
-			voidFileSnapshotOfURI[fsPath] = voidFileSnapshot
-		}
-
-		// // add a change for all user-edited files (that aren't in the history)
-		// for (const fsPath of this._userModifiedFilesToCheckInCheckpoints.keys()) {
-		// 	if (fsPath in lastIdxOfURI) continue // if already visisted, don't visit again
-		// 	const { model } = this._voidModelService.getModelFromFsPath(fsPath)
-		// 	if (!model) continue
-		// 	currStrOfFsPath[fsPath] = model.getValue(EndOfLinePreference.LF)
-		// }
-
-		return { voidFileSnapshotOfURI }
-	}
-
-
-	private _addUserCheckpoint({ threadId }: { threadId: string }) {
-		const { voidFileSnapshotOfURI } = this._computeNewCheckpointInfo({ threadId }) ?? {}
-		this._addCheckpoint(threadId, {
-			role: 'checkpoint',
-			type: 'user_edit',
-			voidFileSnapshotOfURI: voidFileSnapshotOfURI ?? {},
-			userModifications: { voidFileSnapshotOfURI: {}, },
-		})
-	}
-	// call this right after LLM edits a file
-	private _addToolEditCheckpoint({ threadId, uri, allowAbsent = false }: { threadId: string, uri: URI, allowAbsent?: boolean }) {
-		const thread = this.state.allThreads[threadId]
-		if (!thread) return
-		const { model } = this._voidModelService.getModel(uri)
-		if (!model && !allowAbsent) return // should never happen
-		const diffAreasSnapshot = model ? this._editCodeService.getVoidFileSnapshot(uri) : undefined
-		this._addCheckpoint(threadId, {
-			role: 'checkpoint',
-			type: 'tool_edit',
-			voidFileSnapshotOfURI: { [uri.fsPath]: diffAreasSnapshot },
-			userModifications: { voidFileSnapshotOfURI: {} },
-		})
-	}
-
-
-	private _getCheckpointBeforeMessage = ({ threadId, messageIdx }: { threadId: string, messageIdx: number }): [CheckpointEntry, number] | undefined => {
-		const thread = this.state.allThreads[threadId]
-		if (!thread) return undefined
-		for (let i = messageIdx; i >= 0; i--) {
-			const message = thread.messages[i]
-			if (message.role === 'checkpoint') {
-				return [message, i]
-			}
-		}
-		return undefined
-	}
-
-	private _getCheckpointsBetween({ threadId, loIdx, hiIdx }: { threadId: string, loIdx: number, hiIdx: number }) {
-		const thread = this.state.allThreads[threadId]
-		if (!thread) return { lastIdxOfURI: {} } // should never happen
-		const lastIdxOfURI: { [fsPath: string]: number } = {}
-		for (let i = loIdx; i <= hiIdx; i += 1) {
-			const message = thread.messages[i]
-			if (message?.role !== 'checkpoint') continue
-			for (const fsPath in message.voidFileSnapshotOfURI) { // do not include userModified.beforeStrOfURI here, jumping should not include those changes
-				lastIdxOfURI[fsPath] = i
-			}
-		}
-		return { lastIdxOfURI }
-	}
-
-	private _readCurrentCheckpoint(threadId: string): [CheckpointEntry, number] | undefined {
-		const thread = this.state.allThreads[threadId]
-		if (!thread) return
-
-		const { currCheckpointIdx } = thread.state
-		if (currCheckpointIdx === null) return
-
-		const checkpoint = thread.messages[currCheckpointIdx]
-		if (!checkpoint) return
-		if (checkpoint.role !== 'checkpoint') return
-		return [checkpoint, currCheckpointIdx]
-	}
-	private _addUserModificationsToCurrCheckpoint({ threadId }: { threadId: string }) {
-		const { voidFileSnapshotOfURI } = this._computeNewCheckpointInfo({ threadId }) ?? {}
-		const res = this._readCurrentCheckpoint(threadId)
-		if (!res) return
-		const [checkpoint, checkpointIdx] = res
-		this._editMessageInThread(threadId, checkpointIdx, {
-			...checkpoint,
-			userModifications: { voidFileSnapshotOfURI: voidFileSnapshotOfURI ?? {}, },
-		})
-	}
-
-
-	private _makeUsStandOnCheckpoint({ threadId }: { threadId: string }) {
-		const thread = this.state.allThreads[threadId]
-		if (!thread) return
-		if (thread.state.currCheckpointIdx === null) {
-			const lastMsg = thread.messages[thread.messages.length - 1]
-			if (lastMsg?.role !== 'checkpoint')
-				this._addUserCheckpoint({ threadId })
-			this._setThreadState(threadId, { currCheckpointIdx: thread.messages.length - 1 })
-		}
-	}
-
-	jumpToCheckpointBeforeMessageIdx({ threadId, messageIdx, jumpToUserModified }: { threadId: string, messageIdx: number, jumpToUserModified: boolean }) {
-
-		// if null, add a new temp checkpoint so user can jump forward again
-		this._makeUsStandOnCheckpoint({ threadId })
-
-		const thread = this.state.allThreads[threadId]
-		if (!thread) return
-		if (this.streamState[threadId]?.isRunning) return
-
-		const c = this._getCheckpointBeforeMessage({ threadId, messageIdx })
-		if (c === undefined) return // should never happen
-
-		const fromIdx = thread.state.currCheckpointIdx
-		if (fromIdx === null) return // should never happen
-
-		const [_, toIdx] = c
-		if (toIdx === fromIdx) return
-
-		// console.log(`going from ${fromIdx} to ${toIdx}`)
-
-		// update the user's checkpoint
-		this._addUserModificationsToCurrCheckpoint({ threadId })
-
-		/*
-if undoing
-
-A,B,C are all files.
-x means a checkpoint where the file changed.
-
-A B C D E F G H I
-  x x x x x   x           <-- you can't always go up to find the "before" version; sometimes you need to go down
-  | | | | |   | x
---x-|-|-|-x---x-|-----     <-- to
-	| | | | x   x
-	| | x x |
-	| |   | |
-----x-|---x-x-------     <-- from
-	  x
-
-We need to revert anything that happened between to+1 and from.
-**We do this by finding the last x from 0...`to` for each file and applying those contents.**
-We only need to do it for files that were edited since `to`, ie files between to+1...from.
-*/
-		if (toIdx < fromIdx) {
-			const { lastIdxOfURI } = this._getCheckpointsBetween({ threadId, loIdx: toIdx + 1, hiIdx: fromIdx })
-
-			const idxes = function* () {
-				for (let k = toIdx; k >= 0; k -= 1) { // first go up
-					yield k
-				}
-				for (let k = toIdx + 1; k < thread.messages.length; k += 1) { // then go down
-					yield k
-				}
-			}
-
-			for (const fsPath in lastIdxOfURI) {
-				// find the first instance of this file starting at toIdx (go up to latest file; if there is none, go down)
-				for (const k of idxes()) {
-					const message = thread.messages[k]
-					if (message.role !== 'checkpoint') continue
-					const res = this._getCheckpointInfo(message, fsPath, { includeUserModifiedChanges: jumpToUserModified })
-					if (!res) continue
-					const { voidFileSnapshot } = res
-					if (!voidFileSnapshot) continue
-					this._editCodeService.restoreVoidFileSnapshot(URI.file(fsPath), voidFileSnapshot)
-					break
-				}
-			}
-		}
-
-		/*
-if redoing
-
-A B C D E F G H I J
-  x x x x x   x     x
-  | | | | |   | x x x
---x-|-|-|-x---x-|-|---     <-- from
-	| | | | x   x
-	| | x x |
-	| |   | |
-----x-|---x-x-----|---     <-- to
-	  x           x
-
-
-We need to apply latest change for anything that happened between from+1 and to.
-We only need to do it for files that were edited since `from`, ie files between from+1...to.
-*/
-		if (toIdx > fromIdx) {
-			const { lastIdxOfURI } = this._getCheckpointsBetween({ threadId, loIdx: fromIdx + 1, hiIdx: toIdx })
-			for (const fsPath in lastIdxOfURI) {
-				// apply lowest down content for each uri
-				for (let k = toIdx; k >= fromIdx + 1; k -= 1) {
-					const message = thread.messages[k]
-					if (message.role !== 'checkpoint') continue
-					const res = this._getCheckpointInfo(message, fsPath, { includeUserModifiedChanges: jumpToUserModified })
-					if (!res) continue
-					const { voidFileSnapshot } = res
-					if (!voidFileSnapshot) continue
-					this._editCodeService.restoreVoidFileSnapshot(URI.file(fsPath), voidFileSnapshot)
-					break
-				}
-			}
-		}
-
-		this._setThreadState(threadId, { currCheckpointIdx: toIdx })
 	}
 
 
@@ -1251,12 +949,6 @@ We only need to do it for files that were edited since `from`, ie files between 
 			await this.abortRunning(threadId)
 		}
 
-		// add dummy before this message to keep checkpoint before user message idea consistent
-		if (thread.messages.length === 0) {
-			this._addUserCheckpoint({ threadId })
-		}
-
-
 		// add user's message to chat history
 		const instructions = userMessage
 		const currSelns: StagingSelectionItem[] = _chatSelections ?? thread.state.stagingSelections
@@ -1264,8 +956,6 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const userMessageContent = await chat_userMessageContent(instructions, currSelns, { directoryStrService: this._directoryStringService, fileService: this._fileService }) // user message + names of files (NOT content)
 		const userHistoryElt: ChatMessage = { role: 'user', content: userMessageContent, displayContent: instructions, selections: currSelns, state: defaultMessageState }
 		this._addMessageToThread(threadId, userHistoryElt)
-
-		this._setThreadState(threadId, { currCheckpointIdx: null }) // no longer at a checkpoint because started streaming
 
 		this._wrapRunAgentToNotify(
 			this._runChatAgent({ threadId, ...this._currentModelSelectionProps(), }),
@@ -1283,25 +973,6 @@ We only need to do it for files that were edited since `from`, ie files between 
 		const thread = this.state.allThreads[threadId];
 		if (!thread) return
 
-		// if there's a current checkpoint, delete all messages after it
-		if (thread.state.currCheckpointIdx !== null) {
-			const checkpointIdx = thread.state.currCheckpointIdx;
-			const newMessages = thread.messages.slice(0, checkpointIdx + 1);
-
-			// Update the thread with truncated messages
-			const newThreads = {
-				...this.state.allThreads,
-				[threadId]: {
-					...thread,
-					lastModified: new Date().toISOString(),
-					messages: newMessages,
-				}
-			};
-			this._storeAllThreads(newThreads);
-			this._setState({ allThreads: newThreads });
-		}
-
-		// Now call the original method to add the user message and stream the response
 		await this._addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId });
 
 	}
@@ -1728,9 +1399,6 @@ We only need to do it for files that were edited since `from`, ie files between 
 			}
 		})
 
-		// // when change focused message idx, jump - do not jump back when click edit, too confusing.
-		// if (messageIdx !== undefined)
-		// 	this.jumpToCheckpointBeforeMessageIdx({ threadId, messageIdx, jumpToUserModified: true })
 	}
 
 

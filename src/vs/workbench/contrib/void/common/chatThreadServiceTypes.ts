@@ -4,7 +4,6 @@
  *--------------------------------------------------------------------------------------*/
 
 import { URI } from '../../../../base/common/uri.js';
-import { VoidFileSnapshot } from './editCodeServiceTypes.js';
 import { AnthropicReasoning, RawToolParamsObj } from './sendLLMMessageTypes.js';
 import { ToolCallParams, ToolName, ToolResult } from './toolsServiceTypes.js';
 
@@ -34,18 +33,6 @@ export type DecorativeCanceledTool = {
 }
 
 
-// checkpoints
-export type CheckpointEntry = {
-	role: 'checkpoint';
-	type: 'user_edit' | 'tool_edit';
-	voidFileSnapshotOfURI: { [fsPath: string]: VoidFileSnapshot | undefined };
-
-	userModifications: {
-		voidFileSnapshotOfURI: { [fsPath: string]: VoidFileSnapshot | undefined };
-	};
-}
-
-
 // WARNING: changing this format is a big deal!!!!!! need to migrate old format to new format on users' computers so people don't get errors.
 export type ChatMessage =
 	| {
@@ -66,7 +53,6 @@ export type ChatMessage =
 	}
 	| ToolMessage<ToolName>
 	| DecorativeCanceledTool
-	| CheckpointEntry
 
 
 // one of the square items that indicates a selection in a chat bubble
