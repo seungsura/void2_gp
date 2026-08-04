@@ -248,9 +248,9 @@ const rawToolCallObjOfParamsStr = (name: string, toolParamsStr: string, id: stri
 	catch (e) { return null }
 
 	if (input === null) return null
-	if (typeof input !== 'object') return null
+	if (typeof input !== 'object' || Array.isArray(input)) return null
 
-	const rawParams: RawToolParamsObj = input
+	const rawParams = input as RawToolParamsObj
 	return { id, name, rawParams, doneParams: Object.keys(rawParams), isDone: true }
 }
 
@@ -259,9 +259,9 @@ const rawToolCallObjOfAnthropicParams = (toolBlock: Anthropic.Messages.ToolUseBl
 	const { id, name, input } = toolBlock
 
 	if (input === null) return null
-	if (typeof input !== 'object') return null
+	if (typeof input !== 'object' || Array.isArray(input)) return null
 
-	const rawParams: RawToolParamsObj = input
+	const rawParams = input as RawToolParamsObj
 	return { id, name, rawParams, doneParams: Object.keys(rawParams), isDone: true }
 }
 
@@ -436,7 +436,10 @@ const toAnthropicTool = (toolInfo: InternalToolInfo) => {
 	return {
 		name: name,
 		description: description,
-		input_schema: toolInfo.schema ?? {
+		input_schema: toolInfo.schema ? {
+			...toolInfo.schema,
+			type: 'object',
+		} : {
 			type: 'object',
 			properties: paramsWithType,
 			// required: Object.keys(params),

@@ -1,5 +1,6 @@
 import { CancellationToken } from '../../../../base/common/cancellation.js'
 import { URI } from '../../../../base/common/uri.js'
+import { dirname } from '../../../../base/common/resources.js'
 import { FileOperationError, FileOperationResult, IFileService, IFileStat } from '../../../../platform/files/common/files.js'
 import { registerSingleton, InstantiationType } from '../../../../platform/instantiation/common/extensions.js'
 import { createDecorator, IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js'
@@ -17,7 +18,6 @@ import { IMarkerService, MarkerSeverity } from '../../../../platform/markers/com
 import { timeout } from '../../../../base/common/async.js'
 import { RawToolParamsObj } from '../common/sendLLMMessageTypes.js'
 import { MAX_CHILDREN_URIs_PAGE, MAX_FILE_CHARS_PAGE, MAX_TERMINAL_BG_COMMAND_TIME, MAX_TERMINAL_INACTIVE_TIME } from '../common/prompt/prompts.js'
-import { IVoidSettingsService } from '../common/voidSettingsService.js'
 import { generateUuid } from '../../../../base/common/uuid.js'
 import { isWriteFileReceiptCurrent, planWriteFileModify, WriteFileEdit, WriteFileReceipt } from '../common/writeFilePlanner.js'
 import { VSBuffer } from '../../../../base/common/buffer.js'
@@ -157,7 +157,6 @@ export class ToolsService implements IToolsService {
 		@IVoidCommandBarService private readonly commandBarService: IVoidCommandBarService,
 		@IDirectoryStrService private readonly directoryStrService: IDirectoryStrService,
 		@IMarkerService private readonly markerService: IMarkerService,
-		@IVoidSettingsService private readonly voidSettingsService: IVoidSettingsService,
 	) {
 		const queryBuilder = instantiationService.createInstance(QueryBuilder);
 		this.prepareWriteFile = async (params) => {
@@ -165,7 +164,7 @@ export class ToolsService implements IToolsService {
 				const ensureCreateTargetIsAvailable = async () => {
 					let parent: IFileStat
 					try {
-						parent = await fileService.resolve(params.uri.dirname)
+						parent = await fileService.resolve(dirname(params.uri))
 					}
 					catch (error) {
 						if (error instanceof FileOperationError && error.fileOperationResult === FileOperationResult.FILE_NOT_FOUND) {
