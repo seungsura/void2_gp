@@ -352,10 +352,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		for (const thread of Object.values(threads)) {
 			if (!thread) continue
 			const legacyThread = thread as ThreadType & {
-				messages: Array<ChatMessage | { role: 'checkpoint' }>;
 				state: ThreadType['state'] & { currCheckpointIdx?: number | null };
 			};
-			legacyThread.messages = legacyThread.messages.filter((message): message is ChatMessage => message.role !== 'checkpoint');
+			const legacyMessages = legacyThread.messages as unknown[];
+			legacyThread.messages = legacyMessages.filter((message): message is ChatMessage => {
+				return !(typeof message === 'object' && message !== null && (message as { role?: unknown }).role === 'checkpoint');
+			});
 			delete legacyThread.state.currCheckpointIdx;
 		}
 
