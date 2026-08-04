@@ -10,6 +10,21 @@ export type WriteFilePlan = {
 	edits: readonly { start: number; end: number; newText: string }[];
 };
 
+/**
+ * Captures the immutable facts a prepared modify operation was planned from.
+ * Keeping this check pure makes the UI/orchestration await boundary testable
+ * without importing editor or filesystem services.
+ */
+export type WriteFileReceipt<TModel> = {
+	model: TModel;
+	versionId: number;
+	lfText: string;
+	plan: WriteFilePlan;
+};
+
+export const isWriteFileReceiptCurrent = <TModel>(receipt: WriteFileReceipt<TModel>, model: TModel, versionId: number, lfText: string) =>
+	receipt.model === model && receipt.versionId === versionId && receipt.lfText === lfText;
+
 const isLineStart = (text: string, offset: number) => offset === 0 || (offset === 1 && text.charCodeAt(0) === 0xFEFF) || text.charCodeAt(offset - 1) === 10;
 const isLineEnd = (text: string, offset: number) => offset === text.length || text.charCodeAt(offset) === 10 || (text.charCodeAt(offset) === 13 && text.charCodeAt(offset + 1) === 10);
 

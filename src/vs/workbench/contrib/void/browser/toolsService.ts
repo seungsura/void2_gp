@@ -1,6 +1,6 @@
 import { CancellationToken } from '../../../../base/common/cancellation.js'
 import { URI } from '../../../../base/common/uri.js'
-import { FileOperationError, FileOperationResult, IFileService } from '../../../../platform/files/common/files.js'
+import { FileOperationError, FileOperationResult, IFileService, IFileStat } from '../../../../platform/files/common/files.js'
 import { registerSingleton, InstantiationType } from '../../../../platform/instantiation/common/extensions.js'
 import { createDecorator, IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js'
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js'
@@ -19,7 +19,7 @@ import { RawToolParamsObj } from '../common/sendLLMMessageTypes.js'
 import { MAX_CHILDREN_URIs_PAGE, MAX_FILE_CHARS_PAGE, MAX_TERMINAL_BG_COMMAND_TIME, MAX_TERMINAL_INACTIVE_TIME } from '../common/prompt/prompts.js'
 import { IVoidSettingsService } from '../common/voidSettingsService.js'
 import { generateUuid } from '../../../../base/common/uuid.js'
-import { planWriteFileModify, WriteFileEdit } from '../common/writeFilePlanner.js'
+import { isWriteFileReceiptCurrent, planWriteFileModify, WriteFileEdit, WriteFileReceipt } from '../common/writeFilePlanner.js'
 import { VSBuffer } from '../../../../base/common/buffer.js'
 
 
@@ -162,28 +162,60 @@ export class ToolsService implements IToolsService {
 		const queryBuilder = instantiationService.createInstance(QueryBuilder);
 		this.prepareWriteFile = async (params) => {
 			if (params.operation === 'create') {
-				// Verify the intended absent state before the checkpoint; createFile remains the exclusive race guard.
-				await fileService.resolve(params.uri.dirname)
-				try { await fileService.resolve(params.uri); throw new Error('write_file rejected: target already exists.') }
-				catch (error) { if (!(error instanceof FileOperationError) || error.fileOperationResult !== FileOperationResult.FILE_NOT_FOUND) throw error }
-				return { uri: params.uri, execute: async () => { await fileService.createFile(params.uri, VSBuffer.fromString(params.content), { overwrite: false }); return { operation: 'create', didChange: true, editCount: 0 } } }
+				const ensureCreateTargetIsAvailable = async () => {
+					let parent: IFileStat
+					try {
+						parent = await fileService.resolve(params.uri.dirname)
+					}
+					catch (error) {
+						if (error instanceof FileOperationError && error.fileOperationResult === FileOperationResult.FILE_NOT_FOUND) {
+							throw new Error('write_file rejected: the target parent folder does not exist.')
+						}
+						throw error
+					}
+					if (!parent.isDirectory) throw new Error('write_file rejected: the target parent is not a folder.')
+					try {
+						await fileService.resolve(params.uri)
+						throw new Error('write_file rejected: target already exists.')
+					}
+					catch (error) {
+						if (!(error instanceof FileOperationError) || error.fileOperationResult !== FileOperationResult.FILE_NOT_FOUND) throw error
+					}
+				}
+				// The execution-time check is intentionally repeated: approval/UI work may await.
+				await ensureCreateTargetIsAvailable()
+				return {
+					uri: params.uri,
+					execute: async () => {
+						await ensureCreateTargetIsAvailable()
+						await fileService.createFile(params.uri, VSBuffer.fromString(params.content), { overwrite: false })
+						return { operation: 'create', didChange: true, editCount: 0 }
+					}
+				}
 			}
 			if (this.commandBarService.getStreamState(params.uri) === 'streaming') throw new Error(`Another LLM is currently making changes to this file. Please stop streaming for now and ask the user to resume later.`)
 			await voidModelService.initializeModel(params.uri)
 			const { model } = await voidModelService.getModelSafe(params.uri)
 			if (!model) throw new Error('No contents; File does not exist.')
 			const versionId = model.getVersionId()
-			const snapshot = model.getValue(EndOfLinePreference.LF)
-			const plan = planWriteFileModify(snapshot, params.edits)
+			const lfText = model.getValue(EndOfLinePreference.LF)
+			const plan = planWriteFileModify(lfText, params.edits)
 			if (!plan) throw new Error('write_file rejected: each old_text must be a unique, exact whole-line match in the latest file snapshot.')
+			const receipt: WriteFileReceipt<typeof model> = { model, versionId, lfText, plan }
+			const verifyReceipt = () => {
+				const current = voidModelService.getModel(params.uri).model
+				if (!current || !isWriteFileReceiptCurrent(receipt, current, current.getVersionId(), current.getValue(EndOfLinePreference.LF))) {
+					throw new Error('write_file rejected: file changed before the edit could be applied.')
+				}
+			}
 			return {
 				uri: params.uri,
 				execute: async () => {
-					if (model.getVersionId() !== versionId) throw new Error('write_file rejected: file changed before the edit could be applied.')
+					verifyReceipt()
 					await editCodeService.callBeforeApplyOrEdit(params.uri)
-					if (model.getVersionId() !== versionId) throw new Error('write_file rejected: file changed before the edit could be applied.')
+					verifyReceipt()
 					model.applyEdits([{ range: model.getFullModelRange(), text: plan.newText }])
-					return { operation: 'modify', didChange: plan.newText !== snapshot, editCount: params.edits.length }
+					return { operation: 'modify', didChange: plan.newText !== lfText, editCount: params.edits.length }
 				}
 			}
 		}
@@ -296,6 +328,7 @@ export class ToolsService implements IToolsService {
 				const edits: WriteFileEdit[] = params.edits.map((edit, index) => {
 					if (!edit || typeof edit !== 'object') throw new Error(`Invalid LLM output: edits[${index}] must be an object.`)
 					const value = edit as Record<string, unknown>
+					for (const key of Object.keys(value)) if (key !== 'old_text' && key !== 'new_text') throw new Error(`Invalid LLM output: edits[${index}] does not allow ${key}.`)
 					return { oldText: validateStr(`edits[${index}].old_text`, value.old_text), newText: validateStr(`edits[${index}].new_text`, value.new_text) }
 				})
 				return { uri, operation, edits }

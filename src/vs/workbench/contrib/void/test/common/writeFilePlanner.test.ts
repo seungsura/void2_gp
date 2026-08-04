@@ -3,7 +3,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
-import { planWriteFileModify } from '../../common/writeFilePlanner.js';
+import { isWriteFileReceiptCurrent, planWriteFileModify, WriteFileReceipt } from '../../common/writeFilePlanner.js';
 
 suite('Void write_file planner', () => {
 	test('creates one result from multiple exact whole-line replacements', () => {
@@ -31,5 +31,16 @@ suite('Void write_file planner', () => {
 	test('treats conflict marker strings as ordinary payload', () => {
 		const plan = planWriteFileModify('<<<<<<<\n=======\n>>>>>>>\n', [{ oldText: '=======', newText: 'marker' }]);
 		assert.deepStrictEqual(plan?.newText, '<<<<<<<\nmarker\n>>>>>>>\n');
+	});
+
+	test('requires the prepared model identity, version, and LF snapshot at mutation time', () => {
+		const model = {};
+		const plan = planWriteFileModify('before\n', [{ oldText: 'before', newText: 'after' }]);
+		assert.ok(plan);
+		const receipt: WriteFileReceipt<object> = { model, versionId: 7, lfText: 'before\n', plan: plan! };
+		assert.strictEqual(isWriteFileReceiptCurrent(receipt, model, 7, 'before\n'), true);
+		assert.strictEqual(isWriteFileReceiptCurrent(receipt, {}, 7, 'before\n'), false);
+		assert.strictEqual(isWriteFileReceiptCurrent(receipt, model, 8, 'before\n'), false);
+		assert.strictEqual(isWriteFileReceiptCurrent(receipt, model, 7, 'changed\n'), false);
 	});
 });

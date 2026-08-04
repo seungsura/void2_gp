@@ -276,7 +276,7 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 		reasoningCapabilities,
 		additionalOpenAIPayload,
 	} = getModelCapabilities(providerName, modelName_, overridesOfModel)
-	if (chatMode === 'agent' && !specialToolFormat) {
+	if (chatMode === 'agent' && specialToolFormat !== 'openai-style') {
 		onError({ message: 'Agent mode requires a native tool-calling model; XML tool fallback is disabled.', fullError: null })
 		return
 	}
@@ -463,7 +463,7 @@ const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessag
 		modelName,
 		specialToolFormat,
 	} = getModelCapabilities(providerName, modelName_, overridesOfModel)
-	if (chatMode === 'agent' && !specialToolFormat) {
+	if (chatMode === 'agent' && specialToolFormat !== 'anthropic-style') {
 		onError({ message: 'Agent mode requires a native tool-calling model; XML tool fallback is disabled.', fullError: null })
 		return
 	}
@@ -761,7 +761,7 @@ const sendGeminiChat = async ({
 		specialToolFormat,
 		// reasoningCapabilities,
 	} = getModelCapabilities(providerName, modelName_, overridesOfModel)
-	if (chatMode === 'agent' && !specialToolFormat) {
+	if (chatMode === 'agent' && specialToolFormat !== 'gemini-style') {
 		onError({ message: 'Agent mode requires a native tool-calling model; XML tool fallback is disabled.', fullError: null })
 		return
 	}
