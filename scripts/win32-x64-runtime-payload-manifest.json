@@ -1,0 +1,105 @@
+{
+  "schemaVersion": 1,
+  "target": {
+    "platform": "win32",
+    "architecture": "x64"
+  },
+  "entries": [
+    {
+      "component": "@vscode/sqlite3",
+      "path": "resources/app/node_modules/@vscode/sqlite3/build/Release/vscode-sqlite3.node"
+    },
+    {
+      "component": "@vscode/spdlog",
+      "path": "resources/app/node_modules/@vscode/spdlog/build/Release/spdlog.node"
+    },
+    {
+      "component": "@vscode/windows-mutex",
+      "path": "resources/app/node_modules/@vscode/windows-mutex/build/Release/CreateMutex.node"
+    },
+    {
+      "component": "@vscode/policy-watcher",
+      "path": "resources/app/node_modules/@vscode/policy-watcher/build/Release/vscode-policy-watcher.node"
+    },
+    {
+      "component": "@vscode/windows-process-tree",
+      "path": "resources/app/node_modules/@vscode/windows-process-tree/build/Release/windows_process_tree.node"
+    },
+    {
+      "component": "@vscode/deviceid",
+      "path": "resources/app/node_modules/@vscode/deviceid/build/Release/windows.node"
+    },
+    {
+      "component": "@vscode/windows-registry",
+      "path": "resources/app/node_modules/@vscode/windows-registry/build/Release/winregistry.node"
+    },
+    {
+      "component": "@parcel/watcher",
+      "path": "resources/app/node_modules/@parcel/watcher/build/Release/watcher.node"
+    },
+    {
+      "component": "native-is-elevated",
+      "path": "resources/app/node_modules/native-is-elevated/build/Release/iselevated.node"
+    },
+    {
+      "component": "native-keymap",
+      "path": "resources/app/node_modules/native-keymap/build/Release/keymapping.node"
+    },
+    {
+      "component": "native-watchdog",
+      "path": "resources/app/node_modules/native-watchdog/build/Release/watchdog.node"
+    },
+    {
+      "component": "node-pty",
+      "path": "resources/app/node_modules/node-pty/build/Release/conpty.node"
+    },
+    {
+      "component": "node-pty",
+      "path": "resources/app/node_modules/node-pty/build/Release/conpty_console_list.node"
+    },
+    {
+      "component": "node-pty",
+      "path": "resources/app/node_modules/node-pty/build/Release/pty.node"
+    },
+    {
+      "component": "node-pty",
+      "path": "resources/app/node_modules/node-pty/build/Release/winpty-agent.exe"
+    },
+    {
+      "component": "node-pty",
+      "path": "resources/app/node_modules/node-pty/build/Release/winpty.dll"
+    },
+    {
+      "component": "node-pty",
+      "path": "resources/app/node_modules/node-pty/build/Release/conpty/conpty.dll"
+    },
+    {
+      "component": "node-pty",
+      "path": "resources/app/node_modules/node-pty/build/Release/conpty/OpenConsole.exe"
+    },
+    {
+      "component": "kerberos",
+      "path": "resources/app/node_modules/kerberos/build/Release/kerberos.node"
+    },
+    {
+      "component": "windows-foreground-love",
+      "path": "resources/app/node_modules/windows-foreground-love/build/Release/foreground_love.node"
+    },
+    {
+      "component": "@vscode/windows-ca-certs",
+      "path": "resources/app/node_modules/@vscode/windows-ca-certs/build/Release/crypt32.node"
+    },
+    {
+      "component": "@vscode/ripgrep",
+      "path": "resources/app/node_modules/@vscode/ripgrep/bin/rg.exe"
+    },
+    {
+      "component": "microsoft-authentication",
+      "path": "resources/app/extensions/microsoft-authentication/dist/msal-node-runtime.node"
+    },
+    {
+      "component": "microsoft-authentication",
+      "path": "resources/app/extensions/microsoft-authentication/dist/msalruntime.dll"
+    }
+  ]
+}
