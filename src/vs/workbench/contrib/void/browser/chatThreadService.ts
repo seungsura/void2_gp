@@ -640,9 +640,6 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				this._addMessageToThread(threadId, { role: 'tool', type: 'invalid_params', rawParams: opts.unvalidatedToolParams, result: null, name: toolName, content: errorMessage, id: toolId, mcpServerName })
 				return {}
 			}
-			// once validated, add checkpoint for edit
-			if (toolName === 'write_file') { this._addToolEditCheckpoint({ threadId, uri: (toolParams as BuiltinToolCallParams['write_file']).uri }) }
-
 			// 2. if tool requires approval, break from the loop, awaiting approval
 
 			const approvalType = isBuiltInTool ? approvalTypeOfBuiltinToolName[toolName] : 'MCP tools'
@@ -679,7 +676,17 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			this._setStreamState(threadId, { isRunning: 'tool', interrupt: interruptorPromise, toolInfo: { toolName, toolParams, id: toolId, content: 'interrupted...', rawParams: opts.unvalidatedToolParams, mcpServerName } })
 
 			if (isBuiltInTool) {
-				const { result, interruptTool } = await this._toolsService.callTool[toolName](toolParams as any)
+				let preparedWrite: Awaited<ReturnType<IToolsService['prepareWriteFile']>> | null = null
+				if (toolName === 'write_file' && (toolParams as BuiltinToolCallParams['write_file']).operation === 'modify') {
+					preparedWrite = await this._toolsService.prepareWriteFile(toolParams as BuiltinToolCallParams['write_file'])
+					if (!preparedWrite) throw new Error('Internal error: modify write_file did not produce a receipt.')
+					// Receipt exists only after semantic planning; checkpoint and mutation share it.
+					this._addToolEditCheckpoint({ threadId, uri: preparedWrite.uri })
+				}
+				const call = preparedWrite
+					? { result: preparedWrite.execute() }
+					: await this._toolsService.callTool[toolName](toolParams as any)
+				const { result, interruptTool } = call
 				const interruptor = () => { interrupted = true; interruptTool?.() }
 				resolveInterruptor(interruptor)
 

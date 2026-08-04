@@ -27,6 +27,7 @@ import { VSBuffer } from '../../../../base/common/buffer.js'
 type ValidateBuiltinParams = { [T in BuiltinToolName]: (p: RawToolParamsObj) => BuiltinToolCallParams[T] }
 type CallBuiltinTool = { [T in BuiltinToolName]: (p: BuiltinToolCallParams[T]) => Promise<{ result: BuiltinToolResultType[T] | Promise<BuiltinToolResultType[T]>, interruptTool?: () => void }> }
 type BuiltinToolResultToString = { [T in BuiltinToolName]: (p: BuiltinToolCallParams[T], result: Awaited<BuiltinToolResultType[T]>) => string }
+type PreparedWriteFile = { uri: URI; execute: () => Promise<BuiltinToolResultType['write_file']> }
 
 
 const isFalsy = (u: unknown) => {
@@ -130,6 +131,7 @@ export interface IToolsService {
 	readonly _serviceBrand: undefined;
 	validateParams: ValidateBuiltinParams;
 	callTool: CallBuiltinTool;
+	prepareWriteFile: (params: BuiltinToolCallParams['write_file']) => Promise<PreparedWriteFile | null>;
 	stringOfResult: BuiltinToolResultToString;
 }
 
@@ -141,6 +143,7 @@ export class ToolsService implements IToolsService {
 
 	public validateParams: ValidateBuiltinParams;
 	public callTool: CallBuiltinTool;
+	public prepareWriteFile: (params: BuiltinToolCallParams['write_file']) => Promise<PreparedWriteFile | null>;
 	public stringOfResult: BuiltinToolResultToString;
 
 	constructor(
@@ -157,6 +160,27 @@ export class ToolsService implements IToolsService {
 		@IVoidSettingsService private readonly voidSettingsService: IVoidSettingsService,
 	) {
 		const queryBuilder = instantiationService.createInstance(QueryBuilder);
+		this.prepareWriteFile = async (params) => {
+			if (params.operation !== 'modify') return null;
+			if (this.commandBarService.getStreamState(params.uri) === 'streaming') throw new Error(`Another LLM is currently making changes to this file. Please stop streaming for now and ask the user to resume later.`)
+			await voidModelService.initializeModel(params.uri)
+			const { model } = await voidModelService.getModelSafe(params.uri)
+			if (!model) throw new Error('No contents; File does not exist.')
+			const versionId = model.getVersionId()
+			const snapshot = model.getValue(EndOfLinePreference.LF)
+			const plan = planWriteFileModify(snapshot, params.edits)
+			if (!plan) throw new Error('write_file rejected: each old_text must be a unique, exact whole-line match in the latest file snapshot.')
+			return {
+				uri: params.uri,
+				execute: async () => {
+					if (model.getVersionId() !== versionId) throw new Error('write_file rejected: file changed before the edit could be applied.')
+					await editCodeService.callBeforeApplyOrEdit(params.uri)
+					if (model.getVersionId() !== versionId) throw new Error('write_file rejected: file changed before the edit could be applied.')
+					model.applyEdits([{ range: model.getFullModelRange(), text: plan.newText }])
+					return { operation: 'modify', didChange: plan.newText !== snapshot, editCount: params.edits.length }
+				}
+			}
+		}
 
 		this.validateParams = {
 			read_file: (params: RawToolParamsObj) => {
@@ -419,23 +443,13 @@ export class ToolsService implements IToolsService {
 			},
 
 			write_file: async (params) => {
-				if (this.commandBarService.getStreamState(params.uri) === 'streaming') throw new Error(`Another LLM is currently making changes to this file. Please stop streaming for now and ask the user to resume later.`)
 				if (params.operation === 'create') {
 					await fileService.createFile(params.uri, VSBuffer.fromString(params.content), { overwrite: false })
 					return { result: { operation: 'create', didChange: true, editCount: 0 } }
 				}
-				await voidModelService.initializeModel(params.uri)
-				const { model } = await voidModelService.getModelSafe(params.uri)
-				if (!model) throw new Error('No contents; File does not exist.')
-				const versionId = model.getVersionId()
-				const snapshot = model.getValue(EndOfLinePreference.LF)
-				const plan = planWriteFileModify(snapshot, params.edits)
-				if (!plan) throw new Error('write_file rejected: each old_text must be a unique, exact whole-line match in the latest file snapshot.')
-				if (model.getVersionId() !== versionId) throw new Error('write_file rejected: file changed while the edit was being planned.')
-				await editCodeService.callBeforeApplyOrEdit(params.uri)
-				if (model.getVersionId() !== versionId) throw new Error('write_file rejected: file changed before the edit could be applied.')
-				model.applyEdits([{ range: model.getFullModelRange(), text: plan.newText }])
-				return { result: { operation: 'modify', didChange: plan.newText !== snapshot, editCount: params.edits.length } }
+				const prepared = await this.prepareWriteFile(params)
+				if (!prepared) throw new Error('Internal error: modify write_file did not produce a receipt.')
+				return { result: prepared.execute() }
 			},
 			// ---
 			run_command: async ({ command, cwd, terminalId }) => {
