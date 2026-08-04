@@ -78,9 +78,7 @@ export type LLMFIMMessage = {
 }
 
 
-export type RawToolParamsObj = {
-	[paramName in ToolParamName<ToolName>]?: string;
-}
+export type RawToolParamsObj = Record<string, unknown>
 export type RawToolCallObj = {
 	name: ToolName;
 	rawParams: RawToolParamsObj;
@@ -209,7 +207,6 @@ export type MainModelListParams<modelResponse> = Omit<ModelListParams<modelRespo
 
 export type EventModelListOnSuccessParams<modelResponse> = Parameters<ModelListParams<modelResponse>['onSuccess']>[0] & { requestId: string }
 export type EventModelListOnErrorParams<modelResponse> = Parameters<ModelListParams<modelResponse>['onError']>[0] & { requestId: string }
-
 
 
 

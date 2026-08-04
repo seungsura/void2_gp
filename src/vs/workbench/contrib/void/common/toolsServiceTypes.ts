@@ -21,8 +21,7 @@ export type ShallowDirectoryItem = {
 export const approvalTypeOfBuiltinToolName: Partial<{ [T in BuiltinToolName]?: 'edits' | 'terminal' | 'MCP tools' }> = {
 	'create_file_or_folder': 'edits',
 	'delete_file_or_folder': 'edits',
-	'rewrite_file': 'edits',
-	'edit_file': 'edits',
+	'write_file': 'edits',
 	'run_command': 'terminal',
 	'run_persistent_command': 'terminal',
 	'open_persistent_terminal': 'terminal',
@@ -51,8 +50,7 @@ export type BuiltinToolCallParams = {
 	'search_in_file': { uri: URI, query: string, isRegex: boolean },
 	'read_lint_errors': { uri: URI },
 	// ---
-	'rewrite_file': { uri: URI, newContent: string },
-	'edit_file': { uri: URI, searchReplaceBlocks: string },
+	'write_file': { uri: URI, operation: 'modify', edits: { oldText: string, newText: string }[] } | { uri: URI, operation: 'create', content: string },
 	'create_file_or_folder': { uri: URI, isFolder: boolean },
 	'delete_file_or_folder': { uri: URI, isRecursive: boolean, isFolder: boolean },
 	// ---
@@ -72,8 +70,7 @@ export type BuiltinToolResultType = {
 	'search_in_file': { lines: number[]; },
 	'read_lint_errors': { lintErrors: LintErrorItem[] | null },
 	// ---
-	'rewrite_file': Promise<{ lintErrors: LintErrorItem[] | null }>,
-	'edit_file': Promise<{ lintErrors: LintErrorItem[] | null }>,
+	'write_file': { operation: 'modify' | 'create', didChange: boolean, editCount: number },
 	'create_file_or_folder': {},
 	'delete_file_or_folder': {},
 	// ---

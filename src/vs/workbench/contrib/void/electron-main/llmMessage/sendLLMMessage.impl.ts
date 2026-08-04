@@ -179,7 +179,6 @@ const _sendOpenAICompatibleFIM = async ({ messages: { prefix, suffix, stopTokens
 		supportsFIM,
 		additionalOpenAIPayload,
 	} = getModelCapabilities(providerName, modelName_, overridesOfModel)
-
 	if (!supportsFIM) {
 		if (modelName === modelName_)
 			onError({ message: `Model ${modelName} does not support FIM.`, fullError: null })
@@ -220,7 +219,7 @@ const toOpenAICompatibleTool = (toolInfo: InternalToolInfo) => {
 			name: name,
 			// strict: true, // strict mode - https://platform.openai.com/docs/guides/function-calling?api-mode=chat
 			description: description,
-			parameters: {
+			parameters: toolInfo.schema ?? {
 				type: 'object',
 				properties: params,
 				// required: Object.keys(params), // in strict mode, all params are required and additionalProperties is false
@@ -277,6 +276,10 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 		reasoningCapabilities,
 		additionalOpenAIPayload,
 	} = getModelCapabilities(providerName, modelName_, overridesOfModel)
+	if (chatMode === 'agent' && !specialToolFormat) {
+		onError({ message: 'Agent mode requires a native tool-calling model; XML tool fallback is disabled.', fullError: null })
+		return
+	}
 
 	const { providerReasoningIOSettings } = getProviderCapabilities(providerName)
 
@@ -433,7 +436,7 @@ const toAnthropicTool = (toolInfo: InternalToolInfo) => {
 	return {
 		name: name,
 		description: description,
-		input_schema: {
+		input_schema: toolInfo.schema ?? {
 			type: 'object',
 			properties: paramsWithType,
 			// required: Object.keys(params),
@@ -460,6 +463,10 @@ const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessag
 		modelName,
 		specialToolFormat,
 	} = getModelCapabilities(providerName, modelName_, overridesOfModel)
+	if (chatMode === 'agent' && !specialToolFormat) {
+		onError({ message: 'Agent mode requires a native tool-calling model; XML tool fallback is disabled.', fullError: null })
+		return
+	}
 
 	const thisConfig = settingsOfProvider.anthropic
 	const { providerReasoningIOSettings } = getProviderCapabilities(providerName)
@@ -687,7 +694,7 @@ const toGeminiFunctionDecl = (toolInfo: InternalToolInfo) => {
 	return {
 		name,
 		description,
-		parameters: {
+		parameters: toolInfo.schema ? toolInfo.schema as Schema : {
 			type: Type.OBJECT,
 			properties: Object.entries(params).reduce((acc, [key, value]) => {
 				acc[key] = {
@@ -739,6 +746,10 @@ const sendGeminiChat = async ({
 		specialToolFormat,
 		// reasoningCapabilities,
 	} = getModelCapabilities(providerName, modelName_, overridesOfModel)
+	if (chatMode === 'agent' && !specialToolFormat) {
+		onError({ message: 'Agent mode requires a native tool-calling model; XML tool fallback is disabled.', fullError: null })
+		return
+	}
 
 	// const { providerReasoningIOSettings } = getProviderCapabilities(providerName)
 

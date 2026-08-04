@@ -19,6 +19,8 @@ import { RawToolParamsObj } from '../common/sendLLMMessageTypes.js'
 import { MAX_CHILDREN_URIs_PAGE, MAX_FILE_CHARS_PAGE, MAX_TERMINAL_BG_COMMAND_TIME, MAX_TERMINAL_INACTIVE_TIME } from '../common/prompt/prompts.js'
 import { IVoidSettingsService } from '../common/voidSettingsService.js'
 import { generateUuid } from '../../../../base/common/uuid.js'
+import { planWriteFileModify, WriteFileEdit } from '../common/writeFilePlanner.js'
+import { VSBuffer } from '../../../../base/common/buffer.js'
 
 
 // tool use for AI
@@ -249,18 +251,17 @@ export class ToolsService implements IToolsService {
 				return { uri, isRecursive, isFolder }
 			},
 
-			rewrite_file: (params: RawToolParamsObj) => {
-				const { uri: uriStr, new_content: newContentUnknown } = params
-				const uri = validateURI(uriStr)
-				const newContent = validateStr('newContent', newContentUnknown)
-				return { uri, newContent }
-			},
-
-			edit_file: (params: RawToolParamsObj) => {
-				const { uri: uriStr, search_replace_blocks: searchReplaceBlocksUnknown } = params
-				const uri = validateURI(uriStr)
-				const searchReplaceBlocks = validateStr('searchReplaceBlocks', searchReplaceBlocksUnknown)
-				return { uri, searchReplaceBlocks }
+			write_file: (params: RawToolParamsObj) => {
+				const uri = validateURI(params.uri)
+				const operation = validateStr('operation', params.operation)
+				if (operation === 'create') return { uri, operation, content: validateStr('content', params.content) }
+				if (operation !== 'modify' || !Array.isArray(params.edits) || params.edits.length === 0) throw new Error('Invalid LLM output: write_file modify requires a non-empty edits array.')
+				const edits: WriteFileEdit[] = params.edits.map((edit, index) => {
+					if (!edit || typeof edit !== 'object') throw new Error(`Invalid LLM output: edits[${index}] must be an object.`)
+					const value = edit as Record<string, unknown>
+					return { oldText: validateStr(`edits[${index}].old_text`, value.old_text), newText: validateStr(`edits[${index}].new_text`, value.new_text) }
+				})
+				return { uri, operation, edits }
 			},
 
 			// ---
@@ -410,38 +411,24 @@ export class ToolsService implements IToolsService {
 				return { result: {} }
 			},
 
-			rewrite_file: async ({ uri, newContent }) => {
-				await voidModelService.initializeModel(uri)
-				if (this.commandBarService.getStreamState(uri) === 'streaming') {
-					throw new Error(`Another LLM is currently making changes to this file. Please stop streaming for now and ask the user to resume later.`)
+			write_file: async (params) => {
+				if (this.commandBarService.getStreamState(params.uri) === 'streaming') throw new Error(`Another LLM is currently making changes to this file. Please stop streaming for now and ask the user to resume later.`)
+				if (params.operation === 'create') {
+					await fileService.createFile(params.uri, VSBuffer.fromString(params.content), { overwrite: false })
+					return { result: { operation: 'create', didChange: true, editCount: 0 } }
 				}
-				await editCodeService.callBeforeApplyOrEdit(uri)
-				editCodeService.instantlyRewriteFile({ uri, newContent })
-				// at end, get lint errors
-				const lintErrorsPromise = Promise.resolve().then(async () => {
-					await timeout(2000)
-					const { lintErrors } = this._getLintErrors(uri)
-					return { lintErrors }
-				})
-				return { result: lintErrorsPromise }
-			},
-
-			edit_file: async ({ uri, searchReplaceBlocks }) => {
-				await voidModelService.initializeModel(uri)
-				if (this.commandBarService.getStreamState(uri) === 'streaming') {
-					throw new Error(`Another LLM is currently making changes to this file. Please stop streaming for now and ask the user to resume later.`)
-				}
-				await editCodeService.callBeforeApplyOrEdit(uri)
-				editCodeService.instantlyApplySearchReplaceBlocks({ uri, searchReplaceBlocks })
-
-				// at end, get lint errors
-				const lintErrorsPromise = Promise.resolve().then(async () => {
-					await timeout(2000)
-					const { lintErrors } = this._getLintErrors(uri)
-					return { lintErrors }
-				})
-
-				return { result: lintErrorsPromise }
+				await voidModelService.initializeModel(params.uri)
+				const { model } = await voidModelService.getModelSafe(params.uri)
+				if (!model) throw new Error('No contents; File does not exist.')
+				const versionId = model.getVersionId()
+				const snapshot = model.getValue(EndOfLinePreference.LF)
+				const plan = planWriteFileModify(snapshot, params.edits)
+				if (!plan) throw new Error('write_file rejected: each old_text must be a unique, exact whole-line match in the latest file snapshot.')
+				if (model.getVersionId() !== versionId) throw new Error('write_file rejected: file changed while the edit was being planned.')
+				await editCodeService.callBeforeApplyOrEdit(params.uri)
+				if (model.getVersionId() !== versionId) throw new Error('write_file rejected: file changed before the edit could be applied.')
+				model.applyEdits([{ range: model.getFullModelRange(), text: plan.newText }])
+				return { result: { operation: 'modify', didChange: plan.newText !== snapshot, editCount: params.edits.length } }
 			},
 			// ---
 			run_command: async ({ command, cwd, terminalId }) => {
@@ -512,24 +499,7 @@ export class ToolsService implements IToolsService {
 			delete_file_or_folder: (params, result) => {
 				return `URI ${params.uri.fsPath} successfully deleted.`
 			},
-			edit_file: (params, result) => {
-				const lintErrsString = (
-					this.voidSettingsService.state.globalSettings.includeToolLintErrors ?
-						(result.lintErrors ? ` Lint errors found after change:\n${stringifyLintErrors(result.lintErrors)}.\nIf this is related to a change made while calling this tool, you might want to fix the error.`
-							: ` No lint errors found.`)
-						: '')
-
-				return `Change successfully made to ${params.uri.fsPath}.${lintErrsString}`
-			},
-			rewrite_file: (params, result) => {
-				const lintErrsString = (
-					this.voidSettingsService.state.globalSettings.includeToolLintErrors ?
-						(result.lintErrors ? ` Lint errors found after change:\n${stringifyLintErrors(result.lintErrors)}.\nIf this is related to a change made while calling this tool, you might want to fix the error.`
-							: ` No lint errors found.`)
-						: '')
-
-				return `Change successfully made to ${params.uri.fsPath}.${lintErrsString}`
-			},
+			write_file: (params, result) => JSON.stringify({ operation: result.operation, didChange: result.didChange, editCount: result.editCount }),
 			run_command: (params, result) => {
 				const { resolveReason, result: result_, } = result
 				// success

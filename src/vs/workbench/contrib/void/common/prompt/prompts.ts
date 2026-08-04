@@ -144,6 +144,8 @@ ${tripleTick[1]}`
 export type InternalToolInfo = {
 	name: string,
 	description: string,
+	/** JSON Schema for native tool providers. Legacy params remain for XML only. */
+	schema?: Record<string, unknown>,
 	params: {
 		[paramName: string]: { description: string }
 	},
@@ -163,7 +165,7 @@ const paginationParam = {
 
 
 
-const terminalDescHelper = `You can use this tool to run any command: sed, grep, etc. Do not edit any files with this tool; use edit_file instead. When working with git and other tools that open an editor (e.g. git diff), you should pipe to cat to get all results and not get stuck in vim.`
+const terminalDescHelper = `You can use this tool to run any command: sed, grep, etc. Do not edit any files with this tool; use write_file instead. When working with git and other tools that open an editor (e.g. git diff), you should pipe to cat to get all results and not get stuck in vim.`
 
 const cwdHelper = 'Optional. The directory in which to run the command. Defaults to the first workspace folder.'
 
@@ -286,21 +288,22 @@ export const builtinTools: {
 		},
 	},
 
-	edit_file: {
-		name: 'edit_file',
-		description: `Edit the contents of a file. You must provide the file's URI as well as a SINGLE string of SEARCH/REPLACE block(s) that will be used to apply the edit.`,
-		params: {
-			...uriParam('file'),
-			search_replace_blocks: { description: replaceTool_description }
-		},
-	},
-
-	rewrite_file: {
-		name: 'rewrite_file',
-		description: `Edits a file, deleting all the old contents and replacing them with your new contents. Use this tool if you want to edit a file you just created.`,
-		params: {
-			...uriParam('file'),
-			new_content: { description: `The new contents of the file. Must be a string.` }
+	write_file: {
+		name: 'write_file',
+		description: `Creates a new file with content, or applies one or more exact, unique, whole-line replacements to an existing file.`,
+		params: {},
+		schema: {
+			type: 'object', additionalProperties: false, required: ['uri', 'operation'],
+			properties: {
+				uri: { type: 'string', description: 'The FULL path to the file.' },
+				operation: { type: 'string', enum: ['modify', 'create'] },
+				edits: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['old_text', 'new_text'], properties: { old_text: { type: 'string' }, new_text: { type: 'string' } } }, minItems: 1 },
+				content: { type: 'string' },
+			},
+			oneOf: [
+				{ properties: { operation: { const: 'modify' } }, required: ['edits'] },
+				{ properties: { operation: { const: 'create' } }, required: ['content'] },
+			],
 		},
 	},
 	run_command: {
