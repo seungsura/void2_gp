@@ -42,20 +42,67 @@ function Test-IsTransientFileLockException {
     return $Win32Error -eq 32 -or $Win32Error -eq 33
 }
 
-function Remove-ExpectedPackageTransientFile {
+function Remove-PackageFileWithBoundedRetry {
     param(
         [Parameter(Mandatory = $true)]
         [string]$CandidatePath,
 
         [Parameter(Mandatory = $true)]
+        [string]$CleanupPurpose
+    )
+
+    # Five attempts with 200 ms, 400 ms, 600 ms, and 800 ms waits (2 seconds total)
+    # tolerate a short-lived scanner/indexer lock without hiding non-lock failures.
+    $MaximumAttempts = 5
+    for ($Attempt = 1; $Attempt -le $MaximumAttempts; $Attempt++) {
+        if (-not (Test-Path -LiteralPath $CandidatePath)) {
+            return
+        }
+
+        try {
+            Remove-Item -LiteralPath $CandidatePath -Force -ErrorAction Stop
+            return
+        } catch {
+            if (-not (Test-IsTransientFileLockException -Exception $_.Exception)) {
+                throw
+            }
+            if ($Attempt -eq $MaximumAttempts) {
+                throw "$CleanupPurpose failed after $MaximumAttempts attempts due to a sharing/lock violation; the exact candidate remains: $CandidatePath"
+            }
+
+            # Release any managed archive/hash handles before retrying a locked file.
+            Write-Output "$CleanupPurpose retry $Attempt of $MaximumAttempts after sharing/lock violation; waiting $($Attempt * 200) ms: $CandidatePath"
+            [GC]::Collect()
+            [GC]::WaitForPendingFinalizers()
+            [GC]::Collect()
+            Start-Sleep -Milliseconds (200 * $Attempt)
+        }
+    }
+}
+
+function Remove-ExpectedPackageCleanupFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CandidatePath,
+
         [string]$ExpectedLeafName,
+
+        [string]$ExpectedLeafPattern,
 
         [Parameter(Mandatory = $true)]
         [string]$PackageDirectoryPath,
 
         [Parameter(Mandatory = $true)]
-        [string]$FinalOutputPath
+        [string]$FinalOutputPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$CleanupPurpose
     )
+
+    if (([string]::IsNullOrWhiteSpace($ExpectedLeafName) -and [string]::IsNullOrWhiteSpace($ExpectedLeafPattern)) -or
+        (-not [string]::IsNullOrWhiteSpace($ExpectedLeafName) -and -not [string]::IsNullOrWhiteSpace($ExpectedLeafPattern))) {
+        throw 'Portable package cleanup requires exactly one expected leaf name or leaf pattern.'
+    }
 
     $ResolvedPackageDirectory = [IO.Path]::GetFullPath($PackageDirectoryPath).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     $ResolvedCandidatePath = [IO.Path]::GetFullPath($CandidatePath)
@@ -63,39 +110,51 @@ function Remove-ExpectedPackageTransientFile {
     $CandidateParent = Split-Path -Parent $ResolvedCandidatePath
     $CandidateLeaf = Split-Path -Leaf $ResolvedCandidatePath
 
+    $ExpectedLeafMatches = if (-not [string]::IsNullOrWhiteSpace($ExpectedLeafName)) {
+        [StringComparer]::Ordinal.Equals($CandidateLeaf, $ExpectedLeafName)
+    } else {
+        $CandidateLeaf -cmatch $ExpectedLeafPattern
+    }
+
     if (-not [StringComparer]::OrdinalIgnoreCase.Equals($CandidateParent, $ResolvedPackageDirectory) -or
-        -not [StringComparer]::Ordinal.Equals($CandidateLeaf, $ExpectedLeafName) -or
+        -not $ExpectedLeafMatches -or
         [StringComparer]::OrdinalIgnoreCase.Equals($ResolvedCandidatePath, $ResolvedFinalOutputPath)) {
-        throw "Refusing to remove an unexpected portable package transient file: $ResolvedCandidatePath"
+        throw "Refusing $CleanupPurpose for an unexpected portable package file: $ResolvedCandidatePath"
     }
 
-    # Five attempts with 200 ms, 400 ms, 600 ms, and 800 ms waits (2 seconds total)
-    # tolerate a short-lived scanner/indexer lock without hiding non-lock failures.
-    $MaximumAttempts = 5
-    for ($Attempt = 1; $Attempt -le $MaximumAttempts; $Attempt++) {
-        if (-not (Test-Path -LiteralPath $ResolvedCandidatePath)) {
-            return
-        }
+    Remove-PackageFileWithBoundedRetry -CandidatePath $ResolvedCandidatePath -CleanupPurpose $CleanupPurpose
+}
 
-        try {
-            Remove-Item -LiteralPath $ResolvedCandidatePath -Force -ErrorAction Stop
-            return
-        } catch {
-            if (-not (Test-IsTransientFileLockException -Exception $_.Exception)) {
-                throw
-            }
-            if ($Attempt -eq $MaximumAttempts) {
-                throw "Portable package transient cleanup failed after $MaximumAttempts attempts due to a sharing/lock violation; the validated final ZIP and preserved backup were left in place: $ResolvedCandidatePath"
-            }
+function Remove-UnverifiedPublishedOutputForRollback {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CandidatePath,
 
-            # Release any managed archive/hash handles before retrying a locked file.
-            Write-Output "Portable package transient cleanup retry $Attempt of $MaximumAttempts after sharing/lock violation; waiting $($Attempt * 200) ms: $ResolvedCandidatePath"
-            [GC]::Collect()
-            [GC]::WaitForPendingFinalizers()
-            [GC]::Collect()
-            Start-Sleep -Milliseconds (200 * $Attempt)
-        }
+        [Parameter(Mandatory = $true)]
+        [string]$OutputName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PackageDirectoryPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$FinalOutputPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$CleanupPurpose
+    )
+
+    $ResolvedPackageDirectory = [IO.Path]::GetFullPath($PackageDirectoryPath).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $ResolvedCandidatePath = [IO.Path]::GetFullPath($CandidatePath)
+    $ResolvedFinalOutputPath = [IO.Path]::GetFullPath($FinalOutputPath)
+    $CandidateParent = Split-Path -Parent $ResolvedCandidatePath
+    $CandidateLeaf = Split-Path -Leaf $ResolvedCandidatePath
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($CandidateParent, $ResolvedPackageDirectory) -or
+        -not [StringComparer]::Ordinal.Equals($CandidateLeaf, $OutputName) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals($ResolvedCandidatePath, $ResolvedFinalOutputPath)) {
+        throw "Refusing rollback removal for an unexpected portable package final ZIP: $ResolvedCandidatePath"
     }
+
+    Remove-PackageFileWithBoundedRetry -CandidatePath $ResolvedCandidatePath -CleanupPurpose $CleanupPurpose
 }
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
@@ -236,15 +295,14 @@ if (Test-Path -LiteralPath $LocalNodePath -PathType Leaf) {
 
 try {
     if (Test-Path -LiteralPath $TemporaryOutputPath) {
-        Remove-ExpectedPackageTransientFile -CandidatePath $TemporaryOutputPath -ExpectedLeafName ".${OutputName}.tmp" -PackageDirectoryPath $PackageDirectory -FinalOutputPath $OutputPath
+        Remove-ExpectedPackageCleanupFile -CandidatePath $TemporaryOutputPath -ExpectedLeafName ".${OutputName}.tmp" -PackageDirectoryPath $PackageDirectory -FinalOutputPath $OutputPath -CleanupPurpose 'Pre-package temporary ZIP cleanup'
     }
 
     if (Test-Path -LiteralPath $BackupOutputPath) {
-        if (-not (Test-Path -LiteralPath $OutputPath -PathType Leaf)) {
-            throw "A preserved portable ZIP publish backup exists without a final ZIP; resolve it manually before packaging: $BackupOutputPath"
+        if (Test-Path -LiteralPath $OutputPath -PathType Leaf) {
+            throw "Ambiguous portable ZIP publish state: both the final ZIP and preserved backup exist. The final ZIP may be unverified from a failed rollback. No files were deleted; verify both hashes and resolve manually before packaging. Final: $OutputPath Backup: $BackupOutputPath"
         }
-        Write-Output "Removing stale portable publish backup after a previously published final ZIP: $BackupOutputPath"
-        Remove-ExpectedPackageTransientFile -CandidatePath $BackupOutputPath -ExpectedLeafName ".${OutputName}.backup" -PackageDirectoryPath $PackageDirectory -FinalOutputPath $OutputPath
+        throw "A preserved portable ZIP publish backup exists without a final ZIP; no files were deleted. Resolve it manually before packaging: $BackupOutputPath"
     }
 
     & $NodePath $PackerPath $ArtifactRoot $TemporaryOutputPath
@@ -321,7 +379,12 @@ try {
     } catch {
         $PublishFailure = $_
         if (Test-Path -LiteralPath $OutputPath -PathType Leaf) {
-            Remove-Item -LiteralPath $OutputPath -Force
+            $RollbackCleanupPurpose = if ($BackupCreated) {
+                "Rollback removal of the unverified published portable ZIP; preserved backup remains at $BackupOutputPath"
+            } else {
+                'Rollback removal of the unverified published portable ZIP'
+            }
+            Remove-UnverifiedPublishedOutputForRollback -CandidatePath $OutputPath -OutputName $OutputName -PackageDirectoryPath $PackageDirectory -FinalOutputPath $OutputPath -CleanupPurpose $RollbackCleanupPurpose
         }
         if ($BackupCreated) {
             try {
@@ -340,17 +403,25 @@ try {
     }
 
     if ($BackupCreated) {
-        Remove-ExpectedPackageTransientFile -CandidatePath $BackupOutputPath -ExpectedLeafName ".${OutputName}.backup" -PackageDirectoryPath $PackageDirectory -FinalOutputPath $OutputPath
+        Remove-ExpectedPackageCleanupFile -CandidatePath $BackupOutputPath -ExpectedLeafName ".${OutputName}.backup" -PackageDirectoryPath $PackageDirectory -FinalOutputPath $OutputPath -CleanupPurpose "Post-publish backup cleanup after validated final ZIP $OutputPath"
         $BackupCreated = $false
     }
 
     $FinalOutputPath = [IO.Path]::GetFullPath($OutputPath)
+    $FinalTemporaryOutputPath = [IO.Path]::GetFullPath($TemporaryOutputPath)
+    $FinalBackupOutputPath = [IO.Path]::GetFullPath($BackupOutputPath)
     $OldArchives = @(Get-ChildItem -LiteralPath $PackageDirectory -File | Where-Object {
-        $_.Name -match '^Void-.*-win32-x64-portable(?:-clean)?\.zip$' -and
-        -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($_.FullName), $FinalOutputPath)
+        $_.Name -cmatch '^Void-.*-win32-x64-portable\.zip$' -and
+        -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($_.FullName), $FinalOutputPath) -and
+        -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($_.FullName), $FinalTemporaryOutputPath) -and
+        -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($_.FullName), $FinalBackupOutputPath)
     })
-    foreach ($OldArchive in $OldArchives) {
-        Remove-Item -LiteralPath $OldArchive.FullName -Force
+    try {
+        foreach ($OldArchive in $OldArchives) {
+            Remove-ExpectedPackageCleanupFile -CandidatePath $OldArchive.FullName -ExpectedLeafPattern '^Void-.*-win32-x64-portable\.zip$' -PackageDirectoryPath $PackageDirectory -FinalOutputPath $OutputPath -CleanupPurpose "Old portable ZIP retention cleanup after validated final ZIP $OutputPath"
+        }
+    } catch {
+        throw "Portable ZIP was published and validated at $OutputPath (SHA-256: $Hash), but old ZIP retention cleanup left duplicate residue. $($_.Exception.Message)"
     }
 
     Write-Output "Portable package: $OutputPath"
@@ -360,6 +431,6 @@ try {
     Write-Output "Runtime payload manifest: static packaging validation passed; runtime launch certification is separate"
 } finally {
     if (Test-Path -LiteralPath $TemporaryOutputPath) {
-        Remove-ExpectedPackageTransientFile -CandidatePath $TemporaryOutputPath -ExpectedLeafName ".${OutputName}.tmp" -PackageDirectoryPath $PackageDirectory -FinalOutputPath $OutputPath
+        Remove-ExpectedPackageCleanupFile -CandidatePath $TemporaryOutputPath -ExpectedLeafName ".${OutputName}.tmp" -PackageDirectoryPath $PackageDirectory -FinalOutputPath $OutputPath -CleanupPurpose 'Final temporary ZIP cleanup'
     }
 }
