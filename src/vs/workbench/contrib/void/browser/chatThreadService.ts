@@ -19,7 +19,7 @@ import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { getIsReasoningEnabledState, getModelCapabilities, getReservedOutputTokenSpace } from '../common/modelCapabilities.js';
 import { estimateHistoryTokensForReadBudget } from './convertToLLMMessageService.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolResultType, ToolCallParams, ToolName, ToolResult } from '../common/toolsServiceTypes.js';
-import { isBoundedReadHistory, isBoundedReadHistoryString } from '../common/readFileReliability.js';
+import { computeMaxReadOutputTokens, isBoundedReadHistory, isBoundedReadHistoryString } from '../common/readFileReliability.js';
 import { IToolsService } from './toolsService.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { ILanguageFeaturesService } from '../../../../editor/common/services/languageFeatures.js';
@@ -649,7 +649,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 						const reasoning = getIsReasoningEnabledState('Chat', selection.providerName, selection.modelName, options, this._settingsService.state.overridesOfModel)
 						const reserve = getReservedOutputTokenSpace(selection.providerName, selection.modelName, { isReasoningEnabled: reasoning, overridesOfModel: this._settingsService.state.overridesOfModel }) ?? 4096
 						const baseline = estimateHistoryTokensForReadBudget(this.state.allThreads[threadId]?.messages ?? [])
-						return { ownerThreadId: threadId, maxReadOutputTokens: Math.max(0, capabilities.contextWindow - reserve - baseline - 1024) }
+						return { ownerThreadId: threadId, maxReadOutputTokens: computeMaxReadOutputTokens(capabilities.contextWindow, reserve, baseline) }
 					} catch { return { ownerThreadId: threadId, maxReadOutputTokens: 0 } }
 				})()
 				let preparedWrite: Awaited<ReturnType<IToolsService['prepareWriteFile']>> | null = null

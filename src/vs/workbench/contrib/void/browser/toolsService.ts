@@ -22,7 +22,7 @@ import { MAX_CHILDREN_URIs_PAGE, MAX_FILE_CHARS_PAGE, MAX_TERMINAL_BG_COMMAND_TI
 import { generateUuid } from '../../../../base/common/uuid.js'
 import { isWriteFileReceiptCurrent, planWriteFileModify, WriteFileEdit, WriteFileReceipt } from '../common/writeFilePlanner.js'
 import { VSBuffer } from '../../../../base/common/buffer.js'
-import { clampReadFileLimits, pageReadFileLines, ReadReceiptRegistry, validateReadFileRequest } from '../common/readFileReliability.js'
+import { effectiveReadFileLimits, pageReadFileLines, ReadReceiptRegistry, validateReadFileRequest } from '../common/readFileReliability.js'
 
 
 // tool use for AI
@@ -90,20 +90,6 @@ const validatePageNum = (pageNumberUnknown: unknown) => {
 	if (!Number.isInteger(parsedInt)) throw new Error(`Page number was not an integer: "${pageNumberUnknown}".`)
 	if (parsedInt < 1) throw new Error(`Invalid LLM output format: Specified page number must be 1 or greater: "${pageNumberUnknown}".`)
 	return parsedInt
-}
-
-const validateNumber = (numStr: unknown, opts: { default: number | null }) => {
-	if (typeof numStr === 'number')
-		return numStr
-	if (isFalsy(numStr)) return opts.default
-
-	if (typeof numStr === 'string') {
-		const parsedInt = Number.parseInt(numStr + '')
-		if (!Number.isInteger(parsedInt)) return opts.default
-		return parsedInt
-	}
-
-	return opts.default
 }
 
 const validateProposedTerminalId = (terminalIdUnknown: unknown) => {
@@ -375,8 +361,8 @@ export class ToolsService implements IToolsService {
 				if (model === null) { throw new Error(`No contents; File does not exist.`) }
 
 				const lines = Array.from({ length: model.getLineCount() }, (_, i) => model.getLineContent(i + 1))
-				const limits = clampReadFileLimits(this.voidSettingsService.state.globalSettings.readFileLimits)
-				const page = pageReadFileLines(lines, { startLine, endLine, lineByteOffset }, { ...limits, maxTokens: Math.min(limits.maxTokens, typeof context === 'string' ? 0 : context.maxReadOutputTokens) })
+				const limits = effectiveReadFileLimits(this.voidSettingsService.state.globalSettings.readFileLimits, typeof context === 'string' ? 0 : context.maxReadOutputTokens)
+				const page = pageReadFileLines(lines, { startLine, endLine, lineByteOffset }, limits)
 				const canonicalURI = uri.toString(); const documentVersion = model.getVersionId(); const id = generateUuid()
 				readReceipts.add({ id, uri: canonicalURI, version: documentVersion, model, owner })
 				return { result: { ...page, receipt: { id, uri: canonicalURI, documentVersion, sourceKind: uri.scheme === 'file' ? 'file' : 'model', requestedRange: { startLine, endLine, lineByteOffset }, returnedRange: { startLine: page.startLine, endLine: page.endLine, nextLine: page.nextLine, nextByteOffset: page.nextByteOffset } } } }

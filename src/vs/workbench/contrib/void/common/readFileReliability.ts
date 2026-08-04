@@ -15,6 +15,8 @@ export const clampReadFileLimits = (value: Partial<ReadFileLimits> | undefined):
 	maxBytes: clampInt(value?.maxBytes, READ_FILE_DEFAULTS.maxBytes, 1024, READ_FILE_LIMITS.maxBytes),
 	maxTokens: clampInt(value?.maxTokens, READ_FILE_DEFAULTS.maxTokens, 1, READ_FILE_LIMITS.maxTokens),
 });
+export const effectiveReadFileLimits = (configured: Partial<ReadFileLimits> | undefined, maxReadOutputTokens: number): ReadFileLimits => ({ ...clampReadFileLimits(configured), maxTokens: Math.max(0, Math.min(clampReadFileLimits(configured).maxTokens, maxReadOutputTokens)) });
+export const computeMaxReadOutputTokens = (contextWindow: number, reservedOutputTokens: number, baselineEstimatedTokens: number) => Math.max(0, contextWindow - reservedOutputTokens - baselineEstimatedTokens - 1024);
 const clampInt = (value: unknown, fallback: number, min: number, max: number) => typeof value === 'number' && Number.isInteger(value) ? Math.min(max, Math.max(min, value)) : fallback;
 
 export const validateReadFileRequest = (params: Record<string, unknown>): ReadFileRequest => {
@@ -32,7 +34,7 @@ export const validateReadFileRequest = (params: Record<string, unknown>): ReadFi
 };
 
 export const pageReadFileLines = (lines: readonly string[], request: ReadFileRequest, limits_: Partial<ReadFileLimits> = {}): ReadFilePage => {
-	const limits = clampReadFileLimits(limits_); const totalNumLines = lines.length; const totalFileLen = lines.join('\n').length;
+	const limits = { ...clampReadFileLimits(limits_), maxTokens: limits_.maxTokens === 0 ? 0 : clampReadFileLimits(limits_).maxTokens }; const totalNumLines = lines.length; const totalFileLen = lines.join('\n').length;
 	const start = request.startLine ?? 1; const last = Math.min(request.endLine ?? totalNumLines, totalNumLines);
 	if (start > totalNumLines || totalNumLines === 0) return { fileContents: '', totalFileLen, totalNumLines, hasNextPage: false, startLine: start, endLine: null, nextLine: null, truncated: false, eof: true, longLineContinuation: false };
 	const first = lines[start - 1]; const firstBytes = encoder.encode(first);

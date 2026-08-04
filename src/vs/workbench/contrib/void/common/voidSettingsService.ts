@@ -307,7 +307,7 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 				// ...defaultSettingsOfProvider,
 				// ...readS.settingsOfProvider,
 			}
-			readS.globalSettings = { ...defaultGlobalSettings, ...readS.globalSettings, readFileLimits: clampReadFileLimits(readS.globalSettings?.readFileLimits) }
+			readS = { ...readS, globalSettings: { ...defaultGlobalSettings, ...readS.globalSettings, readFileLimits: clampReadFileLimits(readS.globalSettings?.readFileLimits) } }
 
 			for (const providerName of providerNames) {
 				readS.settingsOfProvider[providerName] = {
