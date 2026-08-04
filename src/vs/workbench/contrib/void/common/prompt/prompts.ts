@@ -302,8 +302,8 @@ export const builtinTools: {
 				content: { type: 'string' },
 			},
 			oneOf: [
-				{ properties: { operation: { const: 'modify' } }, required: ['edits'] },
-				{ properties: { operation: { const: 'create' } }, required: ['content'] },
+				{ properties: { operation: { const: 'modify' } }, required: ['edits'], not: { required: ['content'] } },
+				{ properties: { operation: { const: 'create' } }, required: ['content'], not: { required: ['edits'] } },
 			],
 		},
 	},

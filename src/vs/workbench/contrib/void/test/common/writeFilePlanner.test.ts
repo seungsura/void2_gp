@@ -18,6 +18,7 @@ suite('Void write_file planner', () => {
 		assert.strictEqual(planWriteFileModify('same\nsame\n', [{ oldText: 'same', newText: 'x' }]), null);
 		assert.strictEqual(planWriteFileModify('prefix value\n', [{ oldText: 'value', newText: 'x' }]), null);
 		assert.strictEqual(planWriteFileModify('a\nb\n', [{ oldText: 'a\nb', newText: 'x' }, { oldText: 'b', newText: 'y' }]), null);
+		assert.strictEqual(planWriteFileModify('same\n', [{ oldText: 'same', newText: 'same' }]), null);
 		assert.strictEqual(planWriteFileModify('text\n', []), null);
 	});
 

@@ -252,10 +252,17 @@ export class ToolsService implements IToolsService {
 			},
 
 			write_file: (params: RawToolParamsObj) => {
+				const assertExactKeys = (allowed: readonly string[]) => {
+					for (const key of Object.keys(params)) if (!allowed.includes(key)) throw new Error(`Invalid LLM output: write_file does not allow ${key} for this operation.`)
+				}
 				const uri = validateURI(params.uri)
 				const operation = validateStr('operation', params.operation)
-				if (operation === 'create') return { uri, operation, content: validateStr('content', params.content) }
+				if (operation === 'create') {
+					assertExactKeys(['uri', 'operation', 'content'])
+					return { uri, operation, content: validateStr('content', params.content) }
+				}
 				if (operation !== 'modify' || !Array.isArray(params.edits) || params.edits.length === 0) throw new Error('Invalid LLM output: write_file modify requires a non-empty edits array.')
+				assertExactKeys(['uri', 'operation', 'edits'])
 				const edits: WriteFileEdit[] = params.edits.map((edit, index) => {
 					if (!edit || typeof edit !== 'object') throw new Error(`Invalid LLM output: edits[${index}] must be an object.`)
 					const value = edit as Record<string, unknown>

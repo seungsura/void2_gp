@@ -20,6 +20,7 @@ export const planWriteFileModify = (lfText: string, edits: readonly WriteFileEdi
 
 	for (const edit of edits) {
 		if (typeof edit.oldText !== 'string' || typeof edit.newText !== 'string') return null;
+		if (edit.oldText === edit.newText) return null;
 		if (edit.oldText === '') {
 			if (lfText !== '' || edits.length !== 1) return null;
 			planned.push({ start: 0, end: 0, newText: edit.newText });
@@ -42,7 +43,13 @@ export const planWriteFileModify = (lfText: string, edits: readonly WriteFileEdi
 	const ordered = [...planned].sort((a, b) => a.start - b.start);
 	for (let i = 1; i < ordered.length; i++) if (ordered[i - 1].end > ordered[i].start) return null;
 
-	let newText = lfText;
-	for (const edit of [...ordered].reverse()) newText = newText.slice(0, edit.start) + edit.newText + newText.slice(edit.end);
+	const parts: string[] = [];
+	let offset = 0;
+	for (const edit of ordered) {
+		parts.push(lfText.slice(offset, edit.start), edit.newText);
+		offset = edit.end;
+	}
+	parts.push(lfText.slice(offset));
+	const newText = parts.join('');
 	return { newText, edits: ordered };
 };

@@ -13,7 +13,7 @@ import { ChatMarkdownRender, ChatMessageLocation, getApplyBoxId } from '../markd
 import { URI } from '../../../../../../../base/common/uri.js';
 import { IDisposable } from '../../../../../../../base/common/lifecycle.js';
 import { ErrorDisplay } from './ErrorDisplay.js';
-import { BlockCode, TextAreaFns, VoidCustomDropdownBox, VoidInputBox2, VoidSlider, VoidSwitch, VoidDiffEditor } from '../util/inputs.js';
+import { BlockCode, TextAreaFns, VoidCustomDropdownBox, VoidInputBox2, VoidSlider, VoidSwitch } from '../util/inputs.js';
 import { ModelDropdown, } from '../void-settings-tsx/ModelDropdown.js';
 import { PastThreadsList } from './SidebarThreadSelector.js';
 import { VOID_CTRL_L_ACTION_ID } from '../../../actionIDs.js';
@@ -25,11 +25,10 @@ import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../co
 import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, CircleEllipsis, Folder, ALargeSmall, TypeOutline, Text } from 'lucide-react';
 import { ChatMessage, CheckpointEntry, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, ToolName, LintErrorItem, ToolApprovalType, toolApprovalTypes } from '../../../../common/toolsServiceTypes.js';
-import { CopyButton, EditToolAcceptRejectButtonsHTML, IconShell1, JumpToFileButton, JumpToTerminalButton, StatusIndicator, StatusIndicatorForApplyButton, useApplyStreamState, useEditToolStreamState } from '../markdown/ApplyBlockHoverButtons.js';
+import { IconShell1, JumpToFileButton, JumpToTerminalButton, StatusIndicator, useApplyStreamState } from '../markdown/ApplyBlockHoverButtons.js';
 import { IsRunningType } from '../../../chatThreadService.js';
 import { acceptAllBg, acceptBorder, buttonFontSize, buttonTextColor, rejectAllBg, rejectBg, rejectBorder } from '../../../../common/helpers/colors.js';
 import { builtinToolNames, isABuiltinToolName, MAX_FILE_CHARS_PAGE, MAX_TERMINAL_INACTIVE_TIME } from '../../../../common/prompt/prompts.js';
-import { RawToolCallObj } from '../../../../common/sendLLMMessageTypes.js';
 import ErrorBoundary from './ErrorBoundary.js';
 import { ToolApprovalTypeSwitch } from '../void-settings-tsx/Settings.js';
 
@@ -903,75 +902,21 @@ const ToolHeaderWrapper = ({
 
 
 
-const EditTool = ({ toolMessage, threadId, messageIdx, content }: Parameters<ResultWrapper<'edit_file' | 'rewrite_file'>>[0] & { content: string }) => {
+const WriteFileTool = ({ toolMessage }: Parameters<ResultWrapper<'write_file'>>[0]) => {
 	const accessor = useAccessor()
-	const isError = false
+	const isError = toolMessage.type === 'tool_error'
 	const isRejected = toolMessage.type === 'rejected'
-
 	const title = getTitle(toolMessage)
-
 	const { desc1, desc1Info } = toolNameToDesc(toolMessage.name, toolMessage.params, accessor)
-	const icon = null
-
-	const { rawParams, params, name } = toolMessage
-	const desc1OnClick = () => voidOpenFileFn(params.uri, accessor)
-	const componentParams: ToolHeaderParams = { title, desc1, desc1OnClick, desc1Info, isError, icon, isRejected, }
-
-
-	const editToolType = toolMessage.name === 'edit_file' ? 'diff' : 'rewrite'
-	if (toolMessage.type === 'running_now' || toolMessage.type === 'tool_request') {
-		componentParams.children = <ToolChildrenWrapper className='bg-void-bg-3'>
-			<EditToolChildren
-				uri={params.uri}
-				code={content}
-				type={editToolType}
-			/>
-		</ToolChildrenWrapper>
-		// JumpToFileButton removed in favor of FileLinkText
-	}
-	else if (toolMessage.type === 'success' || toolMessage.type === 'rejected' || toolMessage.type === 'tool_error') {
-		// add apply box
-		const applyBoxId = getApplyBoxId({
-			threadId: threadId,
-			messageIdx: messageIdx,
-			tokenIdx: 'N/A',
-		})
-		componentParams.desc2 = <EditToolHeaderButtons
-			applyBoxId={applyBoxId}
-			uri={params.uri}
-			codeStr={content}
-			toolName={name}
-			threadId={threadId}
-		/>
-
-		// add children
-		componentParams.children = <ToolChildrenWrapper className='bg-void-bg-3'>
-			<EditToolChildren
-				uri={params.uri}
-				code={content}
-				type={editToolType}
-			/>
-		</ToolChildrenWrapper>
-
-		if (toolMessage.type === 'success' || toolMessage.type === 'rejected') {
-			const { result } = toolMessage
-			componentParams.bottomChildren = <BottomChildren title='Lint errors'>
-				{result?.lintErrors?.map((error, i) => (
-					<div key={i} className='whitespace-nowrap'>Lines {error.startLineNumber}-{error.endLineNumber}: {error.message}</div>
-				))}
-			</BottomChildren>
-		}
-		else if (toolMessage.type === 'tool_error') {
-			// error
-			const { result } = toolMessage
-			componentParams.bottomChildren = <BottomChildren title='Error'>
-				<CodeChildren>
-					{result}
-				</CodeChildren>
-			</BottomChildren>
-		}
-	}
-
+	const { desc1, desc1Info } = toolNameToDesc('write_file', toolMessage.params, accessor)
+	const params = toolMessage.params
+	const componentParams: ToolHeaderParams = { title, desc1, desc1OnClick: () => voidOpenFileFn(params.uri, accessor), desc1Info, isError, icon: null, isRejected }
+	const preview = params.operation === 'create'
+		? { operation: 'create', content: params.content }
+		: { operation: 'modify', edits: params.edits }
+	componentParams.children = <ToolChildrenWrapper className='bg-void-bg-3'><CodeChildren>{JSON.stringify(preview, null, 2)}</CodeChildren></ToolChildrenWrapper>
+	if (toolMessage.type === 'success') componentParams.bottomChildren = <BottomChildren title='Result'><CodeChildren>{JSON.stringify(toolMessage.result)}</CodeChildren></BottomChildren>
+	if (toolMessage.type === 'tool_error') componentParams.bottomChildren = <BottomChildren title='Error'><CodeChildren>{toolMessage.result}</CodeChildren></BottomChildren>
 	return <ToolHeaderWrapper {...componentParams} />
 }
 
@@ -1410,8 +1355,7 @@ const titleOfBuiltinToolName = {
 	'search_for_files': { done: 'Searched', proposed: 'Search', running: loadingTitleWrapper('Searching') },
 	'create_file_or_folder': { done: `Created`, proposed: `Create`, running: loadingTitleWrapper(`Creating`) },
 	'delete_file_or_folder': { done: `Deleted`, proposed: `Delete`, running: loadingTitleWrapper(`Deleting`) },
-	'edit_file': { done: `Edited file`, proposed: 'Edit file', running: loadingTitleWrapper('Editing file') },
-	'rewrite_file': { done: `Wrote file`, proposed: 'Write file', running: loadingTitleWrapper('Writing file') },
+	'write_file': { done: `Wrote file`, proposed: 'Write file', running: loadingTitleWrapper('Writing file') },
 	'run_command': { done: `Ran terminal`, proposed: 'Run terminal', running: loadingTitleWrapper('Running terminal') },
 	'run_persistent_command': { done: `Ran terminal`, proposed: 'Run terminal', running: loadingTitleWrapper('Running terminal') },
 
@@ -1512,15 +1456,8 @@ const toolNameToDesc = (toolName: BuiltinToolName, _toolParams: BuiltinToolCallP
 				desc1Info: getRelative(toolParams.uri, accessor),
 			}
 		},
-		'rewrite_file': () => {
-			const toolParams = _toolParams as BuiltinToolCallParams['rewrite_file']
-			return {
-				desc1: getBasename(toolParams.uri.fsPath),
-				desc1Info: getRelative(toolParams.uri, accessor),
-			}
-		},
-		'edit_file': () => {
-			const toolParams = _toolParams as BuiltinToolCallParams['edit_file']
+		'write_file': () => {
+			const toolParams = _toolParams as BuiltinToolCallParams['write_file']
 			return {
 				desc1: getBasename(toolParams.uri.fsPath),
 				desc1Info: getRelative(toolParams.uri, accessor),
@@ -1668,21 +1605,6 @@ export const ListableToolItem = ({ name, onClick, isSmall, className, showDot }:
 
 
 
-const EditToolChildren = ({ uri, code, type }: { uri: URI | undefined, code: string, type: 'diff' | 'rewrite' }) => {
-
-	const content = type === 'diff' ?
-		<VoidDiffEditor uri={uri} searchReplaceBlocks={code} />
-		: <ChatMarkdownRender string={`\`\`\`\n${code}\n\`\`\``} codeURI={uri} chatMessageLocation={undefined} />
-
-	return <div className='!select-text cursor-auto'>
-		<SmallProseWrapper>
-			{content}
-		</SmallProseWrapper>
-	</div>
-
-}
-
-
 const LintErrorChildren = ({ lintErrors }: { lintErrors: LintErrorItem[] }) => {
 	return <div className="text-xs text-void-fg-4 opacity-80 border-l-2 border-void-warning px-2 py-0.5 flex flex-col gap-0.5 overflow-x-auto whitespace-nowrap">
 		{lintErrors.map((error, i) => (
@@ -1715,17 +1637,6 @@ const BottomChildren = ({ children, title }: { children: React.ReactNode, title:
 			</div>
 		</div>
 	);
-}
-
-
-const EditToolHeaderButtons = ({ applyBoxId, uri, codeStr, toolName, threadId }: { threadId: string, applyBoxId: string, uri: URI, codeStr: string, toolName: 'edit_file' | 'rewrite_file' }) => {
-	const { streamState } = useEditToolStreamState({ applyBoxId, uri })
-	return <div className='flex items-center gap-1'>
-		{/* <StatusIndicatorForApplyButton applyBoxId={applyBoxId} uri={uri} /> */}
-		{/* <JumpToFileButton uri={uri} /> */}
-		{streamState === 'idle-no-changes' && <CopyButton codeStr={codeStr} toolTipName='Copy' />}
-		<EditToolAcceptRejectButtonsHTML type={toolName} codeStr={codeStr} applyBoxId={applyBoxId} uri={uri} threadId={threadId} />
-	</div>
 }
 
 
@@ -2348,16 +2259,7 @@ const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapper: Res
 			return <ToolHeaderWrapper {...componentParams} />
 		}
 	},
-	'rewrite_file': {
-		resultWrapper: (params) => {
-			return <EditTool {...params} content={params.toolMessage.params.newContent} />
-		}
-	},
-	'edit_file': {
-		resultWrapper: (params) => {
-			return <EditTool {...params} content={params.toolMessage.params.searchReplaceBlocks} />
-		}
-	},
+	'write_file': { resultWrapper: (params) => <WriteFileTool {...params} /> },
 
 	// ---
 
@@ -2841,43 +2743,6 @@ const CommandBarInChat = () => {
 
 
 
-const EditToolSoFar = ({ toolCallSoFar, }: { toolCallSoFar: RawToolCallObj }) => {
-
-	if (!isABuiltinToolName(toolCallSoFar.name)) return null
-
-	const accessor = useAccessor()
-
-	const uri = toolCallSoFar.rawParams.uri ? URI.file(toolCallSoFar.rawParams.uri) : undefined
-
-	const title = titleOfBuiltinToolName[toolCallSoFar.name].proposed
-
-	const uriDone = toolCallSoFar.doneParams.includes('uri')
-	const desc1 = <span className='flex items-center'>
-		{uriDone ?
-			getBasename(toolCallSoFar.rawParams['uri'] ?? 'unknown')
-			: `Generating`}
-		<IconLoading />
-	</span>
-
-	const desc1OnClick = () => { uri && voidOpenFileFn(uri, accessor) }
-
-	// If URI has not been specified
-	return <ToolHeaderWrapper
-		title={title}
-		desc1={desc1}
-		desc1OnClick={desc1OnClick}
-	>
-		<EditToolChildren
-			uri={uri}
-			code={toolCallSoFar.rawParams.search_replace_blocks ?? toolCallSoFar.rawParams.new_content ?? ''}
-			type={'rewrite'} // as it streams, show in rewrite format, don't make a diff editor
-		/>
-		<IconLoading />
-	</ToolHeaderWrapper>
-
-}
-
-
 export const SidebarChat = () => {
 	const textAreaRef = useRef<HTMLTextAreaElement | null>(null)
 	const textAreaFnsRef = useRef<TextAreaFns | null>(null)
@@ -3004,10 +2869,7 @@ export const SidebarChat = () => {
 
 	// the tool currently being generated
 	const generatingTool = toolIsGenerating ?
-		toolCallSoFar.name === 'edit_file' || toolCallSoFar.name === 'rewrite_file' ? <EditToolSoFar
-			key={'curr-streaming-tool'}
-			toolCallSoFar={toolCallSoFar}
-		/>
+		toolCallSoFar.name === 'write_file' ? <SimplifiedToolHeader key={'curr-streaming-tool'} title='Writing file' />
 			: null
 		: null
 
