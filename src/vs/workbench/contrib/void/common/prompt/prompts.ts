@@ -106,24 +106,6 @@ ${FINAL}
 ${tripleTick[1]}`
 
 
-const replaceTool_description = `\
-A string of SEARCH/REPLACE block(s) which will be applied to the given file.
-Your SEARCH/REPLACE blocks string must be formatted as follows:
-${searchReplaceBlockTemplate}
-
-## Guidelines:
-
-1. You may output multiple search replace blocks if needed.
-
-2. The ORIGINAL code in each SEARCH/REPLACE block must EXACTLY match lines in the original file. Do not add or remove any whitespace or comments from the original code.
-
-3. Each ORIGINAL text must be large enough to uniquely identify the change. However, bias towards writing as little as possible.
-
-4. Each ORIGINAL text must be DISJOINT from all other ORIGINAL text.
-
-5. This field is a STRING (not an array).`
-
-
 // ======================================================== tools ========================================================
 
 

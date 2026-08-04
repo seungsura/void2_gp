@@ -6,7 +6,7 @@
 import { generateUuid } from '../../../../../base/common/uuid.js'
 import { endsWithAnyPrefixOf, SurroundingsRemover } from '../../common/helpers/extractCodeFromResult.js'
 import { availableTools, InternalToolInfo } from '../../common/prompt/prompts.js'
-import { OnFinalMessage, OnText, RawToolCallObj, RawToolParamsObj } from '../../common/sendLLMMessageTypes.js'
+import { OnFinalMessage, OnText, RawToolCallObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolName, ToolParamName } from '../../common/toolsServiceTypes.js'
 import { ChatMode } from '../../common/voidSettingsTypes.js'
 
@@ -166,7 +166,7 @@ const findIndexOfAny = (fullText: string, matches: string[]) => {
 
 type ToolOfToolName = { [toolName: string]: InternalToolInfo | undefined }
 const parseXMLPrefixToToolCall = <T extends ToolName,>(toolName: T, toolId: string, str: string, toolOfToolName: ToolOfToolName): RawToolCallObj => {
-	const paramsObj: RawToolParamsObj = {}
+	const paramsObj: Record<string, string> = {}
 	const doneParams: ToolParamName<T>[] = []
 	let isDone = false
 
