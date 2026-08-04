@@ -677,11 +677,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 			if (isBuiltInTool) {
 				let preparedWrite: Awaited<ReturnType<IToolsService['prepareWriteFile']>> | null = null
-				if (toolName === 'write_file' && (toolParams as BuiltinToolCallParams['write_file']).operation === 'modify') {
+				if (toolName === 'write_file') {
 					preparedWrite = await this._toolsService.prepareWriteFile(toolParams as BuiltinToolCallParams['write_file'])
-					if (!preparedWrite) throw new Error('Internal error: modify write_file did not produce a receipt.')
+					if (!preparedWrite) throw new Error('Internal error: write_file did not produce a receipt.')
 					// Receipt exists only after semantic planning; checkpoint and mutation share it.
-					this._addToolEditCheckpoint({ threadId, uri: preparedWrite.uri })
+					this._addToolEditCheckpoint({ threadId, uri: preparedWrite.uri, allowAbsent: (toolParams as BuiltinToolCallParams['write_file']).operation === 'create' })
 				}
 				const call = preparedWrite
 					? { result: preparedWrite.execute() }
@@ -1012,12 +1012,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		})
 	}
 	// call this right after LLM edits a file
-	private _addToolEditCheckpoint({ threadId, uri, }: { threadId: string, uri: URI }) {
+	private _addToolEditCheckpoint({ threadId, uri, allowAbsent = false }: { threadId: string, uri: URI, allowAbsent?: boolean }) {
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return
 		const { model } = this._voidModelService.getModel(uri)
-		if (!model) return // should never happen
-		const diffAreasSnapshot = this._editCodeService.getVoidFileSnapshot(uri)
+		if (!model && !allowAbsent) return // should never happen
+		const diffAreasSnapshot = model ? this._editCodeService.getVoidFileSnapshot(uri) : undefined
 		this._addCheckpoint(threadId, {
 			role: 'checkpoint',
 			type: 'tool_edit',

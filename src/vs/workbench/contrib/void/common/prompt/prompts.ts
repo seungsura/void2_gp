@@ -294,16 +294,9 @@ export const builtinTools: {
 		description: `Creates a new file with content, or applies one or more exact, unique, whole-line replacements to an existing file.`,
 		params: {},
 		schema: {
-			type: 'object', additionalProperties: false, required: ['uri', 'operation'],
-			properties: {
-				uri: { type: 'string', description: 'The FULL path to the file.' },
-				operation: { type: 'string', enum: ['modify', 'create'] },
-				edits: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['old_text', 'new_text'], properties: { old_text: { type: 'string' }, new_text: { type: 'string' } } }, minItems: 1 },
-				content: { type: 'string' },
-			},
 			oneOf: [
-				{ properties: { operation: { const: 'modify' } }, required: ['edits'], not: { required: ['content'] } },
-				{ properties: { operation: { const: 'create' } }, required: ['content'], not: { required: ['edits'] } },
+				{ type: 'object', additionalProperties: false, required: ['uri', 'operation', 'edits'], properties: { uri: { type: 'string', description: 'The FULL path to the file.' }, operation: { type: 'string', const: 'modify', enum: ['modify'] }, edits: { type: 'array', minItems: 1, items: { type: 'object', additionalProperties: false, required: ['old_text', 'new_text'], properties: { old_text: { type: 'string' }, new_text: { type: 'string' } } } } } },
+				{ type: 'object', additionalProperties: false, required: ['uri', 'operation', 'content'], properties: { uri: { type: 'string', description: 'The FULL path to the file.' }, operation: { type: 'string', const: 'create', enum: ['create'] }, content: { type: 'string' } } },
 			],
 		},
 	},

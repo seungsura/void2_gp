@@ -1,6 +1,6 @@
 import { CancellationToken } from '../../../../base/common/cancellation.js'
 import { URI } from '../../../../base/common/uri.js'
-import { IFileService } from '../../../../platform/files/common/files.js'
+import { FileOperationError, FileOperationResult, IFileService } from '../../../../platform/files/common/files.js'
 import { registerSingleton, InstantiationType } from '../../../../platform/instantiation/common/extensions.js'
 import { createDecorator, IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js'
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js'
@@ -161,7 +161,13 @@ export class ToolsService implements IToolsService {
 	) {
 		const queryBuilder = instantiationService.createInstance(QueryBuilder);
 		this.prepareWriteFile = async (params) => {
-			if (params.operation !== 'modify') return null;
+			if (params.operation === 'create') {
+				// Verify the intended absent state before the checkpoint; createFile remains the exclusive race guard.
+				await fileService.resolve(params.uri.dirname)
+				try { await fileService.resolve(params.uri); throw new Error('write_file rejected: target already exists.') }
+				catch (error) { if (!(error instanceof FileOperationError) || error.fileOperationResult !== FileOperationResult.FILE_NOT_FOUND) throw error }
+				return { uri: params.uri, execute: async () => { await fileService.createFile(params.uri, VSBuffer.fromString(params.content), { overwrite: false }); return { operation: 'create', didChange: true, editCount: 0 } } }
+			}
 			if (this.commandBarService.getStreamState(params.uri) === 'streaming') throw new Error(`Another LLM is currently making changes to this file. Please stop streaming for now and ask the user to resume later.`)
 			await voidModelService.initializeModel(params.uri)
 			const { model } = await voidModelService.getModelSafe(params.uri)
@@ -443,12 +449,8 @@ export class ToolsService implements IToolsService {
 			},
 
 			write_file: async (params) => {
-				if (params.operation === 'create') {
-					await fileService.createFile(params.uri, VSBuffer.fromString(params.content), { overwrite: false })
-					return { result: { operation: 'create', didChange: true, editCount: 0 } }
-				}
 				const prepared = await this.prepareWriteFile(params)
-				if (!prepared) throw new Error('Internal error: modify write_file did not produce a receipt.')
+				if (!prepared) throw new Error('Internal error: write_file did not produce a receipt.')
 				return { result: prepared.execute() }
 			},
 			// ---
