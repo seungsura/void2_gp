@@ -617,6 +617,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		// Check if it's a built-in tool
 		const isBuiltInTool = isABuiltinToolName(toolName)
+		if (toolName === 'edit_file' || toolName === 'rewrite_file') {
+			const message = `${toolName} is no longer supported; use write_file with native structured arguments.`
+			this._addMessageToThread(threadId, { role: 'tool', type: 'invalid_params', rawParams: opts.unvalidatedToolParams, result: null, name: toolName, content: message, id: toolId, mcpServerName })
+			return {}
+		}
 
 
 		if (!opts.preapproved) { // skip this if pre-approved

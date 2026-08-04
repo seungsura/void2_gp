@@ -689,12 +689,27 @@ const sendOllamaFIM = ({ messages, onFinalMessage, onError, settingsOfProvider, 
 
 // ---------------- GEMINI NATIVE IMPLEMENTATION ----------------
 
+/** Gemini uses its own enum values and supports anyOf rather than JSON Schema oneOf. */
+const toGeminiSchema = (schema: Record<string, unknown>): Schema => {
+	const typeOf: Record<string, Type> = { object: Type.OBJECT, array: Type.ARRAY, string: Type.STRING, number: Type.NUMBER, integer: Type.INTEGER, boolean: Type.BOOLEAN };
+	const converted: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(schema)) {
+		if (key === 'type' && typeof value === 'string') converted.type = typeOf[value] ?? value;
+		else if (key === 'properties' && value && typeof value === 'object') converted.properties = Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([name, child]) => [name, toGeminiSchema(child as Record<string, unknown>)]));
+		else if (key === 'items' && value && typeof value === 'object') converted.items = toGeminiSchema(value as Record<string, unknown>);
+		else if (key === 'oneOf') converted.anyOf = (value as Record<string, unknown>[]).map(child => toGeminiSchema(child));
+		else if (key === 'const') converted.enum = [value];
+		else if (key !== 'additionalProperties' && key !== 'not') converted[key] = value;
+	}
+	return converted as Schema;
+}
+
 const toGeminiFunctionDecl = (toolInfo: InternalToolInfo) => {
 	const { name, description, params } = toolInfo
 	return {
 		name,
 		description,
-		parameters: toolInfo.schema ? toolInfo.schema as Schema : {
+		parameters: toolInfo.schema ? toGeminiSchema(toolInfo.schema) : {
 			type: Type.OBJECT,
 			properties: Object.entries(params).reduce((acc, [key, value]) => {
 				acc[key] = {
