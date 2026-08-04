@@ -189,6 +189,7 @@ export const builtinTools: {
 	[T in keyof BuiltinToolCallParams]: {
 		name: string;
 		description: string;
+		schema?: Record<string, unknown>;
 		// more params can be generated than exist here, but these params must be a subset of them
 		params: Partial<{ [paramName in keyof SnakeCaseKeys<BuiltinToolCallParams[T]>]: { description: string } }>
 	}
