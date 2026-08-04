@@ -411,14 +411,14 @@ try {
     $FinalTemporaryOutputPath = [IO.Path]::GetFullPath($TemporaryOutputPath)
     $FinalBackupOutputPath = [IO.Path]::GetFullPath($BackupOutputPath)
     $OldArchives = @(Get-ChildItem -LiteralPath $PackageDirectory -File | Where-Object {
-        $_.Name -cmatch '^Void-.*-win32-x64-portable\.zip$' -and
+        $_.Name -cmatch '^Void-.*-win32-x64-portable(?:-clean)?\.zip$' -and
         -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($_.FullName), $FinalOutputPath) -and
         -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($_.FullName), $FinalTemporaryOutputPath) -and
         -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($_.FullName), $FinalBackupOutputPath)
     })
     try {
         foreach ($OldArchive in $OldArchives) {
-            Remove-ExpectedPackageCleanupFile -CandidatePath $OldArchive.FullName -ExpectedLeafPattern '^Void-.*-win32-x64-portable\.zip$' -PackageDirectoryPath $PackageDirectory -FinalOutputPath $OutputPath -CleanupPurpose "Old portable ZIP retention cleanup after validated final ZIP $OutputPath"
+            Remove-ExpectedPackageCleanupFile -CandidatePath $OldArchive.FullName -ExpectedLeafPattern '^Void-.*-win32-x64-portable(?:-clean)?\.zip$' -PackageDirectoryPath $PackageDirectory -FinalOutputPath $OutputPath -CleanupPurpose "Old portable ZIP retention cleanup after validated final ZIP $OutputPath"
         }
     } catch {
         throw "Portable ZIP was published and validated at $OutputPath (SHA-256: $Hash), but old ZIP retention cleanup left duplicate residue. $($_.Exception.Message)"
