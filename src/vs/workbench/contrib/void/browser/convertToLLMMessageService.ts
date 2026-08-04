@@ -43,6 +43,10 @@ type SimpleLLMMessage = {
 const CHARS_PER_TOKEN = 4 // assume abysmal chars per token
 const TRIM_TO_LEN = 120
 
+// This deliberately mirrors the conservative character estimator used by prepareMessages.
+// It is state-free so tool execution can derive a bound without serializing or mutating history.
+export const estimateHistoryTokensForReadBudget = (history: readonly unknown[]) => Math.ceil(JSON.stringify(history).length / CHARS_PER_TOKEN)
+
 
 
 
@@ -762,5 +766,4 @@ gemini response:
 	}
 }
 */
-
 

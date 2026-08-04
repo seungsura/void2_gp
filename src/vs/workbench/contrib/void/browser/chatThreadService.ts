@@ -16,7 +16,10 @@ import { AnthropicReasoning, getErrorMessage, RawToolCallObj, RawToolParamsObj }
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { FeatureName, ModelSelection, ModelSelectionOptions } from '../common/voidSettingsTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
-import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, ToolCallParams, ToolName, ToolResult } from '../common/toolsServiceTypes.js';
+import { getIsReasoningEnabledState, getModelCapabilities, getReservedOutputTokenSpace } from '../common/modelCapabilities.js';
+import { estimateHistoryTokensForReadBudget } from './convertToLLMMessageService.js';
+import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolResultType, ToolCallParams, ToolName, ToolResult } from '../common/toolsServiceTypes.js';
+import { isBoundedReadHistory, isBoundedReadHistoryString } from '../common/readFileReliability.js';
 import { IToolsService } from './toolsService.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { ILanguageFeaturesService } from '../../../../editor/common/services/languageFeatures.js';
@@ -636,14 +639,27 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			this._setStreamState(threadId, { isRunning: 'tool', interrupt: interruptorPromise, toolInfo: { toolName, toolParams, id: toolId, content: 'interrupted...', rawParams: opts.unvalidatedToolParams, mcpServerName } })
 
 			if (isBuiltInTool) {
+				const readContext = (() => {
+					if (toolName !== 'read_file') return threadId
+					const selection = this._settingsService.state.modelSelectionOfFeature['Chat']
+					if (!selection) return { ownerThreadId: threadId, maxReadOutputTokens: 0 }
+					try {
+						const options = this._settingsService.state.optionsOfModelSelection['Chat'][selection.providerName]?.[selection.modelName]
+						const capabilities = getModelCapabilities(selection.providerName, selection.modelName, this._settingsService.state.overridesOfModel)
+						const reasoning = getIsReasoningEnabledState('Chat', selection.providerName, selection.modelName, options, this._settingsService.state.overridesOfModel)
+						const reserve = getReservedOutputTokenSpace(selection.providerName, selection.modelName, { isReasoningEnabled: reasoning, overridesOfModel: this._settingsService.state.overridesOfModel }) ?? 4096
+						const baseline = estimateHistoryTokensForReadBudget(this.state.allThreads[threadId]?.messages ?? [])
+						return { ownerThreadId: threadId, maxReadOutputTokens: Math.max(0, capabilities.contextWindow - reserve - baseline - 1024) }
+					} catch { return { ownerThreadId: threadId, maxReadOutputTokens: 0 } }
+				})()
 				let preparedWrite: Awaited<ReturnType<IToolsService['prepareWriteFile']>> | null = null
 				if (toolName === 'write_file') {
-					preparedWrite = await this._toolsService.prepareWriteFile(toolParams as BuiltinToolCallParams['write_file'])
+					preparedWrite = await this._toolsService.prepareWriteFile(toolParams as BuiltinToolCallParams['write_file'], threadId)
 					if (!preparedWrite) throw new Error('Internal error: write_file did not produce a receipt.')
 				}
 				const call = preparedWrite
 					? { result: preparedWrite.execute() }
-					: await this._toolsService.callTool[toolName](toolParams as any)
+					: await this._toolsService.callTool[toolName](toolParams as any, readContext)
 				const { result, interruptTool } = call
 				const interruptor = () => { interrupted = true; interruptTool?.() }
 				resolveInterruptor(interruptor)
@@ -691,6 +707,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}
 
 		// 5. add to history and keep going
+		if (toolName === 'read_file' && (!isBoundedReadHistory(toolResult as BuiltinToolResultType['read_file'], this._settingsService.state.globalSettings.readFileLimits) || !isBoundedReadHistoryString(toolResultStr, this._settingsService.state.globalSettings.readFileLimits))) {
+			const errorMessage = 'read_file rejected: bounded history validation failed; re-read a smaller continuation.'
+			this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: toolParams, result: errorMessage, name: toolName, content: errorMessage, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName })
+			return {}
+		}
 		this._updateLatestTool(threadId, { role: 'tool', type: 'success', params: toolParams, result: toolResult, name: toolName, content: toolResultStr, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName })
 		return {}
 	};
@@ -930,8 +951,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		}
 
 		p.then(() => {
+			if (this.streamState[threadId]?.isRunning !== 'awaiting_user') this._toolsService.invalidateReadReceipts(threadId)
 			if (threadId !== this.state.currentThreadId) notify({ error: null })
 		}).catch((e) => {
+			this._toolsService.invalidateReadReceipts(threadId)
 			if (threadId !== this.state.currentThreadId) notify({ error: getErrorMessage(e) })
 			throw e
 		})
@@ -1338,6 +1361,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// delete the thread
 		const newThreads = { ...currentThreads };
 		delete newThreads[threadId];
+		this._toolsService.invalidateReadReceipts(threadId)
 
 		// store the updated threads
 		this._storeAllThreads(newThreads);

@@ -11,6 +11,7 @@ import { IEditCodeService } from './editCodeServiceInterface.js'
 import { ITerminalToolService } from './terminalToolService.js'
 import { LintErrorItem, BuiltinToolCallParams, BuiltinToolResultType, BuiltinToolName } from '../common/toolsServiceTypes.js'
 import { IVoidModelService } from '../common/voidModelService.js'
+import { IVoidSettingsService } from '../common/voidSettingsService.js'
 import { EndOfLinePreference } from '../../../../editor/common/model.js'
 import { IVoidCommandBarService } from './voidCommandBarService.js'
 import { computeDirectoryTree1Deep, IDirectoryStrService, stringifyDirectoryTree1Deep } from '../common/directoryStrService.js'
@@ -21,11 +22,13 @@ import { MAX_CHILDREN_URIs_PAGE, MAX_FILE_CHARS_PAGE, MAX_TERMINAL_BG_COMMAND_TI
 import { generateUuid } from '../../../../base/common/uuid.js'
 import { isWriteFileReceiptCurrent, planWriteFileModify, WriteFileEdit, WriteFileReceipt } from '../common/writeFilePlanner.js'
 import { VSBuffer } from '../../../../base/common/buffer.js'
+import { clampReadFileLimits, pageReadFileLines, ReadReceiptRegistry, validateReadFileRequest } from '../common/readFileReliability.js'
 
 
 // tool use for AI
 type ValidateBuiltinParams = { [T in BuiltinToolName]: (p: RawToolParamsObj) => BuiltinToolCallParams[T] }
-type CallBuiltinTool = { [T in BuiltinToolName]: (p: BuiltinToolCallParams[T]) => Promise<{ result: BuiltinToolResultType[T] | Promise<BuiltinToolResultType[T]>, interruptTool?: () => void }> }
+type ToolExecutionContext = { ownerThreadId: string; maxReadOutputTokens: number }
+type CallBuiltinTool = { [T in BuiltinToolName]: (p: BuiltinToolCallParams[T], context?: string | ToolExecutionContext) => Promise<{ result: BuiltinToolResultType[T] | Promise<BuiltinToolResultType[T]>, interruptTool?: () => void }> }
 type BuiltinToolResultToString = { [T in BuiltinToolName]: (p: BuiltinToolCallParams[T], result: Awaited<BuiltinToolResultType[T]>) => string }
 type PreparedWriteFile = { uri: URI; execute: () => Promise<BuiltinToolResultType['write_file']> }
 
@@ -131,7 +134,8 @@ export interface IToolsService {
 	readonly _serviceBrand: undefined;
 	validateParams: ValidateBuiltinParams;
 	callTool: CallBuiltinTool;
-	prepareWriteFile: (params: BuiltinToolCallParams['write_file']) => Promise<PreparedWriteFile | null>;
+	prepareWriteFile: (params: BuiltinToolCallParams['write_file'], owner?: string) => Promise<PreparedWriteFile | null>;
+	invalidateReadReceipts: (owner: string) => void;
 	stringOfResult: BuiltinToolResultToString;
 }
 
@@ -143,7 +147,8 @@ export class ToolsService implements IToolsService {
 
 	public validateParams: ValidateBuiltinParams;
 	public callTool: CallBuiltinTool;
-	public prepareWriteFile: (params: BuiltinToolCallParams['write_file']) => Promise<PreparedWriteFile | null>;
+	public prepareWriteFile: (params: BuiltinToolCallParams['write_file'], owner?: string) => Promise<PreparedWriteFile | null>;
+	public invalidateReadReceipts: (owner: string) => void;
 	public stringOfResult: BuiltinToolResultToString;
 
 	constructor(
@@ -152,14 +157,17 @@ export class ToolsService implements IToolsService {
 		@ISearchService searchService: ISearchService,
 		@IInstantiationService instantiationService: IInstantiationService,
 		@IVoidModelService voidModelService: IVoidModelService,
+		@IVoidSettingsService private readonly voidSettingsService: IVoidSettingsService,
 		@IEditCodeService editCodeService: IEditCodeService,
 		@ITerminalToolService private readonly terminalToolService: ITerminalToolService,
 		@IVoidCommandBarService private readonly commandBarService: IVoidCommandBarService,
 		@IDirectoryStrService private readonly directoryStrService: IDirectoryStrService,
 		@IMarkerService private readonly markerService: IMarkerService,
 	) {
+		const readReceipts = new ReadReceiptRegistry<object>()
+		this.invalidateReadReceipts = owner => readReceipts.invalidateOwner(owner)
 		const queryBuilder = instantiationService.createInstance(QueryBuilder);
-		this.prepareWriteFile = async (params) => {
+		this.prepareWriteFile = async (params, owner = 'direct') => {
 			if (params.operation === 'create') {
 				const ensureCreateTargetIsAvailable = async () => {
 					let parent: IFileStat
@@ -196,6 +204,8 @@ export class ToolsService implements IToolsService {
 			await voidModelService.initializeModel(params.uri)
 			const { model } = await voidModelService.getModelSafe(params.uri)
 			if (!model) throw new Error('No contents; File does not exist.')
+			const canonicalURI = params.uri.toString()
+			if (!readReceipts.validate(params.readReceiptId, canonicalURI, owner, model, model.getVersionId())) throw new Error('write_file stale_read: re-read the file before modifying it.')
 			const versionId = model.getVersionId()
 			const lfText = model.getValue(EndOfLinePreference.LF)
 			const plan = planWriteFileModify(lfText, params.edits)
@@ -203,6 +213,7 @@ export class ToolsService implements IToolsService {
 			const receipt: WriteFileReceipt<typeof model> = { model, versionId, lfText, plan }
 			const verifyReceipt = () => {
 				const current = voidModelService.getModel(params.uri).model
+				if (!current || !readReceipts.validate(params.readReceiptId, canonicalURI, owner, current, current.getVersionId())) throw new Error('write_file stale_read: re-read the file before modifying it.')
 				if (!current || !isWriteFileReceiptCurrent(receipt, current, current.getVersionId(), current.getValue(EndOfLinePreference.LF))) {
 					throw new Error('write_file rejected: file changed before the edit could be applied.')
 				}
@@ -221,17 +232,10 @@ export class ToolsService implements IToolsService {
 
 		this.validateParams = {
 			read_file: (params: RawToolParamsObj) => {
-				const { uri: uriStr, start_line: startLineUnknown, end_line: endLineUnknown, page_number: pageNumberUnknown } = params
+				const { uri: uriStr } = params
 				const uri = validateURI(uriStr)
-				const pageNumber = validatePageNum(pageNumberUnknown)
-
-				let startLine = validateNumber(startLineUnknown, { default: null })
-				let endLine = validateNumber(endLineUnknown, { default: null })
-
-				if (startLine !== null && startLine < 1) startLine = null
-				if (endLine !== null && endLine < 1) endLine = null
-
-				return { uri, startLine, endLine, pageNumber }
+				const request = validateReadFileRequest(params)
+				return { uri, ...request }
 			},
 			ls_dir: (params: RawToolParamsObj) => {
 				const { uri: uriStr, page_number: pageNumberUnknown } = params
@@ -323,14 +327,14 @@ export class ToolsService implements IToolsService {
 					return { uri, operation, content: validateStr('content', params.content) }
 				}
 				if (operation !== 'modify' || !Array.isArray(params.edits) || params.edits.length === 0) throw new Error('Invalid LLM output: write_file modify requires a non-empty edits array.')
-				assertExactKeys(['uri', 'operation', 'edits'])
+				assertExactKeys(['uri', 'operation', 'read_receipt_id', 'edits'])
 				const edits: WriteFileEdit[] = params.edits.map((edit, index) => {
 					if (!edit || typeof edit !== 'object') throw new Error(`Invalid LLM output: edits[${index}] must be an object.`)
 					const value = edit as Record<string, unknown>
 					for (const key of Object.keys(value)) if (key !== 'old_text' && key !== 'new_text') throw new Error(`Invalid LLM output: edits[${index}] does not allow ${key}.`)
 					return { oldText: validateStr(`edits[${index}].old_text`, value.old_text), newText: validateStr(`edits[${index}].new_text`, value.new_text) }
 				})
-				return { uri, operation, edits }
+				return { uri, operation, readReceiptId: validateStr('read_receipt_id', params.read_receipt_id), edits }
 			},
 
 			// ---
@@ -364,29 +368,18 @@ export class ToolsService implements IToolsService {
 
 
 		this.callTool = {
-			read_file: async ({ uri, startLine, endLine, pageNumber }) => {
+			read_file: async ({ uri, startLine, endLine, lineByteOffset }, context = 'direct') => {
+				const owner = typeof context === 'string' ? context : context.ownerThreadId
 				await voidModelService.initializeModel(uri)
 				const { model } = await voidModelService.getModelSafe(uri)
 				if (model === null) { throw new Error(`No contents; File does not exist.`) }
 
-				let contents: string
-				if (startLine === null && endLine === null) {
-					contents = model.getValue(EndOfLinePreference.LF)
-				}
-				else {
-					const startLineNumber = startLine === null ? 1 : startLine
-					const endLineNumber = endLine === null ? model.getLineCount() : endLine
-					contents = model.getValueInRange({ startLineNumber, startColumn: 1, endLineNumber, endColumn: Number.MAX_SAFE_INTEGER }, EndOfLinePreference.LF)
-				}
-
-				const totalNumLines = model.getLineCount()
-
-				const fromIdx = MAX_FILE_CHARS_PAGE * (pageNumber - 1)
-				const toIdx = MAX_FILE_CHARS_PAGE * pageNumber - 1
-				const fileContents = contents.slice(fromIdx, toIdx + 1) // paginate
-				const hasNextPage = (contents.length - 1) - toIdx >= 1
-				const totalFileLen = contents.length
-				return { result: { fileContents, totalFileLen, hasNextPage, totalNumLines } }
+				const lines = Array.from({ length: model.getLineCount() }, (_, i) => model.getLineContent(i + 1))
+				const limits = clampReadFileLimits(this.voidSettingsService.state.globalSettings.readFileLimits)
+				const page = pageReadFileLines(lines, { startLine, endLine, lineByteOffset }, { ...limits, maxTokens: Math.min(limits.maxTokens, typeof context === 'string' ? 0 : context.maxReadOutputTokens) })
+				const canonicalURI = uri.toString(); const documentVersion = model.getVersionId(); const id = generateUuid()
+				readReceipts.add({ id, uri: canonicalURI, version: documentVersion, model, owner })
+				return { result: { ...page, receipt: { id, uri: canonicalURI, documentVersion, sourceKind: uri.scheme === 'file' ? 'file' : 'model', requestedRange: { startLine, endLine, lineByteOffset }, returnedRange: { startLine: page.startLine, endLine: page.endLine, nextLine: page.nextLine, nextByteOffset: page.nextByteOffset } } } }
 			},
 
 			ls_dir: async ({ uri, pageNumber }) => {
@@ -518,7 +511,7 @@ export class ToolsService implements IToolsService {
 		// given to the LLM after the call for successful tool calls
 		this.stringOfResult = {
 			read_file: (params, result) => {
-				return `${params.uri.fsPath}\n\`\`\`\n${result.fileContents}\n\`\`\`${nextPageStr(result.hasNextPage)}${result.hasNextPage ? `\nMore info because truncated: this file has ${result.totalNumLines} lines, or ${result.totalFileLen} characters.` : ''}`
+				return `${params.uri.fsPath}\n\`\`\`\n${result.fileContents}\n\`\`\`${result.hasNextPage ? `\nTruncated. Continue with next_line=${result.nextLine}${result.nextByteOffset !== undefined ? ` and line_byte_offset=${result.nextByteOffset}` : ''}.` : ''}\nReceipt: ${result.receipt.id}`
 			},
 			ls_dir: (params, result) => {
 				const dirTreeStr = stringifyDirectoryTree1Deep(params, result)

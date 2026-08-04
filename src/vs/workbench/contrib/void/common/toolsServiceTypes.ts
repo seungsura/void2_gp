@@ -42,7 +42,7 @@ export const toolApprovalTypes = new Set<ToolApprovalType>([
 
 // PARAMS OF TOOL CALL
 export type BuiltinToolCallParams = {
-	'read_file': { uri: URI, startLine: number | null, endLine: number | null, pageNumber: number },
+	'read_file': { uri: URI, startLine: number | null, endLine: number | null, lineByteOffset: number },
 	'ls_dir': { uri: URI, pageNumber: number },
 	'get_dir_tree': { uri: URI },
 	'search_pathnames_only': { query: string, includePattern: string | null, pageNumber: number },
@@ -50,7 +50,7 @@ export type BuiltinToolCallParams = {
 	'search_in_file': { uri: URI, query: string, isRegex: boolean },
 	'read_lint_errors': { uri: URI },
 	// ---
-	'write_file': { uri: URI, operation: 'modify', edits: { oldText: string, newText: string }[] } | { uri: URI, operation: 'create', content: string },
+	'write_file': { uri: URI, operation: 'modify', readReceiptId: string, edits: { oldText: string, newText: string }[] } | { uri: URI, operation: 'create', content: string },
 	'create_file_or_folder': { uri: URI, isFolder: boolean },
 	'delete_file_or_folder': { uri: URI, isRecursive: boolean, isFolder: boolean },
 	// ---
@@ -62,7 +62,7 @@ export type BuiltinToolCallParams = {
 
 // RESULT OF TOOL CALL
 export type BuiltinToolResultType = {
-	'read_file': { fileContents: string, totalFileLen: number, totalNumLines: number, hasNextPage: boolean },
+	'read_file': { fileContents: string, totalFileLen: number, totalNumLines: number, hasNextPage: boolean, startLine: number, endLine: number | null, nextLine: number | null, nextByteOffset?: number, truncated: boolean, eof: boolean, longLineContinuation: boolean, receipt: { id: string, uri: string, documentVersion: number, sourceKind: string, requestedRange: object, returnedRange: object } },
 	'ls_dir': { children: ShallowDirectoryItem[] | null, hasNextPage: boolean, hasPrevPage: boolean, itemsRemaining: number },
 	'get_dir_tree': { str: string, },
 	'search_pathnames_only': { uris: URI[], hasNextPage: boolean },

@@ -1392,6 +1392,13 @@ export const Settings = () => {
 
 							{/* General section */}
 							<div className={`${shouldShowTab('general') ? `` : 'hidden'} flex flex-col gap-12`}>
+								<div className='max-w-[600px]'>
+									<h2 className='text-3xl mb-2'>Read file limits</h2>
+									<h4 className='text-void-fg-3 mb-3'>Per-call ceilings: 1–4,000 lines, 1–128 KiB UTF-8, and 1–24,000 estimated tokens.</h4>
+									<div className='flex gap-2'>
+										{(['maxLines', 'maxBytes', 'maxTokens'] as const).map(key => <input key={key} className='bg-void-bg-2 px-2 py-1 w-32' type='number' value={settingsState.globalSettings.readFileLimits[key]} onChange={e => voidSettingsService.setGlobalSetting('readFileLimits', { ...settingsState.globalSettings.readFileLimits, [key]: Number(e.target.value) })} aria-label={key} />)}
+									</div>
+								</div>
 								{/* One-Click Switch section */}
 								<div>
 									<ErrorBoundary>

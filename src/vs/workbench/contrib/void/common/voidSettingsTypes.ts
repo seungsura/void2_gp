@@ -439,6 +439,7 @@ export type ChatMode = 'agent' | 'gather' | 'normal'
 
 
 export type GlobalSettings = {
+	readFileLimits: { maxLines: number; maxBytes: number; maxTokens: number };
 	autoRefreshModels: boolean;
 	aiInstructions: string;
 	enableAutocomplete: boolean;
@@ -455,6 +456,7 @@ export type GlobalSettings = {
 }
 
 export const defaultGlobalSettings: GlobalSettings = {
+	readFileLimits: { maxLines: 2000, maxBytes: 64 * 1024, maxTokens: 12000 },
 	autoRefreshModels: true,
 	aiInstructions: '',
 	enableAutocomplete: false,

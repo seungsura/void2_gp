@@ -22,7 +22,7 @@ export const MAX_DIRSTR_RESULTS_TOTAL_BEGINNING = 100
 export const MAX_DIRSTR_RESULTS_TOTAL_TOOL = 100
 
 // tool info
-export const MAX_FILE_CHARS_PAGE = 500_000
+export const MAX_FILE_CHARS_PAGE = 64 * 1024
 export const MAX_CHILDREN_URIs_PAGE = 500
 
 // terminal tool info
@@ -180,12 +180,12 @@ export const builtinTools: {
 
 	read_file: {
 		name: 'read_file',
-		description: `Returns full contents of a given file.`,
+		description: `Returns a bounded, line-safe page of a file. Continue with next_line and, only for a long single line, line_byte_offset from the result.`,
 		params: {
 			...uriParam('file'),
 			start_line: { description: 'Optional. Do NOT fill this field in unless you were specifically given exact line numbers to search. Defaults to the beginning of the file.' },
 			end_line: { description: 'Optional. Do NOT fill this field in unless you were specifically given exact line numbers to search. Defaults to the end of the file.' },
-			...paginationParam,
+			line_byte_offset: { description: 'Optional. 0-based UTF-8 byte offset, only when continuing an oversized single line. Default is 0.' },
 		},
 	},
 
@@ -273,11 +273,11 @@ export const builtinTools: {
 
 	write_file: {
 		name: 'write_file',
-		description: `Creates a new file with content, or applies one or more exact, unique, whole-line replacements to an existing file.`,
+		description: `Creates a new file with content, or applies one or more exact, unique, whole-line replacements to an existing file. A modify requires the read receipt from a current read_file result.`,
 		params: {},
 		schema: {
 			oneOf: [
-				{ type: 'object', additionalProperties: false, required: ['uri', 'operation', 'edits'], properties: { uri: { type: 'string', description: 'The FULL path to the file.' }, operation: { type: 'string', const: 'modify', enum: ['modify'] }, edits: { type: 'array', minItems: 1, items: { type: 'object', additionalProperties: false, required: ['old_text', 'new_text'], properties: { old_text: { type: 'string' }, new_text: { type: 'string' } } } } } },
+				{ type: 'object', additionalProperties: false, required: ['uri', 'operation', 'read_receipt_id', 'edits'], properties: { uri: { type: 'string', description: 'The FULL path to the file.' }, operation: { type: 'string', const: 'modify', enum: ['modify'] }, read_receipt_id: { type: 'string' }, edits: { type: 'array', minItems: 1, items: { type: 'object', additionalProperties: false, required: ['old_text', 'new_text'], properties: { old_text: { type: 'string' }, new_text: { type: 'string' } } } } } },
 				{ type: 'object', additionalProperties: false, required: ['uri', 'operation', 'content'], properties: { uri: { type: 'string', description: 'The FULL path to the file.' }, operation: { type: 'string', const: 'create', enum: ['create'] }, content: { type: 'string' } } },
 			],
 		},

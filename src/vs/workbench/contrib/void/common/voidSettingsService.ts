@@ -13,6 +13,7 @@ import { IStorageService, StorageScope, StorageTarget } from '../../../../platfo
 import { IMetricsService } from './metricsService.js';
 import { defaultProviderSettings, getModelCapabilities, ModelOverrides } from './modelCapabilities.js';
 import { VOID_SETTINGS_STORAGE_KEY } from './storageKeys.js';
+import { clampReadFileLimits } from './readFileReliability.js';
 import { defaultSettingsOfProvider, FeatureName, ProviderName, ModelSelectionOfFeature, SettingsOfProvider, SettingName, providerNames, ModelSelection, modelSelectionsEqual, featureNames, VoidStatefulModelInfo, GlobalSettings, GlobalSettingName, defaultGlobalSettings, ModelSelectionOptions, OptionsOfModelSelection, ChatMode, OverridesOfModel, defaultOverridesOfModel, MCPUserStateOfName as MCPUserStateOfName, MCPUserState } from './voidSettingsTypes.js';
 
 
@@ -306,6 +307,7 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 				// ...defaultSettingsOfProvider,
 				// ...readS.settingsOfProvider,
 			}
+			readS.globalSettings = { ...defaultGlobalSettings, ...readS.globalSettings, readFileLimits: clampReadFileLimits(readS.globalSettings?.readFileLimits) }
 
 			for (const providerName of providerNames) {
 				readS.settingsOfProvider[providerName] = {
@@ -410,6 +412,7 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 	}
 
 	setGlobalSetting: SetGlobalSettingFn = async (settingName, newVal) => {
+		if (settingName === 'readFileLimits') newVal = clampReadFileLimits(newVal as GlobalSettings['readFileLimits']) as GlobalSettings[typeof settingName]
 		const newState: VoidSettingsState = {
 			...this.state,
 			globalSettings: {
