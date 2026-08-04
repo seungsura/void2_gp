@@ -25,6 +25,79 @@ function ConvertTo-NormalizedArchivePath {
     return $NormalizedPath.ToLowerInvariant()
 }
 
+function Test-IsTransientFileLockException {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Exception]$Exception
+    )
+
+    if ($Exception -isnot [IO.IOException] -and
+        $Exception -isnot [UnauthorizedAccessException]) {
+        return $false
+    }
+
+    # Win32 ERROR_SHARING_VIOLATION (32) and ERROR_LOCK_VIOLATION (33), including
+    # their HRESULT-wrapped forms (0x80070020 / 0x80070021).
+    $Win32Error = $Exception.HResult -band 0xffff
+    return $Win32Error -eq 32 -or $Win32Error -eq 33
+}
+
+function Remove-ExpectedPackageTransientFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CandidatePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedLeafName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PackageDirectoryPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$FinalOutputPath
+    )
+
+    $ResolvedPackageDirectory = [IO.Path]::GetFullPath($PackageDirectoryPath).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $ResolvedCandidatePath = [IO.Path]::GetFullPath($CandidatePath)
+    $ResolvedFinalOutputPath = [IO.Path]::GetFullPath($FinalOutputPath)
+    $CandidateParent = Split-Path -Parent $ResolvedCandidatePath
+    $CandidateLeaf = Split-Path -Leaf $ResolvedCandidatePath
+
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($CandidateParent, $ResolvedPackageDirectory) -or
+        -not [StringComparer]::Ordinal.Equals($CandidateLeaf, $ExpectedLeafName) -or
+        [StringComparer]::OrdinalIgnoreCase.Equals($ResolvedCandidatePath, $ResolvedFinalOutputPath)) {
+        throw "Refusing to remove an unexpected portable package transient file: $ResolvedCandidatePath"
+    }
+
+    # Five attempts with 200 ms, 400 ms, 600 ms, and 800 ms waits (2 seconds total)
+    # tolerate a short-lived scanner/indexer lock without hiding non-lock failures.
+    $MaximumAttempts = 5
+    for ($Attempt = 1; $Attempt -le $MaximumAttempts; $Attempt++) {
+        if (-not (Test-Path -LiteralPath $ResolvedCandidatePath)) {
+            return
+        }
+
+        try {
+            Remove-Item -LiteralPath $ResolvedCandidatePath -Force -ErrorAction Stop
+            return
+        } catch {
+            if (-not (Test-IsTransientFileLockException -Exception $_.Exception)) {
+                throw
+            }
+            if ($Attempt -eq $MaximumAttempts) {
+                throw "Portable package transient cleanup failed after $MaximumAttempts attempts due to a sharing/lock violation; the validated final ZIP and preserved backup were left in place: $ResolvedCandidatePath"
+            }
+
+            # Release any managed archive/hash handles before retrying a locked file.
+            Write-Output "Portable package transient cleanup retry $Attempt of $MaximumAttempts after sharing/lock violation; waiting $($Attempt * 200) ms: $ResolvedCandidatePath"
+            [GC]::Collect()
+            [GC]::WaitForPendingFinalizers()
+            [GC]::Collect()
+            Start-Sleep -Milliseconds (200 * $Attempt)
+        }
+    }
+}
+
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $SourceParent = Split-Path -Parent $ProjectRoot
 
@@ -152,10 +225,6 @@ $TemporaryOutputPath = Join-Path $PackageDirectory ".${OutputName}.tmp"
 $BackupOutputPath = Join-Path $PackageDirectory ".${OutputName}.backup"
 $PackerPath = Join-Path $PSScriptRoot 'package-portable.js'
 
-if (Test-Path -LiteralPath $BackupOutputPath) {
-    throw "A preserved portable ZIP publish backup already exists; resolve it before packaging: $BackupOutputPath"
-}
-
 $WorkspaceRoot = Split-Path -Parent $SourceParent
 $LocalNodePath = Join-Path $WorkspaceRoot '.toolchain\node-v20.18.2-win-x64\node.exe'
 if (Test-Path -LiteralPath $LocalNodePath -PathType Leaf) {
@@ -167,7 +236,15 @@ if (Test-Path -LiteralPath $LocalNodePath -PathType Leaf) {
 
 try {
     if (Test-Path -LiteralPath $TemporaryOutputPath) {
-        Remove-Item -LiteralPath $TemporaryOutputPath -Force
+        Remove-ExpectedPackageTransientFile -CandidatePath $TemporaryOutputPath -ExpectedLeafName ".${OutputName}.tmp" -PackageDirectoryPath $PackageDirectory -FinalOutputPath $OutputPath
+    }
+
+    if (Test-Path -LiteralPath $BackupOutputPath) {
+        if (-not (Test-Path -LiteralPath $OutputPath -PathType Leaf)) {
+            throw "A preserved portable ZIP publish backup exists without a final ZIP; resolve it manually before packaging: $BackupOutputPath"
+        }
+        Write-Output "Removing stale portable publish backup after a previously published final ZIP: $BackupOutputPath"
+        Remove-ExpectedPackageTransientFile -CandidatePath $BackupOutputPath -ExpectedLeafName ".${OutputName}.backup" -PackageDirectoryPath $PackageDirectory -FinalOutputPath $OutputPath
     }
 
     & $NodePath $PackerPath $ArtifactRoot $TemporaryOutputPath
@@ -263,7 +340,7 @@ try {
     }
 
     if ($BackupCreated) {
-        Remove-Item -LiteralPath $BackupOutputPath -Force
+        Remove-ExpectedPackageTransientFile -CandidatePath $BackupOutputPath -ExpectedLeafName ".${OutputName}.backup" -PackageDirectoryPath $PackageDirectory -FinalOutputPath $OutputPath
         $BackupCreated = $false
     }
 
@@ -283,6 +360,6 @@ try {
     Write-Output "Runtime payload manifest: static packaging validation passed; runtime launch certification is separate"
 } finally {
     if (Test-Path -LiteralPath $TemporaryOutputPath) {
-        Remove-Item -LiteralPath $TemporaryOutputPath -Force
+        Remove-ExpectedPackageTransientFile -CandidatePath $TemporaryOutputPath -ExpectedLeafName ".${OutputName}.tmp" -PackageDirectoryPath $PackageDirectory -FinalOutputPath $OutputPath
     }
 }
