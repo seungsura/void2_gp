@@ -22,7 +22,7 @@ import { MAX_CHILDREN_URIs_PAGE, MAX_FILE_CHARS_PAGE, MAX_TERMINAL_BG_COMMAND_TI
 import { generateUuid } from '../../../../base/common/uuid.js'
 import { isWriteFileReceiptCurrent, planWriteFileModify, WriteFileEdit, WriteFileReceipt } from '../common/writeFilePlanner.js'
 import { VSBuffer } from '../../../../base/common/buffer.js'
-import { effectiveReadFileLimits, pageReadFileLines, ReadReceiptRegistry, validateReadFileRequest } from '../common/readFileReliability.js'
+import { assertReadFilePageMakesProgress, effectiveReadFileLimits, pageReadFileLines, ReadReceiptRegistry, validateReadFileRequest } from '../common/readFileReliability.js'
 
 
 // tool use for AI
@@ -363,6 +363,7 @@ export class ToolsService implements IToolsService {
 				const lines = Array.from({ length: model.getLineCount() }, (_, i) => model.getLineContent(i + 1))
 				const limits = effectiveReadFileLimits(this.voidSettingsService.state.globalSettings.readFileLimits, typeof context === 'string' ? 0 : context.maxReadOutputTokens)
 				const page = pageReadFileLines(lines, { startLine, endLine, lineByteOffset }, limits)
+				assertReadFilePageMakesProgress(page, { startLine, endLine, lineByteOffset })
 				const canonicalURI = uri.toString(); const documentVersion = model.getVersionId(); const id = generateUuid()
 				readReceipts.add({ id, uri: canonicalURI, version: documentVersion, model, owner })
 				return { result: { ...page, receipt: { id, uri: canonicalURI, documentVersion, sourceKind: uri.scheme === 'file' ? 'file' : 'model', requestedRange: { startLine, endLine, lineByteOffset }, returnedRange: { startLine: page.startLine, endLine: page.endLine, nextLine: page.nextLine, nextByteOffset: page.nextByteOffset } } } }

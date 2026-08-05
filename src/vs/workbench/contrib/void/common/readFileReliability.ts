@@ -57,6 +57,20 @@ export const pageReadFileLines = (lines: readonly string[], request: ReadFileReq
 	const eof = line > last || line > totalNumLines; const nextLine = eof ? null : line;
 	return { fileContents: content, totalFileLen, totalNumLines, hasNextPage: !eof, startLine: start, endLine: content === '' ? null : line - 1, nextLine, truncated: !eof, eof, longLineContinuation: false };
 };
+
+/**
+ * A truncated non-EOF page is usable only when its continuation cursor moves
+ * beyond the caller's requested position. Returning it as a success otherwise
+ * invites an infinite retry loop when the chat has no remaining read budget.
+ */
+export const assertReadFilePageMakesProgress = (page: ReadFilePage, request: ReadFileRequest): void => {
+	if (!page.truncated || page.eof) return;
+	const requestedLine = request.startLine ?? 1;
+	const lineAdvanced = page.nextLine !== null && page.nextLine > requestedLine;
+	const byteAdvanced = page.nextByteOffset !== undefined && page.nextByteOffset > request.lineByteOffset;
+	if (lineAdvanced || byteAdvanced) return;
+	throw new Error('read_file context_exhausted: output/context budget could not return a progressing page. Use search_in_file, a targeted range, or retry in a new task.');
+};
 const isUtf8Boundary = (text: string, offset: number) => encoder.encode(new TextDecoder().decode(encoder.encode(text).slice(0, offset))).length === offset;
 const validUtf8Prefix = (text: string, start: number, count: number) => { const bytes = encoder.encode(text); let end = Math.min(bytes.length, start + count); while (end > start && !isUtf8Boundary(text, end)) end--; return end; };
 
