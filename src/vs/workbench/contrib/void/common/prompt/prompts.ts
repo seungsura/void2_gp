@@ -276,10 +276,29 @@ export const builtinTools: {
 		description: `Creates a new file with content, or applies one or more exact, unique, whole-line replacements to an existing file. A modify requires the read receipt from a current read_file result.`,
 		params: {},
 		schema: {
-			oneOf: [
-				{ type: 'object', additionalProperties: false, required: ['uri', 'operation', 'read_receipt_id', 'edits'], properties: { uri: { type: 'string', description: 'The FULL path to the file.' }, operation: { type: 'string', const: 'modify', enum: ['modify'] }, read_receipt_id: { type: 'string' }, edits: { type: 'array', minItems: 1, items: { type: 'object', additionalProperties: false, required: ['old_text', 'new_text'], properties: { old_text: { type: 'string' }, new_text: { type: 'string' } } } } } },
-				{ type: 'object', additionalProperties: false, required: ['uri', 'operation', 'content'], properties: { uri: { type: 'string', description: 'The FULL path to the file.' }, operation: { type: 'string', const: 'create', enum: ['create'] }, content: { type: 'string' } } },
-			],
+			type: 'object',
+			additionalProperties: false,
+			required: ['uri', 'operation'],
+			properties: {
+				uri: { type: 'string', description: 'The FULL path to the file.' },
+				operation: { type: 'string', enum: ['create', 'modify'], description: 'Use create only for a new path. Use modify only after read_file and with that current read_receipt_id.' },
+				content: { type: 'string', description: 'Required only when operation is create; an empty string is valid. Do not include content when operation is modify.' },
+				read_receipt_id: { type: 'string', description: 'Required only when operation is modify. Copy the current read_file receipt for this exact file; do not include it when operation is create.' },
+				edits: {
+					type: 'array',
+					minItems: 1,
+					description: 'Required only when operation is modify; do not include edits when operation is create. All edits apply to one immutable current snapshot.',
+					items: {
+						type: 'object',
+						additionalProperties: false,
+						required: ['old_text', 'new_text'],
+						properties: {
+							old_text: { type: 'string', description: 'Exact, unique, whole-line text from the current snapshot. It must be non-empty except for the sole edit of an empty snapshot, which may use an empty string; empty old_text is forbidden for a non-empty snapshot or multiple edits.' },
+							new_text: { type: 'string', description: 'Replacement text. An empty string is permitted to delete the exact old_text range.' },
+						},
+					},
+				},
+			},
 		},
 	},
 	run_command: {

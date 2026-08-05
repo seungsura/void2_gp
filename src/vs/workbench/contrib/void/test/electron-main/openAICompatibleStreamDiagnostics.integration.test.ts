@@ -5,15 +5,16 @@ import assert from 'assert';
 import * as http from 'http';
 import { AddressInfo } from 'net';
 import OpenAI from 'openai';
+import { availableTools } from '../../common/prompt/prompts.js';
 import { classifyOpenAICompatibleToolSchemaDialect, formatPrematureStreamCloseMessage, isPrematureStreamClose, OpenAICompatibleStreamDiagnostics, redactOpenAICompatibleEndpoint } from '../../electron-main/llmMessage/openAICompatibleDiagnostics.js';
 
 type Scenario = 'success' | 'close-before-first-event' | 'close-after-first-event';
 type CapturedRequest = { body: Record<string, unknown> };
 
 const flatTool = { type: 'function', function: { name: 'flat_tool', description: 'synthetic', parameters: { type: 'object', properties: { value: { type: 'string' } } } } } as const;
-const writeFileShapeTool = {
+const syntheticComposedSchemaTool = {
 	type: 'function', function: {
-		name: 'write_file', description: 'synthetic', parameters: {
+		name: 'synthetic_composed_tool', description: 'Synthetic composed-schema diagnostics regression fixture; it is not the current write_file schema.', parameters: {
 			oneOf: [
 				{ type: 'object', additionalProperties: false, required: ['uri', 'operation', 'read_receipt_id', 'edits'], properties: { uri: { type: 'string' }, operation: { type: 'string', const: 'modify', enum: ['modify'] }, read_receipt_id: { type: 'string' }, edits: { type: 'array', minItems: 1, items: { type: 'object', additionalProperties: false, required: ['old_text', 'new_text'], properties: { old_text: { type: 'string' }, new_text: { type: 'string' } } } } } },
 				{ type: 'object', additionalProperties: false, required: ['uri', 'operation', 'content'], properties: { uri: { type: 'string' }, operation: { type: 'string', const: 'create', enum: ['create'] }, content: { type: 'string' } } },
@@ -21,6 +22,10 @@ const writeFileShapeTool = {
 		},
 	}
 } as const;
+
+const writeFileToolInfo = availableTools('agent', undefined)?.find(tool => tool.name === 'write_file');
+if (!writeFileToolInfo?.schema) throw new Error('Expected the production write_file schema in agent tools.');
+const productionWriteFileTool = { type: 'function', function: { name: writeFileToolInfo.name, description: writeFileToolInfo.description, parameters: writeFileToolInfo.schema } };
 
 const withTimeout = async <T>(promise: Promise<T>, milliseconds = 2_000): Promise<T> => {
 	let timer: ReturnType<typeof setTimeout> | undefined;
@@ -82,16 +87,21 @@ const requestStream = async (client: OpenAI, model: Scenario, tools?: readonly u
 };
 
 suite('OpenAI-compatible local streaming regression fixture', () => {
-	test('sends synthetic no-tools, flat, and write_file-shaped tool payloads over local SSE', async () => {
+	test('serializes the production flat write_file schema and synthetic composed diagnostics fixture over local SSE', async () => {
 		const fixture = await startServer();
 		try {
 			await withTimeout(requestStream(fixture.client, 'success'));
 			await withTimeout(requestStream(fixture.client, 'success', [flatTool]));
-			await withTimeout(requestStream(fixture.client, 'success', [writeFileShapeTool]));
-			assert.strictEqual(fixture.captured.length, 3);
-			const [noTools, flat, composed] = fixture.captured.map(request => request.body);
+			await withTimeout(requestStream(fixture.client, 'success', [productionWriteFileTool]));
+			await withTimeout(requestStream(fixture.client, 'success', [syntheticComposedSchemaTool]));
+			assert.strictEqual(fixture.captured.length, 4);
+			const [noTools, flat, productionWriteFile, composed] = fixture.captured.map(request => request.body);
 			assert.strictEqual(noTools.stream, true); assert.strictEqual(noTools.tools, undefined);
 			assert.strictEqual(flat.stream, true); assert.strictEqual((flat.tools as unknown[]).length, 1); assert.strictEqual(classifyOpenAICompatibleToolSchemaDialect(flat.tools as unknown[]), 'flat');
+			assert.strictEqual(productionWriteFile.stream, true); assert.strictEqual((productionWriteFile.tools as unknown[]).length, 1); assert.strictEqual(classifyOpenAICompatibleToolSchemaDialect(productionWriteFile.tools as unknown[]), 'flat');
+			const productionParameters = ((productionWriteFile.tools as { function: { parameters: { required: string[]; properties: { operation: { enum: string[] } } } } }[])[0]).function.parameters;
+			assert.deepStrictEqual(productionParameters.required, ['uri', 'operation']);
+			assert.deepStrictEqual(productionParameters.properties.operation.enum, ['create', 'modify']);
 			assert.strictEqual(composed.stream, true); assert.strictEqual((composed.tools as unknown[]).length, 1); assert.strictEqual(classifyOpenAICompatibleToolSchemaDialect(composed.tools as unknown[]), 'oneOf-or-composition');
 			const parameters = ((composed.tools as { function: { parameters: { oneOf: unknown[] } } }[])[0]).function.parameters;
 			assert.strictEqual(parameters.oneOf.length, 2);
@@ -104,7 +114,7 @@ suite('OpenAI-compatible local streaming regression fixture', () => {
 		const fixture = await startServer();
 		try {
 			for (const expected of [{ model: 'close-before-first-event' as const, phase: 'after-response-headers-before-first-parsed-stream-event' }, { model: 'close-after-first-event' as const, phase: 'after-first-parsed-stream-event' }]) {
-				const result = await withTimeout(requestStream(fixture.client, expected.model, [writeFileShapeTool]));
+				const result = await withTimeout(requestStream(fixture.client, expected.model, [syntheticComposedSchemaTool]));
 				assert.ok(result.error); assert.strictEqual(isPrematureStreamClose(result.error), true);
 				const diagnostics: OpenAICompatibleStreamDiagnostics = { endpoint: redactOpenAICompatibleEndpoint(fixture.endpoint), model: 'fixture', chatMode: 'agent', toolCount: 1, toolSchemaDialect: 'oneOf-or-composition', dispatchAttempted: true, responseHeadersReceived: true, httpStatus: result.response.status, requestId: result.requestId, firstParsedStreamEvent: result.firstParsedStreamEvent };
 				const message = formatPrematureStreamCloseMessage(diagnostics);

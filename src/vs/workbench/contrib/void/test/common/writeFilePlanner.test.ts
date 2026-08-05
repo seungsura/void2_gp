@@ -25,6 +25,7 @@ suite('Void write_file planner', () => {
 	test('allows only the empty-snapshot create-like modify exception and preserves BOM/CRLF data', () => {
 		assert.deepStrictEqual(planWriteFileModify('', [{ oldText: '', newText: 'created' }])?.newText, 'created');
 		assert.strictEqual(planWriteFileModify('not empty', [{ oldText: '', newText: 'x' }]), null);
+		assert.strictEqual(planWriteFileModify('', [{ oldText: '', newText: 'created' }, { oldText: 'other', newText: 'changed' }]), null);
 		assert.deepStrictEqual(planWriteFileModify('\uFEFFa\r\nb\r\n', [{ oldText: 'a\r\nb', newText: 'x' }])?.newText, '\uFEFFx\r\n');
 	});
 
