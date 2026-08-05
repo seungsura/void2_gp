@@ -235,7 +235,7 @@ function Publish-PortableArchive {
         [Parameter(Mandatory = $true)][object[]]$PayloadEntries
     )
     # This is the sole final/backup transaction for generated and prepared candidates.
-    if (Test-Path -LiteralPath $OutputPath -PathType Leaf -and Test-Path -LiteralPath $BackupPath -PathType Leaf) { throw "Ambiguous portable ZIP publish state: both final and backup exist. Final: $OutputPath Backup: $BackupPath" }
+    if ((Test-Path -LiteralPath $OutputPath -PathType Leaf) -and (Test-Path -LiteralPath $BackupPath -PathType Leaf)) { throw "Ambiguous portable ZIP publish state: both final and backup exist. Final: $OutputPath Backup: $BackupPath" }
     $expectedLength = (Get-Item -LiteralPath $TemporaryPath).Length
     $expectedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $TemporaryPath).Hash.ToLowerInvariant()
     $null = Assert-PortableArchive -ArchivePath $TemporaryPath -PayloadEntries $PayloadEntries
