@@ -193,11 +193,12 @@ try {
 		$nodeGyp = Join-Path $gypDirectory 'node_modules\.bin\node-gyp.cmd'
 		if (-not (Test-Path -LiteralPath $nodeGyp -PathType Leaf)) { throw "Locked node-gyp helper was not installed: $nodeGyp" }
 
+		# npm ci --ignore-scripts suppresses these manifest payload producers' default binding.gyp/install hooks, so rebuild them explicitly.
 		$gypPackages = @(
 			'@vscode/policy-watcher', '@vscode/windows-registry', 'native-is-elevated',
 			'native-keymap', 'native-watchdog', 'kerberos', 'windows-foreground-love',
 			'@vscode/windows-ca-certs', '@vscode/sqlite3', '@vscode/spdlog', '@vscode/windows-mutex',
-			'node-pty'
+			'node-pty', '@vscode/deviceid', '@parcel/watcher'
 		)
 		foreach ($package in $gypPackages) { Invoke-GypRebuild -Package $package -NodeGyp $nodeGyp }
 
