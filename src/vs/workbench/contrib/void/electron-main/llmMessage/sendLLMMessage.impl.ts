@@ -19,6 +19,7 @@ import { ChatMode, displayInfoOfProviderName, ModelSelectionOptions, OverridesOf
 import { getSendableReasoningInfo, getModelCapabilities, getProviderCapabilities, defaultProviderSettings, getReservedOutputTokenSpace } from '../../common/modelCapabilities.js';
 import { extractReasoningWrapper, extractXMLToolsWrapper } from './extractGrammar.js';
 import { availableTools, InternalToolInfo } from '../../common/prompt/prompts.js';
+import { classifyOpenAICompatibleToolSchemaDialect, formatPrematureStreamCloseMessage, isPrematureStreamClose, OpenAICompatibleStreamDiagnostics, redactOpenAICompatibleEndpoint } from './openAICompatibleDiagnostics.js';
 import { generateUuid } from '../../../../../base/common/uuid.js';
 
 const getGoogleApiKey = async () => {
@@ -336,12 +337,11 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 	let toolId = ''
 	let toolParamsStr = ''
 
-	openai.chat.completions
-		.create(options)
-		.then(async response => {
+	const consumeResponse = async (response: AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk> & { controller: AbortController }, diagnostics: OpenAICompatibleStreamDiagnostics | undefined) => {
 			_setAborter(() => response.controller.abort())
 			// when receive text
 			for await (const chunk of response) {
+				diagnostics && (diagnostics.firstParsedStreamEvent = true);
 				// message
 				const newText = chunk.choices[0]?.delta?.content ?? ''
 				fullTextSoFar += newText
@@ -382,12 +382,46 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 				const toolCallObj = toolCall ? { toolCall } : {}
 				onFinalMessage({ fullText: fullTextSoFar, fullReasoning: fullReasoningSoFar, anthropicReasoning: null, ...toolCallObj });
 			}
-		})
-		// when error/fail - this catches errors of both .create() and .then(for await)
-		.catch(error => {
+	}
+	const onErrorFromStream = (error: any, diagnostics: OpenAICompatibleStreamDiagnostics | undefined) => {
+			if (diagnostics && isPrematureStreamClose(error)) {
+				onError({ message: formatPrematureStreamCloseMessage(diagnostics), fullError: error });
+				return;
+			}
 			if (error instanceof OpenAI.APIError && error.status === 401) { onError({ message: invalidApiKeyMessage(providerName), fullError: error }); }
 			else { onError({ message: error + '', fullError: error }); }
-		})
+	}
+
+	if (providerName === 'openAICompatible') {
+		const diagnostics: OpenAICompatibleStreamDiagnostics = {
+			endpoint: redactOpenAICompatibleEndpoint(openai.baseURL),
+			model: modelName,
+			chatMode,
+			toolCount: potentialTools?.length ?? 0,
+			toolSchemaDialect: classifyOpenAICompatibleToolSchemaDialect(potentialTools),
+			dispatchStarted: true,
+			responseHeadersReceived: false,
+			httpStatus: undefined,
+			requestId: undefined,
+			firstParsedStreamEvent: false,
+		};
+		openai.chat.completions
+			.create(options)
+			.withResponse()
+			.then(async ({ data: response, response: rawResponse, request_id }) => {
+				diagnostics.responseHeadersReceived = true;
+				diagnostics.httpStatus = rawResponse.status;
+				diagnostics.requestId = request_id ?? undefined;
+				await consumeResponse(response, diagnostics);
+			})
+			.catch(error => onErrorFromStream(error, diagnostics));
+	}
+	else {
+		openai.chat.completions
+			.create(options)
+			.then(response => consumeResponse(response, undefined))
+			.catch(error => onErrorFromStream(error, undefined));
+	}
 }
 
 
