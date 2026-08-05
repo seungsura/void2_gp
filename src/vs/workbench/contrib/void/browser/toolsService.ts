@@ -210,8 +210,9 @@ export class ToolsService implements IToolsService {
 					verifyReceipt()
 					await editCodeService.callBeforeApplyOrEdit(params.uri)
 					verifyReceipt()
-					model.applyEdits([{ range: model.getFullModelRange(), text: plan.newText }])
-					return { operation: 'modify', didChange: plan.newText !== lfText, editCount: params.edits.length }
+					const didChange = plan.newText !== lfText
+					if (didChange) await editCodeService.applyStructuredWriteFile({ uri: params.uri, newContent: plan.newText })
+					return { operation: 'modify', didChange, editCount: params.edits.length }
 				}
 			}
 		}

@@ -46,6 +46,7 @@ import { deepClone } from '../../../../base/common/objects.js';
 import { acceptBg, acceptBorder, buttonFontSize, buttonTextColor, rejectBg, rejectBorder } from '../common/helpers/colors.js';
 import { DiffArea, Diff, CtrlKZone, VoidFileSnapshot, DiffAreaSnapshotEntry, diffAreaSnapshotKeys, DiffZone, TrackingZone, ComputedDiff } from '../common/editCodeServiceTypes.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
+import { restoreWriteFileEditorSnapshot, runWriteFileEditorTransaction } from '../common/writeFileEditorTransaction.js';
 // import { isMacintosh } from '../../../../base/common/platform.js';
 // import { VOID_OPEN_SETTINGS_ACTION_ID } from './voidSettingsPane.js';
 
@@ -736,17 +737,21 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		// this._noLongerNeedModelReference(uri)
 	}
 
-	private _addToHistory(uri: URI, opts?: { onWillUndo?: () => void }) {
+	private _addToHistory(uri: URI, opts?: { onWillUndo?: () => void; saveOnRestore?: boolean }) {
 		const beforeSnapshot: VoidFileSnapshot = this._getCurrentVoidFileSnapshot(uri)
 		let afterSnapshot: VoidFileSnapshot | null = null
+		const restoreSnapshot = (snapshot: VoidFileSnapshot) => restoreWriteFileEditorSnapshot({
+			restore: () => this._restoreVoidFileSnapshot(uri, snapshot),
+			save: opts?.saveOnRestore ? () => this._voidModelService.saveModel(uri) : undefined,
+		})
 
 		const elt: IUndoRedoElement = {
 			type: UndoRedoElementType.Resource,
 			resource: uri,
 			label: 'Void Agent',
 			code: 'undoredo.editCode',
-			undo: async () => { opts?.onWillUndo?.(); await this._restoreVoidFileSnapshot(uri, beforeSnapshot) },
-			redo: async () => { if (afterSnapshot) await this._restoreVoidFileSnapshot(uri, afterSnapshot) }
+			undo: async () => { opts?.onWillUndo?.(); await restoreSnapshot(beforeSnapshot) },
+			redo: async () => { if (afterSnapshot) await restoreSnapshot(afterSnapshot) }
 		}
 		this._undoRedoService.pushElement(elt)
 
@@ -1194,7 +1199,11 @@ class EditCodeService extends Disposable implements IEditCodeService {
 	}
 
 
-	public instantlyRewriteFile({ uri, newContent }: { uri: URI, newContent: string }) {
+	public async applyStructuredWriteFile({ uri, newContent }: { uri: URI, newContent: string }): Promise<void> {
+		const { model } = this._voidModelService.getModel(uri)
+		if (!model) throw new Error('write_file failed: editor model is unavailable.')
+		if (model.getValue(EndOfLinePreference.LF) === newContent) return
+
 		// start diffzone
 		const res = this._startStreamingDiffZone({
 			uri,
@@ -1202,25 +1211,23 @@ class EditCodeService extends Disposable implements IEditCodeService {
 			startBehavior: 'keep-conflicts',
 			linkedCtrlKZone: null,
 			onWillUndo: () => { },
+			saveOnRestore: true,
 		})
-		if (!res) return
+		if (!res) throw new Error('write_file failed: editor transaction could not be started.')
 		const { diffZone, onFinishEdit } = res
 
-
-		const onDone = () => {
-			diffZone._streamState = { isStreaming: false, }
-			this._onDidChangeStreamingInDiffZone.fire({ uri, diffareaid: diffZone.diffareaid })
-			this._refreshStylesAndDiffsInURI(uri)
-			onFinishEdit()
-
-			// auto accept
-			if (this._settingsService.state.globalSettings.autoAcceptLLMChanges) {
-				this.acceptOrRejectAllDiffAreas({ uri, removeCtrlKs: false, behavior: 'accept' })
-			}
-		}
-
-		this._writeURIText(uri, newContent, 'wholeFileRange', { shouldRealignDiffAreas: true })
-		onDone()
+		await runWriteFileEditorTransaction({
+			write: () => this._writeURIText(uri, newContent, 'wholeFileRange', { shouldRealignDiffAreas: true }),
+			markStreamingComplete: () => {
+				diffZone._streamState = { isStreaming: false, }
+				this._onDidChangeStreamingInDiffZone.fire({ uri, diffareaid: diffZone.diffareaid })
+			},
+			refreshDiffs: () => this._refreshStylesAndDiffsInURI(uri),
+			shouldAutoAccept: this._settingsService.state.globalSettings.autoAcceptLLMChanges,
+			// Keep auto-accept inside the same undo element so one Ctrl+Z restores content.
+			autoAccept: () => this.acceptOrRejectAllDiffAreas({ uri, removeCtrlKs: false, behavior: 'accept', _addToHistory: false }),
+			finishAndSave: onFinishEdit,
+		})
 	}
 
 
@@ -1251,12 +1258,14 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		streamRequestIdRef,
 		linkedCtrlKZone,
 		onWillUndo,
+		saveOnRestore,
 	}: {
 		uri: URI,
 		startBehavior: 'accept-conflicts' | 'reject-conflicts' | 'keep-conflicts',
 		streamRequestIdRef: { current: string | null },
 		linkedCtrlKZone: CtrlKZone | null,
 		onWillUndo: () => void,
+		saveOnRestore?: boolean,
 	}) {
 		const { model } = this._voidModelService.getModel(uri)
 		if (!model) return
@@ -1272,7 +1281,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 
 
 		// Capture an editor undo memento before modifying.
-		const { onFinishEdit } = this._addToHistory(uri, { onWillUndo })
+		const { onFinishEdit } = this._addToHistory(uri, { onWillUndo, saveOnRestore })
 
 		// clear diffZones so no conflict
 		if (startBehavior === 'keep-conflicts') {
@@ -2447,6 +2456,3 @@ class AcceptRejectInlineWidget extends Widget implements IOverlayWidget {
 	}
 
 }
-
-
-

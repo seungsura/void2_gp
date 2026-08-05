@@ -47,7 +47,7 @@ export interface IEditCodeService {
 	callBeforeApplyOrEdit(uri: URI | 'current'): Promise<void>;
 	startApplying(opts: StartApplyingOpts): [URI, Promise<void>] | null;
 	instantlyApplySearchReplaceBlocks(opts: { uri: URI; searchReplaceBlocks: string }): void;
-	instantlyRewriteFile(opts: { uri: URI; newContent: string }): void;
+	applyStructuredWriteFile(opts: { uri: URI; newContent: string }): Promise<void>;
 	addCtrlKZone(opts: AddCtrlKOpts): number | undefined;
 	removeCtrlKZone(opts: { diffareaid: number }): void;
 
@@ -55,7 +55,7 @@ export interface IEditCodeService {
 	diffAreasOfURI: Record<string, Set<string> | undefined>;
 	diffOfId: Record<string, Diff>;
 
-	acceptOrRejectAllDiffAreas(opts: { uri: URI, removeCtrlKs: boolean, behavior: 'reject' | 'accept', _addToHistory?: boolean }): void;
+	acceptOrRejectAllDiffAreas(opts: { uri: URI, removeCtrlKs: boolean, behavior: 'reject' | 'accept', _addToHistory?: boolean }): Promise<void>;
 	acceptDiff({ diffid }: { diffid: number }): void;
 	rejectDiff({ diffid }: { diffid: number }): void;
 
