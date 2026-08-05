@@ -21,9 +21,9 @@ suite('OpenAI-compatible streaming diagnostics', () => {
 		assert.strictEqual(isPrematureStreamClose({ code: 'ECONNRESET' }), false);
 	});
 	test('formats phases without endpoint secrets, prompts, or tool values', () => {
-		const before = formatPrematureStreamCloseMessage({ endpoint: 'https://example.test/v1', model: 'gpt-4.1', chatMode: 'agent', toolCount: 3, toolSchemaDialect: 'oneOf-or-composition', dispatchStarted: true, responseHeadersReceived: false, httpStatus: undefined, requestId: undefined, firstParsedStreamEvent: false });
-		const after = formatPrematureStreamCloseMessage({ endpoint: 'https://example.test/v1', model: 'gpt-4.1', chatMode: 'agent', toolCount: 3, toolSchemaDialect: 'oneOf-or-composition', dispatchStarted: true, responseHeadersReceived: true, httpStatus: 200, requestId: 'req_123', firstParsedStreamEvent: true });
-		assert.match(before, /after-dispatch-before-response-headers/);
+		const before = formatPrematureStreamCloseMessage({ endpoint: 'https://example.test/v1', model: 'gpt-4.1', chatMode: 'agent', toolCount: 3, toolSchemaDialect: 'oneOf-or-composition', dispatchAttempted: true, responseHeadersReceived: false, httpStatus: undefined, requestId: undefined, firstParsedStreamEvent: false });
+		const after = formatPrematureStreamCloseMessage({ endpoint: 'https://example.test/v1', model: 'gpt-4.1', chatMode: 'agent', toolCount: 3, toolSchemaDialect: 'oneOf-or-composition', dispatchAttempted: true, responseHeadersReceived: true, httpStatus: 200, requestId: 'req_123', firstParsedStreamEvent: true });
+		assert.match(before, /after-sdk-dispatch-attempt-before-response-headers/);
 		assert.match(after, /after-first-parsed-stream-event/);
 		assert.match(after, /status=200/);
 		assert.match(after, /requestId=req_123/);

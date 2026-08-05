@@ -8,7 +8,7 @@ export type OpenAICompatibleStreamDiagnostics = {
 	chatMode: string | null;
 	toolCount: number;
 	toolSchemaDialect: 'none' | 'flat' | 'oneOf-or-composition' | 'other';
-	dispatchStarted: boolean;
+	dispatchAttempted: boolean;
 	responseHeadersReceived: boolean;
 	httpStatus: number | undefined;
 	requestId: string | undefined;
@@ -50,6 +50,6 @@ const value = (input: string | number | undefined | null) => input === undefined
 export const formatPrematureStreamCloseMessage = (diagnostics: OpenAICompatibleStreamDiagnostics): string => {
 	const phase = diagnostics.responseHeadersReceived
 		? diagnostics.firstParsedStreamEvent ? 'after-first-parsed-stream-event' : 'after-response-headers-before-first-parsed-stream-event'
-		: diagnostics.dispatchStarted ? 'after-dispatch-before-response-headers' : 'before-dispatch';
+		: diagnostics.dispatchAttempted ? 'after-sdk-dispatch-attempt-before-response-headers' : 'before-sdk-dispatch-attempt';
 	return `OpenAI-compatible stream closed prematurely (endpoint=${diagnostics.endpoint}, model=${diagnostics.model}, chatMode=${value(diagnostics.chatMode)}, toolCount=${diagnostics.toolCount}, dialect=${diagnostics.toolSchemaDialect}, phase=${phase}, status=${value(diagnostics.httpStatus)}, requestId=${value(diagnostics.requestId)}). This does not identify a schema cause; compare proxy request validation, upstream behavior, and SSE relay behavior with an A/B fixture.`;
 };
