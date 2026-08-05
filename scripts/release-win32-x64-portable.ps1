@@ -142,10 +142,25 @@ function Invoke-ReleaseCommand {
     param([string]$Stage,[string]$Name,[string]$FilePath,[string[]]$Arguments,[string]$LogDirectory,$Summary,[string]$SummaryPath,[switch]$AllowNonZero)
     # Only non-secret fixed release arguments are allowed; main must not pass keys or headers.
     $logRoot=Assert-ContainedPath $Stage $LogDirectory;if(-not(Test-Path -LiteralPath $logRoot)){New-Item -ItemType Directory -Path $logRoot -ErrorAction Stop|Out-Null};Assert-NotReparsePoint $logRoot|Out-Null
-    $log=Assert-ContainedPath $logRoot (Join-Path $logRoot ($Name+'.log'));$record=[ordered]@{stage=$Stage;name=$Name;filePath=$FilePath;arguments=@($Arguments);startedUtc=[DateTime]::UtcNow.ToString('o');finishedUtc=$null;durationMs=0;exitCode=$null;invocationError=$null;log=$log;sha256=$null}
-    $writer=New-Object IO.StreamWriter([IO.File]::Open($log,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::Read),$Utf8NoBom);$watch=[Diagnostics.Stopwatch]::StartNew();$global:LASTEXITCODE=$null;$invocationException=$null
-    try { & $FilePath @Arguments 2>&1 | ForEach-Object { $line=[string]$_;$writer.WriteLine($line);Write-Host $line };if($null -eq $global:LASTEXITCODE){throw "Native command did not report an exit code: $FilePath"};$record.exitCode=[int]$global:LASTEXITCODE } catch {$invocationException=$_.Exception;$record.invocationError=$invocationException.ToString();if($null -eq $record.exitCode){$record.exitCode=-1}} finally {$watch.Stop();$writer.Dispose();$record.finishedUtc=[DateTime]::UtcNow.ToString('o');$record.durationMs=$watch.ElapsedMilliseconds;$record.sha256=Get-Sha256File $log;Add-ReleaseStageRecord $Summary $record $SummaryPath}
-    if($null -ne $invocationException){throw [InvalidOperationException]::new(("Release command invocation failed: $Name; $($invocationException.Message)"),$invocationException)};if($record.exitCode -ne 0 -and -not $AllowNonZero){throw "Release command failed: $Name exit $($record.exitCode)"};[pscustomobject]$record
+    $log=Assert-ContainedPath $logRoot (Join-Path $logRoot ($Name+'.log'));$record=[ordered]@{stage=$Stage;name=$Name;filePath=$FilePath;arguments=@($Arguments);startedUtc=[DateTime]::UtcNow.ToString('o');finishedUtc=$null;durationMs=0;exitCode=$null;invocationError=$null;loggingError=$null;summaryError=$null;log=$log;sha256=$null}
+    try {$writer=New-Object IO.StreamWriter([IO.File]::Open($log,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::Read),$Utf8NoBom)}catch{throw [InvalidOperationException]::new(("Release command log creation failed: $Name; $($_.Exception.Message)"),$_.Exception)}
+    $watch=[Diagnostics.Stopwatch]::StartNew();$global:LASTEXITCODE=$null;$invocationException=$null;$loggingException=$null;$summaryException=$null;$streamState=[pscustomobject]@{loggingException=$null};$nativeExitCode=$null;$savedErrorActionPreference=$ErrorActionPreference
+    try {
+        try {
+            $ErrorActionPreference='Continue'
+            try {& $FilePath @Arguments 2>&1 | ForEach-Object {try {$line=[string]$_;$writer.WriteLine($line);Write-Host $line}catch{$streamState.loggingException=$_.Exception;throw}};$nativeExitCode=$global:LASTEXITCODE}
+            catch {if($null -ne $streamState.loggingException){$loggingException=$streamState.loggingException}else{$invocationException=$_.Exception}}
+        } finally {$ErrorActionPreference=$savedErrorActionPreference}
+        if($null -ne $loggingException){$record.loggingError=$loggingException.ToString();$record.exitCode=-1}
+        elseif($null -ne $invocationException){$record.invocationError=$invocationException.ToString();$record.exitCode=-1}
+        elseif($null -eq $nativeExitCode){$invocationException=[InvalidOperationException]::new("Native command did not report an exit code: $FilePath");$record.invocationError=$invocationException.ToString();$record.exitCode=-1}
+        else {$record.exitCode=[int]$nativeExitCode}
+    } finally {
+        $watch.Stop();try {$writer.Dispose()}catch{$loggingException=$_.Exception;$record.loggingError=$loggingException.ToString();$record.exitCode=-1};$record.finishedUtc=[DateTime]::UtcNow.ToString('o');$record.durationMs=$watch.ElapsedMilliseconds
+        if($null -eq $loggingException){try {$record.sha256=Get-Sha256File $log}catch{$loggingException=$_.Exception;$record.loggingError=$loggingException.ToString();$record.exitCode=-1}}
+        try {Add-ReleaseStageRecord $Summary $record $SummaryPath}catch{$summaryException=$_.Exception;$record.summaryError=$summaryException.ToString()}
+    }
+    if($null -ne $summaryException){throw [InvalidOperationException]::new(("Release command summary failed: $Name; $($summaryException.Message)"),$summaryException)};if($null -ne $loggingException){throw [InvalidOperationException]::new(("Release command logging failed: $Name; $($loggingException.Message)"),$loggingException)};if($null -ne $invocationException){throw [InvalidOperationException]::new(("Release command invocation failed: $Name; $($invocationException.Message)"),$invocationException)};if($record.exitCode -ne 0 -and -not $AllowNonZero){throw "Release command failed: $Name exit $($record.exitCode)"};[pscustomobject]$record
 }
 function Get-ExpectedPreHelperFailure {
     param($Record,$Summary,[string]$SummaryPath)
