@@ -19,9 +19,9 @@
 
 ## OpenAI-compatible streaming repair와 privacy
 
-이전 root `oneOf`-only schema는 사내 LiteLLM/OpenAI validation에서 거부됐습니다. non-stream은 500/inner 502, stream은 200 SSE headers 뒤 event 또는 `[DONE]` 없이 close되어 `ERR_STREAM_PREMATURE_CLOSE`로 보였습니다. OpenAI SDK/local loopback은 정상이라 SDK fault가 아니었습니다.
+이전 root `oneOf`-only schema는 일부 OpenAI-compatible validator에서 거부됐고, stream이 완료 event 없이 닫히면 `ERR_STREAM_PREMATURE_CLOSE`로 보일 수 있었습니다. 현재 flat schema는 이 호환 문제를 피하고 runtime 검증으로 파일 안전 경계를 유지합니다.
 
-현재 flat schema가 이를 피하지만 실제 provider/UI E2E는 새 package에서 미검증입니다. diagnostic error는 endpoint path(관찰된 configured path: `/chat/completions`), tool mode/schema posture, stream phase를 표시할 수 있습니다. API key와 custom headers는 기록하지 않습니다. endpoint로 직접 요청하지 말고 Void의 실제 chat과 tool trace만 관찰하세요.
+현재 flat schema가 이를 피하지만 실제 provider/UI E2E는 새 package에서 미검증입니다. diagnostic error는 configured endpoint path(관찰된 path: `/chat/completions`), tool mode/schema posture, stream phase를 표시할 수 있습니다. 민감한 설정값이나 요청 내용은 진단 기록에 복사하지 말고 Void의 실제 chat과 tool trace만 관찰하세요.
 
 ## 사용자가 직접 확인할 것
 

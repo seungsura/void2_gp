@@ -111,8 +111,8 @@
 
 - Setup: tool을 제공하는 Agent chat에서 실제 close/failure가 재현될 때만 시행합니다.
 - Exact prompt: “`failure-observation.txt`를 새로 만들고 `observe only`를 넣어 주세요.”
-- Expected: raw `ERR_STREAM_PREMATURE_CLOSE`만 남기지 않고 diagnostic error가 endpoint path, tool mode/schema posture, stream phase를 포함합니다. API key/custom headers는 보이거나 기록되면 안 됩니다.
-- Record: `EXPLORATORY` / endpoint path / stream phase / schema posture / tool mode / HTTP-visible status가 있으면 그것만 / API key·custom headers 미기록 / retry 여부. 이 기록은 endpoint 직접 요청을 허용하지 않습니다.
+- Expected: raw `ERR_STREAM_PREMATURE_CLOSE`만 남기지 않고 diagnostic error가 endpoint path, tool mode/schema posture, stream phase를 포함합니다. 민감한 설정값이나 요청 내용은 보이거나 기록되면 안 됩니다.
+- Record: `EXPLORATORY` / endpoint path / stream phase / schema posture / tool mode / HTTP-visible status가 있으면 그것만 / 민감한 설정값 미기록 / retry 여부. 이 기록은 endpoint 직접 요청을 허용하지 않습니다.
 
 ## 해석 주의
 

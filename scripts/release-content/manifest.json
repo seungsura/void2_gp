@@ -1,0 +1,49 @@
+{
+	"schemaVersion": 1,
+	"entries": [
+		{
+			"source": "README.md",
+			"outerPath": "README.md",
+			"materialization": "outer-metadata"
+		},
+		{
+			"source": "portable/README.md",
+			"portablePath": "docs/README.md",
+			"materialization": "copy"
+		},
+		{
+			"source": "portable/getting-started.md",
+			"portablePath": "docs/getting-started.md",
+			"materialization": "copy"
+		},
+		{
+			"source": "portable/release-notes.md",
+			"portablePath": "docs/release-notes.md",
+			"materialization": "product-version"
+		},
+		{
+			"source": "guides/write-tool-guide.md",
+			"outerPath": "guides/write-tool-guide.md",
+			"portablePath": "docs/guides/write-tool-guide.md",
+			"materialization": "copy"
+		},
+		{
+			"source": "guides/read-tool-guide.md",
+			"outerPath": "guides/read-tool-guide.md",
+			"portablePath": "docs/guides/read-tool-guide.md",
+			"materialization": "copy"
+		},
+		{
+			"source": "prompts/write-tool-test-prompts.md",
+			"outerPath": "prompts/write-tool-test-prompts.md",
+			"portablePath": "docs/prompts/write-tool-test-prompts.md",
+			"materialization": "copy"
+		},
+		{
+			"source": "prompts/read-tool-test-prompts.md",
+			"outerPath": "prompts/read-tool-test-prompts.md",
+			"portablePath": "docs/prompts/read-tool-test-prompts.md",
+			"materialization": "copy"
+		}
+	]
+}

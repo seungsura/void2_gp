@@ -1,6 +1,6 @@
 # Void 1.99.3 Windows x64 배포 묶음
 
-이 묶음은 portable 제품 ZIP과 `write_file`/`read_file` 안내서, 그리고 실제 제품 관찰용 프롬프트를 함께 전달합니다. 이 README의 값은 assembler가 실제 새 portable을 만든 뒤에만 확정합니다. placeholder를 hash 또는 통과 사실로 해석하지 마세요.
+이 묶음은 사용자 문서가 내장된 portable 제품 ZIP과 `write_file`/`read_file` 안내서, 그리고 실제 제품 관찰용 프롬프트를 함께 전달합니다. 이 README의 값은 assembler가 실제 새 portable을 만든 뒤에만 확정합니다. placeholder를 hash 또는 통과 사실로 해석하지 마세요.
 
 ## 포함 파일
 
@@ -8,6 +8,8 @@
 - `SHA256SUMS.txt`: assembler가 placeholder 치환 뒤 생성하는 manifest
 - `guides/write-tool-guide.md`, `guides/read-tool-guide.md`: 도구 계약과 안전 경계
 - `prompts/write-tool-test-prompts.md`, `prompts/read-tool-test-prompts.md`: 탐색적 제품 테스트 절차
+
+portable ZIP 자체의 `docs/`에도 시작 안내, current-only release notes와 위 guide/prompt의 동일한 bytes가 들어 있습니다. release notes는 누적 내부 이력이 아니라 해당 portable에서 실제 shipped된 동작만 설명하며, 아직 배포되지 않은 기능은 manual이나 사용 가능 기능으로 표시하지 않습니다.
 
 ## 새 portable 정보 — assembler가 채울 값
 

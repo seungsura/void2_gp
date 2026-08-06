@@ -3,10 +3,12 @@ param(
     [string]$ArtifactRoot,
     [string]$PackageDirectory,
     [string]$PreparedArchivePath,
-    [string]$PreparedArchiveRoot
+    [string]$PreparedArchiveRoot,
+    [int]$RequiredDocsContract = -1
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'release-content-manifest.ps1')
 
 function ConvertTo-NormalizedArchivePath {
     param(
@@ -195,11 +197,26 @@ function Get-PeMachineFromFile {
 }
 
 function Assert-PortableArchive {
-    param([Parameter(Mandatory = $true)][string]$ArchivePath, [Parameter(Mandatory = $true)][object[]]$PayloadEntries)
+    param(
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][object[]]$PayloadEntries,
+        [Parameter(Mandatory = $true)]$ContentManifest,
+        [int]$RequiredContract = -1
+    )
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $archive = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
     try {
-        $entries = @($archive.Entries | ForEach-Object { [pscustomobject]@{ Entry = $_; FullName = $_.FullName; NormalizedArchivePath = ConvertTo-NormalizedArchivePath -Path $_.FullName; Length = $_.Length } })
+        $byPath = @{}
+        $entries = @($archive.Entries | ForEach-Object {
+            $canonicalPath = $_.FullName
+            $normalizedPath = ConvertTo-NormalizedArchivePath -Path $canonicalPath
+            if ($canonicalPath.IndexOf([char]92) -ge 0 -or $canonicalPath -cne $canonicalPath.Trim('/') -or $canonicalPath.ToLowerInvariant() -cne $normalizedPath) {
+                throw "Portable ZIP contains a non-canonical entry path: $canonicalPath"
+            }
+            if ($byPath.ContainsKey($canonicalPath)) { throw "Portable ZIP contains a duplicate or case-colliding path: $canonicalPath" }
+            $byPath[$canonicalPath] = $_
+            [pscustomobject]@{ Entry = $_; FullName = $canonicalPath; NormalizedArchivePath = $normalizedPath; Length = $_.Length }
+        })
         foreach ($required in @('Void.exe', 'data/README.txt', 'resources/app/product.json')) {
             if ($entries.NormalizedArchivePath -notcontains (ConvertTo-NormalizedArchivePath -Path $required)) { throw "Portable ZIP is missing required entry: $required" }
         }
@@ -210,7 +227,12 @@ function Assert-PortableArchive {
             # All manifest payloads are native Windows binaries and must be x64, not merely nonzero.
             if ((Get-PeMachineFromArchiveEntry -Entry $matches[0].Entry) -ne 0x8664) { throw "Runtime payload is not x64: $($payload.RelativePath) [$($payload.Component)]" }
         }
-        return $entries
+        $productEntry = $byPath['resources/app/product.json']
+        $reader = New-Object IO.StreamReader($productEntry.Open(), [Text.UTF8Encoding]::new($false, $true), $true)
+        try { $productVersion = [string](($reader.ReadToEnd() | ConvertFrom-Json).version) } finally { $reader.Dispose() }
+        if ([string]::IsNullOrWhiteSpace($productVersion)) { throw 'Portable ZIP product version is empty.' }
+        $docs = Assert-ReleaseContentArchiveDocsContract -EntriesByPath $byPath -Manifest $ContentManifest -ProductVersion $productVersion -RequiredContract $RequiredContract
+        [pscustomobject]@{ Entries = $entries; DocsContract = $docs.Contract; DocsCount = $docs.Count; Docs = @($docs.Entries); Version = $productVersion }
     } finally { $archive.Dispose() }
 }
 
@@ -232,25 +254,29 @@ function Publish-PortableArchive {
         [Parameter(Mandatory = $true)][string]$OutputPath,
         [Parameter(Mandatory = $true)][string]$BackupPath,
         [Parameter(Mandatory = $true)][string]$OutputName,
-        [Parameter(Mandatory = $true)][object[]]$PayloadEntries
+        [Parameter(Mandatory = $true)][object[]]$PayloadEntries,
+        [Parameter(Mandatory = $true)]$ContentManifest,
+        [int]$CandidateRequiredDocsContract = 1
     )
     # This is the sole final/backup transaction for generated and prepared candidates.
     if ((Test-Path -LiteralPath $OutputPath -PathType Leaf) -and (Test-Path -LiteralPath $BackupPath -PathType Leaf)) { throw "Ambiguous portable ZIP publish state: both final and backup exist. Final: $OutputPath Backup: $BackupPath" }
     $expectedLength = (Get-Item -LiteralPath $TemporaryPath).Length
     $expectedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $TemporaryPath).Hash.ToLowerInvariant()
-    $null = Assert-PortableArchive -ArchivePath $TemporaryPath -PayloadEntries $PayloadEntries
+    $null = Assert-PortableArchive -ArchivePath $TemporaryPath -PayloadEntries $PayloadEntries -ContentManifest $ContentManifest -RequiredContract $CandidateRequiredDocsContract
     $previousLength = $null; $previousHash = $null; $backupCreated = $false
+    $previousDocsContract = -1
     if (Test-Path -LiteralPath $OutputPath -PathType Leaf) {
         $previousLength = (Get-Item -LiteralPath $OutputPath).Length
         $previousHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $OutputPath).Hash.ToLowerInvariant()
-        $null = Assert-PortableArchive -ArchivePath $OutputPath -PayloadEntries $PayloadEntries
+        $previousValidation = Assert-PortableArchive -ArchivePath $OutputPath -PayloadEntries $PayloadEntries -ContentManifest $ContentManifest
+        $previousDocsContract = $previousValidation.DocsContract
         Move-PackageFileWithBoundedRetry -SourcePath $OutputPath -DestinationPath $BackupPath -Purpose 'Preserve validated portable ZIP backup'
         $backupCreated = $true
     }
     try {
         Move-PackageFileWithBoundedRetry -SourcePath $TemporaryPath -DestinationPath $OutputPath -Purpose 'Publish validated portable ZIP'
         if ((Get-Item -LiteralPath $OutputPath).Length -ne $expectedLength -or (Get-FileHash -Algorithm SHA256 -LiteralPath $OutputPath).Hash.ToLowerInvariant() -ne $expectedHash) { throw 'Published portable ZIP hash or length differs from its validated candidate.' }
-        $entries = @(Assert-PortableArchive -ArchivePath $OutputPath -PayloadEntries $PayloadEntries)
+        $publishedValidation = Assert-PortableArchive -ArchivePath $OutputPath -PayloadEntries $PayloadEntries -ContentManifest $ContentManifest -RequiredContract $CandidateRequiredDocsContract
     } catch {
         $failure = $_
         if (Test-Path -LiteralPath $OutputPath -PathType Leaf) {
@@ -261,14 +287,14 @@ function Publish-PortableArchive {
             try {
                 Move-PackageFileWithBoundedRetry -SourcePath $BackupPath -DestinationPath $OutputPath -Purpose 'Restore validated portable ZIP backup'
                 if ((Get-Item -LiteralPath $OutputPath).Length -ne $previousLength -or (Get-FileHash -Algorithm SHA256 -LiteralPath $OutputPath).Hash.ToLowerInvariant() -ne $previousHash) { throw 'Restored backup hash or length differs from the preserved final.' }
-                $null = Assert-PortableArchive -ArchivePath $OutputPath -PayloadEntries $PayloadEntries
+                $null = Assert-PortableArchive -ArchivePath $OutputPath -PayloadEntries $PayloadEntries -ContentManifest $ContentManifest -RequiredContract $previousDocsContract
                 $backupCreated = $false
             } catch { throw "Portable publish failed and backup restoration failed. Publish: $($failure.Exception.Message) Restore: $($_.Exception.Message)" }
         }
         throw "Portable publish failed; prior final was restored when present. $($failure.Exception.Message)"
     }
     if ($backupCreated) { Remove-ExpectedPackageCleanupFile -CandidatePath $BackupPath -ExpectedLeafName ".${OutputName}.backup" -PackageDirectoryPath (Split-Path -Parent $OutputPath) -FinalOutputPath $OutputPath -CleanupPurpose 'Post-publish validated backup cleanup' }
-    return [pscustomobject]@{ Hash = $expectedHash; Length = $expectedLength; Entries = $entries }
+    return [pscustomobject]@{ Hash = $expectedHash; Length = $expectedLength; Entries = $publishedValidation.Entries; DocsContract = $publishedValidation.DocsContract; DocsCount = $publishedValidation.DocsCount; Docs = @($publishedValidation.Docs) }
 }
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
@@ -289,8 +315,12 @@ $ExecutablePath = Join-Path $ArtifactRoot 'Void.exe'
 $PortableReadmePath = Join-Path $ArtifactRoot 'data\README.txt'
 $PortableReadmeTemplatePath = Join-Path $PSScriptRoot 'portable-data-readme.txt'
 $RuntimePayloadManifestPath = Join-Path $PSScriptRoot 'win32-x64-runtime-payload-manifest.json'
+$ReleaseContentManifestPath = Join-Path $PSScriptRoot 'release-content\manifest.json'
+$ReleaseContentRoot = Join-Path $PSScriptRoot 'release-content'
 $ExpectedPortableReadmeLength = 134
 $ExpectedPortableReadmeHash = '5109876d2a58f1e06f257c774ffb7286b9845e96b888265ec425944175e8b695'
+$ReleaseContentManifest = Get-ReleaseContentManifest -ManifestPath $ReleaseContentManifestPath -ContentRoot $ReleaseContentRoot
+if ($RequiredDocsContract -notin @(-1, 0, 1)) { throw 'RequiredDocsContract must be -1, 0, or 1.' }
 $IsPreparedMode = -not [string]::IsNullOrWhiteSpace($PreparedArchivePath)
 if (-not $IsPreparedMode -and -not [string]::IsNullOrWhiteSpace($PreparedArchiveRoot)) { throw 'PreparedArchiveRoot requires PreparedArchivePath.' }
 if ($IsPreparedMode) {
@@ -301,6 +331,8 @@ if ($IsPreparedMode) {
 }
 
 if (-not $IsPreparedMode) {
+if (-not (Test-Path -LiteralPath $ArtifactRoot -PathType Container)) { throw "Artifact root was not found: $ArtifactRoot" }
+$null = Assert-ReleaseContentNoArtifactCollisions -Manifest $ReleaseContentManifest -ArtifactRoot $ArtifactRoot
 if (-not (Test-Path -LiteralPath $ExecutablePath -PathType Leaf)) {
     throw "Void.exe was not found: $ExecutablePath"
 }
@@ -432,7 +464,7 @@ try {
     }
 
     if ([string]::IsNullOrWhiteSpace($PreparedArchivePath)) {
-        & $NodePath $PackerPath $ArtifactRoot $TemporaryOutputPath
+        & $NodePath $PackerPath $ArtifactRoot $TemporaryOutputPath $ReleaseContentManifestPath $Version
         if ($LASTEXITCODE -ne 0) { throw "Portable ZIP creation failed with exit code $LASTEXITCODE" }
     } else {
         $PreparedArchivePath = [IO.Path]::GetFullPath($PreparedArchivePath)
@@ -441,15 +473,16 @@ try {
             [StringComparer]::OrdinalIgnoreCase.Equals($PreparedArchivePath, $OutputPath) -or
             [StringComparer]::OrdinalIgnoreCase.Equals($PreparedArchivePath, $TemporaryOutputPath) -or
             [StringComparer]::OrdinalIgnoreCase.Equals($PreparedArchivePath, $BackupOutputPath)) { throw "Prepared archive must be an existing external file named $OutputName" }
-        $null = Assert-PortableArchive -ArchivePath $PreparedArchivePath -PayloadEntries $RuntimePayloadEntries
+        $null = Assert-PortableArchive -ArchivePath $PreparedArchivePath -PayloadEntries $RuntimePayloadEntries -ContentManifest $ReleaseContentManifest -RequiredContract $RequiredDocsContract
         $PreparedLength = (Get-Item -LiteralPath $PreparedArchivePath).Length
         $PreparedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $PreparedArchivePath).Hash.ToLowerInvariant()
         [IO.File]::Copy($PreparedArchivePath, $TemporaryOutputPath, $false)
         if ((Get-Item -LiteralPath $TemporaryOutputPath).Length -ne $PreparedLength -or (Get-FileHash -Algorithm SHA256 -LiteralPath $TemporaryOutputPath).Hash.ToLowerInvariant() -ne $PreparedHash) { throw 'Prepared archive copy does not match the validated input.' }
     }
-    $ArchiveEntries = @(Assert-PortableArchive -ArchivePath $TemporaryOutputPath -PayloadEntries $RuntimePayloadEntries)
+    $CandidateRequiredDocsContract = if ($IsPreparedMode) { $RequiredDocsContract } else { 1 }
+    $null = Assert-PortableArchive -ArchivePath $TemporaryOutputPath -PayloadEntries $RuntimePayloadEntries -ContentManifest $ReleaseContentManifest -RequiredContract $CandidateRequiredDocsContract
 
-    $Published = Publish-PortableArchive -TemporaryPath $TemporaryOutputPath -OutputPath $OutputPath -BackupPath $BackupOutputPath -OutputName $OutputName -PayloadEntries $RuntimePayloadEntries
+    $Published = Publish-PortableArchive -TemporaryPath $TemporaryOutputPath -OutputPath $OutputPath -BackupPath $BackupOutputPath -OutputName $OutputName -PayloadEntries $RuntimePayloadEntries -ContentManifest $ReleaseContentManifest -CandidateRequiredDocsContract $CandidateRequiredDocsContract
     $Hash = $Published.Hash
     $ArchiveEntries = $Published.Entries
 
@@ -472,6 +505,7 @@ try {
 
     Write-Output "Portable package: $OutputPath"
     Write-Output "Entries: $($ArchiveEntries.Count)"
+    Write-Output "Portable docs contract: $($Published.DocsContract) ($($Published.DocsCount) manifest entries)"
     Write-Output "SHA-256: $Hash"
     Write-Output "Retention: only the newest matching portable ZIP is kept in $PackageDirectory"
     Write-Output "Runtime payload manifest: static packaging validation passed; runtime launch certification is separate"
