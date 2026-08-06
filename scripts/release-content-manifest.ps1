@@ -24,6 +24,25 @@ function Get-ReleaseContentStrictUtf8Data {
     [pscustomobject]@{ Path = $item.FullName; Bytes = $bytes; Text = $text }
 }
 
+function Assert-ReleaseContentWindowsSafePathSegments {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Purpose
+    )
+
+    foreach ($segment in $Path.Split('/')) {
+        $dotIndex = $segment.IndexOf('.')
+        $deviceBaseName = if ($dotIndex -ge 0) { $segment.Substring(0, $dotIndex) } else { $segment }
+        if ($segment -eq '' -or
+            $segment.EndsWith('.') -or
+            $segment.EndsWith(' ') -or
+            [regex]::IsMatch($segment, '[\x00-\x1f<>:"/\\|?*]') -or
+            $deviceBaseName -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$') {
+            throw "Release content $Purpose path contains a Windows-unsafe segment: $Path"
+        }
+    }
+}
+
 function ConvertTo-ReleaseContentCanonicalPath {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -43,11 +62,7 @@ function ConvertTo-ReleaseContentCanonicalPath {
     if ($segments.Count -eq 0 -or @($segments | Where-Object { $_ -eq '' -or $_ -eq '.' -or $_ -eq '..' }).Count -gt 0) {
         throw "Release content $Purpose path is unsafe: $Path"
     }
-    foreach ($segment in $segments) {
-        if ($segment.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) {
-            throw "Release content $Purpose path contains an invalid segment: $Path"
-        }
-    }
+    Assert-ReleaseContentWindowsSafePathSegments -Path $Path -Purpose $Purpose
     $Path
 }
 
@@ -176,6 +191,10 @@ function Get-ReleaseContentManifest {
 
         $sourcePath = Resolve-ReleaseContentSourceFile $ContentRoot $source
         $data = Get-ReleaseContentStrictUtf8Data $sourcePath
+        $datedInternalRoute = '(?i)(?<![a-z0-9])gpt-[a-z0-9._-]*\d{4}-\d{2}-\d{2}(?![a-z0-9])'
+        if ($data.Text.Contains('gpt-5.6-luna-2026-07-09') -or $data.Text -match $datedInternalRoute) {
+            throw "Release content contains a dated internal model route: $source"
+        }
         $placeholders = @([regex]::Matches($data.Text, '\{\{[^{}\r\n]+\}\}') | ForEach-Object { $_.Value })
         if ($materialization -ceq 'copy' -and $placeholders.Count -ne 0) {
             throw "Copy release content has an unresolved placeholder: $source"

@@ -56,6 +56,29 @@ function Assert-Throws {
     $threw=$false;try{& $Action}catch{$threw=$true};if(-not $threw){throw "Expected failure did not occur: $Name"};Add-Pass $Name
 }
 
+function Invoke-FixturePacker {
+    param([string]$NodePath,[string]$PackerPath,[string]$ArtifactRoot,[string]$OutputPath,[string]$ManifestPath)
+    $output=& $NodePath $PackerPath $ArtifactRoot $OutputPath $ManifestPath '9.9.9' 2>&1|Out-String
+    if($LASTEXITCODE -ne 0){throw "Fixture package-portable.js failed ($LASTEXITCODE): $output"}
+}
+
+function Assert-ManifestRejectedByPowerShellAndJavaScript {
+    param([string]$Name,$Case,[string]$NodePath,[string]$PackerPath,[string]$ArtifactRoot)
+    Assert-Throws "$Name PowerShell" {Get-ReleaseContentManifest $Case.ManifestPath $Case.ContentRoot|Out-Null}
+    $outputPath=Join-Path $Case.Root 'should-not-package.zip'
+    $oldPreference=$ErrorActionPreference
+    $exitCode=$null
+    try {
+        $ErrorActionPreference='Continue'
+        $output=& $NodePath $PackerPath $ArtifactRoot $outputPath $Case.ManifestPath '9.9.9' 2>&1|Out-String
+        $exitCode=$LASTEXITCODE
+    } finally {
+        $ErrorActionPreference=$oldPreference
+    }
+    if($exitCode -eq 0 -or (Test-Path -LiteralPath $outputPath)){throw "JavaScript packer accepted $Name. Output: $output"}
+    Add-Pass "$Name JavaScript"
+}
+
 function New-DocsFixtureZip {
     param([string]$Path,$Manifest,[ValidateSet('legacy','exact','partial','extra','mismatch')][string]$Mode)
     $plan=@(Get-ReleaseContentPlan $Manifest Portable -ProductVersion '9.9.9')
@@ -82,6 +105,11 @@ New-Item -ItemType Directory -Path $tempRoot -ErrorAction Stop|Out-Null
 try {
     $production=Get-ReleaseContentManifest -ManifestPath (Join-Path $PSScriptRoot 'release-content\manifest.json') -ContentRoot (Join-Path $PSScriptRoot 'release-content')
     if($production.PortableEntries.Count -ne 7 -or $production.OuterEntries.Count -ne 5){throw 'Production release content manifest does not have the approved 7 portable / 5 outer mapping.'};Add-Pass 'production manifest'
+    $productionTokens=@{'{{PORTABLE_SIZE}}'='1 byte';'{{PORTABLE_SHA256}}'=('a'*64);'{{PORTABLE_ENTRIES}}'='1';'{{SOURCE_HEAD}}'=('b'*40);'{{BUILD_DATE_KST}}'='2026-08-06 KST'}
+    $productionPlans=@(Get-ReleaseContentPlan $production Portable -ProductVersion '9.9.9')+@(Get-ReleaseContentPlan $production Outer -OuterTokens $productionTokens)
+    $productionUserText=(@($productionPlans|ForEach-Object{$Utf8NoBom.GetString([byte[]]$_.Bytes)})) -join "`n"
+    $datedInternalRoute='(?i)(?<![a-z0-9])gpt-[a-z0-9._-]*\d{4}-\d{2}-\d{2}(?![a-z0-9])'
+    if($productionUserText.Contains('gpt-5.6-luna-2026-07-09') -or $productionUserText -match $datedInternalRoute){throw 'Production user documentation contains a dated internal model route.'};Add-Pass 'production user docs exclude dated internal routes'
     $releaseScriptText=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'release-win32-x64-portable.ps1'));$forwardMarker="if(`$TransactionTag -ceq 'forward'){Assert-PortableArchive `$candidatePath -RequiredDocsContract 1}else{Assert-PortableArchive `$candidatePath}";$argumentMarker="'-RequiredDocsContract',[string]`$requiredDocsContract";if(-not $releaseScriptText.Contains($forwardMarker) -or -not $releaseScriptText.Contains($argumentMarker)){throw 'Forward/recovery prepared-inner docs-contract distinction is missing.'};Add-Pass 'forward 1 recovery detected contract'
 
     $positive=New-FixtureCase $tempRoot 'positive';$positiveManifest=Get-ReleaseContentManifest $positive.ManifestPath $positive.ContentRoot
@@ -112,8 +140,17 @@ try {
     $outerMaterialized=Join-Path $positive.Root 'outer-materialized';New-Item -ItemType Directory -Path $outerMaterialized|Out-Null;$tokens=@{'{{PORTABLE_SIZE}}'='1 byte';'{{PORTABLE_SHA256}}'=('a'*64);'{{PORTABLE_ENTRIES}}'='4';'{{SOURCE_HEAD}}'=('b'*40);'{{BUILD_DATE_KST}}'='2026-08-06 KST'};$outerPlan=@(Write-ReleaseContentOuterFiles $positiveManifest $outerMaterialized $tokens);$portablePlan=@(Get-ReleaseContentPlan $positiveManifest Portable -ProductVersion '9.9.9');$outerShared=[IO.File]::ReadAllBytes((Join-Path $outerMaterialized 'guides\guide.md'));$portableShared=[byte[]](@($portablePlan|Where-Object{$_.Path -ceq 'docs/guides/guide.md'})[0].Bytes);if(-not(Test-ReleaseContentBytesEqual $outerShared $portableShared)){throw 'Shared outer/portable fixture bytes differ.'};Add-Pass 'shared outer portable bytes'
 
     $artifact=Join-Path $positive.Root 'artifact';New-Item -ItemType Directory -Path (Join-Path $artifact 'data') -Force|Out-Null;Write-FixtureText (Join-Path $artifact 'app.txt') "artifact`n";Write-FixtureText (Join-Path $artifact 'data\argv.json') "generated`n"
-    $packed=Join-Path $positive.Root 'packed.zip';$workspaceRoot=Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot));$node=Join-Path $workspaceRoot '.toolchain\node-v20.18.2-win-x64\node.exe';if(-not(Test-Path -LiteralPath $node -PathType Leaf)){$node=(Get-Command node -ErrorAction Stop).Source}
-    & $node (Join-Path $PSScriptRoot 'package-portable.js') $artifact $packed $positive.ManifestPath '9.9.9'|Out-Null;if($LASTEXITCODE -ne 0){throw "Fixture package-portable.js failed: $LASTEXITCODE"};if(Test-Path -LiteralPath (Join-Path $artifact 'docs')){throw 'Fixture packer mutated ArtifactRoot with docs.'}
+    $workspaceRoot=Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot));$node=Join-Path $workspaceRoot '.toolchain\node-v20.18.2-win-x64\node.exe';if(-not(Test-Path -LiteralPath $node -PathType Leaf)){$node=(Get-Command node -ErrorAction Stop).Source};$packer=Join-Path $PSScriptRoot 'package-portable.js'
+
+    $dotAlias=New-FixtureCase $tempRoot 'dot-alias';Write-FixtureText (Join-Path $dotAlias.ContentRoot 'portable\item.md') "item`n";Write-FixtureText (Join-Path $dotAlias.ContentRoot 'portable\item-other.md') "other`n";$dotAlias.Manifest.entries+=,[ordered]@{source='portable/item.md';portablePath='docs/item';materialization='copy'};$dotAlias.Manifest.entries+=,[ordered]@{source='portable/item-other.md';portablePath='docs/item.';materialization='copy'};Write-FixtureManifest $dotAlias $dotAlias.Manifest;Assert-ManifestRejectedByPowerShellAndJavaScript 'item versus item-dot alias' $dotAlias $node $packer $artifact
+    $spaceAlias=New-FixtureCase $tempRoot 'space-alias';$spaceAlias.Manifest.entries[1].portablePath='docs/trailing /README.md';Write-FixtureManifest $spaceAlias $spaceAlias.Manifest;Assert-ManifestRejectedByPowerShellAndJavaScript 'trailing-space segment' $spaceAlias $node $packer $artifact
+    $reservedAlias=New-FixtureCase $tempRoot 'reserved-alias';$reservedAlias.Manifest.entries[1].portablePath='docs/CON.md';Write-FixtureManifest $reservedAlias $reservedAlias.Manifest;Assert-ManifestRejectedByPowerShellAndJavaScript 'reserved-device segment' $reservedAlias $node $packer $artifact
+    $exactRoute=New-FixtureCase $tempRoot 'exact-route';Write-FixtureText (Join-Path $exactRoute.ContentRoot 'shared\guide.md') "gpt-5.6-luna-2026-07-09`n";Assert-ManifestRejectedByPowerShellAndJavaScript 'exact internal route privacy' $exactRoute $node $packer $artifact
+    $datedRoute=New-FixtureCase $tempRoot 'dated-route';Write-FixtureText (Join-Path $datedRoute.ContentRoot 'shared\guide.md') "gpt-9.9-internal-2030-01-02`n";Assert-ManifestRejectedByPowerShellAndJavaScript 'dated internal route privacy' $datedRoute $node $packer $artifact
+
+    $packed=Join-Path $positive.Root 'packed-one.zip';$packedAgain=Join-Path $positive.Root 'packed-two.zip';Invoke-FixturePacker $node $packer $artifact $packed $positive.ManifestPath;Start-Sleep -Milliseconds 2200;Invoke-FixturePacker $node $packer $artifact $packedAgain $positive.ManifestPath
+    $packedHash=(Get-FileHash -Algorithm SHA256 -LiteralPath $packed).Hash;$packedAgainHash=(Get-FileHash -Algorithm SHA256 -LiteralPath $packedAgain).Hash;$packedBytes=[IO.File]::ReadAllBytes($packed);$packedAgainBytes=[IO.File]::ReadAllBytes($packedAgain);if($packedHash -cne $packedAgainHash -or -not(Test-ReleaseContentBytesEqual $packedBytes $packedAgainBytes)){throw "Two identical packer runs were not byte-identical: $packedHash / $packedAgainHash"};Add-Pass 'two-run deterministic supplemental ZIP bytes'
+    if(Test-Path -LiteralPath (Join-Path $artifact 'docs')){throw 'Fixture packer mutated ArtifactRoot with docs.'}
     $packedZip=[IO.Compression.ZipFile]::OpenRead($packed);try{$names=@($packedZip.Entries|ForEach-Object{$_.FullName});if($names -ccontains 'data/argv.json'){throw 'Fixture packer included generated user data.'};$sorted=@($names);[Array]::Sort($sorted,[StringComparer]::Ordinal);if(($names -join "`n") -cne ($sorted -join "`n")){throw 'Fixture packer entry order is not deterministic ordinal order.'};$by=@{};foreach($entry in $packedZip.Entries){$by[$entry.FullName]=$entry};$packedDocs=Assert-ReleaseContentArchiveDocsContract $by $positiveManifest '9.9.9' -RequiredContract 1;if($packedDocs.Count -ne 3){throw 'Fixture packer docs count mismatch.'}}finally{$packedZip.Dispose()};Add-Pass 'direct ZIP supplemental package content'
 
     [pscustomobject]@{status='passed';tests=$Results.Count;checks=@($Results)}|ConvertTo-Json -Depth 4

@@ -17,6 +17,12 @@ const normalizedOutputPath = path.resolve(outputPath);
 const normalizedManifestPath = path.resolve(releaseContentManifestPath);
 const contentRoot = path.dirname(normalizedManifestPath);
 const strictUtf8 = new TextDecoder('utf-8', { fatal: true });
+// ZIP DOS timestamps support 1980-2107. Use a fixed, non-boundary local time so
+// supplemental buffers do not inherit yazl's default current timestamp.
+const supplementalZipMtime = new Date(2000, 0, 1, 0, 0, 0, 0);
+const supplementalZipMode = 0o100644;
+const windowsReservedDeviceName = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
+const windowsInvalidSegmentCharacters = /[\u0000-\u001f<>:"\\|?*]/u;
 
 const readStrictUtf8 = (filePath) => {
 	const bytes = fs.readFileSync(filePath);
@@ -40,6 +46,12 @@ const canonicalRelativePath = (value, purpose) => {
 	const segments = value.split('/');
 	if (segments.some(segment => segment === '' || segment === '.' || segment === '..')) {
 		throw new Error(`Release content ${purpose} path is unsafe: ${value}`);
+	}
+	for (const segment of segments) {
+		const deviceBaseName = segment.split('.', 1)[0];
+		if (segment.endsWith('.') || segment.endsWith(' ') || windowsInvalidSegmentCharacters.test(segment) || windowsReservedDeviceName.test(deviceBaseName)) {
+			throw new Error(`Release content ${purpose} path contains a Windows-unsafe segment: ${value}`);
+		}
 	}
 	return value;
 };
@@ -144,6 +156,9 @@ const loadPortableEntries = () => {
 
 		const sourcePath = resolveRegularSource(source);
 		const sourceData = readStrictUtf8(sourcePath);
+		if (sourceData.text.includes('gpt-5.6-luna-2026-07-09') || /(?<![a-z0-9])gpt-[a-z0-9._-]*\d{4}-\d{2}-\d{2}(?![a-z0-9])/i.test(sourceData.text)) {
+			throw new Error(`Release content contains a dated internal model route: ${source}`);
+		}
 		if (portablePath && /([A-Z]:\\|\bapi[ _-]?key\b|\bcustom headers?\b|\b(?:task|thread)[ _-]?ids?\b|\bcorporate host\b|사내|\bspec[\\/])/i.test(sourceData.text)) {
 			throw new Error(`Portable release content contains forbidden internal or sensitive text: ${source}`);
 		}
@@ -269,7 +284,7 @@ for (const file of files) {
 	if (file.absolutePath) {
 		zipFile.addFile(file.absolutePath, file.relativePath);
 	} else {
-		zipFile.addBuffer(file.bytes, file.relativePath);
+		zipFile.addBuffer(file.bytes, file.relativePath, { mtime: supplementalZipMtime, mode: supplementalZipMode });
 	}
 }
 

@@ -25,6 +25,7 @@ function ConvertTo-NormalizedArchivePath {
         $NormalizedPath.Split('/') -contains '.') {
         throw "Runtime payload manifest contains an invalid artifact-relative path: $Path"
     }
+    Assert-ReleaseContentWindowsSafePathSegments -Path $NormalizedPath -Purpose 'archive'
 
     return $NormalizedPath.ToLowerInvariant()
 }

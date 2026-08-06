@@ -7,7 +7,7 @@
 - Setup: OpenAI-compatible Agent를 선택하고 **새 chat**을 엽니다.
 - Exact prompt: `1`
 - Expected: 정상 stream completion을 관찰합니다. 이어서 tool trace/schema를 볼 수 있으면 write_file root가 flat `type: object`, operation enum, optional branch fields이고 composition/const가 없다는 current posture를 기록합니다. 이것은 tool test의 전제 관찰일 뿐 provider/UI E2E 전체 통과를 뜻하지 않습니다.
-- Record: configured endpoint path(관찰된 설정은 `/chat/completions`), requested alias, observed actual model route, first/last stream UI 상태, tool mode/schema posture. `gpt-4.1` requested alias와 `gpt-5.6-luna-2026-07-09` observed route가 다르면 관찰로만 기록합니다.
+- Record: configured endpoint path(관찰된 설정은 `/chat/completions`), requested alias, observed actual model route, first/last stream UI 상태, tool mode/schema posture. requested alias와 observed route가 다르면 provider routing의 관찰로만 기록합니다.
 
 ## 1. 유일한 whole-line 수정
 

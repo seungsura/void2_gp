@@ -11,7 +11,8 @@
 
 ### `read_file`
 
-- 이전: 큰 UTF-8 파일, 매우 긴 한 줄과 continuation 경계에서 진행이 멈추거나 separator가 빠질 수 있었습니다.
+- 원래 upstream Void: 한 페이지에서 최대 500,000 characters를 반환했고, snapshot receipt나 stale/history 안전 gate가 없었습니다.
+- 중간 repair package: bounded paginator를 먼저 도입했지만 출력 여유가 0일 때 진행 없는 성공을 반환하거나, 짧은 이전 줄 다음의 oversized line 경계에서 separator를 빠뜨릴 수 있었습니다. 이 두 결함은 원래 upstream 동작이 아니라 중간 package에만 있었습니다.
 - 현재: 1-based inclusive line 범위, UTF-8 byte continuation, 동적 출력 한도, live editor snapshot receipt와 stale rejection을 사용합니다. 진행할 수 없는 page는 성공처럼 반환하지 않고 명시적으로 거부합니다.
 
 ### OpenAI-compatible schema와 진단

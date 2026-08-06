@@ -30,7 +30,7 @@
 3. tool success 문구만 믿지 말고 editor, disk, Undo, tool trace를 함께 확인합니다.
 4. 실패 시 raw premature-close 문자열이 아니라 endpoint path/tool mode/schema posture/stream phase가 포함된 diagnostic error인지 기록합니다.
 
-requested alias가 `gpt-4.1`인데 observed actual route가 `gpt-5.6-luna-2026-07-09`였던 사례가 있습니다. 이는 해당 관찰의 configured/effective route 불일치일 뿐 일반적인 model alias 동작의 단정이 아닙니다.
+requested alias와 observed actual route는 provider routing에 따라 다를 수 있습니다. 차이가 보이면 configured/effective route 불일치라는 관찰로만 기록하고 일반적인 model alias 동작으로 단정하지 마세요.
 
 ## 미검증 경계
 
