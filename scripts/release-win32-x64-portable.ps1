@@ -288,6 +288,8 @@ function Get-CanonicalBuildAndTestCommands {
         'focused-native-modules'='src/vs/platform/environment/test/node/nativeModules.integrationTest.ts'
         'focused-write-file-planner'='src/vs/workbench/contrib/void/test/common/writeFilePlanner.test.ts'
         'focused-read-file-reliability'='src/vs/workbench/contrib/void/test/common/readFileReliability.test.ts'
+        'focused-read-file-no-progress'='src/vs/workbench/contrib/void/test/common/readFileNoProgress.test.ts'
+        'focused-write-file-editor-transaction'='src/vs/workbench/contrib/void/test/common/writeFileEditorTransaction.test.ts'
         'focused-write-file-schema'='src/vs/workbench/contrib/void/test/common/writeFileToolSchema.test.ts'
         'focused-openai-compatible-diagnostics'='src/vs/workbench/contrib/void/test/common/openAICompatibleDiagnostics.test.ts'
         'focused-openai-compatible-electron-main'='src/vs/workbench/contrib/void/test/electron-main/openAICompatibleStreamDiagnostics.integration.test.ts'
