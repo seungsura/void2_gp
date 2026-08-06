@@ -47,6 +47,27 @@ suite('Void read_file reliability', () => {
 		assert.strictEqual(first.fileContents + second.fileContents, line);
 		assert.throws(() => pageReadFileLines([line], { startLine: 1, endLine: null, lineByteOffset: 1 }), /boundary/);
 	});
+	test('preserves the separator before an oversized UTF-8 line within the page cap', () => {
+		const lines = ['short', '가😀'.repeat(400), 'tail']; const maxBytes = 1024;
+		const page = pageReadFileLines(lines, { startLine: 1, endLine: null, lineByteOffset: 0 }, { maxLines: 10, maxBytes, maxTokens: 10000 });
+		assert.ok(page.fileContents.startsWith('short\n')); assert.ok(page.fileContents.length > 'short\n'.length);
+		assert.strictEqual(page.longLineContinuation, true); assert.ok(new TextEncoder().encode(page.fileContents).length <= maxBytes);
+	});
+	test('reconstructs pages across an oversized UTF-8 line with strictly progressing cursors', () => {
+		const lines = ['short', '가😀'.repeat(400), 'tail']; let request = { startLine: 1, endLine: null, lineByteOffset: 0 }; let reconstructed = '';
+		for (;;) {
+			const page = pageReadFileLines(lines, request, { maxLines: 10, maxBytes: 1024, maxTokens: 10000 }); reconstructed += page.fileContents;
+			if (page.eof) break;
+			assert.ok(page.nextLine! > request.startLine || page.nextByteOffset! > request.lineByteOffset);
+			request = { startLine: page.nextLine!, endLine: null, lineByteOffset: page.nextByteOffset ?? 0 };
+		}
+		assert.strictEqual(reconstructed, lines.join('\n'));
+	});
+	test('preserves a leading separator when the preceding line is empty', () => {
+		const page = pageReadFileLines(['', 'abcdef'], { startLine: 1, endLine: null, lineByteOffset: 0 }, { maxLines: 10, maxBytes: 1024, maxTokens: 1 });
+		assert.strictEqual(page.fileContents, '\nabc'); assert.strictEqual(Math.ceil(page.fileContents.length / 4), 1);
+		assert.strictEqual(page.longLineContinuation, true); assert.strictEqual(page.nextByteOffset, 3);
+	});
 	test('binds receipts to owner, identity, and version', () => {
 		const registry = new ReadReceiptRegistry<object>(); const model = {}; registry.add({ id: 'r', uri: 'file:///a', owner: 'thread', model, version: 1 });
 		assert.strictEqual(registry.validate('r', 'file:///a', 'thread', model, 1), true);

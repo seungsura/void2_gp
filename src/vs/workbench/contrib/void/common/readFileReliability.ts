@@ -45,10 +45,12 @@ export const pageReadFileLines = (lines: readonly string[], request: ReadFileReq
 		const visible = prefix === 0 ? source : new TextDecoder().decode(bytes.slice(prefix));
 		const newlineBytes = line < totalNumLines ? 1 : 0;
 		if (encoder.encode(visible).length + newlineBytes > limits.maxBytes || tokenEstimate(visible) > limits.maxTokens) {
-			const available = Math.min(limits.maxBytes - usedBytes, Math.max(0, (limits.maxTokens - tokenEstimate(content)) * 4));
+			const separator = line > start ? '\n' : '';
+			// The preceding normal line has already reserved this separator in usedBytes.
+			const available = Math.min(limits.maxBytes - usedBytes, Math.max(0, limits.maxTokens * 4 - (content + separator).length));
 			if (available <= 0) break;
 			const consumed = validUtf8Prefix(source, prefix, available); if (consumed <= prefix) break;
-			const part = new TextDecoder().decode(bytes.slice(prefix, consumed)); content += part;
+			const part = new TextDecoder().decode(bytes.slice(prefix, consumed)); content += separator + part;
 			return { fileContents: content, totalFileLen, totalNumLines, hasNextPage: true, startLine: start, endLine: line, nextLine: line, nextByteOffset: consumed, truncated: true, eof: false, longLineContinuation: true };
 		}
 		if (line > start && (usedBytes + encoder.encode(visible).length + newlineBytes > limits.maxBytes || tokenEstimate(content + '\n' + visible) > limits.maxTokens) || line - start >= limits.maxLines) break;
