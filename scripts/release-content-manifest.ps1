@@ -364,6 +364,35 @@ function Test-ReleaseContentBytesEqual {
     $true
 }
 
+function Assert-ReleaseContentSharedArchiveBytes {
+    param(
+        [Parameter(Mandatory = $true)]$Entry,
+        [Parameter(Mandatory = $true)][byte[]]$OuterBytes,
+        [Parameter(Mandatory = $true)]$PortableRecord,
+        [switch]$HistoricalArchive
+    )
+
+    if ($null -eq $PortableRecord -or [long]$PortableRecord.Length -le 0 -or [string]::IsNullOrWhiteSpace([string]$PortableRecord.Sha256)) {
+        throw "Portable docs metadata is missing shared content: $($Entry.PortablePath)"
+    }
+    $outerHash = Get-ReleaseContentBytesSha256 $OuterBytes
+    if ($HistoricalArchive) {
+        if ([long]$OuterBytes.Length -ne [long]$PortableRecord.Length -or $outerHash -cne [string]$PortableRecord.Sha256) {
+            throw "Historical outer and portable shared content bytes differ: $($Entry.Source)"
+        }
+        return
+    }
+
+    $sourceBytes = [byte[]]$Entry.SourceBytes
+    $sourceHash = Get-ReleaseContentBytesSha256 $sourceBytes
+    if ($outerHash -cne $sourceHash -or
+        [string]$PortableRecord.Sha256 -cne $sourceHash -or
+        [long]$PortableRecord.Length -ne [long]$sourceBytes.Length -or
+        -not (Test-ReleaseContentBytesEqual $OuterBytes $sourceBytes)) {
+        throw "Outer and portable shared content bytes differ: $($Entry.Source)"
+    }
+}
+
 function Assert-ReleaseContentArchiveDocsContract {
     param(
         [Parameter(Mandatory = $true)]$EntriesByPath,
