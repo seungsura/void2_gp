@@ -80,21 +80,21 @@ function Assert-ManifestRejectedByPowerShellAndJavaScript {
 }
 
 function New-DocsFixtureZip {
-    param([string]$Path,$Manifest,[ValidateSet('legacy','exact','partial','extra','mismatch')][string]$Mode)
+    param([string]$Path,$Manifest,[ValidateSet('legacy','exact','partial','extra','mismatch','empty','bom','path-mismatch')][string]$Mode)
     $plan=@(Get-ReleaseContentPlan $Manifest Portable -ProductVersion '9.9.9')
     $stream=[IO.File]::Open($Path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None);$zip=New-Object IO.Compression.ZipArchive($stream,[IO.Compression.ZipArchiveMode]::Create,$false)
     try {
         if($Mode -ne 'legacy'){
             $limit=if($Mode -ceq 'partial'){$plan.Count-1}else{$plan.Count}
-            for($index=0;$index -lt $limit;$index++){$entry=$zip.CreateEntry($plan[$index].Path);$output=$entry.Open();try{$bytes=[byte[]]$plan[$index].Bytes;if($Mode -ceq 'mismatch' -and $index -eq 0){$bytes=[byte[]]$Utf8NoBom.GetBytes('changed')};$output.Write($bytes,0,$bytes.Length)}finally{$output.Dispose()}}
+            for($index=0;$index -lt $limit;$index++){$path=$plan[$index].Path;if($Mode -ceq 'path-mismatch' -and $index -eq 0){$path='docs/readme.md'};$entry=$zip.CreateEntry($path);$output=$entry.Open();try{$bytes=[byte[]]$plan[$index].Bytes;if($Mode -ceq 'mismatch' -and $plan[$index].Path -ceq 'docs/release-notes.md'){$bytes=[byte[]]$Utf8NoBom.GetBytes('# 9.8.8`n')};if($Mode -ceq 'empty' -and $index -eq 0){$bytes=[byte[]]@()};if($Mode -ceq 'bom' -and $index -eq 0){$text=$Utf8NoBom.GetString($bytes);$bytes=[byte[]]$Utf8Bom.GetPreamble()+[byte[]]$Utf8Bom.GetBytes($text)};$output.Write($bytes,0,$bytes.Length)}finally{$output.Dispose()}}
             if($Mode -ceq 'extra'){$entry=$zip.CreateEntry('docs/extra.md');$writer=New-Object IO.StreamWriter($entry.Open(),$Utf8NoBom);try{$writer.Write('extra')}finally{$writer.Dispose()}}
         }
     } finally {$zip.Dispose();$stream.Dispose()}
 }
 
 function Test-DocsFixtureZip {
-    param([string]$Path,$Manifest,[int]$RequiredContract=-1)
-    $zip=[IO.Compression.ZipFile]::OpenRead($Path);try{$by=@{};foreach($entry in $zip.Entries){if($by.ContainsKey($entry.FullName)){throw "duplicate $($entry.FullName)"};$by[$entry.FullName]=$entry};Assert-ReleaseContentArchiveDocsContract -EntriesByPath $by -Manifest $Manifest -ProductVersion '9.9.9' -RequiredContract $RequiredContract}finally{$zip.Dispose()}
+    param([string]$Path,$Manifest,[int]$RequiredContract=-1,[switch]$HistoricalArchive)
+    $zip=[IO.Compression.ZipFile]::OpenRead($Path);try{$by=@{};foreach($entry in $zip.Entries){if($by.ContainsKey($entry.FullName)){throw "duplicate $($entry.FullName)"};$by[$entry.FullName]=$entry};Assert-ReleaseContentArchiveDocsContract -EntriesByPath $by -Manifest $Manifest -ProductVersion '9.9.9' -RequiredContract $RequiredContract -HistoricalArchive:$HistoricalArchive}finally{$zip.Dispose()}
 }
 
 $tempRoot=[IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) ('void-release-content-test-'+[guid]::NewGuid().ToString('N'))))
@@ -110,7 +110,7 @@ try {
     $productionUserText=(@($productionPlans|ForEach-Object{$Utf8NoBom.GetString([byte[]]$_.Bytes)})) -join "`n"
     $datedInternalRoute='(?i)(?<![a-z0-9])gpt-[a-z0-9._-]*\d{4}-\d{2}-\d{2}(?![a-z0-9])'
     if($productionUserText.Contains('gpt-5.6-luna-2026-07-09') -or $productionUserText -match $datedInternalRoute){throw 'Production user documentation contains a dated internal model route.'};Add-Pass 'production user docs exclude dated internal routes'
-    $releaseScriptText=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'release-win32-x64-portable.ps1'));$forwardMarker="if(`$TransactionTag -ceq 'forward'){Assert-PortableArchive `$candidatePath -RequiredDocsContract 1}else{Assert-PortableArchive `$candidatePath}";$argumentMarker="'-RequiredDocsContract',[string]`$requiredDocsContract";if(-not $releaseScriptText.Contains($forwardMarker) -or -not $releaseScriptText.Contains($argumentMarker)){throw 'Forward/recovery prepared-inner docs-contract distinction is missing.'};Add-Pass 'forward 1 recovery detected contract'
+    $releaseScriptText=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'release-win32-x64-portable.ps1'));foreach($marker in @('param([string]$Path,[int]$RequiredDocsContract=-1,[switch]$HistoricalArchive)',"`$historicalArchive=`$TransactionTag -cne 'forward'",'Assert-PortableArchive $portableFiles[0].FullName -HistoricalArchive','Assert-PortableArchive $portableCopy -HistoricalArchive','Assert-PortableArchive $portablePath -HistoricalArchive','Assert-PortableArchive $candidatePath -RequiredDocsContract 1')){if(-not $releaseScriptText.Contains($marker)){throw "Historical/strict portable archive routing is missing: $marker"}};Add-Pass 'historical preflight and strict candidate routing'
 
     $positive=New-FixtureCase $tempRoot 'positive';$positiveManifest=Get-ReleaseContentManifest $positive.ManifestPath $positive.ContentRoot
     if($positiveManifest.PortableEntries.Count -ne 3 -or $positiveManifest.OuterEntries.Count -ne 2){throw 'Positive fixture mapping count mismatch.'};Add-Pass 'positive manifest'
@@ -135,7 +135,8 @@ try {
 
     $partialZip=Join-Path $positive.Root 'partial.zip';New-DocsFixtureZip $partialZip $positiveManifest partial;Assert-Throws 'partial docs rejected' {Test-DocsFixtureZip $partialZip $positiveManifest|Out-Null}
     $extraZip=Join-Path $positive.Root 'extra.zip';New-DocsFixtureZip $extraZip $positiveManifest extra;Assert-Throws 'unlisted docs rejected' {Test-DocsFixtureZip $extraZip $positiveManifest|Out-Null}
-    $mismatchZip=Join-Path $positive.Root 'mismatch.zip';New-DocsFixtureZip $mismatchZip $positiveManifest mismatch;Assert-Throws 'docs byte mismatch rejected' {Test-DocsFixtureZip $mismatchZip $positiveManifest|Out-Null}
+    $mismatchZip=Join-Path $positive.Root 'mismatch.zip';New-DocsFixtureZip $mismatchZip $positiveManifest mismatch;Assert-Throws 'candidate strict release-notes mismatch rejected' {Test-DocsFixtureZip $mismatchZip $positiveManifest 1|Out-Null};$historicalMismatch=Test-DocsFixtureZip $mismatchZip $positiveManifest -HistoricalArchive;if($historicalMismatch.Contract -ne 1 -or $historicalMismatch.Count -ne 3){throw 'Historical release-notes fixture did not return contract metadata.'};$historicalNotes=@($historicalMismatch.Entries|Where-Object{$_.Path -ceq 'docs/release-notes.md'})[0];if($historicalNotes.Length -le 0 -or [string]::IsNullOrWhiteSpace($historicalNotes.Sha256)){throw 'Historical release-notes fixture did not return actual metadata.'};Add-Pass 'historical release-notes metadata accepted'
+    foreach($mode in @('partial','extra','empty','bom','path-mismatch')){$badZip=Join-Path $positive.Root ("historical-$mode.zip");New-DocsFixtureZip $badZip $positiveManifest $mode;Assert-Throws "historical $mode rejected" {Test-DocsFixtureZip $badZip $positiveManifest -HistoricalArchive|Out-Null}}
 
     $outerMaterialized=Join-Path $positive.Root 'outer-materialized';New-Item -ItemType Directory -Path $outerMaterialized|Out-Null;$tokens=@{'{{PORTABLE_SIZE}}'='1 byte';'{{PORTABLE_SHA256}}'=('a'*64);'{{PORTABLE_ENTRIES}}'='4';'{{SOURCE_HEAD}}'=('b'*40);'{{BUILD_DATE_KST}}'='2026-08-06 KST'};$outerPlan=@(Write-ReleaseContentOuterFiles $positiveManifest $outerMaterialized $tokens);$portablePlan=@(Get-ReleaseContentPlan $positiveManifest Portable -ProductVersion '9.9.9');$outerShared=[IO.File]::ReadAllBytes((Join-Path $outerMaterialized 'guides\guide.md'));$portableShared=[byte[]](@($portablePlan|Where-Object{$_.Path -ceq 'docs/guides/guide.md'})[0].Bytes);if(-not(Test-ReleaseContentBytesEqual $outerShared $portableShared)){throw 'Shared outer/portable fixture bytes differ.'};Add-Pass 'shared outer portable bytes'
 

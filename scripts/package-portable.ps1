@@ -4,11 +4,13 @@ param(
     [string]$PackageDirectory,
     [string]$PreparedArchivePath,
     [string]$PreparedArchiveRoot,
-    [int]$RequiredDocsContract = -1
+    [int]$RequiredDocsContract = -1,
+    [switch]$HistoricalArchive
 )
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'release-content-manifest.ps1')
+$PSDefaultParameterValues['Assert-ReleaseContentArchiveDocsContract:HistoricalArchive'] = $HistoricalArchive
 
 function ConvertTo-NormalizedArchivePath {
     param(

@@ -335,6 +335,26 @@ function Read-ReleaseContentZipEntryBytes {
     }
 }
 
+function Assert-ReleaseContentStrictUtf8Bytes {
+    param(
+        [Parameter(Mandatory = $true)][byte[]]$Bytes,
+        [Parameter(Mandatory = $true)][string]$Purpose
+    )
+
+    if ($Bytes.Length -eq 0) {
+        throw "Release content $Purpose is empty."
+    }
+    if ($Bytes.Length -ge 3 -and $Bytes[0] -eq 239 -and $Bytes[1] -eq 187 -and $Bytes[2] -eq 191) {
+        throw "Release content $Purpose must be UTF-8 without BOM."
+    }
+    $strictUtf8 = New-Object Text.UTF8Encoding($false, $true)
+    try {
+        [void]$strictUtf8.GetString($Bytes)
+    } catch {
+        throw "Release content $Purpose is not strict UTF-8."
+    }
+}
+
 function Test-ReleaseContentBytesEqual {
     param([Parameter(Mandatory = $true)][byte[]]$Left, [Parameter(Mandatory = $true)][byte[]]$Right)
     if ($Left.Length -ne $Right.Length) { return $false }
@@ -350,7 +370,8 @@ function Assert-ReleaseContentArchiveDocsContract {
         [Parameter(Mandatory = $true)]$Manifest,
         [Parameter(Mandatory = $true)][string]$ProductVersion,
         [int[]]$AllowedContracts = @(0, 1),
-        [int]$RequiredContract = -1
+        [int]$RequiredContract = -1,
+        [switch]$HistoricalArchive
     )
 
     $actualDocs = @($EntriesByPath.Keys | Where-Object { $_ -ceq 'docs' -or $_.StartsWith('docs/', [StringComparison]::OrdinalIgnoreCase) })
@@ -372,13 +393,18 @@ function Assert-ReleaseContentArchiveDocsContract {
 
     $verified = New-Object Collections.ArrayList
     foreach ($item in $expected) {
+        $canonicalPath = ConvertTo-ReleaseContentCanonicalPath $item.Path 'archive'
+        if ($canonicalPath -cne $item.Path) {
+            throw "Portable docs entry path is not canonical: $($item.Path)"
+        }
         $entry = $EntriesByPath[$item.Path]
         if ($null -eq $entry -or $entry.Length -le 0) {
             throw "Portable docs entry is missing or empty: $($item.Path)"
         }
         $actualBytes = [byte[]](Read-ReleaseContentZipEntryBytes $entry)
+        Assert-ReleaseContentStrictUtf8Bytes $actualBytes "archive entry $($item.Path)"
         $actualHash = Get-ReleaseContentBytesSha256 $actualBytes
-        if ($actualHash -cne $item.Sha256 -or -not (Test-ReleaseContentBytesEqual $actualBytes $item.Bytes)) {
+        if (-not $HistoricalArchive -and ($actualHash -cne $item.Sha256 -or -not (Test-ReleaseContentBytesEqual $actualBytes $item.Bytes))) {
             throw "Portable docs entry bytes or SHA-256 differ from the manifest source: $($item.Path)"
         }
         [void]$verified.Add([pscustomobject]@{ Path = $item.Path; Length = $actualBytes.Length; Sha256 = $actualHash; Source = $item.Source })
