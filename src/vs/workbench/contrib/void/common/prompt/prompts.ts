@@ -147,7 +147,7 @@ const paginationParam = {
 
 
 
-const terminalDescHelper = `You can use this tool to run any command: sed, grep, etc. Do not edit any files with this tool; use write_file instead. When working with git and other tools that open an editor (e.g. git diff), you should pipe to cat to get all results and not get stuck in vim.`
+const terminalDescHelper = `You can use this tool to run any command: sed, grep, etc. Use write_file whenever you create or modify files; do not use terminal commands to work around this requirement. Terminal commands are allowed for formatters and large-scale mechanical transformations. When working with git and other tools that open an editor (e.g. git diff), you should pipe to cat to get all results and not get stuck in vim.`
 
 const cwdHelper = 'Optional. The directory in which to run the command. Defaults to the first workspace folder.'
 

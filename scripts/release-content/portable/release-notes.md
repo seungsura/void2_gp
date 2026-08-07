@@ -27,6 +27,7 @@
 
 ## 이 릴리스에 포함된 사용자 기능
 
+- 직접 파일을 생성하거나 수정할 때는 `write_file`을 사용하며, formatter와 대규모 기계적 변환을 제외하고 terminal을 파일 생성·수정의 우회 수단으로 사용하지 않습니다.
 - repaired `write_file`와 editor review/Undo 흐름
 - bounded `read_file` continuation과 receipt 기반 안전 경계
 - OpenAI-compatible flat tool schema와 단계별 streaming 진단
