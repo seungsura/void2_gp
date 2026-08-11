@@ -33,23 +33,26 @@ export const validateReadFileRequest = (params: Record<string, unknown>): ReadFi
 	return { startLine, endLine, lineByteOffset };
 };
 
-export const pageReadFileLines = (lines: readonly string[], request: ReadFileRequest, limits_: Partial<ReadFileLimits> = {}): ReadFilePage => {
-	const limits = { ...clampReadFileLimits(limits_), maxTokens: limits_.maxTokens === 0 ? 0 : clampReadFileLimits(limits_).maxTokens }; const totalNumLines = lines.length; const totalFileLen = lines.join('\n').length;
+export type ReadFileLineSource = Readonly<{ lineCount: number; totalFileLen: number; lineAt: (oneBasedLine: number) => string }>;
+
+/** Pages through a line-addressable source without materializing the whole file. */
+export const pageReadFileLineSource = (source: ReadFileLineSource, request: ReadFileRequest, limits_: Partial<ReadFileLimits> = {}): ReadFilePage => {
+	const limits = { ...clampReadFileLimits(limits_), maxTokens: limits_.maxTokens === 0 ? 0 : clampReadFileLimits(limits_).maxTokens }; const totalNumLines = source.lineCount; const totalFileLen = source.totalFileLen;
 	const start = request.startLine ?? 1; const last = Math.min(request.endLine ?? totalNumLines, totalNumLines);
 	if (start > totalNumLines || totalNumLines === 0) return { fileContents: '', totalFileLen, totalNumLines, hasNextPage: false, startLine: start, endLine: null, nextLine: null, truncated: false, eof: true, longLineContinuation: false };
-	const first = lines[start - 1]; const firstBytes = encoder.encode(first);
+	const first = source.lineAt(start); const firstBytes = encoder.encode(first);
 	if (request.lineByteOffset > 0 && (request.lineByteOffset >= firstBytes.length || !isUtf8Boundary(first, request.lineByteOffset))) throw new Error('Invalid read_file line_byte_offset: it must be within the requested line at a UTF-8 code-point boundary.');
 	let content = ''; let usedBytes = 0; let line = start; let offset = request.lineByteOffset;
 	for (; line <= last; line++) {
-		const source = lines[line - 1]; const bytes = encoder.encode(source); const prefix = line === start ? offset : 0;
-		const visible = prefix === 0 ? source : new TextDecoder().decode(bytes.slice(prefix));
+		const sourceLine = source.lineAt(line); const bytes = encoder.encode(sourceLine); const prefix = line === start ? offset : 0;
+		const visible = prefix === 0 ? sourceLine : new TextDecoder().decode(bytes.slice(prefix));
 		const newlineBytes = line < totalNumLines ? 1 : 0;
 		if (encoder.encode(visible).length + newlineBytes > limits.maxBytes || tokenEstimate(visible) > limits.maxTokens) {
 			const separator = line > start ? '\n' : '';
 			// The preceding normal line has already reserved this separator in usedBytes.
 			const available = Math.min(limits.maxBytes - usedBytes, Math.max(0, limits.maxTokens * 4 - (content + separator).length));
 			if (available <= 0) break;
-			const consumed = validUtf8Prefix(source, prefix, available); if (consumed <= prefix) break;
+			const consumed = validUtf8Prefix(sourceLine, prefix, available); if (consumed <= prefix) break;
 			const part = new TextDecoder().decode(bytes.slice(prefix, consumed)); content += separator + part;
 			return { fileContents: content, totalFileLen, totalNumLines, hasNextPage: true, startLine: start, endLine: line, nextLine: line, nextByteOffset: consumed, truncated: true, eof: false, longLineContinuation: true };
 		}
@@ -59,6 +62,9 @@ export const pageReadFileLines = (lines: readonly string[], request: ReadFileReq
 	const eof = line > last || line > totalNumLines; const nextLine = eof ? null : line;
 	return { fileContents: content, totalFileLen, totalNumLines, hasNextPage: !eof, startLine: start, endLine: content === '' ? null : line - 1, nextLine, truncated: !eof, eof, longLineContinuation: false };
 };
+
+export const pageReadFileLines = (lines: readonly string[], request: ReadFileRequest, limits_: Partial<ReadFileLimits> = {}): ReadFilePage =>
+	pageReadFileLineSource({ lineCount: lines.length, totalFileLen: lines.join('\n').length, lineAt: line => lines[line - 1] }, request, limits_);
 
 /**
  * A truncated non-EOF page is usable only when its continuation cursor moves

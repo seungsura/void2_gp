@@ -25,7 +25,7 @@ export class LLMMessageChannel implements IServerChannel {
 	}
 
 	// aborters for above
-	private readonly _infoOfRunningRequest: Record<string, { waitForSend: Promise<void> | undefined, abortRef: AbortRef }> = {}
+	private readonly _infoOfRunningRequest: Record<string, { abortRef: AbortRef; abortRequested: boolean; settled: boolean }> = {}
 
 
 	// list
@@ -48,6 +48,7 @@ export class LLMMessageChannel implements IServerChannel {
 	// stupidly, channels can't take in @IService
 	constructor(
 		private readonly metricsService: IMetricsService,
+		private readonly send: typeof sendLLMMessage = sendLLMMessage,
 	) { }
 
 	// browser uses this to listen for changes
@@ -92,35 +93,36 @@ export class LLMMessageChannel implements IServerChannel {
 	// the only place sendLLMMessage is actually called
 	private _callSendLLMMessage(params: MainSendLLMMessageParams) {
 		const { requestId } = params;
-
-		if (!(requestId in this._infoOfRunningRequest))
-			this._infoOfRunningRequest[requestId] = { waitForSend: undefined, abortRef: { current: null } }
+		if (requestId in this._infoOfRunningRequest) return;
+		let currentAborter: (() => void) | null = null;
+		const record = { abortRef: {} as AbortRef, abortRequested: false, settled: false };
+		Object.defineProperty(record.abortRef, 'current', { enumerable: true, get: () => currentAborter, set: (value: (() => void) | null) => { currentAborter = value; if (record.abortRequested) { currentAborter?.(); currentAborter = null; } } });
+		this._infoOfRunningRequest[requestId] = record;
+		const finish = () => { if (record.settled) return false; record.settled = true; if (this._infoOfRunningRequest[requestId] === record) delete this._infoOfRunningRequest[requestId]; return true; };
 
 		const mainThreadParams: SendLLMMessageParams = {
 			...params,
 			onText: (p) => {
-				this.llmMessageEmitters.onText.fire({ requestId, ...p });
+				if (!record.settled) this.llmMessageEmitters.onText.fire({ requestId, ...p });
 			},
 			onFinalMessage: (p) => {
-				this.llmMessageEmitters.onFinalMessage.fire({ requestId, ...p });
+				if (finish()) this.llmMessageEmitters.onFinalMessage.fire({ requestId, ...p });
 			},
 			onError: (p) => {
 				console.log('sendLLM: firing err');
-				this.llmMessageEmitters.onError.fire({ requestId, ...p });
+				if (finish()) this.llmMessageEmitters.onError.fire({ requestId, ...p });
 			},
-			abortRef: this._infoOfRunningRequest[requestId].abortRef,
+			abortRef: record.abortRef,
 		}
-		const p = sendLLMMessage(mainThreadParams, this.metricsService);
-		this._infoOfRunningRequest[requestId].waitForSend = p
+		void this.send(mainThreadParams, this.metricsService).finally(() => { if (record.abortRequested) record.abortRef.current?.(); finish(); });
+		if (record.abortRequested) record.abortRef.current?.();
 	}
 
-	private async _callAbort(params: MainLLMMessageAbortParams) {
+	private _callAbort(params: MainLLMMessageAbortParams) {
 		const { requestId } = params;
-		if (!(requestId in this._infoOfRunningRequest)) return
-		const { waitForSend, abortRef } = this._infoOfRunningRequest[requestId]
-		await waitForSend // wait for the send to finish so we know abortRef was set
-		abortRef?.current?.()
-		delete this._infoOfRunningRequest[requestId]
+		const record = this._infoOfRunningRequest[requestId]; if (!record) return;
+		record.abortRequested = true; record.abortRef.current?.(); record.settled = true;
+		if (this._infoOfRunningRequest[requestId] === record) delete this._infoOfRunningRequest[requestId];
 	}
 
 

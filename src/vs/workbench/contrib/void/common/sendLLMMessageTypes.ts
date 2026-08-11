@@ -5,6 +5,7 @@
 
 import { InternalToolInfo } from './prompt/prompts.js'
 import { ToolName, ToolParamName } from './toolsServiceTypes.js'
+import { ToolExecutionProfile } from './agentSubagents.js'
 import { ChatMode, ModelSelection, ModelSelectionOptions, OverridesOfModel, ProviderName, RefreshableProviderName, SettingsOfProvider } from './voidSettingsTypes.js'
 
 
@@ -117,6 +118,11 @@ export type ServiceSendLLMMessageParams = {
 	modelSelectionOptions: ModelSelectionOptions | undefined;
 	overridesOfModel: OverridesOfModel | undefined;
 	onAbort: OnAbort;
+	toolExecutionProfile?: ToolExecutionProfile;
+	/** Ephemeral authority from the current typed @Agent selection; never persisted. */
+	agentDelegationAllowed?: boolean;
+	/** In-memory frozen child-run routing only; the normal parent path keeps live settings. */
+	settingsOfProviderOverride?: SettingsOfProvider;
 } & SendLLMType;
 
 // params to the true sendLLMMessage function
@@ -130,6 +136,8 @@ export type SendLLMMessageParams = {
 	modelSelection: ModelSelection;
 	modelSelectionOptions: ModelSelectionOptions | undefined;
 	overridesOfModel: OverridesOfModel | undefined;
+	toolExecutionProfile?: ToolExecutionProfile;
+	agentDelegationAllowed?: boolean;
 
 	settingsOfProvider: SettingsOfProvider;
 	mcpTools: InternalToolInfo[] | undefined;
@@ -207,6 +215,3 @@ export type MainModelListParams<modelResponse> = Omit<ModelListParams<modelRespo
 
 export type EventModelListOnSuccessParams<modelResponse> = Parameters<ModelListParams<modelResponse>['onSuccess']>[0] & { requestId: string }
 export type EventModelListOnErrorParams<modelResponse> = Parameters<ModelListParams<modelResponse>['onError']>[0] & { requestId: string }
-
-
-

@@ -20,10 +20,10 @@ import { getIsReasoningEnabledState, getModelCapabilities, getReservedOutputToke
 import { estimateHistoryTokensForReadBudget } from './convertToLLMMessageService.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolResultType, ToolCallParams, ToolName, ToolResult } from '../common/toolsServiceTypes.js';
 import { computeMaxReadOutputTokens, isBoundedReadHistory, isBoundedReadHistoryString } from '../common/readFileReliability.js';
-import { IToolsService } from './toolsService.js';
+import { IToolsService } from './toolsServiceInterface.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { ILanguageFeaturesService } from '../../../../editor/common/services/languageFeatures.js';
-import { ChatMessage, CodespanLocationLink, StagingSelectionItem, ToolMessage } from '../common/chatThreadServiceTypes.js';
+import { ChatMessage, CodespanLocationLink, isAgentDelegationSelection, StagingSelectionItem, ToolMessage } from '../common/chatThreadServiceTypes.js';
 import { Position } from '../../../../editor/common/core/position.js';
 import { IMetricsService } from '../common/metricsService.js';
 import { shorten } from '../../../../base/common/labels.js';
@@ -45,11 +45,14 @@ import { IAgentInstructionsService } from './agentInstructionsService.js';
 import { IAgentSkillsService } from './agentSkillsService.js';
 import { AgentInstructionTaskSession, AgentInstructionTurnSnapshot } from '../common/agentInstructions.js';
 import { AgentRuntimeTurnSnapshot, admitProtectedAgentAuthority, createAgentRuntimeTurnSnapshot, reviveAgentRuntimeTurnSnapshot, runtimeModelFingerprint, selectExplicitSkills, skillAdvertisement } from '../common/agentSkills.js';
+import { isAgentSubagentControlName, validateAgentSubagentControlParams } from '../common/agentSubagents.js';
+import { IAgentSubagentService } from './agentSubagentService.js';
 
 
 // related to retrying when LLM message has error
 const CHAT_RETRIES = 3
 const RETRY_DELAY = 2500
+type AgentDelegationTurnAuthority = Readonly<{ allowed: boolean; generation: number }>
 
 
 const findStagingSelectionIndex = (currentSelections: StagingSelectionItem[] | undefined, newSelection: StagingSelectionItem): number | null => {
@@ -60,6 +63,10 @@ const findStagingSelectionIndex = (currentSelections: StagingSelectionItem[] | u
 
 		if (s.type === 'Skill' || newSelection.type === 'Skill') {
 			if (s.type === 'Skill' && newSelection.type === 'Skill' && s.identity === newSelection.identity && s.catalogRevision === newSelection.catalogRevision) return i
+			continue
+		}
+		if (s.type === 'Agent' || newSelection.type === 'Agent') {
+			if (s.type === 'Agent' && newSelection.type === 'Agent') return i
 			continue
 		}
 		if (s.uri.fsPath !== newSelection.uri.fsPath) continue
@@ -313,6 +320,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		@IMCPService private readonly _mcpService: IMCPService,
 		@IAgentInstructionsService private readonly _agentInstructionsService: IAgentInstructionsService,
 		@IAgentSkillsService private readonly _agentSkillsService: IAgentSkillsService,
+		@IAgentSubagentService private readonly _agentSubagentService: IAgentSubagentService,
 	) {
 		super()
 		this.state = { allThreads: {}, currentThreadId: null as unknown as string } // default state
@@ -335,6 +343,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	// Config is task/session scoped; a turn snapshot is deliberately refreshed only for a user turn.
 	private readonly _agentInstructionSessionOfThread = new Map<string, AgentInstructionTaskSessionRecord>();
 	private readonly _instructionTurnOfThread = new Map<string, AgentRuntimeTurnSnapshot>();
+	private readonly _agentControlGeneration = new Map<string, number>();
+	private readonly _agentDelegationAuthorityOfThread = new Map<string, AgentDelegationTurnAuthority>();
 	async getSkillCatalog(threadId = this.state.currentThreadId) {
 		const owner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString();
 		let record = this._agentInstructionSessionOfThread.get(threadId);
@@ -395,6 +405,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	}
 	private _restoreInstructionTurns(threads: ChatThreads) {
 		this._instructionTurnOfThread.clear()
+		this._agentDelegationAuthorityOfThread?.clear()
 		const currentOwner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
 		for (const [id, thread] of Object.entries(threads)) {
 			if (!thread) continue
@@ -438,15 +449,21 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 
 
-	dangerousSetState = (newState: ThreadsState) => {
+	dangerousSetState(newState: ThreadsState) {
+		for (const threadId of Object.keys(this.state.allThreads)) this._agentSubagentService.forgetParent(threadId)
+		this._agentDelegationAuthorityOfThread.clear()
+		this._agentControlGeneration.clear()
 		this._agentInstructionSessionOfThread.clear()
 		this._restoreInstructionTurns(newState.allThreads)
 		this.state = newState
 		this._onDidChangeCurrentThread.fire()
 	}
-	resetState = () => {
+	resetState() {
+		for (const threadId of Object.keys(this.state.allThreads)) this._agentSubagentService.forgetParent(threadId)
 		this._agentInstructionSessionOfThread.clear()
 		this._instructionTurnOfThread.clear()
+		this._agentDelegationAuthorityOfThread.clear()
+		this._agentControlGeneration.clear()
 		this.state = { allThreads: {}, currentThreadId: null as unknown as string } // see constructor
 		this.openNewThread()
 		this._onDidChangeCurrentThread.fire()
@@ -621,11 +638,12 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		}
 
 		this._wrapRunAgentToNotify(
-			this._runChatAgent({ callThisToolFirst, threadId, instructionSnapshot: snapshot, modelSelection: { providerName: snapshot.model.providerName as ModelSelection['providerName'], modelName: snapshot.model.modelName }, modelSelectionOptions: snapshot.model.modelSelectionOptions as ModelSelectionOptions })
+			this._runChatAgent({ callThisToolFirst, threadId, instructionSnapshot: snapshot, modelSelection: { providerName: snapshot.model.providerName as ModelSelection['providerName'], modelName: snapshot.model.modelName }, modelSelectionOptions: snapshot.model.modelSelectionOptions as ModelSelectionOptions, agentDelegationAuthority: this._agentDelegationAuthorityOfThread?.get(threadId) })
 			, threadId
 		)
 	}
 	rejectLatestToolRequest(threadId: string) {
+		this._agentDelegationAuthorityOfThread.delete(threadId)
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
 
@@ -645,10 +663,14 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	}
 
 	private _computeMCPServerOfToolName = (toolName: string) => {
+		if (isAgentSubagentControlName(toolName)) return undefined
 		return this._mcpService.getMCPTools()?.find(t => t.name === toolName)?.mcpServerName
 	}
 
 	async abortRunning(threadId: string) {
+		this._agentControlGeneration.set(threadId, (this._agentControlGeneration.get(threadId) ?? 0) + 1)
+		this._agentDelegationAuthorityOfThread.delete(threadId)
+		this._agentSubagentService.cancelParent(threadId)
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
 
@@ -694,14 +716,15 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 
 	// returns true when the tool call is waiting for user approval
-	private _runToolCall = async (
+	private async _runToolCall(
 		threadId: string,
 		toolName: ToolName,
 		toolId: string,
 		mcpServerName: string | undefined,
 		opts: { preapproved: true, unvalidatedToolParams: RawToolParamsObj, validatedParams: ToolCallParams<ToolName> } | { preapproved: false, unvalidatedToolParams: RawToolParamsObj },
 		instructionSnapshot: AgentRuntimeTurnSnapshot,
-	): Promise<{ awaitingUserApproval?: boolean, interrupted?: boolean }> => {
+		agentDelegationAuthority?: AgentDelegationTurnAuthority,
+	): Promise<{ awaitingUserApproval?: boolean, interrupted?: boolean }> {
 
 		// compute these below
 		let toolParams: ToolCallParams<ToolName>
@@ -714,6 +737,36 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			const message = `${toolName} is no longer supported; use write_file with native structured arguments.`
 			this._addMessageToThread(threadId, { role: 'tool', type: 'invalid_params', rawParams: opts.unvalidatedToolParams, result: null, name: toolName, content: message, id: toolId, mcpServerName })
 			return {}
+		}
+		// These application controls are intentionally routed before builtin/MCP
+		// classification. Their exact-key validation is authoritative and they never ask
+		// for approval or fall through to a server named like a control tool.
+		if (isAgentSubagentControlName(toolName)) {
+			const currentAuthority = this._agentDelegationAuthorityOfThread?.get(threadId)
+			const currentGeneration = this._agentControlGeneration.get(threadId) ?? 0
+			if (!agentDelegationAuthority?.allowed || currentAuthority !== agentDelegationAuthority || agentDelegationAuthority.generation !== currentGeneration) {
+				const content = 'agent_delegation_not_authorized: select @Agent in the current top-level turn before using child controls.';
+				this._addMessageToThread(threadId, { role: 'tool', type: 'invalid_params', rawParams: opts.unvalidatedToolParams, result: null, name: toolName, content, id: toolId, mcpServerName: undefined });
+				return {};
+			}
+			const controlGeneration = agentDelegationAuthority.generation;
+			const isControlCurrent = () => this._agentDelegationAuthorityOfThread?.get(threadId) === agentDelegationAuthority && (this._agentControlGeneration.get(threadId) ?? 0) === controlGeneration;
+			try {
+				const control = validateAgentSubagentControlParams(toolName, opts.unvalidatedToolParams);
+				let result: object;
+				if (control.name === 'spawn_agent') result = await this._agentSubagentService.spawn(threadId, control.message, instructionSnapshot);
+				else if (control.name === 'wait_agent') result = await this._agentSubagentService.wait(threadId, control.timeoutMs);
+				else result = this._agentSubagentService.interrupt(threadId, control.target);
+				if (!isControlCurrent()) return { interrupted: true };
+				const content = JSON.stringify(result);
+				this._addMessageToThread(threadId, { role: 'tool', type: 'success', rawParams: opts.unvalidatedToolParams, result: result as never, name: toolName, params: opts.unvalidatedToolParams, content, id: toolId, mcpServerName: undefined });
+				return {};
+			} catch (error) {
+				if (!isControlCurrent()) return { interrupted: true };
+				const content = getErrorMessage(error);
+				this._addMessageToThread(threadId, { role: 'tool', type: 'invalid_params', rawParams: opts.unvalidatedToolParams, result: null, name: toolName, content, id: toolId, mcpServerName: undefined });
+				return {};
+			}
 		}
 
 
@@ -837,7 +890,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		}
 		this._updateLatestTool(threadId, { role: 'tool', type: 'success', params: toolParams, result: toolResult, name: toolName, content: toolResultStr, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName })
 		return {}
-	};
+	}
 
 
 
@@ -848,6 +901,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		modelSelectionOptions,
 		callThisToolFirst,
 		instructionSnapshot,
+		agentDelegationAuthority,
 	}: {
 		threadId: string,
 		modelSelection: ModelSelection | null,
@@ -855,6 +909,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 		callThisToolFirst?: ToolMessage<ToolName> & { type: 'tool_request' }
 		instructionSnapshot: AgentRuntimeTurnSnapshot,
+		agentDelegationAuthority?: AgentDelegationTurnAuthority,
 	}) {
 
 
@@ -865,6 +920,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		// above just defines helpers, below starts the actual function
 		const { chatMode } = this._settingsService.state.globalSettings // should not change as we loop even if user changes it, so it goes here
 		const snapshot = instructionSnapshot;
+		const isDelegationAuthorityCurrent = () => !!agentDelegationAuthority?.allowed && this._agentDelegationAuthorityOfThread?.get(threadId) === agentDelegationAuthority && (this._agentControlGeneration.get(threadId) ?? 0) === agentDelegationAuthority.generation
 
 		let nMessagesSent = 0
 		let shouldSendAnotherMessage = true
@@ -872,7 +928,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 		// before enter loop, call tool
 		if (callThisToolFirst) {
-			const { interrupted } = await this._runToolCall(threadId, callThisToolFirst.name, callThisToolFirst.id, callThisToolFirst.mcpServerName, { preapproved: true, unvalidatedToolParams: callThisToolFirst.rawParams, validatedParams: callThisToolFirst.params }, snapshot)
+			const { interrupted } = await this._runToolCall(threadId, callThisToolFirst.name, callThisToolFirst.id, callThisToolFirst.mcpServerName, { preapproved: true, unvalidatedToolParams: callThisToolFirst.rawParams, validatedParams: callThisToolFirst.params }, snapshot, agentDelegationAuthority)
 			if (interrupted) {
 				this._setStreamState(threadId, undefined)
 				return
@@ -896,6 +952,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				modelSelection,
 				chatMode,
 				instructionSnapshot: snapshot,
+				agentDelegationAllowed: isDelegationAuthorityCurrent(),
 			})
 
 			if (interruptedWhenIdle) {
@@ -924,6 +981,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 					modelSelection,
 					modelSelectionOptions,
 					overridesOfModel: snapshot.model.hasModel ? { [snapshot.model.providerName]: { [snapshot.model.modelName]: snapshot.model.selectedModelOverrides } } as never : undefined,
+					agentDelegationAllowed: isDelegationAuthorityCurrent(),
 					logging: { loggingName: `Chat - ${chatMode}`, loggingExtras: { threadId, nMessagesSent, chatMode } },
 					separateSystemMessage: separateSystemMessage,
 					onText: ({ fullText, fullReasoning, toolCall }) => {
@@ -997,10 +1055,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 				// call tool if there is one
 				if (toolCall) {
-					const mcpTools = this._mcpService.getMCPTools()
-					const mcpTool = mcpTools?.find(t => t.name === toolCall.name)
+					const mcpTool = isAgentSubagentControlName(toolCall.name) ? undefined : this._mcpService.getMCPTools()?.find(t => t.name === toolCall.name)
 
-					const { awaitingUserApproval, interrupted } = await this._runToolCall(threadId, toolCall.name, toolCall.id, mcpTool?.mcpServerName, { preapproved: false, unvalidatedToolParams: toolCall.rawParams }, snapshot)
+					const { awaitingUserApproval, interrupted } = await this._runToolCall(threadId, toolCall.name, toolCall.id, mcpTool?.mcpServerName, { preapproved: false, unvalidatedToolParams: toolCall.rawParams }, snapshot, agentDelegationAuthority)
 					if (interrupted) {
 						this._setStreamState(threadId, undefined)
 						return
@@ -1095,24 +1152,32 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	private async _addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string }) {
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
+		const capturedSelections = [...(_chatSelections ?? thread.state.stagingSelections)]
+		const agentDelegationAllowed = capturedSelections.some(isAgentDelegationSelection)
+		this._agentDelegationAuthorityOfThread.delete(threadId)
+		this._agentControlGeneration.set(threadId, (this._agentControlGeneration.get(threadId) ?? 0) + 1); this._agentSubagentService.cancelParent(threadId)
 		// interrupt existing stream
 		if (this.streamState[threadId]?.isRunning) {
 			await this.abortRunning(threadId)
 		}
+		const turnGeneration = this._agentControlGeneration.get(threadId) ?? 0
+		const isCurrentTurn = () => (this._agentControlGeneration.get(threadId) ?? 0) === turnGeneration
 		// Capture every model-dependent input before any async catalog/instruction resolution.
 		const capturedModel = this._currentModelSelectionProps();
 		const capturedOverride = capturedModel.modelSelection ? this._settingsService.state.overridesOfModel[capturedModel.modelSelection.providerName]?.[capturedModel.modelSelection.modelName] ?? {} : {};
 		const capturedOverrides = capturedModel.modelSelection ? { [capturedModel.modelSelection.providerName]: { [capturedModel.modelSelection.modelName]: deepClone(capturedOverride) } } as never : undefined;
 		// This must happen before history changes: a task cannot cross a workspace owner boundary.
 		const instructionSnapshot = await this._beginInstructionTurn(threadId)
+		if (!isCurrentTurn()) return
 		// A failed new admission must not leave a previous turn's runtime authority resumable.
 		this._purgeInstructionTurn(threadId, false)
 
 		// add user's message to chat history
 		const instructions = userMessage
-		let currSelns: StagingSelectionItem[] = _chatSelections ?? thread.state.stagingSelections
+		let currSelns: StagingSelectionItem[] = capturedSelections
 		const owner = this._workspaceContextService.getWorkspace().folders[0]?.uri
 		const catalog = await this._agentSkillsService.getCatalog(owner, owner, instructionSnapshot.config)
+		if (!isCurrentTurn()) return
 		const direct = selectExplicitSkills(catalog, instructions)
 		if (!direct.skills) throw new Error(direct.diagnostic?.code ?? 'skill_not_found')
 		const selectedIdentities = new Set<string>(); const normalizedSelections: StagingSelectionItem[] = [];
@@ -1129,6 +1194,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			if (!body.body) throw new Error(body.diagnostic?.code ?? 'skill_body_unreadable')
 			return body.body
 		}))
+		if (!isCurrentTurn()) return
 		if (this._workspaceContextService.getWorkspace().folders[0]?.uri.toString() !== instructionSnapshot.ownerProjectRoot || (!this._workspaceTrustManagementService.isWorkspaceTrusted() && (instructionSnapshot.config.configSources.some(source => source.scope === 'project') || catalog.skills.some(skill => skill.provenance.source === 'repository')))) throw new Error('skill_owner_or_trust_changed')
 		let effectiveReserve = 0
 		if (capturedModel.modelSelection) {
@@ -1142,15 +1208,22 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			: { hasModel: false as const };
 		const runtimeSnapshot = createAgentRuntimeTurnSnapshot(instructionSnapshot, catalog, advertisement, skillSelections.map((selection, index) => ({ identity: selection.identity, skillRoot: selection.skillRoot, bodyRevision: selection.bodyRevision, body: skillBodies[index] })), runtimeModel, this._workspaceTrustManagementService.isWorkspaceTrusted())
 		admitProtectedAgentAuthority(runtimeSnapshot)
-		const userMessageContent = await chat_userMessageContent(instructions, currSelns, { directoryStrService: this._directoryStringService, fileService: this._fileService }) // user message + names of files (NOT content)
+		const userMessageContentBase = await chat_userMessageContent(instructions, currSelns, { directoryStrService: this._directoryStringService, fileService: this._fileService }) // user message + names of files (NOT content)
+		if (!isCurrentTurn()) return
+		const userMessageContent = currSelns.some(isAgentDelegationSelection)
+			? `${userMessageContentBase}\n\n[User delegation marker: a generic read-only child is available, but no child has launched. Call spawn_agent with a valid delegated message if needed.]`
+			: userMessageContentBase
 		const currentOwner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
 		if (currentOwner !== runtimeSnapshot.ownerProjectRoot || currentOwner !== runtimeSnapshot.runCwd || this._workspaceTrustManagementService.isWorkspaceTrusted() !== runtimeSnapshot.workspaceTrustedAtAdmission) { this._purgeInstructionTurn(threadId, false); throw new Error('skill_owner_or_trust_changed') }
+		if (!isCurrentTurn()) return
+		const agentDelegationAuthority = Object.freeze({ allowed: agentDelegationAllowed, generation: turnGeneration })
+		this._agentDelegationAuthorityOfThread.set(threadId, agentDelegationAuthority)
 		this._rememberInstructionTurn(threadId, runtimeSnapshot)
 		const userHistoryElt: ChatMessage = { role: 'user', content: userMessageContent, displayContent: instructions, selections: currSelns, state: defaultMessageState }
 		this._addMessageToThread(threadId, userHistoryElt)
 
 		this._wrapRunAgentToNotify(
-			this._runChatAgent({ threadId, instructionSnapshot: runtimeSnapshot, ...capturedModel, }),
+			this._runChatAgent({ threadId, instructionSnapshot: runtimeSnapshot, agentDelegationAuthority, ...capturedModel, }),
 			threadId,
 		)
 
@@ -1215,7 +1288,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			// URIs of user selections
 			if (m.role === 'user') {
 				for (const sel of m.selections ?? []) {
-					if (sel.type !== 'Skill') addURI(sel.uri)
+					if (sel.type !== 'Skill' && sel.type !== 'Agent') addURI(sel.uri)
 				}
 			}
 			// URIs of files that have been read
@@ -1523,6 +1596,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 
 	deleteThread(threadId: string): void {
+		this._agentSubagentService.forgetParent(threadId)
+		this._agentDelegationAuthorityOfThread.delete(threadId); this._agentControlGeneration.delete(threadId)
 		const { allThreads: currentThreads } = this.state
 
 		// delete the thread
@@ -1535,6 +1610,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		this._storeAllThreads(newThreads);
 		this._setState({ ...this.state, allThreads: newThreads })
 	}
+	override dispose(): void { this._agentDelegationAuthorityOfThread.clear(); this._agentControlGeneration.clear(); super.dispose(); }
 
 	duplicateThread(threadId: string) {
 		const { allThreads: currentThreads } = this.state

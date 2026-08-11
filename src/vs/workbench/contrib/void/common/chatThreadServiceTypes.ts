@@ -80,6 +80,7 @@ export type ChatMessage =
 	| ToolMessage<ToolName>
 	| DecorativeCanceledTool
 
+export const AGENT_DELEGATION_SELECTION_LABEL = 'Void application-level read-only' as const;
 
 // one of the square items that indicates a selection in a chat bubble
 export type StagingSelectionItem = {
@@ -99,6 +100,11 @@ export type StagingSelectionItem = {
 	language?: undefined;
 	state?: undefined;
 } | {
+	/** Inert user-authority marker; the parent must call spawn_agent explicitly. */
+	type: 'Agent';
+	label: typeof AGENT_DELEGATION_SELECTION_LABEL;
+	state?: undefined;
+} | {
 	// A Skill is not a File selection: its immutable catalog/body revisions prevent a stale
 	// metadata chip from silently resolving to another on-disk Skill at submission time.
 	type: 'Skill';
@@ -109,6 +115,12 @@ export type StagingSelectionItem = {
 	description: string;
 	state?: undefined;
 }
+
+export const isAgentDelegationSelection = (value: unknown): value is Extract<StagingSelectionItem, { type: 'Agent' }> => {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+	const record = value as Record<string, unknown>;
+	return record.type === 'Agent' && record.label === AGENT_DELEGATION_SELECTION_LABEL && record.state === undefined && Object.keys(record).every(key => key === 'type' || key === 'label' || key === 'state');
+};
 
 
 // a link to a symbol (an underlined link to a piece of code)

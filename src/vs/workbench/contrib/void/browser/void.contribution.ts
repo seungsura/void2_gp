@@ -37,6 +37,7 @@ import './agentSkillsService.js'
 // tools
 import './toolsService.js'
 import './terminalToolService.js'
+import './agentSubagentService.js'
 
 // register Thread History
 import './chatThreadService.js'

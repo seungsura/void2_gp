@@ -67,7 +67,7 @@ export type BuiltinToolResultType = {
 	'get_dir_tree': { str: string, },
 	'search_pathnames_only': { uris: URI[], hasNextPage: boolean },
 	'search_for_files': { uris: URI[], hasNextPage: boolean },
-	'search_in_file': { lines: number[]; },
+	'search_in_file': { lines: number[]; boundedContent?: string; },
 	'read_lint_errors': { lintErrors: LintErrorItem[] | null },
 	// ---
 	'write_file': { operation: 'modify' | 'create', didChange: boolean, editCount: number },

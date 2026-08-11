@@ -14,6 +14,8 @@ import { Event } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { IVoidSettingsService } from './voidSettingsService.js';
 import { IMCPService } from './mcpService.js';
+import { deepClone } from '../../../../base/common/objects.js';
+import { SettingsOfProvider } from './voidSettingsTypes.js';
 
 // calls channel to implement features
 export const ILLMMessageService = createDecorator<ILLMMessageService>('llmMessageService');
@@ -21,6 +23,7 @@ export const ILLMMessageService = createDecorator<ILLMMessageService>('llmMessag
 export interface ILLMMessageService {
 	readonly _serviceBrand: undefined;
 	sendLLMMessage: (params: ServiceSendLLMMessageParams) => string | null;
+	captureSettingsOfProvider: () => SettingsOfProvider;
 	abort: (requestId: string) => void;
 	ollamaList: (params: ServiceModelListParams<OllamaModelResponse>) => void;
 	openAICompatibleList: (params: ServiceModelListParams<OpenaiCompatibleModelResponse>) => void;
@@ -101,7 +104,7 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 	}
 
 	sendLLMMessage(params: ServiceSendLLMMessageParams) {
-		const { onText, onFinalMessage, onError, onAbort, modelSelection, ...proxyParams } = params;
+		const { onText, onFinalMessage, onError, onAbort, modelSelection, settingsOfProviderOverride, ...proxyParams } = params;
 
 		// throw an error if no model/provider selected (this should usually never be reached, the UI should check this first, but might happen in cases like Apply where we haven't built much UI/checks yet, good practice to have check logic on backend)
 		if (modelSelection === null) {
@@ -116,9 +119,14 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 			return null
 		}
 
-		const { settingsOfProvider, } = this.voidSettingsService.state
+		const settingsOfProvider = settingsOfProviderOverride ?? this.voidSettingsService.state.settingsOfProvider
 
-		const mcpTools = this.mcpService.getMCPTools()
+		// A read-only child has no MCP authority. Do not even enumerate the live MCP
+		// registry for it: later provider filtering is a defense in depth, not the
+		// browser-side serialization boundary.
+		const mcpTools = params.messagesType === 'chatMessages' && params.toolExecutionProfile === 'read-only-child'
+			? []
+			: this.mcpService.getMCPTools()
 
 		// add state for request id
 		const requestId = generateUuid();
@@ -137,6 +145,10 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 		} satisfies MainSendLLMMessageParams);
 
 		return requestId
+	}
+
+	captureSettingsOfProvider(): SettingsOfProvider {
+		return deepClone(this.voidSettingsService.state.settingsOfProvider)
 	}
 
 	abort(requestId: string) {
@@ -186,6 +198,7 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 		delete this.llmMessageHooks.onText[requestId]
 		delete this.llmMessageHooks.onFinalMessage[requestId]
 		delete this.llmMessageHooks.onError[requestId]
+		delete this.llmMessageHooks.onAbort[requestId]
 
 		delete this.listHooks.ollama.success[requestId]
 		delete this.listHooks.ollama.error[requestId]
@@ -196,4 +209,3 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 }
 
 registerSingleton(ILLMMessageService, LLMMessageService, InstantiationType.Eager);
-

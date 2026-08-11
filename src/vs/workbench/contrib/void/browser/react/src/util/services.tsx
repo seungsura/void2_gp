@@ -46,7 +46,7 @@ import { IWorkspaceContextService } from '../../../../../../../platform/workspac
 import { IVoidCommandBarService } from '../../../voidCommandBarService.js'
 import { INativeHostService } from '../../../../../../../platform/native/common/native.js';
 import { IEditCodeService } from '../../../editCodeServiceInterface.js'
-import { IToolsService } from '../../../toolsService.js'
+import { IToolsService } from '../../../toolsServiceInterface.js'
 import { IConvertToLLMMessageService } from '../../../convertToLLMMessageService.js'
 import { ITerminalService } from '../../../../../terminal/browser/terminal.js'
 import { ISearchService } from '../../../../../../services/search/common/search.js'
@@ -54,6 +54,8 @@ import { IExtensionManagementService } from '../../../../../../../platform/exten
 import { IMCPService } from '../../../../common/mcpService.js';
 import { IStorageService, StorageScope } from '../../../../../../../platform/storage/common/storage.js'
 import { OPT_OUT_KEY } from '../../../../common/storageKeys.js'
+import { IAgentSubagentService } from '../../../agentSubagentService.js'
+import { AgentSubagentRunView } from '../../../../common/agentSubagents.js'
 
 
 // normally to do this you'd use a useEffect that calls .onDidChangeState(), but useEffect mounts too late and misses initial state changes
@@ -229,6 +231,7 @@ const getReactAccessor = (accessor: ServicesAccessor) => {
 		IMCPService: accessor.get(IMCPService),
 
 		IStorageService: accessor.get(IStorageService),
+		IAgentSubagentService: accessor.get(IAgentSubagentService),
 
 	} as const
 	return reactAccessor
@@ -302,6 +305,13 @@ export const useChatThreadsStreamState = (threadId: string) => {
 		return () => { chatThreadsStreamStateListeners.delete(listener) }
 	}, [ss, threadId])
 	return s
+}
+
+export const useAgentSubagentRun = (threadId: string): AgentSubagentRunView | undefined => {
+	const service = useAccessor().get('IAgentSubagentService')
+	const [view, setView] = useState(() => service.getRunView(threadId))
+	useEffect(() => { setView(service.getRunView(threadId)); const disposable = service.onDidChangeRun(event => { if (event.parentId === threadId) setView(service.getRunView(threadId)) }); return () => disposable.dispose() }, [service, threadId])
+	return view
 }
 
 export const useFullChatThreadsStreamState = () => {

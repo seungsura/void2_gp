@@ -6,7 +6,7 @@
 import React, { ButtonHTMLAttributes, FormEvent, FormHTMLAttributes, Fragment, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 
-import { useAccessor, useChatThreadsState, useChatThreadsStreamState, useSettingsState, useActiveURI, useCommandBarState } from '../util/services.js';
+import { useAccessor, useAgentSubagentRun, useChatThreadsState, useChatThreadsStreamState, useSettingsState, useActiveURI, useCommandBarState } from '../util/services.js';
 import { ScrollType } from '../../../../../../../editor/common/editorCommon.js';
 
 import { ChatMarkdownRender, ChatMessageLocation, getApplyBoxId } from '../markdown/ChatMarkdownRender.js';
@@ -24,6 +24,7 @@ import { WarningBox } from '../void-settings-tsx/WarningBox.js';
 import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../common/modelCapabilities.js';
 import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, CircleEllipsis, Folder, ALargeSmall, TypeOutline, Text } from 'lucide-react';
 import { ChatMessage, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
+import { agentSubagentStatusLabel, isActiveChildRun } from '../../../../common/agentSubagents.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, ToolName, LintErrorItem, ToolApprovalType, toolApprovalTypes } from '../../../../common/toolsServiceTypes.js';
 import { CopyButton, IconShell1, JumpToFileButton, JumpToTerminalButton, StatusIndicator, useApplyStreamState } from '../markdown/ApplyBlockHoverButtons.js';
 import { acceptAllBg, acceptBorder, buttonFontSize, buttonTextColor, rejectAllBg, rejectBg, rejectBorder } from '../../../../common/helpers/colors.js';
@@ -650,7 +651,7 @@ export const SelectedFiles = (
 					: selection.type === 'File' ? selection.type + selection.language + selection.state.wasAddedAsCurrentFile + selection.uri.fsPath
 						: selection.type === 'Folder' ? selection.type + selection.language + selection.state + selection.uri.fsPath
 							: selection.type === 'Skill' ? selection.type + selection.identity + selection.catalogRevision
-								: i
+								: selection.type + selection.label
 
 				const SelectionIcon = (
 					selection.type === 'File' ? File
@@ -666,7 +667,7 @@ export const SelectedFiles = (
 					{/* tooltip for file path */}
 					<span className="truncate overflow-hidden text-ellipsis"
 						data-tooltip-id='void-tooltip'
-						data-tooltip-content={selection.type === 'Skill' ? selection.identity : getRelative(selection.uri, accessor)}
+						data-tooltip-content={selection.type === 'Skill' ? selection.identity : selection.type === 'Agent' ? 'Agent' : getRelative(selection.uri, accessor)}
 						data-tooltip-place='top'
 						data-tooltip-delay-show={3000}
 					>
@@ -716,7 +717,7 @@ export const SelectedFiles = (
 						>
 							{<SelectionIcon size={10} />}
 
-							{selection.type === 'Skill' ? selection.identity : getBasename(selection.uri.fsPath) + (selection.type === 'CodeSelection' ? ` (${selection.range[0]}-${selection.range[1]})` : '')}
+							{selection.type === 'Skill' ? selection.identity : selection.type === 'Agent' ? 'Agent' : getBasename(selection.uri.fsPath) + (selection.type === 'CodeSelection' ? ` (${selection.range[0]}-${selection.range[1]})` : '')}
 
 							{selection.type === 'File' && selection.state.wasAddedAsCurrentFile && messageIdx === undefined && currentURI?.fsPath === selection.uri.fsPath ?
 								<span className={`text-[8px] 'void-opacity-60 text-void-fg-4`}>
@@ -2602,8 +2603,9 @@ const CommandBarInChat = () => {
 					</div>
 				</div>
 			)
-		})}
-	</div>
+			})}
+			{type === 'staging' && selections.some(selection => selection.type === 'Agent') ? <div className='basis-full text-xs text-void-fg-3 pt-1'>Agent delegation is explicit: this requests delegation, but does not start a child. The parent decides whether and when to delegate.</div> : null}
+		</div>
 
 	const fileDetailsButton = (
 		<button
@@ -2667,6 +2669,14 @@ const CommandBarInChat = () => {
 
 
 
+const ChildRunRow = ({ view }: { view: ReturnType<typeof useAgentSubagentRun> }) => !view ? null : <details className='text-xs border border-void-border-1 rounded-sm px-2 py-1 mb-1'>
+	<summary className='cursor-pointer select-none' aria-label={`Child Run ${view.id} ${agentSubagentStatusLabel(view.status)}`}>Child Run · {view.id.slice(0, 8)} · {agentSubagentStatusLabel(view.status)}</summary>
+	<div className='pt-1 text-void-fg-3'>
+		<div>Void application-level read-only — terminal disabled, no OS sandbox</div>
+		{view.summary ? <div className='pt-1 whitespace-pre-wrap break-words'>{view.summary}</div> : null}
+	</div>
+</details>
+
 export const SidebarChat = () => {
 	const textAreaRef = useRef<HTMLTextAreaElement | null>(null)
 	const textAreaFnsRef = useRef<TextAreaFns | null>(null)
@@ -2690,6 +2700,9 @@ export const SidebarChat = () => {
 	// stream state
 	const currThreadStreamState = useChatThreadsStreamState(chatThreadsState.currentThreadId)
 	const isRunning = currThreadStreamState?.isRunning
+	const childRun = useAgentSubagentRun(currentThread.id)
+	const childIsActive = isActiveChildRun(childRun)
+	const isAnyRunning = !!isRunning || childIsActive
 	const latestError = currThreadStreamState?.error
 	const { displayContentSoFar, toolCallSoFar, reasoningSoFar } = currThreadStreamState?.llmInfo ?? {}
 
@@ -2709,7 +2722,7 @@ export const SidebarChat = () => {
 	const onSubmit = useCallback(async (_forceSubmit?: string) => {
 
 		if (isDisabled && !_forceSubmit) return
-		if (isRunning) return
+		if (isAnyRunning) return
 
 		const threadId = chatThreadsService.state.currentThreadId
 
@@ -2726,7 +2739,7 @@ export const SidebarChat = () => {
 		textAreaFnsRef.current?.setValue('')
 		textAreaRef.current?.focus() // focus input after submit
 
-	}, [chatThreadsService, isDisabled, isRunning, textAreaRef, textAreaFnsRef, setSelections, settingsState])
+	}, [chatThreadsService, isDisabled, isAnyRunning, textAreaRef, textAreaFnsRef, setSelections, settingsState])
 
 	const onAbort = async () => {
 		const threadId = currentThread.id
@@ -2836,16 +2849,16 @@ export const SidebarChat = () => {
 	const onKeyDown = useCallback((e: KeyboardEvent<HTMLTextAreaElement>) => {
 		if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
 			onSubmit()
-		} else if (e.key === 'Escape' && isRunning) {
+		} else if (e.key === 'Escape' && isAnyRunning) {
 			onAbort()
 		}
-	}, [onSubmit, onAbort, isRunning])
+	}, [onSubmit, onAbort, isAnyRunning])
 
 	const inputChatArea = <VoidChatArea
 		featureName='Chat'
 		onSubmit={() => onSubmit()}
 		onAbort={onAbort}
-		isStreaming={!!isRunning}
+		isStreaming={isAnyRunning}
 		isDisabled={isDisabled}
 		showSelections={true}
 		// showProspectiveSelections={previousMessagesHTML.length === 0}
@@ -2890,6 +2903,7 @@ export const SidebarChat = () => {
 
 	const threadPageInput = <div key={'input' + chatThreadsState.currentThreadId}>
 		<div className='px-4'>
+			<ChildRunRow view={childRun} />
 			<CommandBarInChat />
 		</div>
 		<div className='px-2 pb-2'>
@@ -2899,6 +2913,7 @@ export const SidebarChat = () => {
 
 	const landingPageInput = <div>
 		<div className='pt-8'>
+			<div className='px-4'><ChildRunRow view={childRun} /></div>
 			{inputChatArea}
 		</div>
 	</div>

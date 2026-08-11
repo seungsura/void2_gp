@@ -11,6 +11,7 @@ import { os } from '../helpers/systemInfo.js';
 import { RawToolParamsObj } from '../sendLLMMessageTypes.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, BuiltinToolResultType, ToolName } from '../toolsServiceTypes.js';
 import { ChatMode } from '../voidSettingsTypes.js';
+import { ToolExecutionProfile, agentSubagentToolSchemas, isAgentSubagentControlName, isToolAllowedByProfile, readOnlyChildBuiltinSchemas } from '../agentSubagents.js';
 
 // Triple backtick wrapper used throughout the prompts for code blocks
 export const tripleTick = ['```', '```']
@@ -352,23 +353,36 @@ export const isABuiltinToolName = (toolName: string): toolName is BuiltinToolNam
 	return isAToolName
 }
 
+/** These are application control tools, not builtins: ChatThreadService intercepts them before MCP lookup. */
+const agentSubagentControlTool = (tool: InternalToolInfo): InternalToolInfo => tool;
+export const agentSubagentControlTools: readonly InternalToolInfo[] = Object.freeze([
+	agentSubagentControlTool({ name: 'spawn_agent', description: 'Start one generic read-only child agent for a delegated task. The child has no terminal and no OS sandbox.', params: { message: { description: 'The bounded delegated task.' } }, schema: agentSubagentToolSchemas.spawn_agent }),
+	agentSubagentControlTool({ name: 'wait_agent', description: 'Wait for the current direct child without mutating it. A terminal summary is delivered at most once.', params: { timeout_ms: { description: 'Optional wait time in milliseconds, 0 through 30000.' } }, schema: agentSubagentToolSchemas.wait_agent }),
+	agentSubagentControlTool({ name: 'interrupt_agent', description: 'Cancel the current direct child by its id.', params: { target: { description: 'The direct child id.' } }, schema: agentSubagentToolSchemas.interrupt_agent }),
+]);
 
 
 
 
-export const availableTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined) => {
+
+export const availableTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined, toolExecutionProfile: ToolExecutionProfile = 'default-parent', agentDelegationAllowed = false) => {
 
 	const builtinToolNames: BuiltinToolName[] | undefined = chatMode === 'normal' ? undefined
 		: chatMode === 'gather' ? (Object.keys(builtinTools) as BuiltinToolName[]).filter(toolName => !(toolName in approvalTypeOfBuiltinToolName))
 			: chatMode === 'agent' ? Object.keys(builtinTools) as BuiltinToolName[]
 				: undefined
 
-	const effectiveBuiltinTools = builtinToolNames?.map(toolName => builtinTools[toolName]) ?? undefined
-	const effectiveMCPTools = chatMode === 'agent' ? mcpTools : undefined
+	const effectiveBuiltinTools = builtinToolNames?.filter(name => isToolAllowedByProfile(toolExecutionProfile, name)).map(toolName => toolExecutionProfile === 'read-only-child'
+		? { ...builtinTools[toolName], schema: readOnlyChildBuiltinSchemas[toolName] }
+		: builtinTools[toolName]) ?? undefined
+	// A child is intentionally not allowed to serialize live MCP tools, even if present.
+	const effectiveMCPTools = chatMode === 'agent' && toolExecutionProfile === 'default-parent' ? mcpTools?.filter(tool => !isAgentSubagentControlName(tool.name)) : undefined
 
-	const tools: InternalToolInfo[] | undefined = !(builtinToolNames || mcpTools) ? undefined
+	const controlTools = chatMode === 'agent' && toolExecutionProfile === 'default-parent' && agentDelegationAllowed ? agentSubagentControlTools : []
+	const tools: InternalToolInfo[] | undefined = !(builtinToolNames || mcpTools || controlTools.length) ? undefined
 		: [
 			...effectiveBuiltinTools ?? [],
+			...controlTools,
 			...effectiveMCPTools ?? [],
 		]
 
@@ -397,8 +411,8 @@ export const reParsedToolXMLString = (toolName: ToolName, toolParams: RawToolPar
 
 /* We expect tools to come at the end - not a hard limit, but that's just how we process them, and the flow makes more sense that way. */
 // - You are allowed to call multiple tools by specifying them consecutively. However, there should be NO text or writing between tool calls or after them.
-const systemToolsXMLPrompt = (chatMode: ChatMode, mcpTools: InternalToolInfo[] | undefined) => {
-	const tools = availableTools(chatMode, mcpTools)
+const systemToolsXMLPrompt = (chatMode: ChatMode, mcpTools: InternalToolInfo[] | undefined, toolExecutionProfile: ToolExecutionProfile, agentDelegationAllowed: boolean) => {
+	const tools = availableTools(chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed)
 	if (!tools || tools.length === 0) return null
 
 	const toolXMLDefinitions = (`\
@@ -423,9 +437,10 @@ const systemToolsXMLPrompt = (chatMode: ChatMode, mcpTools: InternalToolInfo[] |
 // ======================================================== chat (normal, gather, agent) ========================================================
 
 
-export const chat_systemMessage = ({ workspaceFolders, openedURIs, activeURI, persistentTerminalIDs, directoryStr, chatMode: mode, mcpTools, includeXMLToolDefinitions }: { workspaceFolders: string[], directoryStr: string, openedURIs: string[], activeURI: string | undefined, persistentTerminalIDs: string[], chatMode: ChatMode, mcpTools: InternalToolInfo[] | undefined, includeXMLToolDefinitions: boolean }) => {
+export const chat_systemMessage = ({ workspaceFolders, openedURIs, activeURI, persistentTerminalIDs, directoryStr, chatMode: mode, mcpTools, includeXMLToolDefinitions, toolExecutionProfile = 'default-parent', agentDelegationAllowed = false }: { workspaceFolders: string[], directoryStr: string, openedURIs: string[], activeURI: string | undefined, persistentTerminalIDs: string[], chatMode: ChatMode, mcpTools: InternalToolInfo[] | undefined, includeXMLToolDefinitions: boolean, toolExecutionProfile?: ToolExecutionProfile, agentDelegationAllowed?: boolean }) => {
 	const header = (`You are an expert coding ${mode === 'agent' ? 'agent' : 'assistant'} whose job is \
-${mode === 'agent' ? `to help the user develop, run, and make changes to their codebase.`
+${toolExecutionProfile === 'read-only-child' ? `to inspect only the captured workspace root. Void application-level read-only — terminal disabled, no OS sandbox.`
+		: mode === 'agent' ? `to help the user develop, run, and make changes to their codebase.`
 			: mode === 'gather' ? `to search, understand, and reference files in the user's codebase.`
 				: mode === 'normal' ? `to assist the user with their coding tasks.`
 					: ''}
@@ -457,7 +472,7 @@ ${directoryStr}
 </files_overview>`)
 
 
-	const toolDefinitions = includeXMLToolDefinitions ? systemToolsXMLPrompt(mode, mcpTools) : null
+	const toolDefinitions = includeXMLToolDefinitions ? systemToolsXMLPrompt(mode, mcpTools, toolExecutionProfile, agentDelegationAllowed) : null
 
 	const details: string[] = []
 
@@ -571,6 +586,7 @@ export const messageOfSelection = async (
 		}
 	}
 ) => {
+	if (s.type === 'Agent') return '';
 	const lineNumAddition = (range: [number, number]) => ` (lines ${range[0]}:${range[1]})`
 
 	if (s.type === 'CodeSelection') {

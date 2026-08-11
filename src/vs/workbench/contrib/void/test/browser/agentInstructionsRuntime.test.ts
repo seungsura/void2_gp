@@ -144,6 +144,7 @@ suite('AGENTS instruction runtime paths', () => {
 		let stored = 0;
 		const receiver = {
 			_beginInstructionTurn: beginInstructionTurn, _purgeInstructionTurn: purgeInstructionTurn,
+			_agentControlGeneration: new Map<string, number>(), _agentDelegationAuthorityOfThread: new Map(), _agentSubagentService: { cancelParent() { } },
 			_agentInstructionSessionOfThread: new Map([['task', { ownerProjectRoot: 'file:///workspace-a', trustedAtStart: true, session: {} }]]),
 			_instructionTurnOfThread: new Map<string, unknown>(), state: { allThreads: { task: thread } },
 			_workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: { toString: () => 'file:///workspace-b' } }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => true },
@@ -176,6 +177,7 @@ suite('AGENTS instruction runtime paths', () => {
 		const delayedTurn = new Promise<typeof originalSnapshot>(resolve => { finishTurn = resolve; });
 		const receiver = {
 			_beginInstructionTurn: beginInstructionTurn, _purgeInstructionTurn: purgeInstructionTurn,
+			_agentControlGeneration: new Map<string, number>(), _agentDelegationAuthorityOfThread: new Map(), _agentSubagentService: { cancelParent() { } },
 			_agentInstructionSessionOfThread: new Map<string, unknown>(), _instructionTurnOfThread: new Map<string, unknown>(), state: { allThreads: { task: thread } },
 			_workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: { toString: () => owner } }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => true },
 			_agentInstructionsService: {

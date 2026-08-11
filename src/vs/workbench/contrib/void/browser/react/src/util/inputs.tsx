@@ -19,7 +19,7 @@ import { useFloating, autoUpdate, offset, flip, shift, size, autoPlacement } fro
 import { URI } from '../../../../../../../base/common/uri.js';
 import { getBasename, getFolderName } from '../sidebar-tsx/SidebarChat.js';
 import { ChevronRight, File, Folder, FolderClosed, LucideProps } from 'lucide-react';
-import { getEnabledOptionIndex, StagingSelectionItem } from '../../../../common/chatThreadServiceTypes.js';
+import { AGENT_DELEGATION_SELECTION_LABEL, getEnabledOptionIndex, StagingSelectionItem } from '../../../../common/chatThreadServiceTypes.js';
 import { DiffEditorWidget } from '../../../../../../../editor/browser/widget/diffEditor/diffEditorWidget.js';
 import { extractSearchReplaceBlocks, ExtractedSearchReplaceBlock } from '../../../../common/helpers/extractCodeFromResult.js';
 import { IAccessibilitySignalService } from '../../../../../../../platform/accessibilitySignal/browser/accessibilitySignalService.js';
@@ -70,7 +70,7 @@ type Option = {
 		| { leafNodeType?: undefined, nextOptions?: undefined, generateNextOptions: GenerateNextOptions, }
 		| { leafNodeType: 'File' | 'Folder', uri: URI, nextOptions?: undefined, generateNextOptions?: undefined, }
 		| { leafNodeType: 'Skill', skill: AgentSkill, catalogRevision: string, nextOptions?: undefined, generateNextOptions?: undefined, }
-		| { leafNodeType: 'Agent', disabled: true, nextOptions?: undefined, generateNextOptions?: undefined, }
+		| { leafNodeType: 'Agent', nextOptions?: undefined, generateNextOptions?: undefined, }
 	)
 
 
@@ -307,7 +307,7 @@ const getOptionsAtPath = async (accessor: ReturnType<typeof useAccessor>, path: 
 				return catalog.skills.filter(skill => isSubsequence(skill.identity, t)).map(skill => ({ leafNodeType: 'Skill' as const, skill, catalogRevision: catalog.revision, iconInMenu: File, fullName: skill.identity, abbreviatedName: skill.identity }));
 			},
 		},
-		{ fullName: 'agents', abbreviatedName: 'agents', iconInMenu: File, leafNodeType: 'Agent', disabled: true },
+		{ fullName: 'Agent', abbreviatedName: 'Agent', iconInMenu: File, leafNodeType: 'Agent' },
 	]
 
 	// follow the path in the optionsTree (until the last path element)
@@ -458,7 +458,7 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 				type: 'Skill', identity: option.skill.identity, catalogRevision: option.catalogRevision, bodyRevision: option.skill.bodyRevision,
 				skillRoot: option.skill.provenance.skillRoot, description: option.skill.description, state: undefined,
 			}
-			else if (option.leafNodeType === 'Agent') return
+			else if (option.leafNodeType === 'Agent') newSelection = { type: 'Agent', label: AGENT_DELEGATION_SELECTION_LABEL, state: undefined }
 			else throw new Error(`Unexpected leafNodeType ${option.leafNodeType}`)
 
 			chatThreadService.addNewStagingSelection(newSelection)

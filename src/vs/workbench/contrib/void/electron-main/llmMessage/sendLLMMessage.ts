@@ -24,6 +24,8 @@ export const sendLLMMessage = async ({
 	chatMode,
 	separateSystemMessage,
 	mcpTools,
+	toolExecutionProfile,
+	agentDelegationAllowed,
 }: SendLLMMessageParams,
 
 	metricsService: IMetricsService
@@ -55,8 +57,10 @@ export const sendLLMMessage = async ({
 
 	let _fullTextSoFar = ''
 	let _aborter: (() => void) | null = null
-	let _setAborter = (fn: () => void) => { _aborter = fn }
 	let _didAbort = false
+	// A child may be cancelled while provider setup is still asynchronous. Latch it,
+	// fence callbacks first, and invoke a late provider aborter once without retaining it.
+	let _setAborter = (fn: () => void) => { if (_didAbort) { try { fn() } catch { } return } _aborter = fn }
 
 	const onText: OnText = (params) => {
 		const { fullText } = params
@@ -86,10 +90,12 @@ export const sendLLMMessage = async ({
 
 	// we should NEVER call onAbort internally, only from the outside
 	const onAbort = () => {
+		if (_didAbort) return
+		_didAbort = true
 		captureLLMEvent(`${loggingName} - Abort`, { messageLengthSoFar: _fullTextSoFar.length })
 		try { _aborter?.() } // aborter sometimes automatically throws an error
 		catch (e) { }
-		_didAbort = true
+		_aborter = null
 	}
 	abortRef_.current = onAbort
 
@@ -108,7 +114,7 @@ export const sendLLMMessage = async ({
 		}
 		const { sendFIM, sendChat } = implementation
 		if (messagesType === 'chatMessages') {
-			await sendChat({ messages: messages_, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions, overridesOfModel, modelName, _setAborter, providerName, separateSystemMessage, chatMode, mcpTools })
+			await sendChat({ messages: messages_, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions, overridesOfModel, modelName, _setAborter, providerName, separateSystemMessage, chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed })
 			return
 		}
 		if (messagesType === 'FIMMessage') {
@@ -133,4 +139,3 @@ export const sendLLMMessage = async ({
 
 
 }
-
