@@ -13,11 +13,9 @@ import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { ChatMode, FeatureName, ModelSelection, ProviderName } from '../common/voidSettingsTypes.js';
 import { IDirectoryStrService } from '../common/directoryStrService.js';
 import { ITerminalToolService } from './terminalToolService.js';
-import { IVoidModelService } from '../common/voidModelService.js';
-import { URI } from '../../../../base/common/uri.js';
-import { EndOfLinePreference } from '../../../../editor/common/model.js';
 import { ToolName } from '../common/toolsServiceTypes.js';
 import { IMCPService } from '../common/mcpService.js';
+import { AgentInstructionTurnSnapshot, assembleAgentInstructionText, routeAgentInstructionAuthority } from '../common/agentInstructions.js';
 
 export const EMPTY_MESSAGE = '(empty message)'
 
@@ -248,7 +246,7 @@ const prepareMessages_XML_tools = (messages: SimpleLLMMessage[], supportsAnthrop
 const prepareOpenAIOrAnthropicMessages = ({
 	messages: messages_,
 	systemMessage,
-	aiInstructions,
+	agentInstructions,
 	supportsSystemMessage,
 	specialToolFormat,
 	supportsAnthropicReasoning,
@@ -257,7 +255,7 @@ const prepareOpenAIOrAnthropicMessages = ({
 }: {
 	messages: SimpleLLMMessage[],
 	systemMessage: string,
-	aiInstructions: string,
+	agentInstructions?: string,
 	supportsSystemMessage: false | 'system-role' | 'developer-role' | 'separated',
 	specialToolFormat: 'openai-style' | 'anthropic-style' | undefined,
 	supportsAnthropicReasoning: boolean,
@@ -274,12 +272,9 @@ const prepareOpenAIOrAnthropicMessages = ({
 	// ================ system message ================
 	// A COMPLETE HACK: last message is system message for context purposes
 
-	const sysMsgParts: string[] = []
-	if (aiInstructions) sysMsgParts.push(`GUIDELINES (from the user's .voidrules file):\n${aiInstructions}`)
-	if (systemMessage) sysMsgParts.push(systemMessage)
-	const combinedSystemMessage = sysMsgParts.join('\n\n')
-
-	messages.unshift({ role: 'system', content: combinedSystemMessage })
+	// Both protected envelope entries participate in context trimming before conversion.
+	messages.unshift({ role: 'system', content: systemMessage })
+	if (agentInstructions) messages.unshift({ role: 'system', content: agentInstructions })
 
 	// ================ trim ================
 	messages = messages.map(m => ({ ...m, content: m.role !== 'tool' ? m.content.trim() : m.content }))
@@ -367,7 +362,9 @@ const prepareOpenAIOrAnthropicMessages = ({
 	}
 
 	// ================ system message hack ================
+	const newInstructionMsg = agentInstructions ? messages.shift()!.content : ''
 	const newSysMsg = messages.shift()!.content
+	const authorityRoute = routeAgentInstructionAuthority(newInstructionMsg, newSysMsg, supportsSystemMessage);
 
 
 	// ================ tools and anthropicReasoning ================
@@ -393,22 +390,24 @@ const prepareOpenAIOrAnthropicMessages = ({
 	// if supports system message
 	if (supportsSystemMessage) {
 		if (supportsSystemMessage === 'separated')
-			separateSystemMessageStr = newSysMsg
+			separateSystemMessageStr = authorityRoute.separateSystemMessage
 		else if (supportsSystemMessage === 'system-role')
-			llmMessages.unshift({ role: 'system', content: newSysMsg }) // add new first message
+			llmMessages.unshift(...authorityRoute.roleMessages.map(message => ({ ...message })))
 		else if (supportsSystemMessage === 'developer-role')
-			llmMessages.unshift({ role: 'developer', content: newSysMsg }) // add new first message
+			llmMessages.unshift(...authorityRoute.roleMessages.map(message => ({ ...message })))
 	}
 	// if does not support system message
 	else {
 		const newFirstMessage = {
 			role: 'user',
-			content: `<SYSTEM_MESSAGE>\n${newSysMsg}\n</SYSTEM_MESSAGE>\n${llmMessages[0].content}`
+			content: `<SYSTEM_MESSAGE>\n${authorityRoute.userFallbackSystemMessage ?? ''}\n</SYSTEM_MESSAGE>\n${llmMessages[0].content}`
 		} as const
 		llmMessages.splice(0, 1) // delete first message
 		llmMessages.unshift(newFirstMessage) // add new first message
 	}
 
+	// Keep source-generated system context separate from user/project instruction authority.
+	// Developer-capable Chat Completions routes receive this as a developer message.
 
 	// ================ no empty message ================
 	for (let i = 0; i < llmMessages.length; i += 1) {
@@ -498,7 +497,7 @@ const prepareGeminiMessages = (messages: AnthropicLLMChatMessage[]) => {
 const prepareMessages = (params: {
 	messages: SimpleLLMMessage[],
 	systemMessage: string,
-	aiInstructions: string,
+	agentInstructions?: string,
 	supportsSystemMessage: false | 'system-role' | 'developer-role' | 'separated',
 	specialToolFormat: 'openai-style' | 'anthropic-style' | 'gemini-style' | undefined,
 	supportsAnthropicReasoning: boolean,
@@ -526,14 +525,14 @@ const prepareMessages = (params: {
 export interface IConvertToLLMMessageService {
 	readonly _serviceBrand: undefined;
 	prepareLLMSimpleMessages: (opts: { simpleMessages: SimpleLLMMessage[], systemMessage: string, modelSelection: ModelSelection | null, featureName: FeatureName }) => { messages: LLMChatMessage[], separateSystemMessage: string | undefined }
-	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined }>
+	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null, instructionSnapshot: AgentInstructionTurnSnapshot }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined }>
 	prepareFIMMessage(opts: { messages: LLMFIMMessage, }): { prefix: string, suffix: string, stopTokens: string[] }
 }
 
 export const IConvertToLLMMessageService = createDecorator<IConvertToLLMMessageService>('ConvertToLLMMessageService');
 
 
-class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMessageService {
+export class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMessageService {
 	_serviceBrand: undefined;
 
 	constructor(
@@ -543,41 +542,10 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		@IDirectoryStrService private readonly directoryStrService: IDirectoryStrService,
 		@ITerminalToolService private readonly terminalToolService: ITerminalToolService,
 		@IVoidSettingsService private readonly voidSettingsService: IVoidSettingsService,
-		@IVoidModelService private readonly voidModelService: IVoidModelService,
 		@IMCPService private readonly mcpService: IMCPService,
 	) {
 		super()
 	}
-
-	// Read .voidrules files from workspace folders
-	private _getVoidRulesFileContents(): string {
-		try {
-			const workspaceFolders = this.workspaceContextService.getWorkspace().folders;
-			let voidRules = '';
-			for (const folder of workspaceFolders) {
-				const uri = URI.joinPath(folder.uri, '.voidrules')
-				const { model } = this.voidModelService.getModel(uri)
-				if (!model) continue
-				voidRules += model.getValue(EndOfLinePreference.LF) + '\n\n';
-			}
-			return voidRules.trim();
-		}
-		catch (e) {
-			return ''
-		}
-	}
-
-	// Get combined AI instructions from settings and .voidrules files
-	private _getCombinedAIInstructions(): string {
-		const globalAIInstructions = this.voidSettingsService.state.globalSettings.aiInstructions;
-		const voidRulesFileContent = this._getVoidRulesFileContents();
-
-		const ans: string[] = []
-		if (globalAIInstructions) ans.push(globalAIInstructions)
-		if (voidRulesFileContent) ans.push(voidRulesFileContent)
-		return ans.join('\n\n')
-	}
-
 
 	// system message
 	private _generateChatMessagesSystemMessage = async (chatMode: ChatMode, specialToolFormat: 'openai-style' | 'anthropic-style' | 'gemini-style' | undefined) => {
@@ -651,8 +619,6 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 
 		const modelSelectionOptions = this.voidSettingsService.state.optionsOfModelSelection[featureName][modelSelection.providerName]?.[modelSelection.modelName]
 
-		// Get combined AI instructions
-		const aiInstructions = this._getCombinedAIInstructions();
 
 		const isReasoningEnabled = getIsReasoningEnabledState(featureName, providerName, modelName, modelSelectionOptions, overridesOfModel)
 		const reservedOutputTokenSpace = getReservedOutputTokenSpace(providerName, modelName, { isReasoningEnabled, overridesOfModel })
@@ -660,7 +626,6 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		const { messages, separateSystemMessage } = prepareMessages({
 			messages: simpleMessages,
 			systemMessage,
-			aiInstructions,
 			supportsSystemMessage,
 			specialToolFormat,
 			supportsAnthropicReasoning: providerName === 'anthropic',
@@ -670,7 +635,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		})
 		return { messages, separateSystemMessage };
 	}
-	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection }) => {
+	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection, instructionSnapshot }) => {
 		if (modelSelection === null) return { messages: [], separateSystemMessage: undefined }
 
 		const { overridesOfModel } = this.voidSettingsService.state
@@ -682,14 +647,12 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			supportsSystemMessage,
 		} = getModelCapabilities(providerName, modelName, overridesOfModel)
 
-		const { disableSystemMessage } = this.voidSettingsService.state.globalSettings;
 		const fullSystemMessage = await this._generateChatMessagesSystemMessage(chatMode, specialToolFormat)
-		const systemMessage = disableSystemMessage ? '' : fullSystemMessage;
+		const systemMessage = fullSystemMessage;
 
 		const modelSelectionOptions = this.voidSettingsService.state.optionsOfModelSelection['Chat'][modelSelection.providerName]?.[modelSelection.modelName]
 
-		// Get combined AI instructions
-		const aiInstructions = this._getCombinedAIInstructions();
+		const agentInstructions = assembleAgentInstructionText(instructionSnapshot);
 		const isReasoningEnabled = getIsReasoningEnabledState('Chat', providerName, modelName, modelSelectionOptions, overridesOfModel)
 		const reservedOutputTokenSpace = getReservedOutputTokenSpace(providerName, modelName, { isReasoningEnabled, overridesOfModel })
 		const llmMessages = this._chatMessagesToSimpleMessages(chatMessages)
@@ -697,7 +660,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		const { messages, separateSystemMessage } = prepareMessages({
 			messages: llmMessages,
 			systemMessage,
-			aiInstructions,
+			agentInstructions,
 			supportsSystemMessage,
 			specialToolFormat,
 			supportsAnthropicReasoning: providerName === 'anthropic',
@@ -712,16 +675,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 	// --- FIM ---
 
 	prepareFIMMessage: IConvertToLLMMessageService['prepareFIMMessage'] = ({ messages }) => {
-		// Get combined AI instructions with the provided aiInstructions as the base
-		const combinedInstructions = this._getCombinedAIInstructions();
-
-		let prefix = `\
-${!combinedInstructions ? '' : `\
-// Instructions:
-// Do not output an explanation. Try to avoid outputting comments. Only output the middle code.
-${combinedInstructions.split('\n').map(line => `//${line}`).join('\n')}`}
-
-${messages.prefix}`
+		const prefix = messages.prefix
 
 		const suffix = messages.suffix
 		const stopTokens = messages.stopTokens
@@ -766,4 +720,3 @@ gemini response:
 	}
 }
 */
-

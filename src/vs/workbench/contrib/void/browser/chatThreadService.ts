@@ -36,10 +36,13 @@ import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { timeout } from '../../../../base/common/async.js';
 import { deepClone } from '../../../../base/common/objects.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
+import { IWorkspaceTrustManagementService } from '../../../../platform/workspace/common/workspaceTrust.js';
 import { IDirectoryStrService } from '../common/directoryStrService.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
 import { IMCPService } from '../common/mcpService.js';
 import { RawMCPToolCall } from '../common/mcpServiceTypes.js';
+import { IAgentInstructionsService } from './agentInstructionsService.js';
+import { AgentInstructionTaskSession, AgentInstructionTurnSnapshot, inheritAgentInstructionTurnSnapshot, reviveAgentInstructionTurnSnapshot } from '../common/agentInstructions.js';
 
 
 // related to retrying when LLM message has error
@@ -76,6 +79,11 @@ const findStagingSelectionIndex = (currentSelections: StagingSelectionItem[] | u
 
 type UserMessageType = ChatMessage & { role: 'user' }
 type UserMessageState = UserMessageType['state']
+type AgentInstructionTaskSessionRecord = {
+	ownerProjectRoot: string | undefined;
+	trustedAtStart: boolean;
+	session: AgentInstructionTaskSession;
+}
 const defaultMessageState: UserMessageState = {
 	stagingSelections: [],
 	isBeingEdited: false,
@@ -108,6 +116,7 @@ export type ThreadType = {
 				[codespanName: string]: CodespanLocationLink
 			}
 		}
+		agentInstructionTurnSnapshot?: AgentInstructionTurnSnapshot;
 
 
 		mountedInfo?: {
@@ -267,7 +276,7 @@ export interface IChatThreadService {
 }
 
 export const IChatThreadService = createDecorator<IChatThreadService>('voidChatThreadService');
-class ChatThreadService extends Disposable implements IChatThreadService {
+export class ChatThreadService extends Disposable implements IChatThreadService {
 	_serviceBrand: undefined;
 
 	// this fires when the current thread changes at all (a switch of currentThread, or a message added to it, etc)
@@ -291,9 +300,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		@INotificationService private readonly _notificationService: INotificationService,
 		@IConvertToLLMMessageService private readonly _convertToLLMMessagesService: IConvertToLLMMessageService,
 		@IWorkspaceContextService private readonly _workspaceContextService: IWorkspaceContextService,
+		@IWorkspaceTrustManagementService private readonly _workspaceTrustManagementService: IWorkspaceTrustManagementService,
 		@IDirectoryStrService private readonly _directoryStringService: IDirectoryStrService,
 		@IFileService private readonly _fileService: IFileService,
 		@IMCPService private readonly _mcpService: IMCPService,
+		@IAgentInstructionsService private readonly _agentInstructionsService: IAgentInstructionsService,
 	) {
 		super()
 		this.state = { allThreads: {}, currentThreadId: null as unknown as string } // default state
@@ -305,10 +316,90 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			allThreads: allThreads,
 			currentThreadId: null as unknown as string, // gets set in startNewThread()
 		}
+		this._restoreInstructionTurns(allThreads)
+		this._storeAllThreads(allThreads)
 
 		// always be in a thread
 		this.openNewThread()
 
+	}
+
+	// Config is task/session scoped; a turn snapshot is deliberately refreshed only for a user turn.
+	private readonly _agentInstructionSessionOfThread = new Map<string, AgentInstructionTaskSessionRecord>();
+	private readonly _instructionTurnOfThread = new Map<string, AgentInstructionTurnSnapshot>();
+	private async _beginInstructionTurn(threadId: string): Promise<AgentInstructionTurnSnapshot> {
+		const currentOwner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
+		const trustedNow = this._workspaceTrustManagementService.isWorkspaceTrusted()
+		let record = this._agentInstructionSessionOfThread.get(threadId);
+		const remembered = this._instructionTurnOfThread.get(threadId)
+		if ((record && record.ownerProjectRoot !== currentOwner) || (remembered && remembered.ownerProjectRoot !== currentOwner)) {
+			this._purgeInstructionTurn(threadId, false)
+			throw new Error('This task belongs to a different workspace. Start a new task to continue in the current workspace.')
+		}
+		// Losing trust starts a new top-level task session so project config is not retained.
+		if (record?.trustedAtStart && !trustedNow) {
+			this._purgeInstructionTurn(threadId)
+			record = undefined
+		}
+		if (!record) {
+			const session = new AgentInstructionTaskSession(
+				() => this._agentInstructionsService.beginTaskSession(),
+				config => this._agentInstructionsService.beginTopLevelTurn(config),
+			);
+			record = { ownerProjectRoot: currentOwner, trustedAtStart: trustedNow, session };
+			this._agentInstructionSessionOfThread.set(threadId, record);
+		}
+		const snapshot = await record.session.beginTopLevelTurn();
+		const currentOwnerAfterLoad = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
+		const trustedAfterLoad = this._workspaceTrustManagementService.isWorkspaceTrusted()
+		const ownerMatches = snapshot.ownerProjectRoot === record.ownerProjectRoot
+			&& snapshot.runCwd === record.ownerProjectRoot
+			&& snapshot.ownerProjectRoot === currentOwnerAfterLoad
+			&& snapshot.runCwd === currentOwnerAfterLoad
+		if (!ownerMatches) {
+			this._purgeInstructionTurn(threadId, false)
+			throw new Error('This task belongs to a different workspace. Start a new task to continue in the current workspace.')
+		}
+		const hasProjectConfig = snapshot.config.configSources.some(source => source.scope === 'project')
+		if ((record.trustedAtStart && !trustedAfterLoad) || (!trustedAfterLoad && hasProjectConfig)) {
+			this._purgeInstructionTurn(threadId)
+			throw new Error('Workspace trust changed while instructions were loading. Send the message again to start a user-only session.')
+		}
+		this._rememberInstructionTurn(threadId, snapshot);
+		return snapshot;
+	}
+	private _purgeInstructionTurn(threadId: string, removeSession = true) {
+		if (removeSession) this._agentInstructionSessionOfThread?.delete(threadId)
+		this._instructionTurnOfThread?.delete(threadId)
+		const thread = this.state.allThreads[threadId]
+		if (!thread) return
+		delete thread.state.agentInstructionTurnSnapshot
+		// Persist security metadata removal before a later provider or tool action.
+		this._storeAllThreads?.(this.state.allThreads)
+	}
+	private _restoreInstructionTurns(threads: ChatThreads) {
+		this._instructionTurnOfThread.clear()
+		const currentOwner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
+		for (const [id, thread] of Object.entries(threads)) {
+			if (!thread) continue
+			const snapshot = reviveAgentInstructionTurnSnapshot(thread.state.agentInstructionTurnSnapshot)
+			const hasProjectConfig = snapshot?.config.configSources.some(source => source.scope === 'project')
+			if (snapshot && snapshot.ownerProjectRoot === currentOwner && snapshot.runCwd === currentOwner && (this._workspaceTrustManagementService.isWorkspaceTrusted() || !hasProjectConfig)) {
+				thread.state.agentInstructionTurnSnapshot = snapshot
+				this._instructionTurnOfThread.set(id, snapshot)
+			}
+			else {
+				delete thread.state.agentInstructionTurnSnapshot
+			}
+		}
+	}
+	private _rememberInstructionTurn(threadId: string, snapshot: AgentInstructionTurnSnapshot) {
+		this._instructionTurnOfThread.set(threadId, snapshot)
+		const thread = this.state.allThreads[threadId]
+		if (!thread) return
+		// Persist this non-UI metadata before provider/tool work can begin.
+		thread.state.agentInstructionTurnSnapshot = snapshot
+		this._storeAllThreads(this.state.allThreads)
 	}
 
 	async focusCurrentChat() {
@@ -333,10 +424,14 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 
 	dangerousSetState = (newState: ThreadsState) => {
+		this._agentInstructionSessionOfThread.clear()
+		this._restoreInstructionTurns(newState.allThreads)
 		this.state = newState
 		this._onDidChangeCurrentThread.fire()
 	}
 	resetState = () => {
+		this._agentInstructionSessionOfThread.clear()
+		this._instructionTurnOfThread.clear()
 		this.state = { allThreads: {}, currentThreadId: null as unknown as string } // see constructor
 		this.openNewThread()
 		this._onDidChangeCurrentThread.fire()
@@ -490,9 +585,19 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		if (!(lastMsg.role === 'tool' && lastMsg.type === 'tool_request')) return // should never happen
 
 		const callThisToolFirst: ToolMessage<ToolName> = lastMsg
+		const snapshot = this._instructionTurnOfThread.get(threadId)
+		const currentOwner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
+		const hasProjectConfig = snapshot?.config.configSources.some(source => source.scope === 'project')
+		if (!snapshot || snapshot.ownerProjectRoot !== currentOwner || snapshot.runCwd !== currentOwner || (!this._workspaceTrustManagementService.isWorkspaceTrusted() && hasProjectConfig)) {
+			this._purgeInstructionTurn(threadId)
+			const content = 'This tool request cannot resume because the current workspace or trust context no longer matches its instruction snapshot. Send a new message in a new task to continue.'
+			this._updateLatestTool(threadId, { role: 'tool', type: 'rejected', params: lastMsg.params, name: lastMsg.name, content, result: null, id: lastMsg.id, rawParams: lastMsg.rawParams, mcpServerName: lastMsg.mcpServerName })
+			this._setStreamState(threadId, undefined)
+			return
+		}
 
 		this._wrapRunAgentToNotify(
-			this._runChatAgent({ callThisToolFirst, threadId, ...this._currentModelSelectionProps() })
+			this._runChatAgent({ callThisToolFirst, threadId, instructionSnapshot: inheritAgentInstructionTurnSnapshot(snapshot), ...this._currentModelSelectionProps() })
 			, threadId
 		)
 	}
@@ -724,12 +829,14 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		modelSelection,
 		modelSelectionOptions,
 		callThisToolFirst,
+		instructionSnapshot,
 	}: {
 		threadId: string,
 		modelSelection: ModelSelection | null,
 		modelSelectionOptions: ModelSelectionOptions | undefined,
 
 		callThisToolFirst?: ToolMessage<ToolName> & { type: 'tool_request' }
+		instructionSnapshot: AgentInstructionTurnSnapshot,
 	}) {
 
 
@@ -739,6 +846,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		// above just defines helpers, below starts the actual function
 		const { chatMode } = this._settingsService.state.globalSettings // should not change as we loop even if user changes it, so it goes here
+		const snapshot = instructionSnapshot;
 		const { overridesOfModel } = this._settingsService.state
 
 		let nMessagesSent = 0
@@ -768,7 +876,8 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			const { messages, separateSystemMessage } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
 				chatMessages,
 				modelSelection,
-				chatMode
+				chatMode,
+				instructionSnapshot: snapshot,
 			})
 
 			if (interruptedWhenIdle) {
@@ -968,11 +1077,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 	private async _addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string }) {
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
-
 		// interrupt existing stream
 		if (this.streamState[threadId]?.isRunning) {
 			await this.abortRunning(threadId)
 		}
+		// This must happen before history changes: a task cannot cross a workspace owner boundary.
+		const instructionSnapshot = await this._beginInstructionTurn(threadId)
 
 		// add user's message to chat history
 		const instructions = userMessage
@@ -983,7 +1093,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		this._addMessageToThread(threadId, userHistoryElt)
 
 		this._wrapRunAgentToNotify(
-			this._runChatAgent({ threadId, ...this._currentModelSelectionProps(), }),
+			this._runChatAgent({ threadId, instructionSnapshot, ...this._currentModelSelectionProps(), }),
 			threadId,
 		)
 
@@ -1361,6 +1471,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// delete the thread
 		const newThreads = { ...currentThreads };
 		delete newThreads[threadId];
+		this._agentInstructionSessionOfThread.delete(threadId); this._instructionTurnOfThread.delete(threadId)
 		this._toolsService.invalidateReadReceipts(threadId)
 
 		// store the updated threads

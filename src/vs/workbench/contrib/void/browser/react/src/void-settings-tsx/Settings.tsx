@@ -781,21 +781,6 @@ export const AutoDetectLocalModelsToggle = () => {
 
 }
 
-export const AIInstructionsBox = () => {
-	const accessor = useAccessor()
-	const voidSettingsService = accessor.get('IVoidSettingsService')
-	const voidSettingsState = useSettingsState()
-	return <VoidInputBox2
-		className='min-h-[81px] p-3 rounded-sm'
-		initValue={voidSettingsState.globalSettings.aiInstructions}
-		placeholder={`Do not change my indentation or delete my comments. When writing TS or JS, do not add ;'s. Write new code using Rust if possible. `}
-		multiline
-		onChangeText={(newText) => {
-			voidSettingsService.setGlobalSetting('aiInstructions', newText)
-		}}
-	/>
-}
-
 const FastApplyMethodDropdown = () => {
 	const accessor = useAccessor()
 	const voidSettingsService = accessor.get('IVoidSettingsService')
@@ -1451,40 +1436,6 @@ export const Settings = () => {
 												<span className='text-void-fg-3 text-xs pointer-events-none'>{'Opt-out (requires restart)'}</span>
 											</div>
 										</ErrorBoundary>
-									</div>
-								</div>
-
-								{/* AI Instructions section */}
-								<div className='max-w-[600px]'>
-									<h2 className={`text-3xl mb-2`}>AI Instructions</h2>
-									<h4 className={`text-void-fg-3 mb-4`}>
-										<ChatMarkdownRender inPTag={true} string={`
-System instructions to include with all AI requests.
-Alternatively, place a \`.voidrules\` file in the root of your workspace.
-								`} chatMessageLocation={undefined} />
-									</h4>
-									<ErrorBoundary>
-										<AIInstructionsBox />
-									</ErrorBoundary>
-									{/* --- Disable System Message Toggle --- */}
-									<div className='my-4'>
-										<ErrorBoundary>
-											<div className='flex items-center gap-x-2'>
-												<VoidSwitch
-													size='xs'
-													value={!!settingsState.globalSettings.disableSystemMessage}
-													onChange={(newValue) => {
-														voidSettingsService.setGlobalSetting('disableSystemMessage', newValue);
-													}}
-												/>
-												<span className='text-void-fg-3 text-xs pointer-events-none'>
-													{'Disable system message'}
-												</span>
-											</div>
-										</ErrorBoundary>
-										<div className='text-void-fg-3 text-xs mt-1'>
-											{`When disabled, Void will not include anything in the system message except for content you specified above.`}
-										</div>
 									</div>
 								</div>
 

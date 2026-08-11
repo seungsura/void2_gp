@@ -31,7 +31,7 @@ import './media/void.css'
 // update (frontend part, also see platform/)
 import './voidUpdateActions.js'
 
-import './convertToLLMMessageWorkbenchContrib.js'
+import './agentInstructionsService.js'
 
 // tools
 import './toolsService.js'
