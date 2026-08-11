@@ -1215,49 +1215,6 @@ export const Settings = () => {
 									<h2 className={`text-3xl mb-2`}>Feature Options</h2>
 
 									<div className='flex flex-col gap-y-8 my-4'>
-										<ErrorBoundary>
-											{/* FIM */}
-											<div>
-												<h4 className={`text-base`}>{displayInfoOfFeatureName('Autocomplete')}</h4>
-												<div className='text-sm text-void-fg-3 mt-1'>
-													<span>
-														Experimental.{' '}
-													</span>
-													<span
-														className='hover:brightness-110'
-														data-tooltip-id='void-tooltip'
-														data-tooltip-content='We recommend using the largest qwen2.5-coder model you can with Ollama (try qwen2.5-coder:3b).'
-														data-tooltip-class-name='void-max-w-[20px]'
-													>
-														Only works with FIM models.*
-													</span>
-												</div>
-
-												<div className='my-2'>
-													{/* Enable Switch */}
-													<ErrorBoundary>
-														<div className='flex items-center gap-x-2 my-2'>
-															<VoidSwitch
-																size='xs'
-																value={settingsState.globalSettings.enableAutocomplete}
-																onChange={(newVal) => voidSettingsService.setGlobalSetting('enableAutocomplete', newVal)}
-															/>
-															<span className='text-void-fg-3 text-xs pointer-events-none'>{settingsState.globalSettings.enableAutocomplete ? 'Enabled' : 'Disabled'}</span>
-														</div>
-													</ErrorBoundary>
-
-													{/* Model Dropdown */}
-													<ErrorBoundary>
-														<div className={`my-2 ${!settingsState.globalSettings.enableAutocomplete ? 'hidden' : ''}`}>
-															<ModelDropdown featureName={'Autocomplete'} className='text-xs text-void-fg-3 bg-void-bg-1 border border-void-border-1 rounded p-0.5 px-1' />
-														</div>
-													</ErrorBoundary>
-
-												</div>
-
-											</div>
-										</ErrorBoundary>
-
 										{/* Apply */}
 										<ErrorBoundary>
 

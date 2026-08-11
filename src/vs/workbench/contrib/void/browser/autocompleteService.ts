@@ -27,6 +27,7 @@ import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 
 const allLinebreakSymbols = ['\r\n', '\n']
 const _ln = isWindows ? allLinebreakSymbols[0] : allLinebreakSymbols[1]
+const legacyFIMAutocompleteRetired = true
 
 // The extension this was called from is here - https://github.com/voideditor/void/blob/autocomplete/extensions/void/src/extension/extension.ts
 
@@ -634,6 +635,7 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 		model: ITextModel,
 		position: Position,
 	): Promise<InlineCompletion[]> {
+		if (legacyFIMAutocompleteRetired) return []
 
 		const isEnabled = this._settingsService.state.globalSettings.enableAutocomplete
 		if (!isEnabled) return []
@@ -945,5 +947,4 @@ export class AutocompleteService extends Disposable implements IAutocompleteServ
 }
 
 registerWorkbenchContribution2(AutocompleteService.ID, AutocompleteService, WorkbenchPhase.BlockRestore);
-
 
