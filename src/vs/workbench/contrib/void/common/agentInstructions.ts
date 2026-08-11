@@ -15,12 +15,16 @@ export type AgentInstructionsConfig = Readonly<{
 	configSources: readonly AgentConfigSourceProvenance[];
 	ownerProjectRoot?: string;
 	runCwd?: string;
+	skillConfigRules: readonly SkillConfigRule[];
+	skillConfigDiagnostics: readonly SkillConfigDiagnostic[];
 }>;
+export type SkillConfigRule = Readonly<{ selector: Readonly<{ kind: 'name' | 'path'; value: string }>; enabled: boolean; source: 'user' | 'project' }>;
+export type SkillConfigDiagnostic = Readonly<{ source: 'user' | 'project'; index: number; reason: 'skills_not_object' | 'config_not_array' | 'entry_not_object' | 'unknown_key' | 'enabled_invalid' | 'selector_xor' | 'name_empty' | 'path_not_absolute_skill'; code: 'skill_config_invalid' }>;
 export type AgentConfigSourceProvenance = Readonly<{
 	uri: string;
 	scope: 'user' | 'project';
 	status: 'loaded' | 'missing' | 'unreadable' | 'invalid_utf8' | 'malformed';
-	projectedKeys: readonly ('developer_instructions' | 'project_doc_max_bytes')[];
+	projectedKeys: readonly ('developer_instructions' | 'project_doc_max_bytes' | 'skills.config')[];
 }>;
 export type ParsedAgentConfigSource = Readonly<{ projected?: ParsedAgentConfig; provenance: AgentConfigSourceProvenance }>;
 export type AgentConfigSourceDescriptor = Readonly<{ scope: 'user' | 'project'; uri: URI }>;
@@ -65,7 +69,7 @@ export const agentInstructionChain = (root: URI, cwd: URI): readonly URI[] => {
 	return Object.freeze(result);
 };
 
-export type ParsedAgentConfig = Readonly<{ developerInstructions?: string; projectDocMaxBytes?: number }>;
+export type ParsedAgentConfig = Readonly<{ developerInstructions?: string; projectDocMaxBytes?: number; skillConfigRules?: readonly SkillConfigRule[]; skillConfigDiagnostics?: readonly SkillConfigDiagnostic[]; skillsConfigPresent?: boolean }>;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true });
@@ -88,14 +92,35 @@ export const projectAgentConfig = (
 	configSources: Object.freeze(configSources.map(source => Object.freeze({ ...source, projectedKeys: Object.freeze([...source.projectedKeys]) }))),
 	ownerProjectRoot,
 	runCwd,
+	skillConfigRules: Object.freeze([...(user?.skillConfigRules ?? []), ...(project?.skillConfigRules ?? [])]),
+	skillConfigDiagnostics: Object.freeze([...(user?.skillConfigDiagnostics ?? []), ...(project?.skillConfigDiagnostics ?? [])]),
 });
 
 export const projectAgentConfigProjection = (value: unknown): ParsedAgentConfig => {
 	if (!value || typeof value !== 'object' || Array.isArray(value)) return Object.freeze({});
 	const record = value as Record<string, unknown>;
+	const rules: SkillConfigRule[] = []; const diagnostics: SkillConfigDiagnostic[] = [];
+	const skillTablePresent = record.skills !== undefined;
+	const skillTable = record.skills && typeof record.skills === 'object' && !Array.isArray(record.skills) ? record.skills as Record<string, unknown> : undefined;
+	if (skillTablePresent && !skillTable) diagnostics.push(Object.freeze({ source: 'user', index: -1, reason: 'skills_not_object', code: 'skill_config_invalid' }));
+	const rawConfig = skillTable?.config;
+	if (rawConfig !== undefined && !Array.isArray(rawConfig)) diagnostics.push(Object.freeze({ source: 'user', index: -1, reason: 'config_not_array', code: 'skill_config_invalid' }));
+	if (Array.isArray(rawConfig)) for (const [index, item] of rawConfig.entries()) {
+		const entry = item && typeof item === 'object' && !Array.isArray(item) ? item as Record<string, unknown> : undefined;
+		const keys = entry ? Object.keys(entry) : []; const name = typeof entry?.name === 'string' ? entry.name.trim() : undefined; const path = typeof entry?.path === 'string' ? entry.path : undefined;
+		const diagnostic = (reason: SkillConfigDiagnostic['reason']) => diagnostics.push(Object.freeze({ source: 'user', index, reason, code: 'skill_config_invalid' }));
+		if (!entry) { diagnostic('entry_not_object'); continue; }
+		if (keys.some(key => !['name', 'path', 'enabled'].includes(key))) { diagnostic('unknown_key'); continue; }
+		if (typeof entry.enabled !== 'boolean') { diagnostic('enabled_invalid'); continue; }
+		if (!!name === !!path) { diagnostic('selector_xor'); continue; }
+		if (name !== undefined && !name) { diagnostic('name_empty'); continue; }
+		if (path !== undefined && (!/^(?:[A-Za-z]:[\\/]|\\\\|\/)/.test(path) || !/SKILL\.md$/i.test(path))) { diagnostic('path_not_absolute_skill'); continue; }
+		rules.push(Object.freeze({ selector: Object.freeze(name ? { kind: 'name' as const, value: name } : { kind: 'path' as const, value: path! }), enabled: entry.enabled, source: 'user' }));
+	}
 	return Object.freeze({
 		developerInstructions: typeof record.developer_instructions === 'string' ? record.developer_instructions : undefined,
 		projectDocMaxBytes: projectDocMaxBytes(record.project_doc_max_bytes),
+		...(skillTablePresent ? { skillConfigRules: Object.freeze(rules), skillConfigDiagnostics: Object.freeze(diagnostics), skillsConfigPresent: true } : {}),
 	});
 };
 
@@ -112,6 +137,7 @@ export const parseAgentConfigSource = (
 		projectedKeys: Object.freeze([
 			...(projected?.developerInstructions !== undefined ? ['developer_instructions'] as const : []),
 			...(projected?.projectDocMaxBytes !== undefined ? ['project_doc_max_bytes'] as const : []),
+			...(projected?.skillsConfigPresent ? ['skills.config'] as const : []),
 		]),
 	});
 	if (outcome.status !== 'bytes') return Object.freeze({ provenance: provenance(outcome.status) });
@@ -123,7 +149,8 @@ export const parseAgentConfigSource = (
 		return Object.freeze({ provenance: provenance('invalid_utf8') });
 	}
 	try {
-		const projected = projectAgentConfigProjection(parseToml(text));
+		const base = projectAgentConfigProjection(parseToml(text));
+		const projected: ParsedAgentConfig = Object.freeze({ ...base, ...(base.skillsConfigPresent ? { skillConfigRules: Object.freeze((base.skillConfigRules ?? []).map(rule => Object.freeze({ ...rule, source: scope }))), skillConfigDiagnostics: Object.freeze((base.skillConfigDiagnostics ?? []).map(diagnostic => Object.freeze({ ...diagnostic, source: scope }))) } : {}) });
 		return Object.freeze({ projected, provenance: provenance('loaded', projected) });
 	}
 	catch {
@@ -184,6 +211,7 @@ export class AgentInstructionTaskSession {
 		this.configPromise ??= this.loadConfig();
 		return this.configPromise.then(config => this.loadTurn(config));
 	}
+	getConfig(): Promise<AgentInstructionsConfig> { this.configPromise ??= this.loadConfig(); return this.configPromise; }
 }
 
 export const inheritAgentInstructionTurnSnapshot = (snapshot: AgentInstructionTurnSnapshot): AgentInstructionTurnSnapshot => snapshot;
@@ -191,7 +219,7 @@ export const inheritAgentInstructionTurnSnapshot = (snapshot: AgentInstructionTu
 export const reviveAgentInstructionTurnSnapshot = (value: unknown): AgentInstructionTurnSnapshot | undefined => {
 	const object = (candidate: unknown): Record<string, unknown> | undefined =>
 		candidate && typeof candidate === 'object' && !Array.isArray(candidate) ? candidate as Record<string, unknown> : undefined;
-	const sourceKeys = new Set(['developer_instructions', 'project_doc_max_bytes']);
+	const sourceKeys = new Set(['developer_instructions', 'project_doc_max_bytes', 'skills.config']);
 	const configStatuses = new Set(['loaded', 'missing', 'unreadable', 'invalid_utf8', 'malformed']);
 	const skipReasons = new Set(['missing', 'empty', 'whitespace', 'unreadable', 'invalid_utf8', 'budget']);
 	const uri = (candidate: unknown): string | undefined => {
@@ -230,6 +258,8 @@ export const reviveAgentInstructionTurnSnapshot = (value: unknown): AgentInstruc
 		|| config.ownerProjectRoot !== owner
 		|| config.runCwd !== cwd
 		|| !Array.isArray(config.configSources)
+		|| !Array.isArray(config.skillConfigRules)
+		|| !Array.isArray(config.skillConfigDiagnostics)
 		|| !Array.isArray(root.provenance)
 	) return undefined;
 
@@ -250,7 +280,7 @@ export const reviveAgentInstructionTurnSnapshot = (value: unknown): AgentInstruc
 			uri: source.uri as string,
 			scope: source.scope as 'user' | 'project',
 			status: source.status as AgentConfigSourceProvenance['status'],
-			projectedKeys: Object.freeze([...source.projectedKeys] as ('developer_instructions' | 'project_doc_max_bytes')[]),
+			projectedKeys: Object.freeze([...source.projectedKeys] as ('developer_instructions' | 'project_doc_max_bytes' | 'skills.config')[]),
 		}));
 	}
 	if (
@@ -302,6 +332,22 @@ export const reviveAgentInstructionTurnSnapshot = (value: unknown): AgentInstruc
 		|| (config.projectDocMaxBytesSource === 'default' && config.projectDocMaxBytes !== DEFAULT_PROJECT_DOC_MAX_BYTES)
 	) return undefined;
 
+	const reviveRule = (raw: unknown): SkillConfigRule | undefined => {
+		const rule = object(raw); const selector = object(rule?.selector);
+		if (!rule || !selector || Object.keys(rule).length !== 3 || Object.keys(selector).length !== 2 || typeof rule.enabled !== 'boolean' || !['user', 'project'].includes(rule.source as string) || !['name', 'path'].includes(selector.kind as string) || typeof selector.value !== 'string' || !selector.value) return undefined;
+		if (selector.kind === 'name' && selector.value !== selector.value.trim()) return undefined;
+		if (selector.kind === 'path' && (!/^(?:[A-Za-z]:[\\/]|\\\\|\/)/.test(selector.value as string) || !/SKILL\.md$/i.test(selector.value as string))) return undefined;
+		return Object.freeze({ selector: Object.freeze({ kind: selector.kind as 'name' | 'path', value: selector.value as string }), enabled: rule.enabled, source: rule.source as 'user' | 'project' });
+	};
+	const reviveDiagnostic = (raw: unknown): SkillConfigDiagnostic | undefined => {
+		const diagnostic = object(raw); const reasons = new Set(['skills_not_object', 'config_not_array', 'entry_not_object', 'unknown_key', 'enabled_invalid', 'selector_xor', 'name_empty', 'path_not_absolute_skill']);
+		if (!diagnostic || Object.keys(diagnostic).length !== 4 || !['user', 'project'].includes(diagnostic.source as string) || !Number.isSafeInteger(diagnostic.index) || (diagnostic.index as number) < -1 || !reasons.has(diagnostic.reason as string) || diagnostic.code !== 'skill_config_invalid') return undefined;
+		return Object.freeze({ source: diagnostic.source as 'user' | 'project', index: diagnostic.index as number, reason: diagnostic.reason as SkillConfigDiagnostic['reason'], code: 'skill_config_invalid' });
+	};
+	const rules = config.skillConfigRules.map(reviveRule); const diagnostics = config.skillConfigDiagnostics.map(reviveDiagnostic);
+	if (rules.some(rule => !rule) || diagnostics.some(diagnostic => !diagnostic)) return undefined;
+	const loadedSkillsConfig = (scope: 'user' | 'project') => revivedConfigSources.some(source => source.scope === scope && source.status === 'loaded' && source.projectedKeys.includes('skills.config'));
+	if ((rules as (SkillConfigRule | undefined)[]).some(rule => !loadedSkillsConfig(rule!.source)) || (diagnostics as (SkillConfigDiagnostic | undefined)[]).some(diagnostic => !loadedSkillsConfig(diagnostic!.source))) return undefined;
 	const revivedConfig: AgentInstructionsConfig = Object.freeze({
 		developerInstructions: config.developerInstructions as string,
 		projectDocMaxBytes: config.projectDocMaxBytes as number,
@@ -310,6 +356,8 @@ export const reviveAgentInstructionTurnSnapshot = (value: unknown): AgentInstruc
 		configSources: Object.freeze(revivedConfigSources),
 		ownerProjectRoot: owner as string | undefined,
 		runCwd: cwd as string | undefined,
+		skillConfigRules: Object.freeze(rules as SkillConfigRule[]),
+		skillConfigDiagnostics: Object.freeze(diagnostics as SkillConfigDiagnostic[]),
 	});
 	return Object.freeze({
 		revision: root.revision,
@@ -384,7 +432,7 @@ export const stableAgentInstructionRevision = (config: AgentInstructionsConfig, 
 	const add = (value: string) => {
 		for (const byte of encoder.encode(value)) hash = Math.imul(hash ^ byte, 16777619);
 	};
-	add(`${config.developerInstructions}\0${config.projectDocMaxBytes}\0${config.developerInstructionsSource}\0${config.projectDocMaxBytesSource}\0${config.ownerProjectRoot ?? ''}\0${config.runCwd ?? ''}`);
+	add(`${config.developerInstructions}\0${config.projectDocMaxBytes}\0${config.developerInstructionsSource}\0${config.projectDocMaxBytesSource}\0${config.ownerProjectRoot ?? ''}\0${config.runCwd ?? ''}\0${config.skillConfigRules.map(rule => `${rule.source}:${rule.selector.kind}:${rule.selector.value}:${rule.enabled}`).join(',')}\0${config.skillConfigDiagnostics.map(diagnostic => `${diagnostic.source}:${diagnostic.index}:${diagnostic.reason}:${diagnostic.code}`).join(',')}`);
 	for (const source of config.configSources) add(`\0${source.uri}\0${source.scope}\0${source.status}\0${source.projectedKeys.join(',')}`);
 	for (const candidate of candidates) {
 		add(`\0${candidate.uri}\0${candidate.outcome.status}`);

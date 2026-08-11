@@ -32,6 +32,7 @@ import './media/void.css'
 import './voidUpdateActions.js'
 
 import './agentInstructionsService.js'
+import './agentSkillsService.js'
 
 // tools
 import './toolsService.js'

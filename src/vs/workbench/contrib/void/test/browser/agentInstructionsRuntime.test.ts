@@ -2,12 +2,23 @@ import assert from 'assert';
 import { ChatThreadService } from '../../browser/chatThreadService.js';
 import { ConvertToLLMMessageService } from '../../browser/convertToLLMMessageService.js';
 import { projectAgentConfig, resolveAgentInstructions, stableAgentInstructionRevision } from '../../common/agentInstructions.js';
+import { createAgentRuntimeTurnSnapshot, createSkillCatalog, skillAdvertisement } from '../../common/agentSkills.js';
+import { getIsReasoningEnabledState, getModelCapabilities, getReservedOutputTokenSpace } from '../../common/modelCapabilities.js';
 
 const snapshot = () => {
 	const config = projectAgentConfig({ developerInstructions: 'developer instruction', projectDocMaxBytes: 100 }, undefined, [{ uri: 'file:///home/.codex/config.toml', scope: 'user', status: 'loaded', projectedKeys: ['developer_instructions', 'project_doc_max_bytes'] }], 'file:///workspace', 'file:///workspace');
 	const candidates = [{ uri: 'file:///workspace/AGENTS.md', outcome: Object.freeze({ status: 'bytes' as const, bytes: new TextEncoder().encode('AGENTS instruction') }) }];
 	return resolveAgentInstructions(config, candidates, stableAgentInstructionRevision(config, candidates));
 };
+const runtimeSnapshot = (trusted = true) => {
+	const catalog = createSkillCatalog([]);
+	return createAgentRuntimeTurnSnapshot(snapshot(), catalog, skillAdvertisement(catalog, undefined), [], { hasModel: false }, trusted);
+};
+const projectRuntimeSnapshot = () => { const catalog = createSkillCatalog([{ source: 'repository' as const, rank: 0, root: 'file:///workspace', skillRoot: 'file:///workspace/.agents/skills/demo', directoryName: 'demo', bytes: new TextEncoder().encode('---\nname: demo\ndescription: demo\n---\nbody') }]); return createAgentRuntimeTurnSnapshot(snapshot(), catalog, skillAdvertisement(catalog, undefined), [], { hasModel: false }, true); };
+const approvalModel = { providerName: 'openAI' as const, modelName: 'gpt-4.1' };
+const approvalOptions = {};
+const approvalOverrides = { openAI: { 'gpt-4.1': {} } } as never;
+const approvalRuntimeSnapshot = () => { const catalog = createSkillCatalog([]); const contextWindow = getModelCapabilities(approvalModel.providerName, approvalModel.modelName, approvalOverrides).contextWindow; const reserve = Math.max(contextWindow / 2, getReservedOutputTokenSpace(approvalModel.providerName, approvalModel.modelName, { isReasoningEnabled: getIsReasoningEnabledState('Chat', approvalModel.providerName, approvalModel.modelName, approvalOptions, approvalOverrides), overridesOfModel: approvalOverrides }) ?? 4096); return createAgentRuntimeTurnSnapshot(snapshot(), catalog, skillAdvertisement(catalog, contextWindow), [], { hasModel: true, ...approvalModel, contextWindow, reservedOutputTokens: reserve, modelSelectionOptions: approvalOptions, selectedModelOverrides: {} }, true); };
 
 const pendingTool = () => ({ role: 'tool', type: 'tool_request', name: 'read_file', params: {}, content: 'approval requested', result: null, id: 'tool-1', rawParams: {}, mcpServerName: undefined });
 
@@ -22,17 +33,21 @@ const rememberInstructionTurn = runtimeHelpers._rememberInstructionTurn;
 
 suite('AGENTS instruction runtime paths', () => {
 	test('restores a persisted snapshot and resumes approval with that exact revived turn', () => {
-		const persisted = JSON.parse(JSON.stringify(snapshot()));
+		const persisted = JSON.parse(JSON.stringify(approvalRuntimeSnapshot()));
 		const thread = { messages: [pendingTool()], state: { stagingSelections: [], focusedMessageIdx: undefined, linksOfMessageIdx: {}, agentInstructionTurnSnapshot: persisted }, filesWithUserChanges: new Set<string>() };
 		let resumed: unknown;
 		const receiver = {
+			_purgeInstructionTurn: purgeInstructionTurn,
 			_instructionTurnOfThread: new Map<string, unknown>(),
 			_workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: { toString: () => 'file:///workspace' } }] }) },
 			_workspaceTrustManagementService: { isWorkspaceTrusted: () => true },
 			state: { allThreads: { task: thread } },
 			_runChatAgent(options: unknown) { resumed = options; return Promise.resolve(); },
+			_updateLatestTool() { },
+			_setStreamState() { },
 			_wrapRunAgentToNotify() { },
-			_currentModelSelectionProps() { return {}; },
+			_settingsService: { state: { overridesOfModel: approvalOverrides } },
+			_currentModelSelectionProps() { return { modelSelection: approvalModel, modelSelectionOptions: approvalOptions }; },
 		};
 		const restore = (ChatThreadService.prototype as unknown as { _restoreInstructionTurns: (threads: unknown) => void })._restoreInstructionTurns;
 		restore.call(receiver, receiver.state.allThreads);
@@ -40,7 +55,7 @@ suite('AGENTS instruction runtime paths', () => {
 		ChatThreadService.prototype.approveLatestToolRequest.call(receiver as never, 'task');
 		assert.notStrictEqual(revived, persisted);
 		assert.strictEqual((resumed as { instructionSnapshot: unknown }).instructionSnapshot, revived);
-		assert.strictEqual(((resumed as { instructionSnapshot: { revision: string } }).instructionSnapshot).revision, snapshot().revision);
+		assert.strictEqual(((resumed as { instructionSnapshot: { revision: string } }).instructionSnapshot).revision, approvalRuntimeSnapshot().revision);
 	});
 
 	test('fails closed when a pending approval lacks or has a corrupt persisted snapshot', () => {
@@ -71,7 +86,7 @@ suite('AGENTS instruction runtime paths', () => {
 	});
 
 	test('purges a cross-workspace snapshot and fails its pending approval closed', () => {
-		const thread = { messages: [pendingTool()], state: { stagingSelections: [], focusedMessageIdx: undefined, linksOfMessageIdx: {}, agentInstructionTurnSnapshot: JSON.parse(JSON.stringify(snapshot())) }, filesWithUserChanges: new Set<string>() };
+		const thread = { messages: [pendingTool()], state: { stagingSelections: [], focusedMessageIdx: undefined, linksOfMessageIdx: {}, agentInstructionTurnSnapshot: JSON.parse(JSON.stringify(runtimeSnapshot(false))) }, filesWithUserChanges: new Set<string>() };
 		let runs = 0;
 		let rejected: unknown;
 		let cleared = false;
@@ -90,6 +105,7 @@ suite('AGENTS instruction runtime paths', () => {
 		const restore = (ChatThreadService.prototype as unknown as { _restoreInstructionTurns: (threads: unknown) => void })._restoreInstructionTurns;
 		restore.call(receiver, receiver.state.allThreads);
 		assert.strictEqual(thread.state.agentInstructionTurnSnapshot, undefined);
+		assert.strictEqual(thread.messages.length, 1);
 		assert.strictEqual(receiver._instructionTurnOfThread.has('task'), false);
 		ChatThreadService.prototype.approveLatestToolRequest.call(receiver as never, 'task');
 		assert.strictEqual(runs, 0);
@@ -98,9 +114,7 @@ suite('AGENTS instruction runtime paths', () => {
 	});
 
 	test('purges trusted project snapshot after workspace trust is downgraded and rejects its approval', () => {
-		const project = projectAgentConfig(undefined, { developerInstructions: 'project' }, [{ uri: 'file:///workspace/.codex/config.toml', scope: 'project', status: 'loaded', projectedKeys: ['developer_instructions'] }], 'file:///workspace', 'file:///workspace');
-		const candidate = [{ uri: 'file:///workspace/AGENTS.md', outcome: Object.freeze({ status: 'bytes' as const, bytes: new TextEncoder().encode('AGENTS') }) }];
-		const persisted = JSON.parse(JSON.stringify(resolveAgentInstructions(project, candidate, stableAgentInstructionRevision(project, candidate))));
+		const persisted = JSON.parse(JSON.stringify(projectRuntimeSnapshot()));
 		const thread = { messages: [pendingTool()], state: { stagingSelections: [], focusedMessageIdx: undefined, linksOfMessageIdx: {}, agentInstructionTurnSnapshot: persisted }, filesWithUserChanges: new Set<string>() };
 		let runCalls = 0;
 		let rejected: unknown;
@@ -224,7 +238,8 @@ suite('AGENTS instruction runtime paths', () => {
 		);
 		(converter as unknown as { _generateChatMessagesSystemMessage: () => Promise<string> })._generateChatMessagesSystemMessage = async () => 'generated internal system';
 		const modelSelection = { providerName: 'openAI', modelName: 'gpt-4.1' };
-		const chat = await converter.prepareLLMChatMessages({ chatMessages: [{ role: 'user', content: 'hello' }] as never, chatMode: 'agent' as never, modelSelection: modelSelection as never, instructionSnapshot: snapshot() });
+		const legacy = Object.assign(Object.create({ schemaVersion: 2 }), snapshot());
+		const chat = await converter.prepareLLMChatMessages({ chatMessages: [{ role: 'user', content: 'hello' }] as never, chatMode: 'agent' as never, modelSelection: modelSelection as never, instructionSnapshot: legacy });
 		const simple = converter.prepareLLMSimpleMessages({ simpleMessages: [{ role: 'user', content: 'simple user' }] as never, systemMessage: 'simple system', modelSelection: modelSelection as never, featureName: 'Ctrl+K' as never });
 		const fim = converter.prepareFIMMessage({ messages: { prefix: 'prefix', suffix: 'suffix', stopTokens: ['stop'] } });
 		const developerMessages = chat.messages.slice(0, 2).map(message => {
@@ -240,7 +255,7 @@ suite('AGENTS instruction runtime paths', () => {
 	});
 
 	test('keeps one immutable instruction snapshot through retry and tool-loop sends', async () => {
-		const instructionSnapshot = Object.freeze(snapshot());
+		const instructionSnapshot = Object.freeze(runtimeSnapshot());
 		const thread = { messages: [{ role: 'user', content: 'start' }] as unknown[], state: {}, filesWithUserChanges: new Set<string>() };
 		const preparedMessages: unknown[][] = [];
 		const preparedSnapshots: unknown[] = [];

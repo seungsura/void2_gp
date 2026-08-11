@@ -16,6 +16,7 @@ import { ITerminalToolService } from './terminalToolService.js';
 import { ToolName } from '../common/toolsServiceTypes.js';
 import { IMCPService } from '../common/mcpService.js';
 import { AgentInstructionTurnSnapshot, assembleAgentInstructionText, routeAgentInstructionAuthority } from '../common/agentInstructions.js';
+import { AgentRuntimeTurnSnapshot, assembleProtectedAgentAuthority } from '../common/agentSkills.js';
 
 export const EMPTY_MESSAGE = '(empty message)'
 
@@ -38,7 +39,7 @@ type SimpleLLMMessage = {
 
 
 
-const CHARS_PER_TOKEN = 4 // assume abysmal chars per token
+export const CHARS_PER_TOKEN = 4 // assume abysmal chars per token
 const TRIM_TO_LEN = 120
 
 // This deliberately mirrors the conservative character estimator used by prepareMessages.
@@ -243,6 +244,13 @@ const prepareMessages_XML_tools = (messages: SimpleLLMMessage[], supportsAnthrop
 
 // --- CHAT ---
 
+export const trimProtectedMutableContent = (content: string, targetLength: number): string => {
+	const target = Math.max(0, Math.floor(targetLength))
+	if (content.length <= target) return content
+	if (target <= '...'.length) return content.slice(0, target)
+	return content.slice(0, target - '...'.length).trim() + '...'
+}
+
 const prepareOpenAIOrAnthropicMessages = ({
 	messages: messages_,
 	systemMessage,
@@ -252,6 +260,7 @@ const prepareOpenAIOrAnthropicMessages = ({
 	supportsAnthropicReasoning,
 	contextWindow,
 	reservedOutputTokenSpace,
+	protectedSkillAuthority = false,
 }: {
 	messages: SimpleLLMMessage[],
 	systemMessage: string,
@@ -261,23 +270,24 @@ const prepareOpenAIOrAnthropicMessages = ({
 	supportsAnthropicReasoning: boolean,
 	contextWindow: number,
 	reservedOutputTokenSpace: number | null | undefined,
+	protectedSkillAuthority?: boolean,
 }): { messages: AnthropicOrOpenAILLMMessage[], separateSystemMessage: string | undefined } => {
 
-	reservedOutputTokenSpace = Math.max(
+	reservedOutputTokenSpace = protectedSkillAuthority ? reservedOutputTokenSpace ?? 0 : Math.max(
 		contextWindow * 1 / 2, // reserve at least 1/4 of the token window length
 		reservedOutputTokenSpace ?? 4_096 // defaults to 4096
 	)
-	let messages: (SimpleLLMMessage | { role: 'system', content: string })[] = deepClone(messages_)
+	let messages: (SimpleLLMMessage | { role: 'system', content: string; protectedSkillAuthority?: boolean })[] = deepClone(messages_)
 
 	// ================ system message ================
 	// A COMPLETE HACK: last message is system message for context purposes
 
 	// Both protected envelope entries participate in context trimming before conversion.
 	messages.unshift({ role: 'system', content: systemMessage })
-	if (agentInstructions) messages.unshift({ role: 'system', content: agentInstructions })
+	if (agentInstructions) messages.unshift({ role: 'system', content: agentInstructions, protectedSkillAuthority: true })
 
 	// ================ trim ================
-	messages = messages.map(m => ({ ...m, content: m.role !== 'tool' ? m.content.trim() : m.content }))
+	messages = messages.map(m => ({ ...m, content: m.role !== 'tool' && !('protectedSkillAuthority' in m && m.protectedSkillAuthority) ? m.content.trim() : m.content }))
 
 	type MesType = (typeof messages)[0]
 
@@ -316,6 +326,7 @@ const prepareOpenAIOrAnthropicMessages = ({
 		let largestWeight = -Infinity
 		for (let i = 0; i < messages.length; i += 1) {
 			const m = messages[i]
+			if (protectedSkillAuthority && 'protectedSkillAuthority' in m && m.protectedSkillAuthority) continue
 			const w = weight(m, messages_, i)
 			if (w > largestWeight) {
 				largestWeight = w
@@ -327,10 +338,15 @@ const prepareOpenAIOrAnthropicMessages = ({
 
 	let totalLen = 0
 	for (const m of messages) { totalLen += m.content.length }
-	const charsNeedToTrim = totalLen - Math.max(
+	const exactInputBudget = Math.max(0, (contextWindow - reservedOutputTokenSpace) * CHARS_PER_TOKEN)
+	const protectedLength = protectedSkillAuthority ? (messages.find(message => 'protectedSkillAuthority' in message && message.protectedSkillAuthority)?.content.length ?? 0) : 0
+	if (protectedSkillAuthority && protectedLength > exactInputBudget) throw new Error('skill_context_admission_failed')
+	const mutableBudget = protectedSkillAuthority ? exactInputBudget - protectedLength : 0
+	const mutableLength = protectedSkillAuthority ? totalLen - protectedLength : totalLen
+	const charsNeedToTrim = (protectedSkillAuthority ? mutableLength - mutableBudget : totalLen - Math.max(
 		(contextWindow - reservedOutputTokenSpace) * CHARS_PER_TOKEN, // can be 0, in which case charsNeedToTrim=everything, bad
 		5_000 // ensure we don't trim at least 5k chars (just a random small value)
-	)
+	))
 
 
 	// <----------------------------------------->
@@ -343,21 +359,28 @@ const prepareOpenAIOrAnthropicMessages = ({
 
 	while (remainingCharsToTrim > 0) {
 		i += 1
-		if (i > 100) break
+		if (!protectedSkillAuthority && i > 100) break
 
 		const trimIdx = _findLargestByWeight(messages)
+		if (trimIdx < 0) throw new Error('skill_context_admission_failed')
 		const m = messages[trimIdx]
+		if ('protectedSkillAuthority' in m && m.protectedSkillAuthority) { alreadyTrimmedIdxes.add(trimIdx); continue }
 
 		// if can finish here, do
-		const numCharsWillTrim = m.content.length - TRIM_TO_LEN
+		const minimumLength = protectedSkillAuthority ? 0 : TRIM_TO_LEN
+		const numCharsWillTrim = m.content.length - minimumLength
+		if (numCharsWillTrim <= 0) throw new Error('skill_context_admission_failed')
 		if (numCharsWillTrim > remainingCharsToTrim) {
-			// trim remainingCharsToTrim + '...'.length chars
-			m.content = m.content.slice(0, m.content.length - remainingCharsToTrim - '...'.length).trim() + '...'
+			const targetLength = m.content.length - remainingCharsToTrim
+			m.content = protectedSkillAuthority
+				? trimProtectedMutableContent(m.content, targetLength)
+				// Preserve the legacy non-Skills trimming behavior outside protected Chat admission.
+				: m.content.slice(0, targetLength - '...'.length).trim() + '...'
 			break
 		}
 
 		remainingCharsToTrim -= numCharsWillTrim
-		m.content = m.content.substring(0, TRIM_TO_LEN - '...'.length) + '...'
+		m.content = minimumLength ? m.content.substring(0, minimumLength - '...'.length) + '...' : ''
 		alreadyTrimmedIdxes.add(trimIdx)
 	}
 
@@ -503,6 +526,7 @@ const prepareMessages = (params: {
 	supportsAnthropicReasoning: boolean,
 	contextWindow: number,
 	reservedOutputTokenSpace: number | null | undefined,
+	protectedSkillAuthority?: boolean,
 	providerName: ProviderName
 }): { messages: LLMChatMessage[], separateSystemMessage: string | undefined } => {
 
@@ -525,7 +549,7 @@ const prepareMessages = (params: {
 export interface IConvertToLLMMessageService {
 	readonly _serviceBrand: undefined;
 	prepareLLMSimpleMessages: (opts: { simpleMessages: SimpleLLMMessage[], systemMessage: string, modelSelection: ModelSelection | null, featureName: FeatureName }) => { messages: LLMChatMessage[], separateSystemMessage: string | undefined }
-	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null, instructionSnapshot: AgentInstructionTurnSnapshot }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined }>
+	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null, instructionSnapshot: AgentRuntimeTurnSnapshot | AgentInstructionTurnSnapshot }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined }>
 	prepareFIMMessage(opts: { messages: LLMFIMMessage, }): { prefix: string, suffix: string, stopTokens: string[] }
 }
 
@@ -637,24 +661,27 @@ export class ConvertToLLMMessageService extends Disposable implements IConvertTo
 	}
 	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection, instructionSnapshot }) => {
 		if (modelSelection === null) return { messages: [], separateSystemMessage: undefined }
-
-		const { overridesOfModel } = this.voidSettingsService.state
+		const runtimeCandidate = instructionSnapshot as unknown as Record<string, unknown>
+		const runtime = Object.prototype.hasOwnProperty.call(runtimeCandidate, 'schemaVersion') && runtimeCandidate.schemaVersion === 2 ? instructionSnapshot as AgentRuntimeTurnSnapshot : undefined
+		if (runtime && (!runtime.model.hasModel || modelSelection.providerName !== runtime.model.providerName || modelSelection.modelName !== runtime.model.modelName)) throw new Error('skill_runtime_model_mismatch')
+		const overridesOfModel = runtime ? { [modelSelection.providerName]: { [modelSelection.modelName]: runtime.model.hasModel ? runtime.model.selectedModelOverrides : {} } } as never : this.voidSettingsService.state.overridesOfModel
 
 		const { providerName, modelName } = modelSelection
 		const {
 			specialToolFormat,
-			contextWindow,
+			contextWindow: liveContextWindow,
 			supportsSystemMessage,
 		} = getModelCapabilities(providerName, modelName, overridesOfModel)
 
 		const fullSystemMessage = await this._generateChatMessagesSystemMessage(chatMode, specialToolFormat)
 		const systemMessage = fullSystemMessage;
 
-		const modelSelectionOptions = this.voidSettingsService.state.optionsOfModelSelection['Chat'][modelSelection.providerName]?.[modelSelection.modelName]
+		const modelSelectionOptions = runtime?.model.hasModel ? runtime.model.modelSelectionOptions : this.voidSettingsService.state.optionsOfModelSelection['Chat'][modelSelection.providerName]?.[modelSelection.modelName]
 
-		const agentInstructions = assembleAgentInstructionText(instructionSnapshot);
+		const agentInstructions = runtime ? assembleProtectedAgentAuthority(runtime) : assembleAgentInstructionText(instructionSnapshot as AgentInstructionTurnSnapshot);
 		const isReasoningEnabled = getIsReasoningEnabledState('Chat', providerName, modelName, modelSelectionOptions, overridesOfModel)
-		const reservedOutputTokenSpace = getReservedOutputTokenSpace(providerName, modelName, { isReasoningEnabled, overridesOfModel })
+		const contextWindow = runtime?.model.hasModel ? runtime.model.contextWindow : liveContextWindow
+		const reservedOutputTokenSpace = runtime?.model.hasModel ? runtime.model.reservedOutputTokens : getReservedOutputTokenSpace(providerName, modelName, { isReasoningEnabled, overridesOfModel })
 		const llmMessages = this._chatMessagesToSimpleMessages(chatMessages)
 
 		const { messages, separateSystemMessage } = prepareMessages({
@@ -666,6 +693,7 @@ export class ConvertToLLMMessageService extends Disposable implements IConvertTo
 			supportsAnthropicReasoning: providerName === 'anthropic',
 			contextWindow,
 			reservedOutputTokenSpace,
+			protectedSkillAuthority: !!runtime,
 			providerName,
 		})
 		return { messages, separateSystemMessage };

@@ -166,12 +166,12 @@ function Invoke-ReleaseCommand {
     }
     if($null -ne $summaryException){throw [InvalidOperationException]::new(("Release command summary failed: $Name; $($summaryException.Message)"),$summaryException)};if($null -ne $loggingException){throw [InvalidOperationException]::new(("Release command logging failed: $Name; $($loggingException.Message)"),$loggingException)};if($null -ne $invocationException){throw [InvalidOperationException]::new(("Release command invocation failed: $Name; $($invocationException.Message)"),$invocationException)};if($record.exitCode -ne 0 -and -not $AllowNonZero){throw "Release command failed: $Name exit $($record.exitCode)"};[pscustomobject]$record
 }
-function Assert-FocusedBrowserPassCount {
+function Assert-FocusedExactPassCount {
     param($Record,[int]$Expected)
-    $text=Read-Utf8NoBomText $Record.log
-    if($text -match '(?im)\b(?:0|[1-9][0-9]*)\s+failing\b' -or $text -match '(?im)^\s*BAD\b' -or $text -match '(?im)Failed to resolve module specifier|module load|import.*error'){throw "Focused browser test reported failure: $($Record.name)"}
-    $matches=@([regex]::Matches($text,'(?im)^\s*([0-9]+)\s+passing\b'))
-    if($matches.Count -ne 1 -or [int]$matches[0].Groups[1].Value -ne $Expected){throw "Focused browser pass count mismatch for $($Record.name): expected $Expected"}
+    $text=Read-Utf8NoBomText $Record.log;$text=[regex]::Replace($text,'\x1B\[[0-?]*[ -/]*[@-~]','');$text=[regex]::Replace($text,'\x1B\][^\x07]*(?:\x07|\x1B\\)','');$text=[regex]::Replace($text,'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]','')
+    if($text -match '(?im)\b(?:0|[1-9][0-9]*)\s+failing\b' -or $text -match '(?im)^\s*BAD\b' -or $text -match '(?im)Failed to resolve module specifier|module load|import.*error'){throw "Focused test reported failure: $($Record.name)"}
+    $matches=@([regex]::Matches($text,'(?im)^\s*([0-9]+)\s+passing(?:\s+\([^)]+\))?\s*$'))
+    if($matches.Count -ne 1 -or [int]$matches[0].Groups[1].Value -ne $Expected){throw "Focused pass count mismatch for $($Record.name): expected $Expected"}
 }
 function Get-ExpectedPreHelperFailure {
     param($Record,$Summary,[string]$SummaryPath)
@@ -309,16 +309,22 @@ function Get-CanonicalBuildAndTestCommands {
         'focused-agents-instruction-resolver'='src/vs/workbench/contrib/void/test/common/agentsInstructionResolver.test.ts'
         'focused-agents-instruction-lifecycle'='src/vs/workbench/contrib/void/test/common/agentsInstructionLifecycle.test.ts'
         'focused-agents-prompt-assembly'='src/vs/workbench/contrib/void/test/common/agentsPromptAssembly.test.ts'
+        'focused-agent-skills'='src/vs/workbench/contrib/void/test/common/agentSkills.test.ts'
+        'focused-agent-skill-resources'='src/vs/workbench/contrib/void/test/common/agentSkillResources.test.ts'
+        'focused-agent-skill-typed-selector'='src/vs/workbench/contrib/void/test/common/agentSkillTypedSelector.test.ts'
+        'focused-agent-skills-build-validation'='src/vs/workbench/contrib/void/test/common/agentSkillsBuildValidation.test.ts'
     }
     foreach($name in $focused.Keys){[void]$commands.Add([pscustomobject]@{name=$name;file='npm';args=@('run','test-node','--','--run',$focused[$name]);allowNonZero=$false;expectedPreHelper=$false})}
     [void]$commands.Add([pscustomobject]@{name='focused-autocomplete-runtime-admission';file='npm';args=@('run','test-browser-no-install','--','--browser','chromium','--sequential','--run','src/vs/workbench/contrib/void/test/browser/autocompleteRuntimeAdmission.test.ts');allowNonZero=$false;expectedPreHelper=$false})
     [void]$commands.Add([pscustomobject]@{name='focused-agents-instruction-runtime';file='npm';args=@('run','test-browser-no-install','--','--browser','chromium','--sequential','--run','src/vs/workbench/contrib/void/test/browser/agentInstructionsRuntime.test.ts');allowNonZero=$false;expectedPreHelper=$false})
+    [void]$commands.Add([pscustomobject]@{name='focused-agent-skills-service';file='npm';args=@('run','test-browser-no-install','--','--browser','chromium','--sequential','--run','src/vs/workbench/contrib/void/test/browser/agentSkillsService.test.ts');allowNonZero=$false;expectedPreHelper=$false})
+    [void]$commands.Add([pscustomobject]@{name='focused-agent-skills-runtime';file='npm';args=@('run','test-browser-no-install','--','--browser','chromium','--sequential','--run','src/vs/workbench/contrib/void/test/browser/agentSkillsRuntime.test.ts');allowNonZero=$false;expectedPreHelper=$false})
     [void]$commands.Add([pscustomobject]@{name='buildreact';file='npm';args=@('run','buildreact');allowNonZero=$false;expectedPreHelper=$false});[void]$commands.Add([pscustomobject]@{name='gulp-win32';file='npm';args=@('run','gulp','--','vscode-win32-x64');allowNonZero=$false;expectedPreHelper=$false});@($commands)
 }
 function Invoke-CanonicalBuildAndTestGates {
     param($Context)
-    $null=. (Join-Path $PSScriptRoot 'activate-build-env.ps1');$Context.summary.environment=Get-BuildEnvironment;$commands=@(Get-CanonicalBuildAndTestCommands);$Context.summary.commandPlan=@($commands|ForEach-Object{[pscustomobject]@{name=$_.name;file=$_.file;arguments=@($_.args);allowNonZero=[bool]$_.allowNonZero;expectedPreHelper=[bool]$_.expectedPreHelper}});Save-ReleaseSummary $Context.summary $Context.summaryPath
-    foreach($command in $commands){Assert-CanonicalCommandArguments $command.file $command.args;$record=Invoke-ReleaseCommand -Stage $Context.stage -Name $command.name -FilePath $command.file -Arguments $command.args -LogDirectory $Context.logs -Summary $Context.summary -SummaryPath $Context.summaryPath -AllowNonZero:([bool]$command.allowNonZero);if($command.name -ceq 'focused-autocomplete-runtime-admission'){Assert-FocusedBrowserPassCount $record 1};if($command.name -ceq 'focused-agents-instruction-runtime'){Assert-FocusedBrowserPassCount $record 9};if($command.expectedPreHelper){Get-ExpectedPreHelperFailure $record $Context.summary $Context.summaryPath|Out-Null};if($command.name -ceq 'post-runtime-validation'){if($record.exitCode -ne 0){throw 'Post runtime validation failed.'};$payloads=@(Assert-SourceRuntimePayloads);if($payloads.Count -ne 24){throw 'Post runtime validation did not verify 24 source payloads.'}}}
+    $null=. (Join-Path $PSScriptRoot 'activate-build-env.ps1');$Context.summary.environment=Get-BuildEnvironment;$commands=@(Get-CanonicalBuildAndTestCommands);$focusedExpectedPassCounts=[ordered]@{'focused-agent-skills'=15;'focused-agent-skill-resources'=5;'focused-agent-skill-typed-selector'=3;'focused-agent-skills-build-validation'=3;'focused-autocomplete-runtime-admission'=1;'focused-agents-instruction-runtime'=9;'focused-agent-skills-service'=9;'focused-agent-skills-runtime'=7};$Context.summary.commandPlan=@($commands|ForEach-Object{[pscustomobject]@{name=$_.name;file=$_.file;arguments=@($_.args);allowNonZero=[bool]$_.allowNonZero;expectedPreHelper=[bool]$_.expectedPreHelper}});Save-ReleaseSummary $Context.summary $Context.summaryPath
+    foreach($command in $commands){Assert-CanonicalCommandArguments $command.file $command.args;$record=Invoke-ReleaseCommand -Stage $Context.stage -Name $command.name -FilePath $command.file -Arguments $command.args -LogDirectory $Context.logs -Summary $Context.summary -SummaryPath $Context.summaryPath -AllowNonZero:([bool]$command.allowNonZero);if($focusedExpectedPassCounts.Contains($command.name)){Assert-FocusedExactPassCount $record ([int]$focusedExpectedPassCounts[$command.name])};if($command.expectedPreHelper){Get-ExpectedPreHelperFailure $record $Context.summary $Context.summaryPath|Out-Null};if($command.name -ceq 'post-runtime-validation'){if($record.exitCode -ne 0){throw 'Post runtime validation failed.'};$payloads=@(Assert-SourceRuntimePayloads);if($payloads.Count -ne 24){throw 'Post runtime validation did not verify 24 source payloads.'}}}
     $artifact=Assert-Artifact;$Context.summary.newMetadata=[pscustomobject]@{artifact=[pscustomobject]@{root=$ArtifactRoot;version=$artifact.Version;payloadCount=$artifact.PayloadCount;voidExe=(Get-ExistingFileMetadata (Join-Path $ArtifactRoot 'Void.exe'));productJson=(Get-ExistingFileMetadata (Join-Path $ArtifactRoot 'resources\app\product.json'))}};$Context.summary.gates.buildAndTestComplete=$true;$Context.summary.gates.buildAndTestSourceHead=$Context.head.head;Save-ReleaseSummary $Context.summary $Context.summaryPath;$artifact
 }
 function Assert-ExistingReleaseStateUnchanged {

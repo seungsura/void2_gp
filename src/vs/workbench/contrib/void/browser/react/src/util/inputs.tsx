@@ -19,12 +19,13 @@ import { useFloating, autoUpdate, offset, flip, shift, size, autoPlacement } fro
 import { URI } from '../../../../../../../base/common/uri.js';
 import { getBasename, getFolderName } from '../sidebar-tsx/SidebarChat.js';
 import { ChevronRight, File, Folder, FolderClosed, LucideProps } from 'lucide-react';
-import { StagingSelectionItem } from '../../../../common/chatThreadServiceTypes.js';
+import { getEnabledOptionIndex, StagingSelectionItem } from '../../../../common/chatThreadServiceTypes.js';
 import { DiffEditorWidget } from '../../../../../../../editor/browser/widget/diffEditor/diffEditorWidget.js';
 import { extractSearchReplaceBlocks, ExtractedSearchReplaceBlock } from '../../../../common/helpers/extractCodeFromResult.js';
 import { IAccessibilitySignalService } from '../../../../../../../platform/accessibilitySignal/browser/accessibilitySignalService.js';
 import { IEditorProgressService } from '../../../../../../../platform/progress/common/progress.js';
 import { detectLanguage } from '../../../../common/helpers/languageHelpers.js';
+import { AgentSkill } from '../../../../common/agentSkills.js';
 
 
 // type guard
@@ -63,10 +64,13 @@ type Option = {
 	fullName: string,
 	abbreviatedName: string,
 	iconInMenu: ForwardRefExoticComponent<Omit<LucideProps, "ref"> & RefAttributes<SVGSVGElement>>, // type for lucide-react components
+	disabled?: boolean,
 } & (
 		| { leafNodeType?: undefined, nextOptions: Option[], generateNextOptions?: undefined, }
 		| { leafNodeType?: undefined, nextOptions?: undefined, generateNextOptions: GenerateNextOptions, }
 		| { leafNodeType: 'File' | 'Folder', uri: URI, nextOptions?: undefined, generateNextOptions?: undefined, }
+		| { leafNodeType: 'Skill', skill: AgentSkill, catalogRevision: string, nextOptions?: undefined, generateNextOptions?: undefined, }
+		| { leafNodeType: 'Agent', disabled: true, nextOptions?: undefined, generateNextOptions?: undefined, }
 	)
 
 
@@ -296,6 +300,14 @@ const getOptionsAtPath = async (accessor: ReturnType<typeof useAccessor>, path: 
 			iconInMenu: Folder,
 			generateNextOptions: async (t) => (await searchForFilesOrFolders(t, 'folders')) || [],
 		},
+		{
+			fullName: 'skills', abbreviatedName: 'skills', iconInMenu: File,
+			generateNextOptions: async (t) => {
+				const catalog = await chatThreadService.getSkillCatalog();
+				return catalog.skills.filter(skill => isSubsequence(skill.identity, t)).map(skill => ({ leafNodeType: 'Skill' as const, skill, catalogRevision: catalog.revision, iconInMenu: File, fullName: skill.identity, abbreviatedName: skill.identity }));
+			},
+		},
+		{ fullName: 'agents', abbreviatedName: 'agents', iconInMenu: File, leafNodeType: 'Agent', disabled: true },
 	]
 
 	// follow the path in the optionsTree (until the last path element)
@@ -307,7 +319,7 @@ const getOptionsAtPath = async (accessor: ReturnType<typeof useAccessor>, path: 
 
 		const selectedOption = nextOptionsAtPath.find(o => o.fullName.toLowerCase() === pn.toLowerCase())
 
-		if (!selectedOption) return [];
+		if (!selectedOption || selectedOption.disabled) return [];
 
 		nextOptionsAtPath = selectedOption.nextOptions! // assume nextOptions exists until we hit the very last option (the path will never contain the last possible option)
 		generateNextOptionsAtPath = selectedOption.generateNextOptions
@@ -421,6 +433,7 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 		if (!options.length) { return; }
 
 		const option = options[optionIdx];
+		if (!option || option.disabled) { return; }
 		const newPath = [...optionPath, option.fullName]
 		const isLastOption = !option.generateNextOptions && !option.nextOptions
 		setDidLoadInitialOptions(false)
@@ -441,6 +454,11 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 				language: undefined,
 				state: undefined,
 			}
+			else if (option.leafNodeType === 'Skill') newSelection = {
+				type: 'Skill', identity: option.skill.identity, catalogRevision: option.catalogRevision, bodyRevision: option.skill.bodyRevision,
+				skillRoot: option.skill.provenance.skillRoot, description: option.skill.description, state: undefined,
+			}
+			else if (option.leafNodeType === 'Agent') return
 			else throw new Error(`Unexpected leafNodeType ${option.leafNodeType}`)
 
 			chatThreadService.addNewStagingSelection(newSelection)
@@ -453,7 +471,7 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 			if (currentPathRef.current !== JSON.stringify(newPath)) { return; }
 			setOptionPath(newPath)
 			setOptionText('')
-			setOptionIdx(0)
+			setOptionIdx(getEnabledOptionIndex(newOpts, option => option.disabled === true, 0, 1, false) ?? 0)
 			setOptions(newOpts)
 			setDidLoadInitialOptions(true)
 		}
@@ -466,7 +484,7 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 		if (currentPathRef.current !== JSON.stringify(newPath)) { return; }
 		setOptionPath(newPath)
 		setOptionText('')
-		setOptionIdx(0)
+		setOptionIdx(getEnabledOptionIndex(newOpts, option => option.disabled === true, 0, 1, false) ?? 0)
 		setOptions(newOpts)
 	}
 
@@ -478,7 +496,7 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 		setOptionPath(newPath)
 		setOptionText('')
 		setIsMenuOpen(true);
-		setOptionIdx(0);
+		setOptionIdx(getEnabledOptionIndex(newOpts, option => option.disabled === true, 0, 1, false) ?? 0);
 		setOptions(newOpts);
 	}
 	const onCloseOptionMenu = () => {
@@ -488,25 +506,25 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 	const onNavigateUp = (step = 1, periodic = true) => {
 		if (options.length === 0) return;
 		setOptionIdx((prevIdx) => {
-			const newIdx = prevIdx - step;
-			return periodic ? (newIdx + options.length) % options.length : Math.max(0, newIdx);
+			const startIndex = periodic ? prevIdx - step : Math.max(0, prevIdx - step);
+			return getEnabledOptionIndex(options, option => option.disabled === true, startIndex, -1, periodic) ?? prevIdx;
 		});
 	}
 	const onNavigateDown = (step = 1, periodic = true) => {
 		if (options.length === 0) return;
 		setOptionIdx((prevIdx) => {
-			const newIdx = prevIdx + step;
-			return periodic ? newIdx % options.length : Math.min(options.length - 1, newIdx);
+			const startIndex = periodic ? prevIdx + step : Math.min(options.length - 1, prevIdx + step);
+			return getEnabledOptionIndex(options, option => option.disabled === true, startIndex, 1, periodic) ?? prevIdx;
 		});
 	}
 
 	const onNavigateToTop = () => {
 		if (options.length === 0) return;
-		setOptionIdx(0);
+		setOptionIdx(getEnabledOptionIndex(options, option => option.disabled === true, 0, 1, false) ?? optionIdx);
 	}
 	const onNavigateToBottom = () => {
 		if (options.length === 0) return;
-		setOptionIdx(options.length - 1);
+		setOptionIdx(getEnabledOptionIndex(options, option => option.disabled === true, options.length - 1, -1, false) ?? optionIdx);
 	}
 
 	const debounceTimerRef = useRef<number | null>(null);
@@ -537,7 +555,7 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 			const newOpts = await getOptionsAtPath(accessor, optionPath, newStr) || [];
 			if (currentPathRef.current !== JSON.stringify(optionPath)) { return; }
 			setOptions(newOpts);
-			setOptionIdx(0);
+			setOptionIdx(getEnabledOptionIndex(newOpts, option => option.disabled === true, 0, 1, false) ?? 0);
 			debounceTimerRef.current = null;
 		};
 
@@ -836,24 +854,29 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 
 
 				{/* Options list */}
-				<div className='max-h-[400px] w-full max-w-full overflow-y-auto overflow-x-auto'>
+				<div className='max-h-[400px] w-full max-w-full overflow-y-auto overflow-x-auto' role="listbox">
 					<div className="w-max min-w-full flex flex-col gap-0 text-nowrap flex-nowrap">
 						{options.length === 0 ?
 							<div className="text-void-fg-3 px-3 py-0.5">No results found</div>
 							: options.map((o, oIdx) => {
+								const isDisabled = o.disabled === true;
+								const isSelected = !isDisabled && oIdx === optionIdx;
 
 								return (
 									// Option
 									<div
-										ref={oIdx === optionIdx ? selectedOptionRef : null}
+										ref={isSelected ? selectedOptionRef : null}
 										key={o.fullName}
+										role="option"
+										aria-disabled={isDisabled}
+										aria-selected={isSelected}
 										className={`
 											flex items-center gap-2
-											px-3 py-1 cursor-pointer
-											${oIdx === optionIdx ? 'bg-blue-500 text-white/80' : 'bg-void-bg-2-alt text-void-fg-1'}
+											px-3 py-1
+											${isDisabled ? 'cursor-default opacity-50 text-void-fg-3 pointer-events-none' : isSelected ? 'cursor-pointer bg-blue-500 text-white/80' : 'cursor-pointer bg-void-bg-2-alt text-void-fg-1'}
 										`}
-										onClick={() => { onSelectOption(); }}
-										onMouseMove={() => { setOptionIdx(oIdx) }}
+										onClick={isDisabled ? undefined : () => { onSelectOption(); }}
+										onMouseMove={isDisabled ? undefined : () => { setOptionIdx(oIdx) }}
 									>
 										{<o.iconInMenu size={12} />}
 
@@ -1994,5 +2017,3 @@ export const VoidDiffEditor = ({ uri, searchReplaceBlocks, language }: { uri?: a
 		</div>
 	);
 };
-
-

@@ -1,0 +1,7 @@
+import assert from 'assert';
+import { getEnabledOptionIndex, StagingSelectionItem } from '../../common/chatThreadServiceTypes.js';
+
+suite('Agent Skill typed selection helpers', () => {
+	test('finds enabled options forward, backward, and at both non-wrapping edges', () => { const values = [{ disabled: false }, { disabled: true }, { disabled: false }]; assert.strictEqual(getEnabledOptionIndex(values, value => value.disabled, 1, 1, false), 2); assert.strictEqual(getEnabledOptionIndex(values, value => value.disabled, 1, -1, false), 0); assert.strictEqual(getEnabledOptionIndex(values, value => value.disabled, -1, -1, true), 2); assert.strictEqual(getEnabledOptionIndex(values, value => value.disabled, 3, 1, true), 0); assert.strictEqual(getEnabledOptionIndex(values, value => value.disabled, -1, -1, false), undefined); assert.strictEqual(getEnabledOptionIndex(values, value => value.disabled, 3, 1, false), undefined); });
+	test('returns undefined for all-disabled values and accepts a Skill shape without React', () => { assert.strictEqual(getEnabledOptionIndex([{ disabled: true }], value => value.disabled, 0, 1, true), undefined); const skill: StagingSelectionItem = { type: 'Skill', identity: 'plugin:demo', catalogRevision: 'catalog', bodyRevision: 'body', skillRoot: 'file:///skill', description: 'Demo' }; assert.strictEqual(skill.type, 'Skill'); assert.strictEqual(skill.identity, 'plugin:demo'); });
+});

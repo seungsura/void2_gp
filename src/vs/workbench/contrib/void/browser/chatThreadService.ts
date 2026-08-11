@@ -42,7 +42,9 @@ import { IFileService } from '../../../../platform/files/common/files.js';
 import { IMCPService } from '../common/mcpService.js';
 import { RawMCPToolCall } from '../common/mcpServiceTypes.js';
 import { IAgentInstructionsService } from './agentInstructionsService.js';
-import { AgentInstructionTaskSession, AgentInstructionTurnSnapshot, inheritAgentInstructionTurnSnapshot, reviveAgentInstructionTurnSnapshot } from '../common/agentInstructions.js';
+import { IAgentSkillsService } from './agentSkillsService.js';
+import { AgentInstructionTaskSession, AgentInstructionTurnSnapshot } from '../common/agentInstructions.js';
+import { AgentRuntimeTurnSnapshot, admitProtectedAgentAuthority, createAgentRuntimeTurnSnapshot, reviveAgentRuntimeTurnSnapshot, runtimeModelFingerprint, selectExplicitSkills, skillAdvertisement } from '../common/agentSkills.js';
 
 
 // related to retrying when LLM message has error
@@ -56,6 +58,10 @@ const findStagingSelectionIndex = (currentSelections: StagingSelectionItem[] | u
 	for (let i = 0; i < currentSelections.length; i += 1) {
 		const s = currentSelections[i]
 
+		if (s.type === 'Skill' || newSelection.type === 'Skill') {
+			if (s.type === 'Skill' && newSelection.type === 'Skill' && s.identity === newSelection.identity && s.catalogRevision === newSelection.catalogRevision) return i
+			continue
+		}
 		if (s.uri.fsPath !== newSelection.uri.fsPath) continue
 
 		if (s.type === 'File' && newSelection.type === 'File') {
@@ -116,7 +122,7 @@ export type ThreadType = {
 				[codespanName: string]: CodespanLocationLink
 			}
 		}
-		agentInstructionTurnSnapshot?: AgentInstructionTurnSnapshot;
+		agentInstructionTurnSnapshot?: AgentRuntimeTurnSnapshot;
 
 
 		mountedInfo?: {
@@ -243,6 +249,7 @@ export interface IChatThreadService {
 
 	popStagingSelections(numPops?: number): void;
 	addNewStagingSelection(newSelection: StagingSelectionItem): void;
+	getSkillCatalog(threadId?: string): Promise<import('../common/agentSkills.js').AgentSkillCatalog>;
 
 	dangerousSetState: (newState: ThreadsState) => void;
 	resetState: () => void;
@@ -305,6 +312,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		@IFileService private readonly _fileService: IFileService,
 		@IMCPService private readonly _mcpService: IMCPService,
 		@IAgentInstructionsService private readonly _agentInstructionsService: IAgentInstructionsService,
+		@IAgentSkillsService private readonly _agentSkillsService: IAgentSkillsService,
 	) {
 		super()
 		this.state = { allThreads: {}, currentThreadId: null as unknown as string } // default state
@@ -326,7 +334,16 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 	// Config is task/session scoped; a turn snapshot is deliberately refreshed only for a user turn.
 	private readonly _agentInstructionSessionOfThread = new Map<string, AgentInstructionTaskSessionRecord>();
-	private readonly _instructionTurnOfThread = new Map<string, AgentInstructionTurnSnapshot>();
+	private readonly _instructionTurnOfThread = new Map<string, AgentRuntimeTurnSnapshot>();
+	async getSkillCatalog(threadId = this.state.currentThreadId) {
+		const owner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString();
+		let record = this._agentInstructionSessionOfThread.get(threadId);
+		if (record && record.ownerProjectRoot !== owner) throw new Error('skill_owner_or_trust_changed');
+		if (!record) { const session = new AgentInstructionTaskSession(() => this._agentInstructionsService.beginTaskSession(), config => this._agentInstructionsService.beginTopLevelTurn(config)); record = { ownerProjectRoot: owner, trustedAtStart: this._workspaceTrustManagementService.isWorkspaceTrusted(), session }; this._agentInstructionSessionOfThread.set(threadId, record); }
+		const config = await record.session.getConfig();
+		if (this._workspaceContextService.getWorkspace().folders[0]?.uri.toString() !== owner || (record.trustedAtStart && !this._workspaceTrustManagementService.isWorkspaceTrusted())) { this._agentInstructionSessionOfThread.delete(threadId); throw new Error('skill_owner_or_trust_changed'); }
+		return this._agentSkillsService.getCatalog(owner ? URI.parse(owner) : undefined, owner ? URI.parse(owner) : undefined, config);
+	}
 	private async _beginInstructionTurn(threadId: string): Promise<AgentInstructionTurnSnapshot> {
 		const currentOwner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
 		const trustedNow = this._workspaceTrustManagementService.isWorkspaceTrusted()
@@ -365,7 +382,6 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			this._purgeInstructionTurn(threadId)
 			throw new Error('Workspace trust changed while instructions were loading. Send the message again to start a user-only session.')
 		}
-		this._rememberInstructionTurn(threadId, snapshot);
 		return snapshot;
 	}
 	private _purgeInstructionTurn(threadId: string, removeSession = true) {
@@ -382,9 +398,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const currentOwner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
 		for (const [id, thread] of Object.entries(threads)) {
 			if (!thread) continue
-			const snapshot = reviveAgentInstructionTurnSnapshot(thread.state.agentInstructionTurnSnapshot)
-			const hasProjectConfig = snapshot?.config.configSources.some(source => source.scope === 'project')
-			if (snapshot && snapshot.ownerProjectRoot === currentOwner && snapshot.runCwd === currentOwner && (this._workspaceTrustManagementService.isWorkspaceTrusted() || !hasProjectConfig)) {
+			const snapshot = reviveAgentRuntimeTurnSnapshot(thread.state.agentInstructionTurnSnapshot)
+			if (snapshot && snapshot.ownerProjectRoot === currentOwner && snapshot.runCwd === currentOwner && snapshot.workspaceTrustedAtAdmission === this._workspaceTrustManagementService.isWorkspaceTrusted()) {
 				thread.state.agentInstructionTurnSnapshot = snapshot
 				this._instructionTurnOfThread.set(id, snapshot)
 			}
@@ -393,7 +408,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			}
 		}
 	}
-	private _rememberInstructionTurn(threadId: string, snapshot: AgentInstructionTurnSnapshot) {
+	private _rememberInstructionTurn(threadId: string, snapshot: AgentRuntimeTurnSnapshot) {
 		this._instructionTurnOfThread.set(threadId, snapshot)
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return
@@ -587,17 +602,26 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const callThisToolFirst: ToolMessage<ToolName> = lastMsg
 		const snapshot = this._instructionTurnOfThread.get(threadId)
 		const currentOwner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
-		const hasProjectConfig = snapshot?.config.configSources.some(source => source.scope === 'project')
-		if (!snapshot || snapshot.ownerProjectRoot !== currentOwner || snapshot.runCwd !== currentOwner || (!this._workspaceTrustManagementService.isWorkspaceTrusted() && hasProjectConfig)) {
+		if (!snapshot || snapshot.ownerProjectRoot !== currentOwner || snapshot.runCwd !== currentOwner || snapshot.workspaceTrustedAtAdmission !== this._workspaceTrustManagementService.isWorkspaceTrusted()) {
 			this._purgeInstructionTurn(threadId)
 			const content = 'This tool request cannot resume because the current workspace or trust context no longer matches its instruction snapshot. Send a new message in a new task to continue.'
 			this._updateLatestTool(threadId, { role: 'tool', type: 'rejected', params: lastMsg.params, name: lastMsg.name, content, result: null, id: lastMsg.id, rawParams: lastMsg.rawParams, mcpServerName: lastMsg.mcpServerName })
 			this._setStreamState(threadId, undefined)
 			return
 		}
+		const currentProps = this._currentModelSelectionProps(); const selectedModel = currentProps.modelSelection
+		const currentContext = selectedModel ? getModelCapabilities(selectedModel.providerName, selectedModel.modelName, this._settingsService.state.overridesOfModel).contextWindow : 0
+		const currentReserve = selectedModel ? Math.max(Math.ceil(currentContext / 2), getReservedOutputTokenSpace(selectedModel.providerName, selectedModel.modelName, { isReasoningEnabled: getIsReasoningEnabledState('Chat', selectedModel.providerName, selectedModel.modelName, currentProps.modelSelectionOptions, this._settingsService.state.overridesOfModel), overridesOfModel: this._settingsService.state.overridesOfModel }) ?? 4096) : 0
+		const currentOverride = selectedModel ? this._settingsService.state.overridesOfModel[selectedModel.providerName]?.[selectedModel.modelName] ?? {} : {};
+		if (!snapshot.model.hasModel || !selectedModel || selectedModel.providerName !== snapshot.model.providerName || selectedModel.modelName !== snapshot.model.modelName || runtimeModelFingerprint({ providerName: selectedModel.providerName, modelName: selectedModel.modelName, contextWindow: currentContext, reservedOutputTokens: currentReserve, modelSelectionOptions: currentProps.modelSelectionOptions ?? {}, selectedModelOverrides: currentOverride as never }) !== snapshot.model.fingerprint) {
+			this._purgeInstructionTurn(threadId)
+			this._updateLatestTool(threadId, { role: 'tool', type: 'rejected', params: lastMsg.params, name: lastMsg.name, content: 'This tool request cannot resume because its admitted model changed. Send a new message.', result: null, id: lastMsg.id, rawParams: lastMsg.rawParams, mcpServerName: lastMsg.mcpServerName })
+			this._setStreamState(threadId, undefined)
+			return
+		}
 
 		this._wrapRunAgentToNotify(
-			this._runChatAgent({ callThisToolFirst, threadId, instructionSnapshot: inheritAgentInstructionTurnSnapshot(snapshot), ...this._currentModelSelectionProps() })
+			this._runChatAgent({ callThisToolFirst, threadId, instructionSnapshot: snapshot, modelSelection: { providerName: snapshot.model.providerName as ModelSelection['providerName'], modelName: snapshot.model.modelName }, modelSelectionOptions: snapshot.model.modelSelectionOptions as ModelSelectionOptions })
 			, threadId
 		)
 	}
@@ -676,6 +700,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		toolId: string,
 		mcpServerName: string | undefined,
 		opts: { preapproved: true, unvalidatedToolParams: RawToolParamsObj, validatedParams: ToolCallParams<ToolName> } | { preapproved: false, unvalidatedToolParams: RawToolParamsObj },
+		instructionSnapshot: AgentRuntimeTurnSnapshot,
 	): Promise<{ awaitingUserApproval?: boolean, interrupted?: boolean }> => {
 
 		// compute these below
@@ -746,16 +771,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			if (isBuiltInTool) {
 				const readContext = (() => {
 					if (toolName !== 'read_file') return threadId
-					const selection = this._settingsService.state.modelSelectionOfFeature['Chat']
-					if (!selection) return { ownerThreadId: threadId, maxReadOutputTokens: 0 }
-					try {
-						const options = this._settingsService.state.optionsOfModelSelection['Chat'][selection.providerName]?.[selection.modelName]
-						const capabilities = getModelCapabilities(selection.providerName, selection.modelName, this._settingsService.state.overridesOfModel)
-						const reasoning = getIsReasoningEnabledState('Chat', selection.providerName, selection.modelName, options, this._settingsService.state.overridesOfModel)
-						const reserve = getReservedOutputTokenSpace(selection.providerName, selection.modelName, { isReasoningEnabled: reasoning, overridesOfModel: this._settingsService.state.overridesOfModel }) ?? 4096
-						const baseline = estimateHistoryTokensForReadBudget(this.state.allThreads[threadId]?.messages ?? [])
-						return { ownerThreadId: threadId, maxReadOutputTokens: computeMaxReadOutputTokens(capabilities.contextWindow, reserve, baseline) }
-					} catch { return { ownerThreadId: threadId, maxReadOutputTokens: 0 } }
+					if (!instructionSnapshot.model.hasModel) return { ownerThreadId: threadId, maxReadOutputTokens: 0 }
+					const baseline = estimateHistoryTokensForReadBudget(this.state.allThreads[threadId]?.messages ?? [])
+					return { ownerThreadId: threadId, maxReadOutputTokens: computeMaxReadOutputTokens(instructionSnapshot.model.contextWindow, instructionSnapshot.model.reservedOutputTokens, baseline) }
 				})()
 				let preparedWrite: Awaited<ReturnType<IToolsService['prepareWriteFile']>> | null = null
 				if (toolName === 'write_file') {
@@ -836,7 +854,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		modelSelectionOptions: ModelSelectionOptions | undefined,
 
 		callThisToolFirst?: ToolMessage<ToolName> & { type: 'tool_request' }
-		instructionSnapshot: AgentInstructionTurnSnapshot,
+		instructionSnapshot: AgentRuntimeTurnSnapshot,
 	}) {
 
 
@@ -847,7 +865,6 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		// above just defines helpers, below starts the actual function
 		const { chatMode } = this._settingsService.state.globalSettings // should not change as we loop even if user changes it, so it goes here
 		const snapshot = instructionSnapshot;
-		const { overridesOfModel } = this._settingsService.state
 
 		let nMessagesSent = 0
 		let shouldSendAnotherMessage = true
@@ -855,9 +872,10 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 		// before enter loop, call tool
 		if (callThisToolFirst) {
-			const { interrupted } = await this._runToolCall(threadId, callThisToolFirst.name, callThisToolFirst.id, callThisToolFirst.mcpServerName, { preapproved: true, unvalidatedToolParams: callThisToolFirst.rawParams, validatedParams: callThisToolFirst.params })
+			const { interrupted } = await this._runToolCall(threadId, callThisToolFirst.name, callThisToolFirst.id, callThisToolFirst.mcpServerName, { preapproved: true, unvalidatedToolParams: callThisToolFirst.rawParams, validatedParams: callThisToolFirst.params }, snapshot)
 			if (interrupted) {
 				this._setStreamState(threadId, undefined)
+				return
 			}
 		}
 		this._setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' })  // just decorative, for clarity
@@ -905,7 +923,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 					messages: messages,
 					modelSelection,
 					modelSelectionOptions,
-					overridesOfModel,
+					overridesOfModel: snapshot.model.hasModel ? { [snapshot.model.providerName]: { [snapshot.model.modelName]: snapshot.model.selectedModelOverrides } } as never : undefined,
 					logging: { loggingName: `Chat - ${chatMode}`, loggingExtras: { threadId, nMessagesSent, chatMode } },
 					separateSystemMessage: separateSystemMessage,
 					onText: ({ fullText, fullReasoning, toolCall }) => {
@@ -982,7 +1000,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 					const mcpTools = this._mcpService.getMCPTools()
 					const mcpTool = mcpTools?.find(t => t.name === toolCall.name)
 
-					const { awaitingUserApproval, interrupted } = await this._runToolCall(threadId, toolCall.name, toolCall.id, mcpTool?.mcpServerName, { preapproved: false, unvalidatedToolParams: toolCall.rawParams })
+					const { awaitingUserApproval, interrupted } = await this._runToolCall(threadId, toolCall.name, toolCall.id, mcpTool?.mcpServerName, { preapproved: false, unvalidatedToolParams: toolCall.rawParams }, snapshot)
 					if (interrupted) {
 						this._setStreamState(threadId, undefined)
 						return
@@ -1081,19 +1099,58 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		if (this.streamState[threadId]?.isRunning) {
 			await this.abortRunning(threadId)
 		}
+		// Capture every model-dependent input before any async catalog/instruction resolution.
+		const capturedModel = this._currentModelSelectionProps();
+		const capturedOverride = capturedModel.modelSelection ? this._settingsService.state.overridesOfModel[capturedModel.modelSelection.providerName]?.[capturedModel.modelSelection.modelName] ?? {} : {};
+		const capturedOverrides = capturedModel.modelSelection ? { [capturedModel.modelSelection.providerName]: { [capturedModel.modelSelection.modelName]: deepClone(capturedOverride) } } as never : undefined;
 		// This must happen before history changes: a task cannot cross a workspace owner boundary.
 		const instructionSnapshot = await this._beginInstructionTurn(threadId)
+		// A failed new admission must not leave a previous turn's runtime authority resumable.
+		this._purgeInstructionTurn(threadId, false)
 
 		// add user's message to chat history
 		const instructions = userMessage
-		const currSelns: StagingSelectionItem[] = _chatSelections ?? thread.state.stagingSelections
-
+		let currSelns: StagingSelectionItem[] = _chatSelections ?? thread.state.stagingSelections
+		const owner = this._workspaceContextService.getWorkspace().folders[0]?.uri
+		const catalog = await this._agentSkillsService.getCatalog(owner, owner, instructionSnapshot.config)
+		const direct = selectExplicitSkills(catalog, instructions)
+		if (!direct.skills) throw new Error(direct.diagnostic?.code ?? 'skill_not_found')
+		const selectedIdentities = new Set<string>(); const normalizedSelections: StagingSelectionItem[] = [];
+		for (const selection of currSelns) {
+			if (selection.type !== 'Skill' || !selectedIdentities.has(selection.identity)) { normalizedSelections.push(selection); if (selection.type === 'Skill') selectedIdentities.add(selection.identity); }
+		}
+		for (const skill of direct.skills) if (!selectedIdentities.has(skill.identity)) { selectedIdentities.add(skill.identity); normalizedSelections.push({ type: 'Skill', identity: skill.identity, catalogRevision: catalog.revision, bodyRevision: skill.bodyRevision, skillRoot: skill.provenance.skillRoot, description: skill.description, state: undefined }); }
+		currSelns = normalizedSelections
+		const skillSelections = currSelns.filter((selection): selection is Extract<StagingSelectionItem, { type: 'Skill' }> => selection.type === 'Skill')
+		const skillBodies = await Promise.all(skillSelections.map(async selection => {
+			const descriptor = catalog.skills.find(skill => skill.identity === selection.identity && skill.provenance.skillRoot === selection.skillRoot && skill.bodyRevision === selection.bodyRevision)
+			if (selection.catalogRevision !== catalog.revision || !descriptor) throw new Error('skill_stale')
+			const body = await this._agentSkillsService.readSkillBody(selection.skillRoot, selection.bodyRevision)
+			if (!body.body) throw new Error(body.diagnostic?.code ?? 'skill_body_unreadable')
+			return body.body
+		}))
+		if (this._workspaceContextService.getWorkspace().folders[0]?.uri.toString() !== instructionSnapshot.ownerProjectRoot || (!this._workspaceTrustManagementService.isWorkspaceTrusted() && (instructionSnapshot.config.configSources.some(source => source.scope === 'project') || catalog.skills.some(skill => skill.provenance.source === 'repository')))) throw new Error('skill_owner_or_trust_changed')
+		let effectiveReserve = 0
+		if (capturedModel.modelSelection) {
+			const { contextWindow } = getModelCapabilities(capturedModel.modelSelection.providerName, capturedModel.modelSelection.modelName, capturedOverrides)
+			const reserve = getReservedOutputTokenSpace(capturedModel.modelSelection.providerName, capturedModel.modelSelection.modelName, { isReasoningEnabled: getIsReasoningEnabledState('Chat', capturedModel.modelSelection.providerName, capturedModel.modelSelection.modelName, capturedModel.modelSelectionOptions, capturedOverrides), overridesOfModel: capturedOverrides }) ?? 4096
+			effectiveReserve = Math.max(Math.ceil(contextWindow / 2), reserve)
+		}
+		const advertisement = skillAdvertisement(catalog, capturedModel.modelSelection ? getModelCapabilities(capturedModel.modelSelection.providerName, capturedModel.modelSelection.modelName, capturedOverrides).contextWindow : undefined)
+		const runtimeModel = capturedModel.modelSelection
+			? { hasModel: true as const, providerName: capturedModel.modelSelection.providerName, modelName: capturedModel.modelSelection.modelName, contextWindow: getModelCapabilities(capturedModel.modelSelection.providerName, capturedModel.modelSelection.modelName, capturedOverrides).contextWindow, reservedOutputTokens: effectiveReserve, modelSelectionOptions: { ...(capturedModel.modelSelectionOptions as Record<string, unknown>) }, selectedModelOverrides: deepClone(capturedOverride) as never }
+			: { hasModel: false as const };
+		const runtimeSnapshot = createAgentRuntimeTurnSnapshot(instructionSnapshot, catalog, advertisement, skillSelections.map((selection, index) => ({ identity: selection.identity, skillRoot: selection.skillRoot, bodyRevision: selection.bodyRevision, body: skillBodies[index] })), runtimeModel, this._workspaceTrustManagementService.isWorkspaceTrusted())
+		admitProtectedAgentAuthority(runtimeSnapshot)
 		const userMessageContent = await chat_userMessageContent(instructions, currSelns, { directoryStrService: this._directoryStringService, fileService: this._fileService }) // user message + names of files (NOT content)
+		const currentOwner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
+		if (currentOwner !== runtimeSnapshot.ownerProjectRoot || currentOwner !== runtimeSnapshot.runCwd || this._workspaceTrustManagementService.isWorkspaceTrusted() !== runtimeSnapshot.workspaceTrustedAtAdmission) { this._purgeInstructionTurn(threadId, false); throw new Error('skill_owner_or_trust_changed') }
+		this._rememberInstructionTurn(threadId, runtimeSnapshot)
 		const userHistoryElt: ChatMessage = { role: 'user', content: userMessageContent, displayContent: instructions, selections: currSelns, state: defaultMessageState }
 		this._addMessageToThread(threadId, userHistoryElt)
 
 		this._wrapRunAgentToNotify(
-			this._runChatAgent({ threadId, instructionSnapshot, ...this._currentModelSelectionProps(), }),
+			this._runChatAgent({ threadId, instructionSnapshot: runtimeSnapshot, ...capturedModel, }),
 			threadId,
 		)
 
@@ -1158,7 +1215,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			// URIs of user selections
 			if (m.role === 'user') {
 				for (const sel of m.selections ?? []) {
-					addURI(sel.uri)
+					if (sel.type !== 'Skill') addURI(sel.uri)
 				}
 			}
 			// URIs of files that have been read

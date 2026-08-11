@@ -7,6 +7,32 @@ import { URI } from '../../../../base/common/uri.js';
 import { AnthropicReasoning, RawToolParamsObj } from './sendLLMMessageTypes.js';
 import { ToolCallParams, ToolName, ToolResult } from './toolsServiceTypes.js';
 
+/**
+ * Finds an enabled option from a candidate index without depending on any UI framework.
+ * `startIndex` is included in the search, so callers can use it for both reset and movement.
+ */
+export const getEnabledOptionIndex = <T>(
+	options: readonly T[],
+	isDisabled: (option: T) => boolean,
+	startIndex: number,
+	direction: -1 | 1,
+	wrap: boolean,
+): number | undefined => {
+	for (let attempts = 0, index = startIndex; attempts < options.length; attempts++, index += direction) {
+		if (wrap) {
+			index = ((index % options.length) + options.length) % options.length;
+		} else if (index < 0 || index >= options.length) {
+			return undefined;
+		}
+
+		if (!isDisabled(options[index])) {
+			return index;
+		}
+	}
+
+	return undefined;
+};
+
 export type ToolMessage<T extends ToolName> = {
 	role: 'tool';
 	content: string; // give this result to LLM (string of value)
@@ -71,6 +97,16 @@ export type StagingSelectionItem = {
 	type: 'Folder';
 	uri: URI;
 	language?: undefined;
+	state?: undefined;
+} | {
+	// A Skill is not a File selection: its immutable catalog/body revisions prevent a stale
+	// metadata chip from silently resolving to another on-disk Skill at submission time.
+	type: 'Skill';
+	identity: string;
+	catalogRevision: string;
+	bodyRevision: string;
+	skillRoot: string;
+	description: string;
 	state?: undefined;
 }
 
