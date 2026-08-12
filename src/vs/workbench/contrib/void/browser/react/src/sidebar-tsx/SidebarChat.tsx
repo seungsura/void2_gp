@@ -6,7 +6,7 @@
 import React, { ButtonHTMLAttributes, FormEvent, FormHTMLAttributes, Fragment, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 
-import { useAccessor, useAgentSubagentBudget, useAgentSubagentRuns, useChatThreadsState, useChatThreadsStreamState, useSettingsState, useActiveURI, useCommandBarState } from '../util/services.js';
+import { useAccessor, useAgentSubagentBudget, useAgentSubagentDiagnostics, useAgentSubagentRuns, useChatThreadsState, useChatThreadsStreamState, useSettingsState, useActiveURI, useCommandBarState } from '../util/services.js';
 import { ScrollType } from '../../../../../../../editor/common/editorCommon.js';
 
 import { ChatMarkdownRender, ChatMessageLocation, getApplyBoxId } from '../markdown/ChatMarkdownRender.js';
@@ -2674,7 +2674,18 @@ const ChildRunRow = ({ view }: { view: import('../../../../common/agentSubagents
 	<div className='pt-1 text-void-fg-3'>
 		<div>Void application-level read-only — terminal disabled, no OS sandbox</div>
 		{view.roleDescription ? <div>{view.roleDescription}</div> : null}
+		<div>Timing: {view.queuedMs}ms queued, {view.runningMs}ms running</div>
+		<div>Authority revisions: runtime {view.authority.runtimeRevision.slice(0, 8)}, instructions {view.authority.instructionsRevision.slice(0, 8)}, skills {view.authority.catalogRevision.slice(0, 8)}</div>
 		{view.summary ? <div className='pt-1 whitespace-pre-wrap break-words'>{view.summary}</div> : null}
+	</div>
+</details>
+
+const ChildDiagnostics = ({ diagnostics }: { diagnostics: import('../../../../common/agentSubagents.js').AgentSubagentDiagnosticsView }) => <details className='text-xs border border-void-border-1 rounded-sm px-2 py-1 mb-1'>
+	<summary className='cursor-pointer select-none'>Child timeline · {diagnostics.events.length} events · {diagnostics.elapsedMs}ms</summary>
+	<div className='pt-1 text-void-fg-3'>
+		<div>{diagnostics.completed} completed, {diagnostics.failed} failed, {diagnostics.cancelled} cancelled · usage unavailable</div>
+		{diagnostics.droppedEvents ? <div>{diagnostics.droppedEvents} later events omitted</div> : null}
+		{diagnostics.events.map(event => <div key={event.sequence}>#{event.sequence} +{event.elapsedMs}ms · {event.kind}{event.childId ? ` · ${event.childId.slice(0, 8)}` : ''}{event.diagnostic ? ` · ${event.diagnostic}` : ''} · {event.budget.running} running/{event.budget.queued} queued</div>)}
 	</div>
 </details>
 
@@ -2703,6 +2714,7 @@ export const SidebarChat = () => {
 	const isRunning = currThreadStreamState?.isRunning
 	const childRuns = useAgentSubagentRuns(currentThread.id)
 	const childBudget = useAgentSubagentBudget(currentThread.id)
+	const childDiagnostics = useAgentSubagentDiagnostics(currentThread.id)
 	const childIsActive = childRuns.some(isActiveChildRun)
 	const isAnyRunning = !!isRunning || childIsActive
 	const latestError = currThreadStreamState?.error
@@ -2907,6 +2919,7 @@ export const SidebarChat = () => {
 		<div className='px-4'>
 			{childBudget ? <div className='text-xs text-void-fg-3 mb-1'>Children: {childBudget.running} running, {childBudget.queued} queued, {childBudget.accepted}/{childBudget.maxAccepted} accepted</div> : null}
 			{childRuns.map(view => <ChildRunRow key={view.id} view={view} />)}
+			{childDiagnostics ? <ChildDiagnostics diagnostics={childDiagnostics} /> : null}
 			<CommandBarInChat />
 		</div>
 		<div className='px-2 pb-2'>
@@ -2916,7 +2929,7 @@ export const SidebarChat = () => {
 
 	const landingPageInput = <div>
 		<div className='pt-8'>
-			<div className='px-4'>{childBudget ? <div className='text-xs text-void-fg-3 mb-1'>Children: {childBudget.running} running, {childBudget.queued} queued, {childBudget.accepted}/{childBudget.maxAccepted} accepted</div> : null}{childRuns.map(view => <ChildRunRow key={view.id} view={view} />)}</div>
+			<div className='px-4'>{childBudget ? <div className='text-xs text-void-fg-3 mb-1'>Children: {childBudget.running} running, {childBudget.queued} queued, {childBudget.accepted}/{childBudget.maxAccepted} accepted</div> : null}{childRuns.map(view => <ChildRunRow key={view.id} view={view} />)}{childDiagnostics ? <ChildDiagnostics diagnostics={childDiagnostics} /> : null}</div>
 			{inputChatArea}
 		</div>
 	</div>

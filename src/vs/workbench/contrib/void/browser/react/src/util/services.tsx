@@ -55,7 +55,7 @@ import { IMCPService } from '../../../../common/mcpService.js';
 import { IStorageService, StorageScope } from '../../../../../../../platform/storage/common/storage.js'
 import { OPT_OUT_KEY } from '../../../../common/storageKeys.js'
 import { IAgentSubagentService } from '../../../agentSubagentService.js'
-import { AgentSubagentBudgetView, AgentSubagentRunView } from '../../../../common/agentSubagents.js'
+import { AgentSubagentBudgetView, AgentSubagentDiagnosticsView, AgentSubagentRunView } from '../../../../common/agentSubagents.js'
 
 
 // normally to do this you'd use a useEffect that calls .onDidChangeState(), but useEffect mounts too late and misses initial state changes
@@ -324,6 +324,12 @@ export const useAgentSubagentBudget = (threadId: string): AgentSubagentBudgetVie
 	const [budget, setBudget] = useState(() => service.getBudgetView(threadId))
 	useEffect(() => { setBudget(service.getBudgetView(threadId)); const disposable = service.onDidChangeRun(event => { if (event.parentId === threadId) setBudget(service.getBudgetView(threadId)) }); return () => disposable.dispose() }, [service, threadId])
 	return budget
+}
+export const useAgentSubagentDiagnostics = (threadId: string): AgentSubagentDiagnosticsView | undefined => {
+	const service = useAccessor().get('IAgentSubagentService')
+	const [diagnostics, setDiagnostics] = useState(() => service.getDiagnosticsView(threadId))
+	useEffect(() => { setDiagnostics(service.getDiagnosticsView(threadId)); const disposable = service.onDidChangeDiagnostics(event => { if (event.parentId === threadId) setDiagnostics(service.getDiagnosticsView(threadId)) }); return () => disposable.dispose() }, [service, threadId])
+	return diagnostics
 }
 
 export const useFullChatThreadsStreamState = () => {

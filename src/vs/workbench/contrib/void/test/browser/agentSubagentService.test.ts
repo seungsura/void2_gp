@@ -77,6 +77,21 @@ const final = (options: any, text = 'done') => queueMicrotask(() => options.onFi
 const toolThenFinal = (tool: { id: string; name: string; rawParams: Record<string, unknown> }) => (options: any, turn: number) => { queueMicrotask(() => turn === 1 ? options.onFinalMessage({ fullText: 'tool', fullReasoning: '', anthropicReasoning: null, toolCall: tool }) : options.onFinalMessage({ fullText: 'done', fullReasoning: '', anthropicReasoning: null })); return `request-${turn}`; };
 
 suite('Void AgentSubagentService', () => {
+	test('keeps a bounded local diagnostic timeline separate from model-facing wait results', async () => {
+		const f = fixture({ send: options => { final(options); return 'request'; } }); const changes: any[] = []; f.service.onDidChangeDiagnostics(event => changes.push(event));
+		const child = await f.service.spawn('trace', '$demo inspect', snapshot(['demo'])); const result = await f.service.wait('trace', 1_000, [child.id]); const diagnostics = f.service.getDiagnosticsView('trace')!;
+		assert.ok(diagnostics.events.some(event => event.kind === 'group_created')); assert.ok(diagnostics.events.some(event => event.kind === 'admission_started')); assert.ok(diagnostics.events.some(event => event.kind === 'child_queued' && event.childId === child.id)); assert.ok(diagnostics.events.some(event => event.kind === 'child_running' && event.childId === child.id)); assert.ok(diagnostics.events.some(event => event.kind === 'provider_send' && event.childId === child.id)); assert.strictEqual(diagnostics.events.filter(event => event.kind === 'child_completed' && event.childId === child.id).length, 1);
+		assert.deepStrictEqual(diagnostics.events.map(event => event.sequence), diagnostics.events.map((_event, index) => index + 1)); assert.ok(diagnostics.events.every(event => event.elapsedMs >= 0)); assert.strictEqual(JSON.stringify(result).includes('diagnostics'), false); assert.ok(changes.length > 0);
+		const view = f.service.getRunView('trace')!; assert.ok(view.queuedMs >= 0 && view.runningMs >= 0 && view.totalMs >= 0); assert.strictEqual(JSON.stringify(view.authority).includes('body-demo'), false); assert.strictEqual(JSON.stringify(view.authority).includes('file:///workspace'), false);
+		const group = (f.service as any).groups.get('trace'); for (let index = 0; index < 130; index++) (f.service as any).trace(group, 'provider_send', undefined); const capped = f.service.getDiagnosticsView('trace')!; assert.strictEqual(capped.events.length, 128); assert.strictEqual(capped.droppedEvents, 9);
+		f.service.forgetParent('trace'); assert.strictEqual(f.service.getDiagnosticsView('trace'), undefined);
+	});
+
+	test('records normalized failed admission without retaining a forgotten ledger', async () => {
+		const f = fixture({ readSkillBody: async () => ({ diagnostic: { code: 'skill_stale' } }) }); await assert.rejects(() => f.service.spawn('admission-trace', '$demo inspect', snapshot()), /skill_stale/);
+		const diagnostics = f.service.getDiagnosticsView('admission-trace')!; const failed = diagnostics.events.find(event => event.kind === 'admission_failed'); assert.strictEqual(failed?.diagnostic, 'skill_unavailable'); assert.strictEqual(JSON.stringify(failed).includes('skill_stale'), false);
+		f.service.forgetParent('admission-trace'); assert.strictEqual(f.service.getDiagnosticsView('admission-trace'), undefined);
+	});
 	test('reserves four admissions, starts two, queues FIFO, and never refunds terminal quota', async () => {
 		const f = fixture({ send: () => 'request' });
 		const children = await Promise.all(['one', 'two', 'three', 'four'].map(message => f.service.spawn('parent', message, snapshot())));
@@ -133,7 +148,7 @@ suite('Void AgentSubagentService', () => {
 
 	test('enforces provider/result budgets and the shared cancellation path structurally', async () => {
 		const f = fixture({ send: () => 'request' }); const child = await f.service.spawn('ledger', 'inspect', snapshot()); const group = (f.service as any).groups.get('ledger');
-		group.providerSends = 64; f.service.interrupt('ledger', child.id); const blocked = await f.service.spawn('ledger', 'blocked', snapshot()); await new Promise(resolve => setTimeout(resolve, 0)); assert.strictEqual(f.providerCalls.length, 1); assert.strictEqual(f.service.getRunViews('ledger').find(view => view.id === blocked.id)?.status, 'failed');
+		group.providerSends = 64; f.service.interrupt('ledger', child.id); const blocked = await f.service.spawn('ledger', 'blocked', snapshot()); await new Promise(resolve => setTimeout(resolve, 0)); assert.strictEqual(f.providerCalls.length, 1); assert.strictEqual(f.service.getRunViews('ledger').find(view => view.id === blocked.id)?.status, 'failed'); assert.strictEqual(f.service.getDiagnosticsView('ledger')?.events.find(event => event.kind === 'child_failed' && event.childId === blocked.id)?.diagnostic, 'budget_exhausted');
 		const capped = await Promise.all(['1', '2', '3', '4'].map(message => f.service.spawn('result-cap', message, snapshot()))); const budgetGroup = (f.service as any).groups.get('result-cap'); for (const id of capped.map(child => child.id)) { const run = budgetGroup.runs.find((candidate: any) => candidate.id === id); (f.service as any).settle(run, 'completed', 'x'.repeat(10_000)); } assert.strictEqual(budgetGroup.resultChars, 32_000); assert.deepStrictEqual(budgetGroup.runs.map((run: any) => run.summary.length), [8_000, 8_000, 8_000, 8_000]);
 		let entered!: () => void; const enteredRead = new Promise<void>(resolve => entered = resolve); const deadline = fixture({ readSkillBody: async () => { entered(); return new Promise<any>(() => { }); } }); const pending = deadline.service.spawn('deadline', '$demo inspect', snapshot()); await enteredRead; (deadline.service as any).cancelGroup((deadline.service as any).groups.get('deadline'), 'deadline'); await assert.rejects(pending, /agent_child_cancelled/); assert.deepStrictEqual(deadline.service.getRunViews('deadline'), []); assert.strictEqual(deadline.providerCalls.length, 0);
 	});

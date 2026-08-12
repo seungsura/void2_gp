@@ -50,8 +50,12 @@ export const assertCanonicalReadOnlyChildRawPaths = (name: string, raw: Record<s
 
 export type AgentSubagentStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
 export type AgentSubagentBudgetView = Readonly<{ accepted: number; running: number; queued: number; maxAccepted: number; maxConcurrent: number; providerSends: number; maxProviderSends: number; resultChars: number; maxResultChars: number; deadlineMsRemaining: number; usage: null }>;
-export type AgentSubagentRunView = Readonly<{ id: string; status: AgentSubagentStatus; summary?: string; roleName?: string; roleDescription?: string; usage: null }>;
-export const isActiveChildRun = (view: AgentSubagentRunView | undefined): boolean => view?.status === 'queued' || view?.status === 'running';
+export type AgentSubagentRunView = Readonly<{ id: string; status: AgentSubagentStatus; summary?: string; roleName?: string; roleDescription?: string; queuedMs: number; runningMs: number; totalMs: number; authority: Readonly<{ runtimeRevision: string; instructionsRevision: string; catalogRevision: string; modelFingerprint?: string; roleRevision?: string; selectedSkills: readonly Readonly<{ identity: string; bodyRevision: string }>[] }>; usage: null }>;
+export type AgentSubagentTraceKind = 'group_created' | 'admission_started' | 'admission_failed' | 'child_queued' | 'child_running' | 'provider_send' | 'child_completed' | 'child_failed' | 'child_cancelled' | 'receipt_delivered' | 'group_cancelled';
+export type AgentSubagentTraceEvent = Readonly<{ sequence: number; parentId: string; generation: number; childId?: string; kind: AgentSubagentTraceKind; timestamp: number; elapsedMs: number; status?: Exclude<AgentSubagentStatus, 'queued' | 'running'>; diagnostic?: AgentSubagentTraceDiagnostic; budget: Readonly<{ accepted: number; running: number; queued: number; providerSends: number; resultChars: number }> }>;
+export type AgentSubagentTraceDiagnostic = 'cancelled' | 'model_missing' | 'provider_invalid' | 'owner_changed' | 'role_not_found' | 'role_stale' | 'skill_unavailable' | 'budget_exhausted' | 'provider_error' | 'timeout' | 'turn_limit' | 'unknown';
+export type AgentSubagentDiagnosticsView = Readonly<{ parentId: string; generation: number; elapsedMs: number; events: readonly AgentSubagentTraceEvent[]; droppedEvents: number; completed: number; failed: number; cancelled: number; usage: null }>;
+export const isActiveChildRun = <T extends { readonly status: AgentSubagentStatus }>(view: T | undefined): boolean => view?.status === 'queued' || view?.status === 'running';
 export const agentSubagentStatusLabel = (status: AgentSubagentStatus): string => ({ queued: 'Queued', running: 'Running', completed: 'Completed', failed: 'Failed', cancelled: 'Cancelled' })[status];
 export type AgentSubagentControlName = 'spawn_agent' | 'wait_agent' | 'interrupt_agent';
 
@@ -64,6 +68,8 @@ export const AGENT_SUBAGENT_MAX_ACCEPTED = 4;
 export const AGENT_SUBAGENT_MAX_GROUP_PROVIDER_SENDS = 64;
 export const AGENT_SUBAGENT_MAX_GROUP_RUN_MS = 240_000;
 export const AGENT_SUBAGENT_MAX_AGGREGATE_RESULT_CHARS = 32_000;
+/** UI-only transient trace; it is intentionally absent from model-facing wait receipts. */
+export const AGENT_SUBAGENT_MAX_TRACE_EVENTS = 128;
 
 const flatObject = (properties: Record<string, unknown>, required: readonly string[] = []) => ({
 	type: 'object', additionalProperties: false, ...(required.length ? { required: [...required] } : {}), properties,

@@ -35,4 +35,13 @@ suite('Void LLM message channel lifecycle', () => {
 			assert.strictEqual(providerAborts, 1); assert.strictEqual(texts, 0); assert.strictEqual(finals, 0); assert.strictEqual(errors, 0);
 		} finally { implementation.sendChat = original; }
 	});
+
+	test('real wrapper records a finite nonnegative completion duration', async () => {
+		const implementation = sendLLMMessageToProviderImplementation.openAI; const original = implementation.sendChat; const captured: any[] = []; let finals = 0;
+		implementation.sendChat = async options => { options.onFinalMessage({ fullText: 'done', fullReasoning: '', anthropicReasoning: null }); };
+		try {
+			await sendLLMMessage({ ...params('duration'), abortRef: { current: null }, onText: () => { }, onFinalMessage: () => finals++, onError: () => assert.fail('unexpected error') } as any, { capture: (event: string, values: any) => captured.push({ event, values }) } as any);
+			const received = captured.find(event => event.event === 'fixture - Received Full Message'); assert.strictEqual(finals, 1); assert.strictEqual(typeof received?.values.duration, 'number'); assert.ok(Number.isFinite(received.values.duration)); assert.ok(received.values.duration >= 0);
+		} finally { implementation.sendChat = original; }
+	});
 });

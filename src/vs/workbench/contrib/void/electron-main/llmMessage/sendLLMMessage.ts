@@ -7,6 +7,7 @@ import { SendLLMMessageParams, OnText, OnFinalMessage, OnError } from '../../com
 import { IMetricsService } from '../../common/metricsService.js';
 import { displayInfoOfProviderName } from '../../common/voidSettingsTypes.js';
 import { sendLLMMessageToProviderImplementation } from './sendLLMMessage.impl.js';
+import { StopWatch } from '../../../../../base/common/stopwatch.js';
 
 
 export const sendLLMMessage = async ({
@@ -53,7 +54,7 @@ export const sendLLMMessage = async ({
 			...extras,
 		})
 	}
-	const submit_time = new Date()
+	const submitTime = StopWatch.create()
 
 	let _fullTextSoFar = ''
 	let _aborter: (() => void) | null = null
@@ -72,7 +73,7 @@ export const sendLLMMessage = async ({
 	const onFinalMessage: OnFinalMessage = (params) => {
 		const { fullText, fullReasoning, toolCall } = params
 		if (_didAbort) return
-		captureLLMEvent(`${loggingName} - Received Full Message`, { messageLength: fullText.length, reasoningLength: fullReasoning?.length, duration: new Date().getMilliseconds() - submit_time.getMilliseconds(), toolCallName: toolCall?.name })
+		captureLLMEvent(`${loggingName} - Received Full Message`, { messageLength: fullText.length, reasoningLength: fullReasoning?.length, duration: submitTime.elapsed(), toolCallName: toolCall?.name })
 		onFinalMessage_(params)
 	}
 
