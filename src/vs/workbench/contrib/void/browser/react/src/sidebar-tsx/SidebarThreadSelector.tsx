@@ -34,10 +34,10 @@ export const PastThreadsList = ({ className = '' }: { className?: string }) => {
 			{displayRows.length === 0 ? <div className='p-1 text-sm'>No previous chats yet.</div> : displayRows.map(row => <PastThreadElement key={row.id} row={row} />)}
 
 			{hasMoreThreads && !showAll && (
-				<button type='button' aria-expanded={false} className="void-focus-ring text-left text-void-fg-3 opacity-80 hover:opacity-100 hover:brightness-115 p-1 text-xs" onClick={() => setShowAll(true)}>Show {rows.length - numInitialThreads} more...</button>
+				<button type='button' aria-expanded={false} className="focus-ring text-left text-void-fg-3 opacity-80 hover:opacity-100 hover:brightness-115 p-1 text-xs" onClick={() => setShowAll(true)}>Show {rows.length - numInitialThreads} more...</button>
 			)}
 			{hasMoreThreads && showAll && (
-				<button type='button' aria-expanded={true} className="void-focus-ring text-left text-void-fg-3 opacity-80 hover:opacity-100 hover:brightness-115 p-1 text-xs" onClick={() => setShowAll(false)}>Show less</button>
+				<button type='button' aria-expanded={true} className="focus-ring text-left text-void-fg-3 opacity-80 hover:opacity-100 hover:brightness-115 p-1 text-xs" onClick={() => setShowAll(false)}>Show less</button>
 			)}
 		</div>
 	);
@@ -77,7 +77,7 @@ const DuplicateButton = ({ threadId }: { threadId: string }) => {
 		type='button'
 		aria-label='Duplicate chat'
 		title='Duplicate chat'
-		className='void-focus-ring size-[11px]'
+		className='focus-ring size-[11px]'
 		onClick={() => { chatThreadsService.duplicateThread(threadId); }}
 		data-tooltip-id='void-tooltip'
 		data-tooltip-place='top'
@@ -99,7 +99,7 @@ const TrashButton = ({ threadId }: { threadId: string }) => {
 		<div className='flex flex-nowrap text-nowrap gap-1'>
 			<IconShell1
 				Icon={X}
-				type='button' aria-label='Cancel delete' title='Cancel delete' className='void-focus-ring size-[11px]'
+				type='button' aria-label='Cancel delete' title='Cancel delete' className='focus-ring size-[11px]'
 				onClick={() => { setIsTrashPressed(false); }}
 				data-tooltip-id='void-tooltip'
 				data-tooltip-place='top'
@@ -107,7 +107,7 @@ const TrashButton = ({ threadId }: { threadId: string }) => {
 			/>
 			<IconShell1
 				Icon={Check}
-				type='button' aria-label='Confirm delete' title='Confirm delete' className='void-focus-ring size-[11px]'
+				type='button' aria-label='Confirm delete' title='Confirm delete' className='focus-ring size-[11px]'
 				onClick={() => { chatThreadsService.deleteThread(threadId); setIsTrashPressed(false); }}
 				data-tooltip-id='void-tooltip'
 				data-tooltip-place='top'
@@ -116,7 +116,7 @@ const TrashButton = ({ threadId }: { threadId: string }) => {
 		</div>
 		: <IconShell1
 			Icon={Trash2}
-			type='button' aria-label='Delete chat' title='Delete chat' className='void-focus-ring size-[11px]'
+			type='button' aria-label='Delete chat' title='Delete chat' className='focus-ring size-[11px]'
 			onClick={() => { setIsTrashPressed(true); }}
 			data-tooltip-id='void-tooltip'
 			data-tooltip-place='top'
@@ -158,7 +158,7 @@ const PastThreadElement = ({ row }: { row: ReturnType<typeof getChatHistoryPrese
 
 	const statusIcon = row.status === 'Running' ? <LoaderCircle aria-hidden='true' className='animate-spin flex-shrink-0' size={14} /> : row.status === 'Needs approval' ? <MessageCircleQuestion aria-hidden='true' className='flex-shrink-0' size={14} /> : row.status === 'Error' || row.status === 'Action required' ? <CircleAlert aria-hidden='true' className='flex-shrink-0' size={14} /> : null;
 	return <div className='flex items-center gap-1 py-1 px-2 rounded text-sm bg-zinc-700/5 hover:bg-zinc-700/10 dark:bg-zinc-300/5 dark:hover:bg-zinc-300/10 opacity-80 hover:opacity-100'>
-		<button type='button' className='void-focus-ring min-w-0 flex-1 text-left' aria-current={row.selected ? 'page' : undefined} aria-label={row.ariaLabel} onClick={() => chatThreadsService.switchToThread(row.id)}>
+		<button type='button' className='focus-ring min-w-0 flex-1 text-left' aria-current={row.selected ? 'page' : undefined} aria-label={row.ariaLabel} onClick={() => chatThreadsService.switchToThread(row.id)}>
 			<span className='flex items-center gap-2 min-w-0 overflow-hidden'><span className='truncate overflow-hidden text-ellipsis'>{row.title}</span>{row.selected ? <span className='text-xs'>Current</span> : null}</span>
 			<span className='min-w-0 flex flex-wrap items-center gap-x-1 gap-y-0.5 whitespace-normal text-xs opacity-60'><span>{row.messageCount} {row.messageCount === 1 ? 'message' : 'messages'}</span><span>{formatDate(new Date(row.lastModified))}</span>{row.status ? <><span aria-hidden='true'>{statusIcon}</span><span>{row.status}</span></> : null}</span>
 		</button>

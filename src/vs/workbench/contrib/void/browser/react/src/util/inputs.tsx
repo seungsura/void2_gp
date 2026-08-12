@@ -365,8 +365,10 @@ type InputBox2Props = {
 	onFocus?: (e: React.FocusEvent<HTMLTextAreaElement>) => void;
 	onBlur?: (e: React.FocusEvent<HTMLTextAreaElement>) => void;
 	onChangeHeight?: (newHeight: number) => void;
+	ariaLabel?: string;
+	ariaDescribedBy?: string;
 }
-export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(function X({ initValue, placeholder, multiline, enableAtToMention, fnsRef, className, onKeyDown, onFocus, onBlur, onChangeText }, ref) {
+export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(function X({ initValue, placeholder, multiline, enableAtToMention, fnsRef, className, onKeyDown, onFocus, onBlur, onChangeText, ariaLabel, ariaDescribedBy }, ref) {
 
 
 	// mirrors whatever is in ref
@@ -754,6 +756,8 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 	return <>
 		<textarea
 			autoFocus={false}
+			aria-label={ariaLabel}
+			aria-describedby={ariaDescribedBy}
 			ref={useCallback((r: HTMLTextAreaElement | null) => {
 				if (fnsRef)
 					fnsRef.current = fns
@@ -796,6 +800,7 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 			}, [onChangeText, adjustHeight])}
 
 			onKeyDown={useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+				if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
 
 				if (isMenuOpen) {
 					onMenuKeyDown(e)

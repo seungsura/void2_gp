@@ -26,6 +26,7 @@ import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, Pencil, U
 import { ChatMessage, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
 import { isActiveChildRun } from '../../../../common/agentSubagents.js';
 import { AgentSubagentPresentation, getAgentSubagentPresentation } from '../../../../common/agentSubagentPresentation.js';
+import { canSubmitChatCurrent, ChatCurrentStatusPresentation, getChatCurrentStatusPresentation } from '../../../../common/chatCurrentStatusPresentation.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, ToolName, LintErrorItem, ToolApprovalType, toolApprovalTypes } from '../../../../common/toolsServiceTypes.js';
 import { CopyButton, IconShell1, JumpToFileButton, JumpToTerminalButton, StatusIndicator, useApplyStreamState } from '../markdown/ApplyBlockHoverButtons.js';
 import { acceptAllBg, acceptBorder, buttonFontSize, buttonTextColor, rejectAllBg, rejectBg, rejectBorder } from '../../../../common/helpers/colors.js';
@@ -306,6 +307,9 @@ interface VoidChatAreaProps {
 	showSelections?: boolean;
 	showProspectiveSelections?: boolean;
 	loadingIcon?: React.ReactNode;
+	statusHelp?: React.ReactNode;
+	showStop?: boolean;
+	controlSemantics?: ChatCurrentStatusPresentation['controls'];
 
 	selections?: StagingSelectionItem[]
 	setSelections?: (s: StagingSelectionItem[]) => void
@@ -336,7 +340,12 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 	setSelections,
 	featureName,
 	loadingIcon,
+	statusHelp,
+	showStop,
+	controlSemantics,
 }) => {
+	const shouldShowStop = showStop ?? isStreaming;
+
 	return (
 		<div
 			ref={divRef}
@@ -380,6 +389,8 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 				)}
 			</div>
 
+			{statusHelp}
+
 			{/* Bottom row */}
 			<div className='flex flex-row justify-between items-end gap-1'>
 				{showModelDropdown && (
@@ -397,10 +408,20 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 
 					{isStreaming && loadingIcon}
 
-					{isStreaming ? (
-						<ButtonStop onClick={onAbort} />
+					{shouldShowStop ? (
+						<ButtonStop
+							className={controlSemantics ? 'focus-ring' : ''}
+							id={controlSemantics?.stop.id}
+							aria-label={controlSemantics?.stop.ariaLabel}
+							title={controlSemantics?.stop.title}
+							onClick={onAbort}
+						/>
 					) : (
 						<ButtonSubmit
+							className={controlSemantics ? 'focus-ring' : ''}
+							id={controlSemantics?.send.id}
+							aria-label={controlSemantics?.send.ariaLabel}
+							title={controlSemantics?.send.title}
 							onClick={onSubmit}
 							disabled={isDisabled}
 						/>
@@ -417,10 +438,13 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 
 type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement>
 const DEFAULT_BUTTON_SIZE = 22;
-export const ButtonSubmit = ({ className, disabled, ...props }: ButtonProps & Required<Pick<ButtonProps, 'disabled'>>) => {
+export const ButtonSubmit = ({ className, disabled, 'aria-label': ariaLabel = 'Send message', title = ariaLabel, ...props }: ButtonProps & Required<Pick<ButtonProps, 'disabled'>>) => {
 
 	return <button
 		type='button'
+		disabled={disabled}
+		aria-label={ariaLabel}
+		title={title}
 		className={`rounded-full flex-shrink-0 flex-grow-0 flex items-center justify-center
 			${disabled ? 'bg-vscode-disabled-fg cursor-default' : 'bg-white cursor-pointer'}
 			${className}
@@ -434,8 +458,10 @@ export const ButtonSubmit = ({ className, disabled, ...props }: ButtonProps & Re
 	</button>
 }
 
-export const ButtonStop = ({ className, ...props }: ButtonHTMLAttributes<HTMLButtonElement>) => {
+export const ButtonStop = ({ className, 'aria-label': ariaLabel = 'Stop response', title = ariaLabel, ...props }: ButtonHTMLAttributes<HTMLButtonElement>) => {
 	return <button
+		aria-label={ariaLabel}
+		title={title}
 		className={`rounded-full flex-shrink-0 flex-grow-0 cursor-pointer flex items-center justify-center
 			bg-white
 			${className}
@@ -2676,16 +2702,16 @@ const ChildRunPanel = ({ presentation }: { presentation: AgentSubagentPresentati
 		<div className='text-void-fg-3' role='status' aria-live='polite' aria-atomic='true'>{presentation.summary}</div>
 		{presentation.actionRequired ? <div className='text-void-warning'>{presentation.actionRequiredLabel}. Open details for the recorded status.</div> : null}
 		{presentation.runs.map(view => <details key={view.id} className='border border-void-border-1 rounded-sm px-2 py-1 mt-1'>
-			<summary className='void-focus-ring cursor-pointer select-none' aria-label={`Child Run${view.roleName ? ` ${view.roleName}` : ''} ${view.shortId} ${view.statusLabel}`}>Child Run{view.roleName ? ` · ${view.roleName}` : ''} · {view.shortId} · {view.statusLabel} · {view.totalMs}ms</summary>
+			<summary className='focus-ring cursor-pointer select-none' aria-label={`Child Run${view.roleName ? ` ${view.roleName}` : ''} ${view.shortId} ${view.statusLabel}`}>Child Run{view.roleName ? ` · ${view.roleName}` : ''} · {view.shortId} · {view.statusLabel} · {view.totalMs}ms</summary>
 			<div className='pt-1 text-void-fg-3'>
 				<div>Void application-level read-only — terminal disabled, no OS sandbox</div>
 				{view.roleDescription ? <div>{view.roleDescription}</div> : null}
 				<div>Timing: {view.queuedMs}ms queued, {view.runningMs}ms running, {view.totalMs}ms total</div>
 				{view.summary ? <div className='pt-1 whitespace-pre-wrap break-words'>{view.summary}</div> : null}
-				<details className='mt-1'><summary className='void-focus-ring cursor-pointer select-none' aria-label={`Technical details for child run ${view.shortId}`}>Technical details</summary><div className='pt-1'>Authority revisions: runtime {view.authority.runtimeRevision.slice(0, 8)}, instructions {view.authority.instructionsRevision.slice(0, 8)}, skills {view.authority.catalogRevision.slice(0, 8)}{view.authority.modelFingerprint ? `, model ${view.authority.modelFingerprint}` : ''}{view.authority.selectedSkills.length ? `; selected skills: ${view.authority.selectedSkills.map(skill => skill.identity).join(', ')}` : ''}</div></details>
+				<details className='mt-1'><summary className='focus-ring cursor-pointer select-none' aria-label={`Technical details for child run ${view.shortId}`}>Technical details</summary><div className='pt-1'>Authority revisions: runtime {view.authority.runtimeRevision.slice(0, 8)}, instructions {view.authority.instructionsRevision.slice(0, 8)}, skills {view.authority.catalogRevision.slice(0, 8)}{view.authority.modelFingerprint ? `, model ${view.authority.modelFingerprint}` : ''}{view.authority.selectedSkills.length ? `; selected skills: ${view.authority.selectedSkills.map(skill => skill.identity).join(', ')}` : ''}</div></details>
 			</div>
 		</details>)}
-		{presentation.budget || presentation.diagnostics ? <details className='border border-void-border-1 rounded-sm px-2 py-1 mt-1'><summary className='void-focus-ring cursor-pointer select-none' aria-label='Child diagnostics'>Diagnostics and technical details</summary><div className='pt-1 text-void-fg-3'>
+		{presentation.budget || presentation.diagnostics ? <details className='border border-void-border-1 rounded-sm px-2 py-1 mt-1'><summary className='focus-ring cursor-pointer select-none' aria-label='Child diagnostics'>Diagnostics and technical details</summary><div className='pt-1 text-void-fg-3'>
 			{presentation.budget ? <div>Budget: {presentation.budget.providerSends}/{presentation.budget.maxProviderSends} provider sends, {presentation.budget.resultChars}/{presentation.budget.maxResultChars} result chars, {presentation.budget.deadlineMsRemaining}ms deadline remaining; {presentation.usageLabel}</div> : <div>{presentation.usageLabel}</div>}
 			{presentation.diagnostics ? <><div>Timeline: {presentation.diagnostics.events.length} events, {presentation.diagnostics.elapsedMs}ms</div>{presentation.diagnostics.droppedEvents ? <div>{presentation.diagnostics.droppedEvents} later events omitted</div> : null}{presentation.diagnostics.events.map(event => <div key={event.sequence}>#{event.sequence} +{event.elapsedMs}ms · {event.kind}{event.childId ? ` · ${event.childId.slice(0, 8)}` : ''}{event.diagnostic ? ` · ${event.diagnostic}` : ''} · {event.budget.running} running/{event.budget.queued} queued</div>)}</> : null}
 		</div></details> : null}
@@ -2733,14 +2759,21 @@ export const SidebarChat = () => {
 	const initVal = ''
 	const [instructionsAreEmpty, setInstructionsAreEmpty] = useState(!initVal)
 
-	const isDisabled = instructionsAreEmpty || !!isFeatureNameDisabled('Chat', settingsState)
+	const hasDraft = !instructionsAreEmpty
+	const chatModelUnavailable = !!isFeatureNameDisabled('Chat', settingsState)
+	const currentStatusPresentation = getChatCurrentStatusPresentation({
+		parentIsRunning: isRunning,
+		childActive: childIsActive,
+		hasError: !!latestError,
+		hasDraft,
+		chatModelUnavailable,
+	})
 
 	const sidebarRef = useRef<HTMLDivElement>(null)
 	const scrollContainerRef = useRef<HTMLDivElement | null>(null)
 	const onSubmit = useCallback(async (_forceSubmit?: string) => {
 
-		if (isDisabled && !_forceSubmit) return
-		if (isAnyRunning) return
+		if (!canSubmitChatCurrent({ busy: isAnyRunning, hasDraft, chatModelUnavailable, forcedText: _forceSubmit })) return
 
 		const threadId = chatThreadsService.state.currentThreadId
 
@@ -2751,13 +2784,14 @@ export const SidebarChat = () => {
 			await chatThreadsService.addUserMessageAndStreamResponse({ userMessage, threadId })
 		} catch (e) {
 			console.error('Error while sending message in chat:', e)
+			return
 		}
 
 		setSelections([]) // clear staging
 		textAreaFnsRef.current?.setValue('')
 		textAreaRef.current?.focus() // focus input after submit
 
-	}, [chatThreadsService, isDisabled, isAnyRunning, textAreaRef, textAreaFnsRef, setSelections, settingsState])
+	}, [chatThreadsService, isAnyRunning, hasDraft, chatModelUnavailable, setSelections])
 
 	const onAbort = async () => {
 		const threadId = currentThread.id
@@ -2865,19 +2899,32 @@ export const SidebarChat = () => {
 		setInstructionsAreEmpty(!newStr)
 	}, [setInstructionsAreEmpty])
 	const onKeyDown = useCallback((e: KeyboardEvent<HTMLTextAreaElement>) => {
-		if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+		if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229 || e.repeat) return
+		if (e.key === 'Enter' && !e.shiftKey) {
 			onSubmit()
-		} else if (e.key === 'Escape' && isAnyRunning) {
+		} else if (e.key === 'Escape' && currentStatusPresentation.showStop) {
 			onAbort()
 		}
-	}, [onSubmit, onAbort, isAnyRunning])
+	}, [onSubmit, onAbort, currentStatusPresentation.showStop])
+
+	const currentStatusHelp = <div
+		id={currentStatusPresentation.statusHelp.id}
+		className='min-h-5 flex flex-wrap items-center gap-x-1 px-0.5 text-xs text-void-fg-3'
+	>
+		<span role='status' aria-live='polite' aria-atomic={true} className='text-void-fg-2'>{currentStatusPresentation.liveLabel ?? ''}</span>
+		{currentStatusPresentation.liveLabel ? <span aria-hidden={true}>·</span> : null}
+		<span>{currentStatusPresentation.detail}</span>
+	</div>
 
 	const inputChatArea = <VoidChatArea
 		featureName='Chat'
 		onSubmit={() => onSubmit()}
 		onAbort={onAbort}
 		isStreaming={isAnyRunning}
-		isDisabled={isDisabled}
+		showStop={currentStatusPresentation.showStop}
+		isDisabled={currentStatusPresentation.sendDisabled}
+		statusHelp={currentStatusHelp}
+		controlSemantics={currentStatusPresentation.controls}
 		showSelections={true}
 		// showProspectiveSelections={previousMessagesHTML.length === 0}
 		selections={selections}
@@ -2886,7 +2933,9 @@ export const SidebarChat = () => {
 	>
 		<VoidInputBox2
 			enableAtToMention
-			className={`min-h-[81px] px-0.5 py-0.5`}
+			ariaLabel={currentStatusPresentation.textarea.ariaLabel}
+			ariaDescribedBy={currentStatusPresentation.textarea.ariaDescribedBy}
+			className={`focus-ring min-h-[81px] px-0.5 py-0.5`}
 			placeholder={`@ to mention, ${keybindingString ? `${keybindingString} to add a selection. ` : ''}Enter instructions...`}
 			onChangeText={onChangeText}
 			onKeyDown={onKeyDown}
