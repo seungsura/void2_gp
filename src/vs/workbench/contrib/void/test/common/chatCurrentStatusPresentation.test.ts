@@ -30,14 +30,26 @@ suite('Void ChatCurrentStatusPresentation', () => {
 		assert.strictEqual(running.detail, 'Esc to stop');
 		assert.strictEqual(awaiting.detail, 'Review the request above');
 		assert.strictEqual(error.detail, 'Review the message above');
+		assert.deepStrictEqual(
+			[idle.announcement, unavailable.announcement, running.announcement, awaiting.announcement, error.announcement],
+			['Enter to send · Shift+Enter for new line', 'Choose a Chat model to send', 'Running · Esc to stop', 'Needs approval · Review the request above', 'Error · Review the message above'],
+		);
 	});
 
 	test('uses error, awaiting, running, unavailable, idle priority', () => {
-		assert.strictEqual(present({ hasError: true, parentIsRunning: 'awaiting_user', childActive: true, chatModelUnavailable: true }).kind, 'error');
-		assert.strictEqual(present({ parentIsRunning: 'awaiting_user', childActive: true, chatModelUnavailable: true }).kind, 'awaiting_user');
-		assert.strictEqual(present({ parentIsRunning: 'tool', chatModelUnavailable: true }).kind, 'running');
-		assert.strictEqual(present({ chatModelUnavailable: true }).kind, 'unavailable');
-		assert.strictEqual(present().kind, 'idle');
+		const error = present({ hasError: true, parentIsRunning: 'awaiting_user', childActive: true, chatModelUnavailable: true });
+		const awaiting = present({ parentIsRunning: 'awaiting_user', childActive: true, chatModelUnavailable: true });
+		const running = present({ parentIsRunning: 'tool', chatModelUnavailable: true });
+		const unavailable = present({ chatModelUnavailable: true });
+		const idle = present();
+		assert.deepStrictEqual(
+			[error.kind, awaiting.kind, running.kind, unavailable.kind, idle.kind],
+			['error', 'awaiting_user', 'running', 'unavailable', 'idle'],
+		);
+		assert.deepStrictEqual(
+			[error.announcement, awaiting.announcement, running.announcement, unavailable.announcement, idle.announcement],
+			['Error · Review the message above · Esc to stop active child', 'Needs approval · Review the request above · Draft is not sent yet · Esc to stop active child', 'Running · Esc to stop · Draft is not sent yet', 'Choose a Chat model to send', 'Enter to send · Shift+Enter for new line'],
+		);
 	});
 
 	test('adds draft-not-sent copy only to running and awaiting states', () => {
@@ -84,6 +96,7 @@ suite('Void ChatCurrentStatusPresentation', () => {
 		assert.strictEqual(value.showStop, true);
 		assert.strictEqual(value.sendDisabled, true);
 		assert.strictEqual(value.detail, 'Review the request above · Draft is not sent yet · Esc to stop active child');
+		assert.strictEqual(value.announcement, 'Needs approval · Review the request above · Draft is not sent yet · Esc to stop active child');
 		assert.deepStrictEqual(value.controls.stop, { id: 'void-chat-current-stop', ariaLabel: 'Stop active child run', title: 'Stop active child run' });
 		assert.strictEqual(Object.isFrozen(value.controls), true);
 		assert.strictEqual(Object.isFrozen(value.controls.stop), true);
@@ -93,6 +106,7 @@ suite('Void ChatCurrentStatusPresentation', () => {
 		const value = present({ hasError: true, childActive: true });
 		assert.strictEqual(value.kind, 'error');
 		assert.strictEqual(value.detail, 'Review the message above · Esc to stop active child');
+		assert.strictEqual(value.announcement, 'Error · Review the message above · Esc to stop active child');
 		assert.deepStrictEqual(value.controls.stop, { id: 'void-chat-current-stop', ariaLabel: 'Stop active child run', title: 'Stop active child run' });
 	});
 

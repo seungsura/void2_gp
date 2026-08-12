@@ -3,9 +3,8 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import React, { useEffect, useState } from 'react';
+import React, { useId, useState } from 'react';
 import { AlertCircle, ChevronDown, ChevronUp, X } from 'lucide-react';
-import { useSettingsState } from '../util/services.js';
 import { errorDetails } from '../../../../common/sendLLMMessageTypes.js';
 
 
@@ -21,6 +20,7 @@ export const ErrorDisplay = ({
 	showDismiss?: boolean,
 }) => {
 	const [isExpanded, setIsExpanded] = useState(false);
+	const detailsId = useId();
 
 	const details = errorDetails(fullError)
 	const isExpandable = !!details
@@ -47,7 +47,13 @@ export const ErrorDisplay = ({
 
 				<div className='flex gap-2'>
 					{isExpandable && (
-						<button className='text-red-600 hover:text-red-800 p-1 rounded'
+						<button
+							type='button'
+							aria-label={isExpanded ? 'Hide error details' : 'Show error details'}
+							title={isExpanded ? 'Hide error details' : 'Show error details'}
+							aria-expanded={isExpanded}
+							aria-controls={detailsId}
+							className='text-red-600 hover:text-red-800 p-1 rounded focus-ring'
 							onClick={() => setIsExpanded(!isExpanded)}
 						>
 							{isExpanded ? (
@@ -58,7 +64,11 @@ export const ErrorDisplay = ({
 						</button>
 					)}
 					{showDismiss && onDismiss && (
-						<button className='text-red-600 hover:text-red-800 p-1 rounded'
+						<button
+							type='button'
+							aria-label='Dismiss error'
+							title='Dismiss error'
+							className='text-red-600 hover:text-red-800 p-1 rounded focus-ring'
 							onClick={onDismiss}
 						>
 							<X className='h-5 w-5' />
@@ -68,14 +78,14 @@ export const ErrorDisplay = ({
 			</div>
 
 			{/* Expandable Details */}
-			{isExpanded && details && (
-				<div className='mt-4 space-y-3 border-t border-red-200 pt-3 overflow-auto'>
+			<div id={detailsId} hidden={!isExpanded} className='mt-4 space-y-3 border-t border-red-200 pt-3 overflow-auto'>
+				{details && (
 					<div>
 						<span className='font-semibold text-red-800'>Full Error: </span>
 						<pre className='text-red-700'>{details}</pre>
 					</div>
-				</div>
-			)}
+				)}
+			</div>
 		</div>
 	);
 };

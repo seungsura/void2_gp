@@ -586,15 +586,18 @@ export const ModelDump = ({ filteredProviders }: { filteredProviders?: ProviderN
 				)}
 			</div>
 		) : (
-			<div
-				className="text-void-fg-4 flex flex-nowrap text-nowrap items-center hover:brightness-110 cursor-pointer mt-4"
+			<button
+				type='button'
+				aria-label='Add a model'
+				title='Add a model'
+				className="text-void-fg-4 flex flex-nowrap text-nowrap items-center hover:brightness-110 cursor-pointer mt-4 focus-ring"
 				onClick={() => setIsAddModelOpen(true)}
 			>
-				<div className="flex items-center gap-1">
+				<span className="flex items-center gap-1">
 					<Plus size={16} />
 					<span>Add a model</span>
-				</div>
-			</div>
+				</span>
+			</button>
 		)}
 
 		{/* Model Settings Dialog */}

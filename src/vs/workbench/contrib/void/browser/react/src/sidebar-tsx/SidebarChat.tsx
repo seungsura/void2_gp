@@ -1555,6 +1555,9 @@ const ToolRequestAcceptRejectButtons = ({ toolName }: { toolName: ToolName }) =>
 
 	const approveButton = (
 		<button
+			type='button'
+			aria-label={`Approve ${toolName} tool request`}
+			title={`Approve ${toolName} tool request`}
 			onClick={onAccept}
 			className={`
                 px-2 py-1
@@ -1563,6 +1566,7 @@ const ToolRequestAcceptRejectButtons = ({ toolName }: { toolName: ToolName }) =>
                 hover:bg-[var(--vscode-button-hoverBackground)]
                 rounded
                 text-sm font-medium
+                focus-ring
             `}
 		>
 			Approve
@@ -1571,6 +1575,9 @@ const ToolRequestAcceptRejectButtons = ({ toolName }: { toolName: ToolName }) =>
 
 	const cancelButton = (
 		<button
+			type='button'
+			aria-label={`Reject ${toolName} tool request`}
+			title={`Reject ${toolName} tool request`}
 			onClick={onReject}
 			className={`
                 px-2 py-1
@@ -1579,6 +1586,7 @@ const ToolRequestAcceptRejectButtons = ({ toolName }: { toolName: ToolName }) =>
                 hover:bg-[var(--vscode-button-secondaryHoverBackground)]
                 rounded
                 text-sm font-medium
+                focus-ring
             `}
 		>
 			Cancel
@@ -2919,9 +2927,7 @@ export const SidebarChat = () => {
 		id={currentStatusPresentation.statusHelp.id}
 		className='min-h-5 flex flex-wrap items-center gap-x-1 px-0.5 text-xs text-void-fg-3'
 	>
-		<span role='status' aria-live='polite' aria-atomic={true} className='text-void-fg-2'>{currentStatusPresentation.liveLabel ?? ''}</span>
-		{currentStatusPresentation.liveLabel ? <span aria-hidden={true}>·</span> : null}
-		<span>{currentStatusPresentation.detail}</span>
+		<span role='status' aria-live='polite' aria-atomic={true} className='text-void-fg-2'>{currentStatusPresentation.announcement}</span>
 	</div>
 
 	const inputChatArea = <VoidChatArea

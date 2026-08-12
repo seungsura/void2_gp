@@ -32,6 +32,7 @@ export type ChatCurrentStatusPresentation = Readonly<{
 	kind: ChatCurrentStatusKind;
 	liveLabel?: ChatCurrentLiveLabel;
 	detail: string;
+	announcement: string;
 	showStop: boolean;
 	sendDisabled: boolean;
 	textarea: Readonly<{
@@ -115,11 +116,13 @@ export const getChatCurrentStatusPresentation = (input: ChatCurrentStatusInput):
 			stop: freeze({ id: CHAT_CURRENT_STOP_CONTROL_ID, ariaLabel: 'Stop active child run', title: 'Stop active child run' }),
 		})
 		: controls;
+	const announcement = liveLabel ? `${liveLabel} · ${detail}` : detail;
 
 	return freeze({
 		kind,
 		...(liveLabel ? { liveLabel } : {}),
 		detail,
+		announcement,
 		showStop: stoppable,
 		sendDisabled: !canSubmitChatCurrent({ busy, hasDraft: input.hasDraft, chatModelUnavailable: input.chatModelUnavailable }),
 		textarea,
