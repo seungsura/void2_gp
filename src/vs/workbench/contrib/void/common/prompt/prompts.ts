@@ -357,7 +357,7 @@ export const isABuiltinToolName = (toolName: string): toolName is BuiltinToolNam
 /** These are application control tools, not builtins: ChatThreadService intercepts them before MCP lookup. */
 const agentSubagentControlTool = (tool: InternalToolInfo): InternalToolInfo => tool;
 export const agentSubagentControlTools: readonly InternalToolInfo[] = Object.freeze([
-	agentSubagentControlTool({ name: 'spawn_agent', description: 'Start one generic read-only child agent for a delegated task. The child has no terminal and no OS sandbox.', params: { message: { description: 'The bounded delegated task.' } }, schema: agentSubagentToolSchemas.spawn_agent }),
+	agentSubagentControlTool({ name: 'spawn_agent', description: 'Start one read-only child for a delegated task. Optional agent_type must be an admitted named custom agent. The child has no terminal and no OS sandbox.', params: { message: { description: 'The bounded delegated task.' }, agent_type: { description: 'Optional exact admitted custom-agent identity.' } }, schema: agentSubagentToolSchemas.spawn_agent }),
 	agentSubagentControlTool({ name: 'wait_agent', description: 'Wait for the current direct child without mutating it. A terminal summary is delivered at most once.', params: { timeout_ms: { description: 'Optional wait time in milliseconds, 0 through 30000.' } }, schema: agentSubagentToolSchemas.wait_agent }),
 	agentSubagentControlTool({ name: 'interrupt_agent', description: 'Cancel the current direct child by its id.', params: { target: { description: 'The direct child id.' } }, schema: agentSubagentToolSchemas.interrupt_agent }),
 ]);

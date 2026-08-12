@@ -49,7 +49,7 @@ export const assertCanonicalReadOnlyChildRawPaths = (name: string, raw: Record<s
 };
 
 export type AgentSubagentStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
-export type AgentSubagentRunView = Readonly<{ id: string; status: AgentSubagentStatus; summary?: string; usage: null }>;
+export type AgentSubagentRunView = Readonly<{ id: string; status: AgentSubagentStatus; summary?: string; roleName?: string; roleDescription?: string; usage: null }>;
 export const isActiveChildRun = (view: AgentSubagentRunView | undefined): boolean => view?.status === 'queued' || view?.status === 'running';
 export const agentSubagentStatusLabel = (status: AgentSubagentStatus): string => ({ queued: 'Queued', running: 'Running', completed: 'Completed', failed: 'Failed', cancelled: 'Cancelled' })[status];
 export type AgentSubagentControlName = 'spawn_agent' | 'wait_agent' | 'interrupt_agent';
@@ -66,7 +66,7 @@ const deepFreeze = <T>(value: T): T => { if (value && typeof value === 'object' 
 
 /** Flat schemas are intentionally dialect-conservative. Runtime validation below is authoritative. */
 export const agentSubagentToolSchemas = deepFreeze({
-	spawn_agent: flatObject({ message: { type: 'string', minLength: 1, maxLength: AGENT_SUBAGENT_MAX_MESSAGE_CHARS } }, ['message']),
+	spawn_agent: flatObject({ message: { type: 'string', minLength: 1, maxLength: AGENT_SUBAGENT_MAX_MESSAGE_CHARS }, agent_type: { type: 'string', minLength: 1, maxLength: 64 } }, ['message']),
 	wait_agent: flatObject({ timeout_ms: { type: 'integer', minimum: 0, maximum: AGENT_SUBAGENT_MAX_WAIT_MS } }),
 	interrupt_agent: flatObject({ target: { type: 'string', minLength: 1, maxLength: 256 } }, ['target']),
 });
@@ -81,7 +81,7 @@ export const readOnlyChildBuiltinSchemas: Readonly<Record<string, Record<string,
 });
 
 export type AgentSubagentControlParams =
-	| { readonly name: 'spawn_agent'; readonly message: string }
+	| { readonly name: 'spawn_agent'; readonly message: string; readonly agentType?: string }
 	| { readonly name: 'wait_agent'; readonly timeoutMs: number }
 	| { readonly name: 'interrupt_agent'; readonly target: string };
 
@@ -92,8 +92,8 @@ const exactKeys = (value: Record<string, unknown>, keys: readonly string[]) => O
 export const validateAgentSubagentControlParams = (name: AgentSubagentControlName, raw: unknown): AgentSubagentControlParams => {
 	if (!isPlainObject(raw)) throw new Error('agent_control_invalid_params');
 	if (name === 'spawn_agent') {
-		if (!exactKeys(raw, ['message']) || typeof raw.message !== 'string' || !raw.message.trim() || raw.message.length > AGENT_SUBAGENT_MAX_MESSAGE_CHARS) throw new Error('spawn_agent_invalid_params');
-		return { name, message: raw.message };
+		if (!exactKeys(raw, ['message', 'agent_type']) || typeof raw.message !== 'string' || !raw.message.trim() || raw.message.length > AGENT_SUBAGENT_MAX_MESSAGE_CHARS || (raw.agent_type !== undefined && (typeof raw.agent_type !== 'string' || !/^[a-z][a-z0-9_-]{0,63}$/.test(raw.agent_type)))) throw new Error('spawn_agent_invalid_params');
+		return { name, message: raw.message, ...(raw.agent_type === undefined ? {} : { agentType: raw.agent_type as string }) };
 	}
 	if (name === 'wait_agent') {
 		if (!exactKeys(raw, ['timeout_ms'])) throw new Error('wait_agent_invalid_params');

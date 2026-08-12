@@ -10,6 +10,7 @@ import { createDecorator } from '../../../../platform/instantiation/common/insta
 import { registerSingleton, InstantiationType } from '../../../../platform/instantiation/common/extensions.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { URI } from '../../../../base/common/uri.js';
+import { deepClone } from '../../../../base/common/objects.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
 import { IWorkspaceTrustManagementService } from '../../../../platform/workspace/common/workspaceTrust.js';
@@ -20,15 +21,21 @@ import { assertCanonicalAgentChildRawUri, assertCanonicalAgentChildUriPath, asse
 import { IToolsService } from './toolsServiceInterface.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { IAgentSkillsService } from './agentSkillsService.js';
+import { IAgentCustomAgentService } from './agentCustomAgentService.js';
+import { applyCustomAgentSkillRules } from '../common/agentCustomAgents.js';
+import { CustomAgentCatalog } from '../common/agentCustomAgents.js';
 import { ChatMessage } from '../common/chatThreadServiceTypes.js';
 import { isEqualOrParent } from '../../../../base/common/resources.js';
 import { ModelSelection, providerNames, SettingsOfProvider } from '../common/voidSettingsTypes.js';
+import { IVoidSettingsService } from '../common/voidSettingsService.js';
+import { getModelCapabilities, getReservedOutputTokenSpace } from '../common/modelCapabilities.js';
+import { appendAgentInstructionDeveloperInstructions } from '../common/agentInstructions.js';
 
 const MAX_CHILD_TURNS = 16;
 const MAX_CHILD_SUMMARY = 8_000;
 const MAX_CHILD_RUN_MS = 120_000;
 
-type ChildRun = { readonly id: string; readonly parentId: string; readonly snapshot: AgentRuntimeTurnSnapshot; readonly lifecycle: AgentSubagentLifecycle; readonly cancellation: CancellationTokenSource; readonly settingsOfProvider: SettingsOfProvider; requestId?: string; timeoutHandle?: ReturnType<typeof setTimeout>; summary: string };
+type ChildRun = { readonly id: string; readonly parentId: string; readonly snapshot: AgentRuntimeTurnSnapshot; readonly lifecycle: AgentSubagentLifecycle; readonly cancellation: CancellationTokenSource; readonly settingsOfProvider: SettingsOfProvider; readonly role?: { name: string; description: string; revision: string }; requestId?: string; timeoutHandle?: ReturnType<typeof setTimeout>; summary: string };
 export const IAgentSubagentService = createDecorator<IAgentSubagentService>('voidAgentSubagentService');
 export type AgentSubagentRunChangeEvent = Readonly<
 	{ parentId: string; id: string; status: AgentSubagentStatus; removed?: false }
@@ -36,7 +43,7 @@ export type AgentSubagentRunChangeEvent = Readonly<
 >;
 export interface IAgentSubagentService {
 	readonly _serviceBrand: undefined;
-	spawn(parentId: string, message: string, snapshot: AgentRuntimeTurnSnapshot): Promise<{ id: string; status: AgentSubagentStatus }>;
+	spawn(parentId: string, message: string, snapshot: AgentRuntimeTurnSnapshot, agentType?: string, admittedRoles?: CustomAgentCatalog, admittedSettingsState?: IVoidSettingsService['state'], admittedSettingsOfProvider?: SettingsOfProvider): Promise<{ id: string; status: AgentSubagentStatus }>;
 	wait(parentId: string, timeoutMs: number): Promise<{ id?: string; status: AgentSubagentStatus; receipt?: AgentSubagentReceipt; deliverSummary: boolean }>;
 	interrupt(parentId: string, target: string): { id?: string; status: AgentSubagentStatus; receipt?: AgentSubagentReceipt };
 	cancelParent(parentId: string): void;
@@ -53,30 +60,59 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 	private readonly _onDidChangeRun = this._register(new Emitter<AgentSubagentRunChangeEvent>());
 	readonly onDidChangeRun = this._onDidChangeRun.event;
 
-	constructor(@ILLMMessageService private readonly llm: ILLMMessageService, @IToolsService private readonly tools: IToolsService, @IFileService private readonly fileService: IFileService, @IWorkspaceContextService private readonly workspace: IWorkspaceContextService, @IWorkspaceTrustManagementService private readonly trust: IWorkspaceTrustManagementService, @IConvertToLLMMessageService private readonly converter: IConvertToLLMMessageService, @IAgentSkillsService private readonly skills: IAgentSkillsService) { super(); }
+	constructor(@ILLMMessageService private readonly llm: ILLMMessageService, @IToolsService private readonly tools: IToolsService, @IFileService private readonly fileService: IFileService, @IWorkspaceContextService private readonly workspace: IWorkspaceContextService, @IWorkspaceTrustManagementService private readonly trust: IWorkspaceTrustManagementService, @IConvertToLLMMessageService private readonly converter: IConvertToLLMMessageService, @IAgentSkillsService private readonly skills: IAgentSkillsService, @IAgentCustomAgentService private readonly customAgents: IAgentCustomAgentService, @IVoidSettingsService private readonly settings: IVoidSettingsService) { super(); }
 
-	async spawn(parentId: string, message: string, parent: AgentRuntimeTurnSnapshot) {
+	async spawn(parentId: string, message: string, parent: AgentRuntimeTurnSnapshot, agentType?: string, admittedRoles?: CustomAgentCatalog, admittedSettingsState?: IVoidSettingsService['state'], admittedSettingsOfProvider?: SettingsOfProvider) {
 		const active = this.runs.get(parentId);
 		if (this.pending.has(parentId) || (active && (active.lifecycle.status === 'queued' || active.lifecycle.status === 'running'))) throw new Error('agent_child_already_active');
 		if (!parent.model.hasModel) throw new Error('agent_child_model_missing');
 		if (!providerNames.includes(parent.model.providerName as never)) throw new Error('agent_child_provider_invalid');
 		if (!parent.ownerProjectRoot || !parent.runCwd || parent.ownerProjectRoot !== parent.runCwd || !this.matchesParent(parent)) throw new Error('agent_child_owner_or_trust_changed');
-		const settingsOfProvider = this.llm.captureSettingsOfProvider();
+		const settingsOfProvider = admittedSettingsOfProvider ?? this.llm.captureSettingsOfProvider();
+		const capturedState = admittedSettingsState ?? deepClone(this.settings.state); // compatibility fallback for direct callers; top-level admission supplies the frozen state
 		const admission = new CancellationTokenSource(); this.pending.set(parentId, admission);
 		try {
-			const explicit = selectExplicitSkills(parent.catalog, message);
+			const catalogAtAdmission = agentType ? admittedRoles : undefined;
+			if (admission.token.isCancellationRequested || !this.matchesParent(parent)) throw new Error('agent_child_owner_or_trust_changed');
+			const role = agentType ? catalogAtAdmission?.agents.find(candidate => candidate.identity === agentType) : undefined;
+			if (agentType && !role) throw new Error('custom_agent_not_found');
+			const roleModel = role && (role.model || role.modelReasoningEffort) ? this.roleRuntimeModel(parent.model, role.model, role.modelReasoningEffort, capturedState) : parent.model;
+			const effectiveCatalog = role ? Object.freeze({ ...parent.catalog, skills: applyCustomAgentSkillRules(parent.catalog.skills, role.skillRules) }) : parent.catalog;
+			const explicit = selectExplicitSkills(effectiveCatalog, message);
 			if (explicit.diagnostic) throw new Error(explicit.diagnostic.code);
 			const bodies = await Promise.all((explicit.skills ?? []).map(async skill => { const read = await this.skills.readSkillBody(skill.provenance.skillRoot, skill.bodyRevision); if (admission.token.isCancellationRequested) throw new Error('agent_child_cancelled'); if (!this.matchesParent(parent)) throw new Error('agent_child_owner_or_trust_changed'); if (!read.body || read.diagnostic) throw new Error(read.diagnostic?.code ?? 'skill_body_unreadable'); return { identity: skill.identity, skillRoot: skill.provenance.skillRoot, bodyRevision: skill.bodyRevision, body: read.body }; }));
 			if (admission.token.isCancellationRequested || this.pending.get(parentId) !== admission) throw new Error('agent_child_cancelled');
 			if (!this.matchesParent(parent)) throw new Error('agent_child_owner_or_trust_changed');
-			const snapshot = createAgentRuntimeTurnSnapshot(parent.instructions, parent.catalog, skillAdvertisement(parent.catalog, parent.model.contextWindow), bodies, parent.model, parent.workspaceTrustedAtAdmission);
+			if (role) { const currentCatalog = await this.customAgents.getCatalog(URI.parse(parent.ownerProjectRoot)); const current = currentCatalog.agents.find(candidate => candidate.identity === role.identity); if (!current || currentCatalog.revision !== catalogAtAdmission!.revision || current.revision !== role.revision) throw new Error('custom_agent_stale'); if (!this.matchesParent(parent)) throw new Error('agent_child_owner_or_trust_changed'); }
+			if (admission.token.isCancellationRequested || this.pending.get(parentId) !== admission) throw new Error('agent_child_cancelled');
+			const snapshot = role ? createAgentRuntimeTurnSnapshot(appendAgentInstructionDeveloperInstructions(parent.instructions, role.developerInstructions), effectiveCatalog, skillAdvertisement(effectiveCatalog, roleModel.contextWindow), bodies, roleModel, parent.workspaceTrustedAtAdmission) : createAgentRuntimeTurnSnapshot(parent.instructions, parent.catalog, skillAdvertisement(parent.catalog, parent.model.contextWindow), bodies, parent.model, parent.workspaceTrustedAtAdmission);
 			admitProtectedAgentAuthority(snapshot, false);
-			const run: ChildRun = { id: generateUuid(), parentId, snapshot, lifecycle: new AgentSubagentLifecycle(), cancellation: new CancellationTokenSource(), settingsOfProvider, summary: '' };
+			const run: ChildRun = { id: generateUuid(), parentId, snapshot, lifecycle: new AgentSubagentLifecycle(), cancellation: new CancellationTokenSource(), settingsOfProvider, ...(role ? { role: { name: role.name, description: role.description, revision: role.revision } } : {}), summary: '' };
 			this.runs.set(parentId, run); this.pending.delete(parentId); admission.dispose();
 			this._onDidChangeRun.fire({ parentId, id: run.id, status: run.lifecycle.status });
 			void this.run(run, message).catch(error => this.settleRunFailure(run, error));
 			return { id: run.id, status: run.lifecycle.status };
 		} catch (error) { if (this.pending.get(parentId) === admission) this.pending.delete(parentId); admission.dispose(); throw error; }
+	}
+	private roleRuntimeModel(parent: Extract<AgentRuntimeTurnSnapshot['model'], { hasModel: true }>, modelName: string | undefined, effort: string | undefined, state: IVoidSettingsService['state']): Omit<Extract<AgentRuntimeTurnSnapshot['model'], { hasModel: true }>, 'fingerprint'> {
+		if (!modelName) {
+			if (effort) {
+				const capabilities = getModelCapabilities(parent.providerName as keyof SettingsOfProvider, parent.modelName, { [parent.providerName]: { [parent.modelName]: parent.selectedModelOverrides } } as never);
+				const reasoning = capabilities.reasoningCapabilities; const slider = reasoning && reasoning.reasoningSlider;
+				if (!reasoning || !reasoning.supportsReasoning || !slider || slider.type !== 'effort_slider' || !slider.values.includes(effort)) throw new Error('custom_agent_invalid_reasoning_effort');
+			}
+			return { hasModel: true, providerName: parent.providerName, modelName: parent.modelName, contextWindow: parent.contextWindow, reservedOutputTokens: parent.reservedOutputTokens, modelSelectionOptions: { ...parent.modelSelectionOptions, ...(effort ? { reasoningEnabled: true, reasoningEffort: effort } : {}) }, selectedModelOverrides: parent.selectedModelOverrides };
+		}
+		const provider = parent.providerName as keyof SettingsOfProvider;
+		const providerSettings = state.settingsOfProvider[provider];
+		if (!providerSettings?._didFillInProviderSettings || !providerSettings.models.some(item => item.modelName === modelName && !item.isHidden)) throw new Error('custom_agent_model_unavailable');
+		const overrides = state.overridesOfModel[provider]?.[modelName] ?? {};
+		const capabilities = getModelCapabilities(provider, modelName, state.overridesOfModel);
+		if (!['openai-style', 'anthropic-style', 'gemini-style'].includes(capabilities.specialToolFormat ?? '')) throw new Error('custom_agent_model_unsupported_for_agent');
+		const options = { ...(state.optionsOfModelSelection.Chat[provider]?.[modelName] ?? {}) };
+		if (effort) { const reasoning = capabilities.reasoningCapabilities; const slider = reasoning && reasoning.reasoningSlider; if (!reasoning || !reasoning.supportsReasoning || !slider || slider.type !== 'effort_slider' || !slider.values.includes(effort)) throw new Error('custom_agent_invalid_reasoning_effort'); Object.assign(options, { reasoningEnabled: true, reasoningEffort: effort }); }
+		const reserve = getReservedOutputTokenSpace(provider, modelName, { isReasoningEnabled: effort ? true : options.reasoningEnabled ?? true, overridesOfModel: state.overridesOfModel }) ?? 4096;
+		return { hasModel: true, providerName: parent.providerName, modelName, contextWindow: capabilities.contextWindow, reservedOutputTokens: Math.max(Math.ceil(capabilities.contextWindow / 2), reserve), modelSelectionOptions: options, selectedModelOverrides: overrides as never };
 	}
 
 	private async run(run: ChildRun, message: string): Promise<void> {
@@ -174,7 +210,7 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 		if (run.lifecycle.status === 'queued' || run.lifecycle.status === 'running') await new Promise<void>(resolve => { let done = false; let handle: ReturnType<typeof setTimeout>; const finish = () => { if (done) return; done = true; clearTimeout(handle); listener.dispose(); resolve(); }; const listener = this.onDidChangeRun(event => { if (event.parentId === parentId && (event.removed || (event.status !== 'queued' && event.status !== 'running'))) finish(); }); handle = setTimeout(finish, timeoutMs); });
 		const value = run.lifecycle.receipt(true); return { id: run.id, status: run.lifecycle.status, receipt: value.receipt, deliverSummary: value.deliverSummary };
 	}
-	getRunView(parentId: string): AgentSubagentRunView | undefined { const run = this.runs.get(parentId); return run ? Object.freeze({ id: run.id, status: run.lifecycle.status, ...(run.summary ? { summary: run.summary } : {}), usage: null }) : undefined; }
+	getRunView(parentId: string): AgentSubagentRunView | undefined { const run = this.runs.get(parentId); return run ? Object.freeze({ id: run.id, status: run.lifecycle.status, ...(run.summary ? { summary: run.summary } : {}), ...(run.role ? { roleName: run.role.name, roleDescription: run.role.description } : {}), usage: null }) : undefined; }
 	interrupt(parentId: string, target: string) { const run = this.runs.get(parentId); if (!run || run.id !== target) throw new Error('agent_child_not_direct'); const requestId = run.requestId; run.cancellation.cancel(); if (this.settle(run, 'cancelled', 'Child cancelled by parent.') && requestId) this.llm.abort(requestId); const value = run.lifecycle.receipt(false); return { id: run.id, status: run.lifecycle.status, receipt: value.receipt }; }
 	cancelParent(parentId: string) { const pending = this.pending.get(parentId); if (pending) { this.pending.delete(parentId); pending.cancel(); pending.dispose(); } const run = this.runs.get(parentId); if (run && (run.lifecycle.status === 'queued' || run.lifecycle.status === 'running')) this.interrupt(parentId, run.id); }
 	forgetParent(parentId: string) { const run = this.runs.get(parentId); this.cancelParent(parentId); if (run && this.runs.delete(parentId)) this._onDidChangeRun.fire({ parentId, id: run.id, removed: true }); }

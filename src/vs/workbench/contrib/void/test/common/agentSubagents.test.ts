@@ -12,7 +12,7 @@ suite('Void agent subagents', () => {
 		assert.strictEqual(isToolAllowedByProfile('read-only-child', 'write_file'), false);
 		assert.strictEqual(isToolAllowedByProfile('read-only-child', 'run_command'), false);
 		assert.deepStrictEqual(agentSubagentToolSchemas.spawn_agent, {
-			type: 'object', additionalProperties: false, required: ['message'], properties: { message: { type: 'string', minLength: 1, maxLength: 8000 } },
+			type: 'object', additionalProperties: false, required: ['message'], properties: { message: { type: 'string', minLength: 1, maxLength: 8000 }, agent_type: { type: 'string', minLength: 1, maxLength: 64 } },
 		});
 	});
 
@@ -61,7 +61,7 @@ suite('Void agent subagents', () => {
 		const roots = [URI.file('C:\\workspace').toString(), URI.parse('vscode-remote://ssh-remote+example/workspace').toString()];
 		for (const root of roots) {
 			const xml = chat_systemMessage({ workspaceFolders: [root], openedURIs: [], activeURI: undefined, persistentTerminalIDs: [], directoryStr: `Root hint: ${root} (use read tools; no recursive overview was injected).`, chatMode: 'agent', mcpTools: [{ name: 'remote_mutation', description: 'no', params: {} }], includeXMLToolDefinitions: true, toolExecutionProfile: 'read-only-child' });
-			assert.match(xml, /Void application-level read-only — terminal disabled, no OS sandbox/); assert.strictEqual(xml.includes(root), true); assert.strictEqual(xml.includes('C:\\workspace'), false); for (const name of readOnlyChildToolNames) assert.match(xml, new RegExp(`<${name}>`)); for (const forbidden of ['run_command', 'write_file', 'remote_mutation', 'spawn_agent', 'get_dir_tree', 'read_lint_errors']) assert.strictEqual(xml.includes(`<${forbidden}>`), false);
+			assert.ok(/Void application-level read-only — terminal disabled, no OS sandbox/.test(xml)); assert.strictEqual(xml.includes(root), true); assert.strictEqual(xml.includes('C:\\workspace'), false); for (const name of readOnlyChildToolNames) assert.ok(new RegExp(`<${name}>`).test(xml)); for (const forbidden of ['run_command', 'write_file', 'remote_mutation', 'spawn_agent', 'get_dir_tree', 'read_lint_errors']) assert.strictEqual(xml.includes(`<${forbidden}>`), false);
 		}
 		const unselectedParent = chat_systemMessage({ workspaceFolders: ['C:\\workspace'], openedURIs: [], activeURI: undefined, persistentTerminalIDs: [], directoryStr: '', chatMode: 'agent', mcpTools: [], includeXMLToolDefinitions: true });
 		assert.strictEqual(unselectedParent.includes('<spawn_agent>'), false);
@@ -79,7 +79,8 @@ suite('Void agent subagents', () => {
 	test('enforces control boundary matrix', () => {
 		assert.deepStrictEqual(validateAgentSubagentControlParams('wait_agent', { timeout_ms: 0 }), { name: 'wait_agent', timeoutMs: 0 }); assert.deepStrictEqual(validateAgentSubagentControlParams('wait_agent', { timeout_ms: 30000 }), { name: 'wait_agent', timeoutMs: 30000 });
 		for (const raw of [{ timeout_ms: -1 }, { timeout_ms: 30001 }, { timeout_ms: 1.5 }, { timeout_ms: Number.POSITIVE_INFINITY }, { timeout_ms: '1' }]) assert.throws(() => validateAgentSubagentControlParams('wait_agent', raw), /wait_agent_invalid_params/);
-		for (const raw of [{}, { message: ' ' }, { message: 'x'.repeat(8001) }]) assert.throws(() => validateAgentSubagentControlParams('spawn_agent', raw), /spawn_agent_invalid_params/);
+		assert.deepStrictEqual(validateAgentSubagentControlParams('spawn_agent', { message: 'x', agent_type: 'reader_1' }), { name: 'spawn_agent', message: 'x', agentType: 'reader_1' });
+		for (const raw of [{}, { message: ' ' }, { message: 'x'.repeat(8001) }, { message: 'x', agent_type: '../path' }]) assert.throws(() => validateAgentSubagentControlParams('spawn_agent', raw), /spawn_agent_invalid_params/);
 	});
 
 	test('settles once and delivers a terminal summary at most once', () => {

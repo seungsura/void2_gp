@@ -33,6 +33,7 @@ import './voidUpdateActions.js'
 
 import './agentInstructionsService.js'
 import './agentSkillsService.js'
+import './agentCustomAgentService.js'
 
 // tools
 import './toolsService.js'

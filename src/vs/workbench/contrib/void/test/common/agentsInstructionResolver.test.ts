@@ -1,7 +1,7 @@
 import assert from 'assert';
 import { parse } from 'smol-toml';
 import { URI } from '../../../../../base/common/uri.js';
-import { DEFAULT_PROJECT_DOC_MAX_BYTES, agentConfigSourceDescriptors, agentInstructionChain, parseAgentConfigSource, projectAgentConfig, resolveAgentInstructions, reviveAgentInstructionTurnSnapshot, stableAgentInstructionRevision } from '../../common/agentInstructions.js';
+import { DEFAULT_PROJECT_DOC_MAX_BYTES, agentConfigSourceDescriptors, agentInstructionChain, appendAgentInstructionDeveloperInstructions, parseAgentConfigSource, projectAgentConfig, resolveAgentInstructions, reviveAgentInstructionTurnSnapshot, stableAgentInstructionRevision } from '../../common/agentInstructions.js';
 
 const encode = (value: string) => new TextEncoder().encode(value);
 const source = (uri: string, value: string) => ({ uri, outcome: Object.freeze({ status: 'bytes' as const, bytes: encode(value) }) });
@@ -135,6 +135,24 @@ suite('AGENTS instruction resolver', () => {
 		assert.strictEqual(Object.isFrozen(snapshot.config), true);
 		assert.strictEqual(Object.isFrozen(snapshot.provenance), true);
 		assert.strictEqual(Object.isFrozen(snapshot.provenance[0]), true);
+	});
+
+	test('derives an immutable additive custom-agent authority without losing same-turn AGENTS provenance', () => {
+		const roleConfig = projectAgentConfig(
+			{ developerInstructions: 'developer' },
+			undefined,
+			[{ uri: 'file:///home/.codex/config.toml', scope: 'user', status: 'loaded', projectedKeys: ['developer_instructions'] }],
+		);
+		const base = resolveAgentInstructions(roleConfig, [source('file:///workspace/AGENTS.md', 'same-turn agents')], 'base-revision');
+		const derived = appendAgentInstructionDeveloperInstructions(base, 'role developer');
+		assert.strictEqual(derived.developerInstructions, 'developer\n\nrole developer');
+		assert.strictEqual(derived.config.developerInstructions, derived.developerInstructions);
+		assert.strictEqual(derived.agentsInstructions, base.agentsInstructions);
+		assert.deepStrictEqual(derived.provenance, base.provenance);
+		assert.notStrictEqual(derived.revision, base.revision);
+		assert.strictEqual(Object.isFrozen(derived), true);
+		assert.strictEqual(Object.isFrozen(derived.config), true);
+		assert.strictEqual(reviveAgentInstructionTurnSnapshot(JSON.parse(JSON.stringify(derived)))?.developerInstructions, derived.developerInstructions);
 	});
 
 	test('revives a persisted runtime snapshot and rejects corrupt invariants', () => {

@@ -14,7 +14,7 @@ import { ILLMMessageService } from '../common/sendLLMMessageService.js';
 import { chat_userMessageContent, isABuiltinToolName } from '../common/prompt/prompts.js';
 import { AnthropicReasoning, getErrorMessage, RawToolCallObj, RawToolParamsObj } from '../common/sendLLMMessageTypes.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
-import { FeatureName, ModelSelection, ModelSelectionOptions } from '../common/voidSettingsTypes.js';
+import { FeatureName, ModelSelection, ModelSelectionOptions, SettingsOfProvider } from '../common/voidSettingsTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { getIsReasoningEnabledState, getModelCapabilities, getReservedOutputTokenSpace } from '../common/modelCapabilities.js';
 import { estimateHistoryTokensForReadBudget, protectedSkillResourceHistoryLength } from './convertToLLMMessageService.js';
@@ -47,12 +47,14 @@ import { AgentInstructionTaskSession, AgentInstructionTurnSnapshot } from '../co
 import { AgentRuntimeTurnSnapshot, admitProtectedAgentAuthority, admitSkillResourceContext, assembleProtectedAgentAuthority, createAgentRuntimeTurnSnapshot, isReadSkillResourceToolName, reviveAgentRuntimeTurnSnapshot, runtimeModelFingerprint, selectExplicitSkills, skillAdvertisement, validateReadSkillResourceToolParams } from '../common/agentSkills.js';
 import { isAgentSubagentControlName, validateAgentSubagentControlParams } from '../common/agentSubagents.js';
 import { IAgentSubagentService } from './agentSubagentService.js';
+import { IAgentCustomAgentService } from './agentCustomAgentService.js';
+import { CustomAgentCatalog, customAgentAdvertisement } from '../common/agentCustomAgents.js';
 
 
 // related to retrying when LLM message has error
 const CHAT_RETRIES = 3
 const RETRY_DELAY = 2500
-type AgentDelegationTurnAuthority = Readonly<{ allowed: boolean; generation: number }>
+type AgentDelegationTurnAuthority = Readonly<{ allowed: boolean; generation: number; roles?: CustomAgentCatalog; settingsState?: IVoidSettingsService['state']; settingsOfProvider?: SettingsOfProvider }>
 
 
 const findStagingSelectionIndex = (currentSelections: StagingSelectionItem[] | undefined, newSelection: StagingSelectionItem): number | null => {
@@ -320,6 +322,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		@IMCPService private readonly _mcpService: IMCPService,
 		@IAgentInstructionsService private readonly _agentInstructionsService: IAgentInstructionsService,
 		@IAgentSkillsService private readonly _agentSkillsService: IAgentSkillsService,
+		@IAgentCustomAgentService private readonly _agentCustomAgentService: IAgentCustomAgentService,
 		@IAgentSubagentService private readonly _agentSubagentService: IAgentSubagentService,
 	) {
 		super()
@@ -850,7 +853,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			try {
 				const control = validateAgentSubagentControlParams(toolName, opts.unvalidatedToolParams);
 				let result: object;
-				if (control.name === 'spawn_agent') result = await this._agentSubagentService.spawn(threadId, control.message, instructionSnapshot);
+				if (control.name === 'spawn_agent') result = await this._agentSubagentService.spawn(threadId, control.message, instructionSnapshot, control.agentType, agentDelegationAuthority.roles, agentDelegationAuthority.settingsState, agentDelegationAuthority.settingsOfProvider);
 				else if (control.name === 'wait_agent') result = await this._agentSubagentService.wait(threadId, control.timeoutMs);
 				else result = this._agentSubagentService.interrupt(threadId, control.target);
 				if (!isControlCurrent()) return { interrupted: true };
@@ -1262,6 +1265,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const isCurrentTurn = () => (this._agentControlGeneration.get(threadId) ?? 0) === turnGeneration
 		// Capture every model-dependent input before any async catalog/instruction resolution.
 		const capturedModel = this._currentModelSelectionProps();
+		const capturedSettingsState = agentDelegationAllowed ? deepClone(this._settingsService.state) : undefined;
+		const capturedSettingsOfProvider = agentDelegationAllowed ? this._llmMessageService.captureSettingsOfProvider() : undefined;
 		const capturedOverride = capturedModel.modelSelection ? this._settingsService.state.overridesOfModel[capturedModel.modelSelection.providerName]?.[capturedModel.modelSelection.modelName] ?? {} : {};
 		const capturedOverrides = capturedModel.modelSelection ? { [capturedModel.modelSelection.providerName]: { [capturedModel.modelSelection.modelName]: deepClone(capturedOverride) } } as never : undefined;
 		// This must happen before history changes: a task cannot cross a workspace owner boundary.
@@ -1275,6 +1280,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		let currSelns: StagingSelectionItem[] = capturedSelections
 		const owner = this._workspaceContextService.getWorkspace().folders[0]?.uri
 		const catalog = await this._agentSkillsService.getCatalog(owner, owner, instructionSnapshot.config)
+		if (!isCurrentTurn()) return
+		const roleCatalog = agentDelegationAllowed ? await this._agentCustomAgentService.getCatalog(owner, owner) : undefined
 		if (!isCurrentTurn()) return
 		const direct = selectExplicitSkills(catalog, instructions)
 		if (!direct.skills) throw new Error(direct.diagnostic?.code ?? 'skill_not_found')
@@ -1308,13 +1315,14 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		admitProtectedAgentAuthority(runtimeSnapshot)
 		const userMessageContentBase = await chat_userMessageContent(instructions, currSelns, { directoryStrService: this._directoryStringService, fileService: this._fileService }) // user message + names of files (NOT content)
 		if (!isCurrentTurn()) return
+		const roleAd = roleCatalog ? customAgentAdvertisement(roleCatalog, runtimeModel.hasModel ? Math.min(2_000, Math.max(0, Math.floor(runtimeModel.contextWindow * .01 * 4))) : 2_000) : undefined
 		const userMessageContent = currSelns.some(isAgentDelegationSelection)
-			? `${userMessageContentBase}\n\n[User delegation marker: a generic read-only child is available, but no child has launched. Call spawn_agent with a valid delegated message if needed.]`
+			? `${userMessageContentBase}\n\n[User delegation marker: a generic read-only child is available. Named custom agents admitted for this turn (optional exact agent_type): ${roleAd?.text || 'none'}${roleAd?.omitted ? `; ${roleAd.omitted} omitted` : ''}. Call spawn_agent with a valid delegated message if needed.]`
 			: userMessageContentBase
 		const currentOwner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
 		if (currentOwner !== runtimeSnapshot.ownerProjectRoot || currentOwner !== runtimeSnapshot.runCwd || this._workspaceTrustManagementService.isWorkspaceTrusted() !== runtimeSnapshot.workspaceTrustedAtAdmission) { this._purgeInstructionTurn(threadId, false); throw new Error('skill_owner_or_trust_changed') }
 		if (!isCurrentTurn()) return
-		const agentDelegationAuthority = Object.freeze({ allowed: agentDelegationAllowed, generation: turnGeneration })
+		const agentDelegationAuthority = Object.freeze({ allowed: agentDelegationAllowed, generation: turnGeneration, ...(roleCatalog ? { roles: roleCatalog, settingsState: capturedSettingsState, settingsOfProvider: capturedSettingsOfProvider } : {}) })
 		this._agentDelegationAuthorityOfThread.set(threadId, agentDelegationAuthority)
 		this._rememberInstructionTurn(threadId, runtimeSnapshot)
 		const userHistoryElt: ChatMessage = { role: 'user', content: userMessageContent, displayContent: instructions, selections: currSelns, state: defaultMessageState }

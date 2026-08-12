@@ -2670,9 +2670,10 @@ const CommandBarInChat = () => {
 
 
 const ChildRunRow = ({ view }: { view: ReturnType<typeof useAgentSubagentRun> }) => !view ? null : <details className='text-xs border border-void-border-1 rounded-sm px-2 py-1 mb-1'>
-	<summary className='cursor-pointer select-none' aria-label={`Child Run ${view.id} ${agentSubagentStatusLabel(view.status)}`}>Child Run · {view.id.slice(0, 8)} · {agentSubagentStatusLabel(view.status)}</summary>
+	<summary className='cursor-pointer select-none' aria-label={`Child Run ${view.id} ${agentSubagentStatusLabel(view.status)}`}>Child Run · {view.roleName ?? view.id.slice(0, 8)} · {agentSubagentStatusLabel(view.status)}</summary>
 	<div className='pt-1 text-void-fg-3'>
 		<div>Void application-level read-only — terminal disabled, no OS sandbox</div>
+		{view.roleDescription ? <div>{view.roleDescription}</div> : null}
 		{view.summary ? <div className='pt-1 whitespace-pre-wrap break-words'>{view.summary}</div> : null}
 	</div>
 </details>

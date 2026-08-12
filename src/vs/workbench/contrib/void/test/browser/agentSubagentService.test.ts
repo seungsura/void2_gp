@@ -18,9 +18,9 @@ const catalog = (owner = 'file:///workspace') => {
 	const root = URI.joinPath(URI.parse(owner), '.agents/skills');
 	return createSkillCatalog(['demo', 'other'].map((name, rank) => ({ source: 'repository' as const, rank, root: root.toString(), skillRoot: URI.joinPath(root, name).toString(), directoryName: name, bytes: bytes(skillText(name)) })));
 };
-const snapshot = (selected: string[] = [], owner = 'file:///workspace') => {
+const snapshot = (selected: string[] = [], owner = 'file:///workspace', modelName = 'gpt-4.1') => {
 	const value = catalog(owner);
-	return createAgentRuntimeTurnSnapshot(instructions(owner), value, skillAdvertisement(value, 10_000), selected.map(identity => { const skill = value.skills.find(item => item.identity === identity)!; return { identity, skillRoot: skill.provenance.skillRoot, bodyRevision: skill.bodyRevision, body: skillText(identity) }; }), { hasModel: true, providerName: 'openAI', modelName: 'gpt-4.1', contextWindow: 10_000, reservedOutputTokens: 1_000, modelSelectionOptions: { reasoningEnabled: true }, selectedModelOverrides: { temperature: .2 } }, true);
+	return createAgentRuntimeTurnSnapshot(instructions(owner), value, skillAdvertisement(value, 10_000), selected.map(identity => { const skill = value.skills.find(item => item.identity === identity)!; return { identity, skillRoot: skill.provenance.skillRoot, bodyRevision: skill.bodyRevision, body: skillText(identity) }; }), { hasModel: true, providerName: 'openAI', modelName, contextWindow: 10_000, reservedOutputTokens: 1_000, modelSelectionOptions: { reasoningEnabled: true }, selectedModelOverrides: { temperature: .2 } }, true);
 };
 
 type FixtureOverrides = {
@@ -33,6 +33,8 @@ type FixtureOverrides = {
 	send?: (options: any, turn: number) => string | null;
 	callTool?: (name: string, params: any, context: any) => Promise<any>;
 	stringOfResult?: (name: string, params: any, result: any, context: any) => string;
+	customCatalog?: any;
+	settingsState?: any;
 };
 const fixture = (overrides: FixtureOverrides = {}) => {
 	const providerCalls: any[] = [];
@@ -65,9 +67,11 @@ const fixture = (overrides: FixtureOverrides = {}) => {
 	const trust: any = { isWorkspaceTrusted: () => trusted };
 	const converter: any = { prepareLLMChatMessages: async (options: any) => { converterCalls.push({ ...options, chatMessages: options.chatMessages.map((message: any) => ({ ...message })) }); return overrides.prepare?.(options) ?? { messages: [{ role: 'user', content: 'prepared' }], separateSystemMessage: 'protected' }; } };
 	const skills: any = { readSkillBody: overrides.readSkillBody ?? (async (root: string) => ({ body: skillText(root.endsWith('/other') ? 'other' : 'demo') })) };
-	const service = new AgentSubagentService(llm, tools, file, workspace, trust, converter, skills);
+	const customAgents: any = { getCatalog: async () => overrides.customCatalog ?? ({ revision: 'empty', agents: [], diagnostics: [] }) };
+	const settings: any = { state: overrides.settingsState ?? { settingsOfProvider: liveSettings, optionsOfModelSelection: { Chat: { openAI: {} } }, overridesOfModel: {} } };
+	const service = new AgentSubagentService(llm, tools, file, workspace, trust, converter, skills, customAgents, settings);
 	service.onDidChangeRun(event => events.push(event));
-	return { service, providerCalls, converterCalls, toolCalls, invalidations, events, liveSettings, setOwner: (value: string) => owner = value, setTrusted: (value: boolean) => trusted = value, aborts: () => aborts };
+	return { service, customAgents, settings, providerCalls, converterCalls, toolCalls, invalidations, events, liveSettings, setOwner: (value: string) => owner = value, setTrusted: (value: boolean) => trusted = value, aborts: () => aborts };
 };
 const final = (options: any, text = 'done') => queueMicrotask(() => options.onFinalMessage({ fullText: text, fullReasoning: '', anthropicReasoning: null }));
 const toolThenFinal = (tool: { id: string; name: string; rawParams: Record<string, unknown> }) => (options: any, turn: number) => { queueMicrotask(() => turn === 1 ? options.onFinalMessage({ fullText: 'tool', fullReasoning: '', anthropicReasoning: null, toolCall: tool }) : options.onFinalMessage({ fullText: 'done', fullReasoning: '', anthropicReasoning: null })); return `request-${turn}`; };
@@ -108,6 +112,81 @@ suite('Void AgentSubagentService', () => {
 			assert.strictEqual(rootFixture.converterCalls[0].childRoot.includes('\\'), false);
 			assert.strictEqual(rootFixture.converterCalls[0].childRoot.startsWith(URI.parse(owner).scheme + ':'), true);
 		}
+	});
+
+	test('adopts an admitted same-provider role model and freezes target transport options', async () => {
+		const liveSettings: any = { openAI: { apiKey: 'captured-key', endpoint: 'https://captured.invalid', _didFillInProviderSettings: true, models: [{ modelName: 'gpt-4.1', isHidden: false, type: 'default' }, { modelName: 'gpt-4.1-mini', isHidden: false, type: 'default' }] } };
+		const role: any = { identity: 'reader', name: 'reader', description: 'Read.', developerInstructions: 'role developer', model: 'gpt-4.1-mini', revision: 'role-1', skillRules: [] };
+		const state: any = { settingsOfProvider: liveSettings, optionsOfModelSelection: { Chat: { openAI: { 'gpt-4.1-mini': { reasoningEnabled: false } } } }, overridesOfModel: { openAI: { 'gpt-4.1-mini': { temperature: .7 } } } };
+		const f = fixture({ liveSettings, customCatalog: { revision: 'roles', agents: [role], diagnostics: [] }, settingsState: state, send: options => { final(options); return 'request'; } });
+		const roles: any = { revision: 'roles', agents: [role], diagnostics: [] }; await f.service.spawn('parent', 'inspect', snapshot(), 'reader', roles);
+		liveSettings.openAI.models[1].isHidden = true; state.optionsOfModelSelection.Chat.openAI['gpt-4.1-mini'].reasoningEnabled = true;
+		await f.service.wait('parent', 1000);
+		assert.strictEqual(f.providerCalls[0].modelSelection.modelName, 'gpt-4.1-mini'); assert.strictEqual(f.providerCalls[0].overridesOfModel.openAI['gpt-4.1-mini'].temperature, .7); assert.strictEqual(f.providerCalls[0].modelSelectionOptions.reasoningEnabled, false);
+		assert.strictEqual(f.converterCalls[0].instructionSnapshot.instructions.developerInstructions, 'developer\n\nrole developer'); assert.strictEqual(f.converterCalls[0].instructionSnapshot.instructions.agentsInstructions, 'agents'); assert.notStrictEqual(f.converterCalls[0].instructionSnapshot.revision, snapshot().revision); assert.strictEqual(f.service.getRunView('parent')?.roleName, 'reader'); f.service.forgetParent('parent'); assert.strictEqual(f.service.getRunView('parent'), undefined); assert.strictEqual(f.events.some((event: any) => event.removed), true);
+	});
+
+	test('inherits the admitted parent model for effort-only roles despite live settings mutation', async () => {
+		const liveSettings: any = { openAI: { apiKey: 'parent-key', endpoint: 'https://parent.invalid', _didFillInProviderSettings: true, models: [{ modelName: 'o3', isHidden: false, type: 'default' }] } };
+		const role: any = { identity: 'reader', name: 'reader', description: 'Read.', developerInstructions: 'role developer', modelReasoningEffort: 'high', revision: 'role-1', skillRules: [] };
+		const f = fixture({ liveSettings, customCatalog: { revision: 'roles', agents: [role], diagnostics: [] }, send: options => { final(options); return 'request'; } });
+		const parent = snapshot([], 'file:///workspace', 'o3'); const parentModel = parent.model as any;
+		const admittedState = JSON.parse(JSON.stringify(f.settings.state)); const admittedTransport = JSON.parse(JSON.stringify(liveSettings));
+		await f.service.spawn('parent', 'inspect', parent, 'reader', { revision: 'roles', agents: [role], diagnostics: [] }, admittedState, admittedTransport);
+		liveSettings.openAI.apiKey = 'mutated-key'; liveSettings.openAI.endpoint = 'https://mutated.invalid'; liveSettings.openAI.models[0].isHidden = true;
+		f.settings.state.optionsOfModelSelection.Chat.openAI.o3 = { reasoningEnabled: false, reasoningEffort: 'low' };
+		f.settings.state.overridesOfModel.openAI = { o3: { temperature: .9 } };
+		await f.service.wait('parent', 1_000);
+		const call = f.providerCalls[0]; assert.strictEqual(call.settingsOfProviderOverride.openAI.apiKey, 'parent-key'); assert.strictEqual(call.settingsOfProviderOverride.openAI.endpoint, 'https://parent.invalid'); assert.deepStrictEqual(call.overridesOfModel.openAI.o3, parentModel.selectedModelOverrides); assert.strictEqual(call.modelSelectionOptions.reasoningEnabled, true); assert.strictEqual(call.modelSelectionOptions.reasoningEffort, 'high');
+		const inherited = f.converterCalls[0].instructionSnapshot.model; assert.strictEqual(inherited.contextWindow, parentModel.contextWindow); assert.strictEqual(inherited.reservedOutputTokens, parentModel.reservedOutputTokens); assert.deepStrictEqual(inherited.selectedModelOverrides, parentModel.selectedModelOverrides);
+	});
+
+	test('rejects effort-only roles when the inherited parent cannot accept the requested effort', async () => {
+		const role: any = { identity: 'reader', name: 'reader', description: 'Read.', developerInstructions: 'role developer', modelReasoningEffort: 'high', revision: 'role-1', skillRules: [] };
+		const f = fixture({ customCatalog: { revision: 'roles', agents: [role], diagnostics: [] } });
+		await assert.rejects(() => f.service.spawn('parent', 'inspect', snapshot(), 'reader', { revision: 'roles', agents: [role], diagnostics: [] }), /custom_agent_invalid_reasoning_effort/); assert.strictEqual(f.providerCalls.length, 0);
+	});
+
+	test('inherits the parent model byte-for-byte when a role omits model and effort', async () => {
+		const role: any = { identity: 'reader', name: 'reader', description: 'Read.', developerInstructions: 'role developer', revision: 'role-1', skillRules: [] };
+		const f = fixture({ customCatalog: { revision: 'roles', agents: [role], diagnostics: [] }, send: options => { final(options); return 'request'; } }); const parent = snapshot();
+		await f.service.spawn('parent', 'inspect', parent, 'reader', { revision: 'roles', agents: [role], diagnostics: [] }); await f.service.wait('parent', 1_000);
+		assert.strictEqual(JSON.stringify(f.converterCalls[0].instructionSnapshot.model), JSON.stringify(parent.model));
+	});
+
+	test('rejects unknown, changed, or deleted roles before provider dispatch', async () => {
+		let catalog: any = { revision: 'r1', agents: [{ identity: 'reader', name: 'reader', description: 'd', developerInstructions: 'd', revision: 'one' }], diagnostics: [] };
+		const f = fixture({ customCatalog: catalog });
+		await assert.rejects(() => f.service.spawn('unknown', 'inspect', snapshot(), 'missing', catalog), /custom_agent_not_found/);
+		catalog = { revision: 'r2', agents: [], diagnostics: [] }; (f as any).service.customAgents.getCatalog = async () => catalog;
+		await assert.rejects(() => f.service.spawn('changed', 'inspect', snapshot(), 'reader', { revision: 'r1', agents: [{ identity: 'reader', name: 'reader', description: 'd', developerInstructions: 'd', revision: 'one' }], diagnostics: [] } as any), /custom_agent_stale/);
+		assert.strictEqual(f.providerCalls.length, 0);
+	});
+
+	test('rejects unavailable role models and invalid effort before provider dispatch', async () => {
+		const base: any = { identity: 'reader', name: 'reader', description: 'd', developerInstructions: 'd', revision: 'one', skillRules: [] };
+		for (const role of [{ ...base, model: 'missing' }, { ...base, model: 'gpt-4.1', modelReasoningEffort: 'xhigh' }]) {
+			const f = fixture({ customCatalog: { revision: role.revision, agents: [role], diagnostics: [] } });
+			await assert.rejects(() => f.service.spawn(`p-${role.model}`, 'inspect', snapshot(), 'reader', { revision: role.revision, agents: [role], diagnostics: [] })); assert.strictEqual(f.providerCalls.length, 0);
+		}
+	});
+
+	test('filters disabled role Skills and rejects their explicit selection before dispatch', async () => {
+		const role: any = { identity: 'reader', name: 'reader', description: 'd', developerInstructions: 'd', revision: 'one', skillRules: [{ selector: 'demo', enabled: false }] };
+		const catalog: any = { revision: 'r1', agents: [role], diagnostics: [] }; const f = fixture({ customCatalog: catalog });
+		await assert.rejects(() => f.service.spawn('role-skill', '$demo inspect', snapshot(), 'reader', catalog), /skill_not_found/); assert.strictEqual(f.providerCalls.length, 0);
+	});
+
+	test('admits multiple role-selected bodies atomically and never partially launches', async () => {
+		const role: any = { identity: 'reader', name: 'reader', description: 'd', developerInstructions: 'developer', revision: 'one', skillRules: [] }; const roles: any = { revision: 'r1', agents: [role], diagnostics: [] };
+		const good = fixture({ customCatalog: roles, send: options => { final(options); return 'request'; } }); await good.service.spawn('multi-good', '$demo $other inspect', snapshot(), 'reader', roles); await good.service.wait('multi-good', 1000); assert.strictEqual(good.providerCalls.length, 1);
+		const bad = fixture({ customCatalog: roles, readSkillBody: async root => root.endsWith('/other') ? { diagnostic: { code: 'skill_stale' } } : { body: skillText('demo') } }); await assert.rejects(() => bad.service.spawn('multi-bad', '$demo $other inspect', snapshot(), 'reader', roles), /skill_stale/); assert.strictEqual(bad.providerCalls.length, 0); assert.strictEqual(bad.service.getRunView('multi-bad'), undefined);
+	});
+
+	test('cancellation during deferred final role recheck cannot install a child', async () => {
+		let release!: () => void; let reads = 0; const role: any = { identity: 'reader', name: 'reader', description: 'd', developerInstructions: 'developer', revision: 'one', skillRules: [] }; const roles: any = { revision: 'r1', agents: [role], diagnostics: [] };
+		const f = fixture({ customCatalog: roles, send: options => { final(options); return 'request'; } }); f.customAgents.getCatalog = async () => { if (++reads === 1) await new Promise<void>(resolve => release = resolve); return roles; };
+		const pending = f.service.spawn('cancel-final', 'inspect', snapshot(), 'reader', roles); while (reads < 1) await new Promise<void>(resolve => setTimeout(resolve, 0)); f.service.cancelParent('cancel-final'); release(); await assert.rejects(pending, /agent_child_cancelled/); assert.strictEqual(f.providerCalls.length, 0); assert.strictEqual(f.service.getRunView('cancel-final'), undefined);
 	});
 
 	test('preserves exact provider tool ids for success and tool_error turns', async () => {

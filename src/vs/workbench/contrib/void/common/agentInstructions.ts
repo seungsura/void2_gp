@@ -175,6 +175,28 @@ const utf8PrefixLength = (bytes: Uint8Array, max: number): number => {
 export const assembleAgentInstructionText = (snapshot: AgentInstructionTurnSnapshot): string =>
 	[snapshot.developerInstructions, snapshot.agentsInstructions].filter(Boolean).join('\n\n');
 
+/**
+ * A named child adds constraints to the already-admitted Task/session authority; it never
+ * replaces it. Keep the original AGENTS text and provenance intact, while deriving a fresh
+ * immutable revision so the runtime snapshot fingerprint cannot be confused with its parent.
+ */
+export const appendAgentInstructionDeveloperInstructions = (snapshot: AgentInstructionTurnSnapshot, additionalInstructions: string): AgentInstructionTurnSnapshot => {
+	const parent = reviveAgentInstructionTurnSnapshot(snapshot);
+	if (!parent || typeof additionalInstructions !== 'string' || !additionalInstructions.trim()) throw new Error('agent_instruction_snapshot_invalid');
+	const developerInstructions = [parent.developerInstructions, additionalInstructions].filter(Boolean).join('\n\n');
+	let value = 2166136261;
+	for (const byte of encoder.encode(`${parent.revision}\0${developerInstructions}`)) value = Math.imul(value ^ byte, 16777619);
+	const derived = Object.freeze({
+		...parent,
+		revision: `agents-${(value >>> 0).toString(16)}`,
+		config: Object.freeze({ ...parent.config, developerInstructions }),
+		developerInstructions,
+	});
+	const revived = reviveAgentInstructionTurnSnapshot(derived);
+	if (!revived) throw new Error('agent_instruction_snapshot_invalid');
+	return revived;
+};
+
 export type AgentInstructionAuthorityRoute = Readonly<{
 	roleMessages: readonly Readonly<{ role: 'developer' | 'system'; content: string }>[];
 	separateSystemMessage?: string;
