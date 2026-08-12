@@ -853,9 +853,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			try {
 				const control = validateAgentSubagentControlParams(toolName, opts.unvalidatedToolParams);
 				let result: object;
-				if (control.name === 'spawn_agent') result = await this._agentSubagentService.spawn(threadId, control.message, instructionSnapshot, control.agentType, agentDelegationAuthority.roles, agentDelegationAuthority.settingsState, agentDelegationAuthority.settingsOfProvider);
-				else if (control.name === 'wait_agent') result = await this._agentSubagentService.wait(threadId, control.timeoutMs);
-				else result = this._agentSubagentService.interrupt(threadId, control.target);
+				if (control.name === 'spawn_agent') result = await this._agentSubagentService.spawn(threadId, control.message, instructionSnapshot, control.agentType, agentDelegationAuthority.roles, agentDelegationAuthority.settingsState, agentDelegationAuthority.settingsOfProvider, controlGeneration);
+				else if (control.name === 'wait_agent') result = await this._agentSubagentService.wait(threadId, control.timeoutMs, control.targets, controlGeneration);
+				else result = this._agentSubagentService.interrupt(threadId, control.target, controlGeneration);
 				if (!isControlCurrent()) return { interrupted: true };
 				const content = JSON.stringify(result);
 				this._addMessageToThread(threadId, { role: 'tool', type: 'success', rawParams: opts.unvalidatedToolParams, result: result as never, name: toolName, params: opts.unvalidatedToolParams, content, id: toolId, mcpServerName: undefined });
@@ -1256,7 +1256,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const capturedSelections = [...(_chatSelections ?? thread.state.stagingSelections)]
 		const agentDelegationAllowed = capturedSelections.some(isAgentDelegationSelection)
 		this._agentDelegationAuthorityOfThread.delete(threadId)
-		this._agentControlGeneration.set(threadId, (this._agentControlGeneration.get(threadId) ?? 0) + 1); this._agentSubagentService.cancelParent(threadId)
+		this._agentControlGeneration.set(threadId, (this._agentControlGeneration.get(threadId) ?? 0) + 1); this._agentSubagentService.forgetParent(threadId)
 		// interrupt existing stream
 		if (this.streamState[threadId]?.isRunning) {
 			await this.abortRunning(threadId)
@@ -1317,7 +1317,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		if (!isCurrentTurn()) return
 		const roleAd = roleCatalog ? customAgentAdvertisement(roleCatalog, runtimeModel.hasModel ? Math.min(2_000, Math.max(0, Math.floor(runtimeModel.contextWindow * .01 * 4))) : 2_000) : undefined
 		const userMessageContent = currSelns.some(isAgentDelegationSelection)
-			? `${userMessageContentBase}\n\n[User delegation marker: a generic read-only child is available. Named custom agents admitted for this turn (optional exact agent_type): ${roleAd?.text || 'none'}${roleAd?.omitted ? `; ${roleAd.omitted} omitted` : ''}. Call spawn_agent with a valid delegated message if needed.]`
+			? `${userMessageContentBase}\n\n[User delegation marker: up to four generic read-only children are available for this turn, with two running concurrently. Named custom agents admitted for this turn (optional exact agent_type): ${roleAd?.text || 'none'}${roleAd?.omitted ? `; ${roleAd.omitted} omitted` : ''}. Call spawn_agent for delegated tasks, then wait_agent for their results; partial child failures do not prevent your synthesis.]`
 			: userMessageContentBase
 		const currentOwner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
 		if (currentOwner !== runtimeSnapshot.ownerProjectRoot || currentOwner !== runtimeSnapshot.runCwd || this._workspaceTrustManagementService.isWorkspaceTrusted() !== runtimeSnapshot.workspaceTrustedAtAdmission) { this._purgeInstructionTurn(threadId, false); throw new Error('skill_owner_or_trust_changed') }

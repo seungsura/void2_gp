@@ -6,7 +6,7 @@
 import React, { ButtonHTMLAttributes, FormEvent, FormHTMLAttributes, Fragment, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 
-import { useAccessor, useAgentSubagentRun, useChatThreadsState, useChatThreadsStreamState, useSettingsState, useActiveURI, useCommandBarState } from '../util/services.js';
+import { useAccessor, useAgentSubagentBudget, useAgentSubagentRuns, useChatThreadsState, useChatThreadsStreamState, useSettingsState, useActiveURI, useCommandBarState } from '../util/services.js';
 import { ScrollType } from '../../../../../../../editor/common/editorCommon.js';
 
 import { ChatMarkdownRender, ChatMessageLocation, getApplyBoxId } from '../markdown/ChatMarkdownRender.js';
@@ -2669,7 +2669,7 @@ const CommandBarInChat = () => {
 
 
 
-const ChildRunRow = ({ view }: { view: ReturnType<typeof useAgentSubagentRun> }) => !view ? null : <details className='text-xs border border-void-border-1 rounded-sm px-2 py-1 mb-1'>
+const ChildRunRow = ({ view }: { view: import('../../../../common/agentSubagents.js').AgentSubagentRunView }) => <details className='text-xs border border-void-border-1 rounded-sm px-2 py-1 mb-1'>
 	<summary className='cursor-pointer select-none' aria-label={`Child Run ${view.id} ${agentSubagentStatusLabel(view.status)}`}>Child Run · {view.roleName ?? view.id.slice(0, 8)} · {agentSubagentStatusLabel(view.status)}</summary>
 	<div className='pt-1 text-void-fg-3'>
 		<div>Void application-level read-only — terminal disabled, no OS sandbox</div>
@@ -2701,8 +2701,9 @@ export const SidebarChat = () => {
 	// stream state
 	const currThreadStreamState = useChatThreadsStreamState(chatThreadsState.currentThreadId)
 	const isRunning = currThreadStreamState?.isRunning
-	const childRun = useAgentSubagentRun(currentThread.id)
-	const childIsActive = isActiveChildRun(childRun)
+	const childRuns = useAgentSubagentRuns(currentThread.id)
+	const childBudget = useAgentSubagentBudget(currentThread.id)
+	const childIsActive = childRuns.some(isActiveChildRun)
 	const isAnyRunning = !!isRunning || childIsActive
 	const latestError = currThreadStreamState?.error
 	const { displayContentSoFar, toolCallSoFar, reasoningSoFar } = currThreadStreamState?.llmInfo ?? {}
@@ -2904,7 +2905,8 @@ export const SidebarChat = () => {
 
 	const threadPageInput = <div key={'input' + chatThreadsState.currentThreadId}>
 		<div className='px-4'>
-			<ChildRunRow view={childRun} />
+			{childBudget ? <div className='text-xs text-void-fg-3 mb-1'>Children: {childBudget.running} running, {childBudget.queued} queued, {childBudget.accepted}/{childBudget.maxAccepted} accepted</div> : null}
+			{childRuns.map(view => <ChildRunRow key={view.id} view={view} />)}
 			<CommandBarInChat />
 		</div>
 		<div className='px-2 pb-2'>
@@ -2914,7 +2916,7 @@ export const SidebarChat = () => {
 
 	const landingPageInput = <div>
 		<div className='pt-8'>
-			<div className='px-4'><ChildRunRow view={childRun} /></div>
+			<div className='px-4'>{childBudget ? <div className='text-xs text-void-fg-3 mb-1'>Children: {childBudget.running} running, {childBudget.queued} queued, {childBudget.accepted}/{childBudget.maxAccepted} accepted</div> : null}{childRuns.map(view => <ChildRunRow key={view.id} view={view} />)}</div>
 			{inputChatArea}
 		</div>
 	</div>

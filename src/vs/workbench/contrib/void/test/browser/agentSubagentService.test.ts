@@ -77,13 +77,65 @@ const final = (options: any, text = 'done') => queueMicrotask(() => options.onFi
 const toolThenFinal = (tool: { id: string; name: string; rawParams: Record<string, unknown> }) => (options: any, turn: number) => { queueMicrotask(() => turn === 1 ? options.onFinalMessage({ fullText: 'tool', fullReasoning: '', anthropicReasoning: null, toolCall: tool }) : options.onFinalMessage({ fullText: 'done', fullReasoning: '', anthropicReasoning: null })); return `request-${turn}`; };
 
 suite('Void AgentSubagentService', () => {
-	test('reserves pending admission, cancels it, then permits a clean spawn', async () => {
-		let release!: () => void; let entered!: () => void; const started = new Promise<void>(resolve => entered = resolve);
-		const f = fixture({ readSkillBody: async () => { entered(); await new Promise<void>(resolve => release = resolve); return { body: skillText('demo') }; }, send: options => { final(options); return 'request'; } });
-		const first = f.service.spawn('parent', '$demo inspect', snapshot()); await started;
-		await assert.rejects(() => f.service.spawn('parent', '$demo again', snapshot()), /agent_child_already_active/);
-		f.service.cancelParent('parent'); release(); await assert.rejects(first, /agent_child_cancelled/);
-		const next = await f.service.spawn('parent', 'plain inspect', snapshot()); assert.ok(next.id); f.service.interrupt('parent', next.id);
+	test('reserves four admissions, starts two, queues FIFO, and never refunds terminal quota', async () => {
+		const f = fixture({ send: () => 'request' });
+		const children = await Promise.all(['one', 'two', 'three', 'four'].map(message => f.service.spawn('parent', message, snapshot())));
+		assert.strictEqual(f.providerCalls.length, 2); assert.deepStrictEqual(f.service.getRunViews('parent').map(view => view.status), ['running', 'running', 'queued', 'queued']);
+		await assert.rejects(() => f.service.spawn('parent', 'five', snapshot()), /agent_child_limit_reached/);
+		f.service.interrupt('parent', children[0].id);
+		await Promise.resolve();
+		assert.strictEqual(f.providerCalls.length, 3); assert.deepStrictEqual(f.service.getRunViews('parent').map(view => view.status), ['cancelled', 'running', 'running', 'queued']);
+		f.service.interrupt('parent', children[1].id);
+		await Promise.resolve();
+		assert.strictEqual(f.providerCalls.length, 4); assert.deepStrictEqual(f.service.getRunViews('parent').map(view => view.status), ['cancelled', 'cancelled', 'running', 'running']);
+		assert.deepStrictEqual(f.converterCalls.slice(0, 4).map(call => call.chatMessages[0].content), ['one', 'two', 'three', 'four']);
+		await assert.rejects(() => f.service.spawn('parent', 'still-five', snapshot()), /agent_child_limit_reached/);
+	});
+
+	test('failed admission releases its reservation without a row or event', async () => {
+		const f = fixture({ readSkillBody: async () => ({ diagnostic: { code: 'skill_stale' } }), send: () => 'request' });
+		await assert.rejects(() => f.service.spawn('admission-release', '$demo bad', snapshot()), /skill_stale/);
+		assert.deepStrictEqual(f.service.getRunViews('admission-release'), []); assert.deepStrictEqual(f.events, []);
+		(f.service as any).skills.readSkillBody = async () => ({ body: skillText('demo') });
+		await Promise.all(['1', '2', '3', '4'].map(message => f.service.spawn('admission-release', message, snapshot())));
+		assert.strictEqual(f.service.getBudgetView('admission-release')?.accepted, 4); await assert.rejects(() => f.service.spawn('admission-release', '5', snapshot()), /agent_child_limit_reached/);
+	});
+
+	test('cancels a hung admission promptly without creating a row or provider request', async () => {
+		let entered!: () => void; const enteredRead = new Promise<void>(resolve => entered = resolve); const f = fixture({ readSkillBody: async () => { entered(); return new Promise<any>(() => { }); } }); const pending = f.service.spawn('hung-admission', '$demo inspect', snapshot());
+		await enteredRead; f.service.cancelParent('hung-admission'); await assert.rejects(Promise.race([pending, new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('admission_timeout')), 100))]), /agent_child_cancelled/);
+		assert.deepStrictEqual(f.service.getRunViews('hung-admission'), []); assert.strictEqual(f.providerCalls.length, 0);
+	});
+
+	test('isolates failures, promotes FIFO, supports queued interruption, and cancels an entire retained group', async () => {
+		let sends = 0; const f = fixture({ send: options => { sends++; if (sends === 1) queueMicrotask(() => options.onError({ message: 'first failed' })); return `request-${sends}`; } });
+		const children = await Promise.all(['one', 'two', 'three', 'four'].map(message => f.service.spawn('phase5', message, snapshot())));
+		await new Promise(resolve => setTimeout(resolve, 0));
+		assert.strictEqual(f.service.getRunViews('phase5')[0].status, 'failed'); assert.strictEqual(f.providerCalls.length, 3); // failure promoted child three
+		f.service.interrupt('phase5', children[3].id); assert.strictEqual(f.service.getRunViews('phase5')[3].status, 'cancelled'); assert.strictEqual(f.providerCalls.length, 3);
+		f.service.cancelParent('phase5'); assert.deepStrictEqual(f.service.getRunViews('phase5').map(view => view.status), ['failed', 'cancelled', 'cancelled', 'cancelled']); assert.strictEqual(f.aborts(), 2);
+	});
+
+	test('wait preserves terminal summaries once, waits past an already-delivered terminal, and exposes bounded budget', async () => {
+		const f = fixture({ send: () => 'request' }); const [one, two] = await Promise.all(['one', 'two'].map(message => f.service.spawn('wait-group', message, snapshot())));
+		f.service.interrupt('wait-group', one.id); const first = await f.service.wait('wait-group', 0, [one.id]); assert.strictEqual(first.deliverSummary, true);
+		const pending = f.service.wait('wait-group', 1_000, [one.id, two.id]); await new Promise(resolve => setTimeout(resolve, 0)); f.service.interrupt('wait-group', two.id); const next = await pending;
+		assert.strictEqual(next.deliverSummary, true); assert.strictEqual(next.receipt?.id, two.id); assert.deepStrictEqual(next.children.map(child => child.id), [one.id, two.id]);
+		const repeated = await f.service.wait('wait-group', 0, [two.id, one.id]); assert.strictEqual(repeated.deliverSummary, false); assert.deepStrictEqual(repeated.children.map(child => child.id), [one.id, two.id]); assert.strictEqual(JSON.stringify(repeated.children).includes('Child cancelled by parent.'), false); assert.strictEqual(repeated.timedOut, false); assert.strictEqual(repeated.budget.maxResultChars, 32_000); assert.strictEqual(repeated.budget.usage, null); assert.ok(repeated.budget.deadlineMsRemaining >= 0);
+		const active = await f.service.spawn('wait-group-active', 'active', snapshot()); const timedOut = await f.service.wait('wait-group-active', 0, [active.id]); assert.strictEqual(timedOut.timedOut, true); f.service.interrupt('wait-group-active', active.id);
+		for (const targets of [[], [one.id, one.id], [' ', two.id], ['x'.repeat(257)]]) await assert.rejects(() => f.service.wait('wait-group', 0, targets), /wait_agent_invalid_params|agent_child_not_direct/);
+	});
+
+	test('generation reset forgets quota and old ids cannot be interrupted in a new group', async () => {
+		const f = fixture({ send: () => 'request' }); const old = await f.service.spawn('generation', 'old', snapshot(), undefined, undefined, undefined, undefined, 1); f.service.forgetParent('generation'); const fresh = await f.service.spawn('generation', 'fresh', snapshot(), undefined, undefined, undefined, undefined, 2);
+		assert.deepStrictEqual(f.service.getRunViews('generation').map(view => view.id), [fresh.id]); assert.throws(() => f.service.interrupt('generation', old.id, 2), /agent_child_not_direct/);
+	});
+
+	test('enforces provider/result budgets and the shared cancellation path structurally', async () => {
+		const f = fixture({ send: () => 'request' }); const child = await f.service.spawn('ledger', 'inspect', snapshot()); const group = (f.service as any).groups.get('ledger');
+		group.providerSends = 64; f.service.interrupt('ledger', child.id); const blocked = await f.service.spawn('ledger', 'blocked', snapshot()); await new Promise(resolve => setTimeout(resolve, 0)); assert.strictEqual(f.providerCalls.length, 1); assert.strictEqual(f.service.getRunViews('ledger').find(view => view.id === blocked.id)?.status, 'failed');
+		const capped = await Promise.all(['1', '2', '3', '4'].map(message => f.service.spawn('result-cap', message, snapshot()))); const budgetGroup = (f.service as any).groups.get('result-cap'); for (const id of capped.map(child => child.id)) { const run = budgetGroup.runs.find((candidate: any) => candidate.id === id); (f.service as any).settle(run, 'completed', 'x'.repeat(10_000)); } assert.strictEqual(budgetGroup.resultChars, 32_000); assert.deepStrictEqual(budgetGroup.runs.map((run: any) => run.summary.length), [8_000, 8_000, 8_000, 8_000]);
+		let entered!: () => void; const enteredRead = new Promise<void>(resolve => entered = resolve); const deadline = fixture({ readSkillBody: async () => { entered(); return new Promise<any>(() => { }); } }); const pending = deadline.service.spawn('deadline', '$demo inspect', snapshot()); await enteredRead; (deadline.service as any).cancelGroup((deadline.service as any).groups.get('deadline'), 'deadline'); await assert.rejects(pending, /agent_child_cancelled/); assert.deepStrictEqual(deadline.service.getRunViews('deadline'), []); assert.strictEqual(deadline.providerCalls.length, 0);
 	});
 
 	test('rejects a two-Skill admission atomically without a run, event, or provider call', async () => {
@@ -324,7 +376,7 @@ suite('Void AgentSubagentService', () => {
 		const f = fixture({ send: () => 'request' }); await assert.rejects(() => f.service.wait('missing', 0), /agent_child_not_found/);
 		const child = await f.service.spawn('parent', 'inspect', snapshot()); const listenerBaseline = (f.service as any)._onDidChangeRun._size; for (let i = 0; i < 20; i++) { const waiting = await f.service.wait('parent', 0); assert.strictEqual(waiting.status, 'running'); } assert.strictEqual((f.service as any)._onDidChangeRun._size, listenerBaseline); assert.strictEqual(f.service.getRunView('parent')?.status, 'running');
 		assert.throws(() => f.service.interrupt('parent', 'not-direct'), /agent_child_not_direct/); f.service.interrupt('parent', child.id);
-		const first = await f.service.wait('parent', 0); const second = await f.service.wait('parent', 0); assert.strictEqual(first.deliverSummary, true); assert.ok(first.receipt?.summary); assert.strictEqual(second.deliverSummary, false); assert.strictEqual(second.receipt?.summary, '');
+		const first = await f.service.wait('parent', 0); const second = await f.service.wait('parent', 0); assert.strictEqual(first.deliverSummary, true); assert.ok(first.receipt?.summary); assert.strictEqual(second.deliverSummary, false); assert.strictEqual(second.receipt, undefined);
 	});
 
 	test('owner/trust drift across awaited boundaries cancels without provider/tool leakage', async () => {

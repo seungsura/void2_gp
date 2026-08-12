@@ -78,6 +78,8 @@ suite('Void agent subagents', () => {
 
 	test('enforces control boundary matrix', () => {
 		assert.deepStrictEqual(validateAgentSubagentControlParams('wait_agent', { timeout_ms: 0 }), { name: 'wait_agent', timeoutMs: 0 }); assert.deepStrictEqual(validateAgentSubagentControlParams('wait_agent', { timeout_ms: 30000 }), { name: 'wait_agent', timeoutMs: 30000 });
+		assert.deepStrictEqual(validateAgentSubagentControlParams('wait_agent', { targets: ['one', 'two'] }), { name: 'wait_agent', timeoutMs: AGENT_SUBAGENT_DEFAULT_WAIT_MS, targets: ['one', 'two'] });
+		for (const raw of [{ targets: [] }, { targets: ['one', 'one'] }, { targets: ['1', '2', '3', '4', '5'] }, { targets: ['one', 2] }]) assert.throws(() => validateAgentSubagentControlParams('wait_agent', raw), /wait_agent_invalid_params/);
 		for (const raw of [{ timeout_ms: -1 }, { timeout_ms: 30001 }, { timeout_ms: 1.5 }, { timeout_ms: Number.POSITIVE_INFINITY }, { timeout_ms: '1' }]) assert.throws(() => validateAgentSubagentControlParams('wait_agent', raw), /wait_agent_invalid_params/);
 		assert.deepStrictEqual(validateAgentSubagentControlParams('spawn_agent', { message: 'x', agent_type: 'reader_1' }), { name: 'spawn_agent', message: 'x', agentType: 'reader_1' });
 		for (const raw of [{}, { message: ' ' }, { message: 'x'.repeat(8001) }, { message: 'x', agent_type: '../path' }]) assert.throws(() => validateAgentSubagentControlParams('spawn_agent', raw), /spawn_agent_invalid_params/);

@@ -179,6 +179,12 @@ const parseXMLPrefixToToolCall = <T extends ToolName,>(toolName: T, toolId: stri
 			if (orig === undefined) continue
 			paramsObj[paramName] = trimBeforeAndAfterNewLines(orig)
 		}
+		if (toolName === 'wait_agent') {
+			const timeout = paramsObj.timeout_ms;
+			if (timeout !== undefined && /^(?:0|[1-9]\d*)$/.test(timeout)) (paramsObj as Record<string, unknown>).timeout_ms = Number(timeout);
+			const targets = paramsObj.targets;
+			if (targets !== undefined) { try { const parsed = JSON.parse(targets); if (Array.isArray(parsed)) (paramsObj as Record<string, unknown>).targets = parsed; } catch { /* runtime validator rejects malformed text */ } }
+		}
 
 		// return tool call
 		const ans: RawToolCallObj = {

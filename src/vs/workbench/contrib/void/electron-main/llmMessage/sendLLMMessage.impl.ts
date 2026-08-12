@@ -739,6 +739,7 @@ const toGeminiSchema = (schema: Record<string, unknown>): Schema => {
 		else if (key === 'items' && value && typeof value === 'object') converted.items = toGeminiSchema(value as Record<string, unknown>);
 		else if (key === 'oneOf') converted.anyOf = (value as Record<string, unknown>[]).map(child => toGeminiSchema(child));
 		else if (key === 'const') converted.enum = [value];
+		else if (['minItems', 'maxItems', 'minLength', 'maxLength', 'maxProperties', 'minProperties'].includes(key) && typeof value === 'number') converted[key] = String(value);
 		else if (key !== 'additionalProperties' && key !== 'not') converted[key] = value;
 	}
 	return converted as Schema;

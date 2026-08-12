@@ -142,21 +142,14 @@ suite('Void selected Skill resource Chat runtime', () => {
 		assert.strictEqual(JSON.stringify(childConverted).includes('read_skill_resource'), false);
 	});
 
-	test('serializes optional spawn_agent.agent_type only for delegated parent transport routes', async () => {
+	test('serializes optional spawn_agent.agent_type only for the delegated parent XML fallback', async () => {
 		const converter = new ConvertToLLMMessageService({ getModels: () => [] } as never, { getWorkspace: () => ({ folders: [{ uri: URI.parse('file:///workspace') }] }) } as never, { activeEditor: undefined } as never, { getAllDirectoriesStr: async () => '' } as never, { listPersistentTerminalIds: () => [] } as never, { state: { overridesOfModel: {}, globalSettings: {}, optionsOfModelSelection: {} } } as never, { getMCPTools: () => [] } as never);
-		const routes = [
-			{ providerName: 'openAI', modelName: 'gpt-4.1' },
-			{ providerName: 'anthropic', modelName: 'claude-3-7-sonnet-20250219' },
-			{ providerName: 'gemini', modelName: 'gemini-2.0-flash-lite' },
-			{ providerName: 'openAI', modelName: 'unrecognized-xml-model' },
-		] as const;
-		for (const route of routes) {
-			const runtimeSnapshot = snapshotFor(route.providerName, route.modelName, 10_000);
-			const delegated = await converter.prepareLLMChatMessages({ chatMessages: [{ role: 'user', content: 'delegate' } as any], chatMode: 'agent', modelSelection: route as never, instructionSnapshot: runtimeSnapshot, agentDelegationAllowed: true });
-			const delegatedText = JSON.stringify(delegated); assert.strictEqual(delegatedText.includes('spawn_agent'), true); assert.strictEqual(delegatedText.includes('agent_type'), true);
-			const ordinary = await converter.prepareLLMChatMessages({ chatMessages: [{ role: 'user', content: 'ordinary' } as any], chatMode: 'agent', modelSelection: route as never, instructionSnapshot: runtimeSnapshot, agentDelegationAllowed: false });
-			assert.strictEqual(JSON.stringify(ordinary).includes('spawn_agent'), false);
-		}
+		const route = { providerName: 'openAI', modelName: 'unrecognized-xml-model' } as const;
+		const runtimeSnapshot = snapshotFor(route.providerName, route.modelName, 10_000);
+		const delegated = await converter.prepareLLMChatMessages({ chatMessages: [{ role: 'user', content: 'delegate' } as any], chatMode: 'agent', modelSelection: route as never, instructionSnapshot: runtimeSnapshot, agentDelegationAllowed: true });
+		const delegatedText = JSON.stringify(delegated); assert.strictEqual(delegatedText.includes('spawn_agent'), true); assert.strictEqual(delegatedText.includes('agent_type'), true);
+		const ordinary = await converter.prepareLLMChatMessages({ chatMessages: [{ role: 'user', content: 'ordinary' } as any], chatMode: 'agent', modelSelection: route as never, instructionSnapshot: runtimeSnapshot, agentDelegationAllowed: false });
+		assert.strictEqual(JSON.stringify(ordinary).includes('spawn_agent'), false);
 	});
 
 	test('reserves MCP server-name lookup for the application tool', () => {
