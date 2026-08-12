@@ -24,7 +24,8 @@ import { WarningBox } from '../void-settings-tsx/WarningBox.js';
 import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../common/modelCapabilities.js';
 import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, CircleEllipsis, Folder, ALargeSmall, TypeOutline, Text } from 'lucide-react';
 import { ChatMessage, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
-import { agentSubagentStatusLabel, isActiveChildRun } from '../../../../common/agentSubagents.js';
+import { isActiveChildRun } from '../../../../common/agentSubagents.js';
+import { AgentSubagentPresentation, getAgentSubagentPresentation } from '../../../../common/agentSubagentPresentation.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, ToolName, LintErrorItem, ToolApprovalType, toolApprovalTypes } from '../../../../common/toolsServiceTypes.js';
 import { CopyButton, IconShell1, JumpToFileButton, JumpToTerminalButton, StatusIndicator, useApplyStreamState } from '../markdown/ApplyBlockHoverButtons.js';
 import { acceptAllBg, acceptBorder, buttonFontSize, buttonTextColor, rejectAllBg, rejectBg, rejectBorder } from '../../../../common/helpers/colors.js';
@@ -2669,25 +2670,27 @@ const CommandBarInChat = () => {
 
 
 
-const ChildRunRow = ({ view }: { view: import('../../../../common/agentSubagents.js').AgentSubagentRunView }) => <details className='text-xs border border-void-border-1 rounded-sm px-2 py-1 mb-1'>
-	<summary className='cursor-pointer select-none' aria-label={`Child Run ${view.id} ${agentSubagentStatusLabel(view.status)}`}>Child Run · {view.roleName ?? view.id.slice(0, 8)} · {agentSubagentStatusLabel(view.status)}</summary>
-	<div className='pt-1 text-void-fg-3'>
-		<div>Void application-level read-only — terminal disabled, no OS sandbox</div>
-		{view.roleDescription ? <div>{view.roleDescription}</div> : null}
-		<div>Timing: {view.queuedMs}ms queued, {view.runningMs}ms running</div>
-		<div>Authority revisions: runtime {view.authority.runtimeRevision.slice(0, 8)}, instructions {view.authority.instructionsRevision.slice(0, 8)}, skills {view.authority.catalogRevision.slice(0, 8)}</div>
-		{view.summary ? <div className='pt-1 whitespace-pre-wrap break-words'>{view.summary}</div> : null}
-	</div>
-</details>
-
-const ChildDiagnostics = ({ diagnostics }: { diagnostics: import('../../../../common/agentSubagents.js').AgentSubagentDiagnosticsView }) => <details className='text-xs border border-void-border-1 rounded-sm px-2 py-1 mb-1'>
-	<summary className='cursor-pointer select-none'>Child timeline · {diagnostics.events.length} events · {diagnostics.elapsedMs}ms</summary>
-	<div className='pt-1 text-void-fg-3'>
-		<div>{diagnostics.completed} completed, {diagnostics.failed} failed, {diagnostics.cancelled} cancelled · usage unavailable</div>
-		{diagnostics.droppedEvents ? <div>{diagnostics.droppedEvents} later events omitted</div> : null}
-		{diagnostics.events.map(event => <div key={event.sequence}>#{event.sequence} +{event.elapsedMs}ms · {event.kind}{event.childId ? ` · ${event.childId.slice(0, 8)}` : ''}{event.diagnostic ? ` · ${event.diagnostic}` : ''} · {event.budget.running} running/{event.budget.queued} queued</div>)}
-	</div>
-</details>
+const ChildRunPanel = ({ presentation }: { presentation: AgentSubagentPresentation | undefined }) => {
+	if (!presentation) return null;
+	return <section className='text-xs mb-1' aria-label='Child runs'>
+		<div className='text-void-fg-3' role='status' aria-live='polite' aria-atomic='true'>{presentation.summary}</div>
+		{presentation.actionRequired ? <div className='text-void-warning'>{presentation.actionRequiredLabel}. Open details for the recorded status.</div> : null}
+		{presentation.runs.map(view => <details key={view.id} className='border border-void-border-1 rounded-sm px-2 py-1 mt-1'>
+			<summary className='void-focus-ring cursor-pointer select-none' aria-label={`Child Run${view.roleName ? ` ${view.roleName}` : ''} ${view.shortId} ${view.statusLabel}`}>Child Run{view.roleName ? ` · ${view.roleName}` : ''} · {view.shortId} · {view.statusLabel} · {view.totalMs}ms</summary>
+			<div className='pt-1 text-void-fg-3'>
+				<div>Void application-level read-only — terminal disabled, no OS sandbox</div>
+				{view.roleDescription ? <div>{view.roleDescription}</div> : null}
+				<div>Timing: {view.queuedMs}ms queued, {view.runningMs}ms running, {view.totalMs}ms total</div>
+				{view.summary ? <div className='pt-1 whitespace-pre-wrap break-words'>{view.summary}</div> : null}
+				<details className='mt-1'><summary className='void-focus-ring cursor-pointer select-none' aria-label={`Technical details for child run ${view.shortId}`}>Technical details</summary><div className='pt-1'>Authority revisions: runtime {view.authority.runtimeRevision.slice(0, 8)}, instructions {view.authority.instructionsRevision.slice(0, 8)}, skills {view.authority.catalogRevision.slice(0, 8)}{view.authority.modelFingerprint ? `, model ${view.authority.modelFingerprint}` : ''}{view.authority.selectedSkills.length ? `; selected skills: ${view.authority.selectedSkills.map(skill => skill.identity).join(', ')}` : ''}</div></details>
+			</div>
+		</details>)}
+		{presentation.budget || presentation.diagnostics ? <details className='border border-void-border-1 rounded-sm px-2 py-1 mt-1'><summary className='void-focus-ring cursor-pointer select-none' aria-label='Child diagnostics'>Diagnostics and technical details</summary><div className='pt-1 text-void-fg-3'>
+			{presentation.budget ? <div>Budget: {presentation.budget.providerSends}/{presentation.budget.maxProviderSends} provider sends, {presentation.budget.resultChars}/{presentation.budget.maxResultChars} result chars, {presentation.budget.deadlineMsRemaining}ms deadline remaining; {presentation.usageLabel}</div> : <div>{presentation.usageLabel}</div>}
+			{presentation.diagnostics ? <><div>Timeline: {presentation.diagnostics.events.length} events, {presentation.diagnostics.elapsedMs}ms</div>{presentation.diagnostics.droppedEvents ? <div>{presentation.diagnostics.droppedEvents} later events omitted</div> : null}{presentation.diagnostics.events.map(event => <div key={event.sequence}>#{event.sequence} +{event.elapsedMs}ms · {event.kind}{event.childId ? ` · ${event.childId.slice(0, 8)}` : ''}{event.diagnostic ? ` · ${event.diagnostic}` : ''} · {event.budget.running} running/{event.budget.queued} queued</div>)}</> : null}
+		</div></details> : null}
+	</section>;
+};
 
 export const SidebarChat = () => {
 	const textAreaRef = useRef<HTMLTextAreaElement | null>(null)
@@ -2715,6 +2718,7 @@ export const SidebarChat = () => {
 	const childRuns = useAgentSubagentRuns(currentThread.id)
 	const childBudget = useAgentSubagentBudget(currentThread.id)
 	const childDiagnostics = useAgentSubagentDiagnostics(currentThread.id)
+	const childPresentation = getAgentSubagentPresentation(childBudget, childRuns, childDiagnostics)
 	const childIsActive = childRuns.some(isActiveChildRun)
 	const isAnyRunning = !!isRunning || childIsActive
 	const latestError = currThreadStreamState?.error
@@ -2917,9 +2921,7 @@ export const SidebarChat = () => {
 
 	const threadPageInput = <div key={'input' + chatThreadsState.currentThreadId}>
 		<div className='px-4'>
-			{childBudget ? <div className='text-xs text-void-fg-3 mb-1'>Children: {childBudget.running} running, {childBudget.queued} queued, {childBudget.accepted}/{childBudget.maxAccepted} accepted</div> : null}
-			{childRuns.map(view => <ChildRunRow key={view.id} view={view} />)}
-			{childDiagnostics ? <ChildDiagnostics diagnostics={childDiagnostics} /> : null}
+			<ChildRunPanel presentation={childPresentation} />
 			<CommandBarInChat />
 		</div>
 		<div className='px-2 pb-2'>
@@ -2929,7 +2931,7 @@ export const SidebarChat = () => {
 
 	const landingPageInput = <div>
 		<div className='pt-8'>
-			<div className='px-4'>{childBudget ? <div className='text-xs text-void-fg-3 mb-1'>Children: {childBudget.running} running, {childBudget.queued} queued, {childBudget.accepted}/{childBudget.maxAccepted} accepted</div> : null}{childRuns.map(view => <ChildRunRow key={view.id} view={view} />)}{childDiagnostics ? <ChildDiagnostics diagnostics={childDiagnostics} /> : null}</div>
+			<div className='px-4'><ChildRunPanel presentation={childPresentation} /></div>
 			{inputChatArea}
 		</div>
 	</div>
