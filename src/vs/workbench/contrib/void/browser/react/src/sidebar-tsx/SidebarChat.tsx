@@ -2936,6 +2936,11 @@ export const SidebarChat = () => {
 		</div>
 	</div>
 
+	const chatHistorySection = <ErrorBoundary>
+		<div className='pt-8 mb-2 text-void-fg-3 text-root select-none pointer-events-none'>Chat history</div>
+		<PastThreadsList />
+	</ErrorBoundary>
+
 	const landingPageContent = <div
 		ref={sidebarRef}
 		className='w-full h-full max-h-full flex flex-col overflow-auto px-4'
@@ -2944,17 +2949,12 @@ export const SidebarChat = () => {
 			{landingPageInput}
 		</ErrorBoundary>
 
-		{Object.keys(chatThreadsState.allThreads).length > 1 ? // show if there are threads
-			<ErrorBoundary>
-				<div className='pt-8 mb-2 text-void-fg-3 text-root select-none pointer-events-none'>Previous Threads</div>
-				<PastThreadsList />
-			</ErrorBoundary>
-			:
+		{Object.keys(chatThreadsState.allThreads).length <= 1 &&
 			<ErrorBoundary>
 				<div className='pt-8 mb-2 text-void-fg-3 text-root select-none pointer-events-none'>Suggestions</div>
 				{initiallySuggestedPromptsHTML}
-			</ErrorBoundary>
-		}
+			</ErrorBoundary>}
+		{chatHistorySection}
 	</div>
 
 
@@ -2982,6 +2982,9 @@ export const SidebarChat = () => {
 		<ErrorBoundary>
 			{threadPageInput}
 		</ErrorBoundary>
+		<div className='px-4 overflow-auto'>
+			{chatHistorySection}
+		</div>
 	</div>
 
 

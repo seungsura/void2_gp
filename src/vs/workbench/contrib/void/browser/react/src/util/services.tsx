@@ -56,6 +56,7 @@ import { IStorageService, StorageScope } from '../../../../../../../platform/sto
 import { OPT_OUT_KEY } from '../../../../common/storageKeys.js'
 import { IAgentSubagentService } from '../../../agentSubagentService.js'
 import { AgentSubagentBudgetView, AgentSubagentDiagnosticsView, AgentSubagentRunView } from '../../../../common/agentSubagents.js'
+import { hasActionRequiredChild } from '../../../../common/chatHistoryPresentation.js'
 
 
 // normally to do this you'd use a useEffect that calls .onDidChangeState(), but useEffect mounts too late and misses initial state changes
@@ -333,14 +334,42 @@ export const useAgentSubagentDiagnostics = (threadId: string): AgentSubagentDiag
 }
 
 export const useFullChatThreadsStreamState = () => {
-	const [s, ss] = useState(chatThreadsStreamState)
+	const snapshot = () => Object.freeze(Object.fromEntries(Object.entries(chatThreadsStreamState).map(([threadId, state]) => [threadId, state ? Object.freeze({ ...state }) : state]))) as ThreadStreamState
+	const [s, ss] = useState(snapshot)
 	useEffect(() => {
-		ss(chatThreadsStreamState)
-		const listener = () => { ss(chatThreadsStreamState) }
+		ss(snapshot())
+		const listener = () => { ss(snapshot()) }
 		chatThreadsStreamStateListeners.add(listener)
 		return () => { chatThreadsStreamStateListeners.delete(listener) }
 	}, [ss])
 	return s
+}
+
+export type VisibleThreadChildOverview = Readonly<{ running: boolean; queued: boolean; actionRequired: boolean }>;
+
+/** List-only child state: it deliberately retains no transcript, receipt, or diagnostic payload. */
+export const useVisibleThreadChildOverviews = (threadIds: readonly string[]): Readonly<Record<string, VisibleThreadChildOverview>> => {
+	const service = useAccessor().get('IAgentSubagentService');
+	const threadIdsKey = threadIds.join('\u0000');
+	const getOverview = (): Readonly<Record<string, VisibleThreadChildOverview>> => Object.freeze(Object.fromEntries(threadIds.map(threadId => {
+		const runs = service.getRunViews(threadId);
+		const diagnostics = service.getDiagnosticsView(threadId);
+		return [threadId, Object.freeze({
+			running: runs.some(run => run.status === 'running'),
+			queued: runs.some(run => run.status === 'queued'),
+			actionRequired: hasActionRequiredChild(runs, diagnostics),
+		})];
+	})));
+	const [overview, setOverview] = useState(getOverview);
+	useEffect(() => {
+		const ids = new Set(threadIds);
+		const refresh = (parentId: string) => { if (ids.has(parentId)) setOverview(getOverview()); };
+		setOverview(getOverview());
+		const runChange = service.onDidChangeRun(event => refresh(event.parentId));
+		const diagnosticsChange = service.onDidChangeDiagnostics(event => refresh(event.parentId));
+		return () => { runChange.dispose(); diagnosticsChange.dispose(); };
+	}, [service, threadIdsKey]);
+	return overview;
 }
 
 

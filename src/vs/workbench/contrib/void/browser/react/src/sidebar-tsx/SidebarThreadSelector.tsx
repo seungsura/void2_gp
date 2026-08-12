@@ -4,11 +4,11 @@
  *--------------------------------------------------------------------------------------*/
 
 import { useMemo, useState } from 'react';
-import { CopyButton, IconShell1 } from '../markdown/ApplyBlockHoverButtons.js';
-import { useAccessor, useChatThreadsState, useChatThreadsStreamState, useFullChatThreadsStreamState, useSettingsState } from '../util/services.js';
-import { IconX } from './SidebarChat.js';
-import { Check, Copy, Icon, LoaderCircle, MessageCircleQuestion, Trash2, UserCheck, X } from 'lucide-react';
-import { IsRunningType, ThreadType } from '../../../chatThreadService.js';
+import { IconShell1 } from '../markdown/ApplyBlockHoverButtons.js';
+import { useAccessor, useChatThreadsState, useFullChatThreadsStreamState, useVisibleThreadChildOverviews } from '../util/services.js';
+import { Check, CircleAlert, Copy, LoaderCircle, MessageCircleQuestion, Trash2, X } from 'lucide-react';
+import { ThreadType } from '../../../chatThreadService.js';
+import { ChatHistoryThreadMetadata, getChatHistoryPresentation } from '../../../../common/chatHistoryPresentation.js';
 
 
 const numInitialThreads = 3
@@ -16,70 +16,28 @@ const numInitialThreads = 3
 export const PastThreadsList = ({ className = '' }: { className?: string }) => {
 	const [showAll, setShowAll] = useState(false);
 
-	const [hoveredIdx, setHoveredIdx] = useState<number | null>(null)
-
 	const threadsState = useChatThreadsState()
-	const { allThreads } = threadsState
-
 	const streamState = useFullChatThreadsStreamState()
+	const { allThreads, currentThreadId } = threadsState
 
-	const runningThreadIds: { [threadId: string]: IsRunningType | undefined } = {}
-	for (const threadId in streamState) {
-		const isRunning = streamState[threadId]?.isRunning
-		if (isRunning) { runningThreadIds[threadId] = isRunning }
-	}
-
-	if (!allThreads) {
-		return <div key="error" className="p-1">{`Error accessing chat history.`}</div>;
-	}
-
-	// sorted by most recent to least recent
-	const sortedThreadIds = Object.keys(allThreads ?? {})
-		.sort((threadId1, threadId2) => (allThreads[threadId1]?.lastModified ?? 0) > (allThreads[threadId2]?.lastModified ?? 0) ? -1 : 1)
-		.filter(threadId => (allThreads![threadId]?.messages.length ?? 0) !== 0)
-
-	// Get only first 5 threads if not showing all
-	const hasMoreThreads = sortedThreadIds.length > numInitialThreads;
-	const displayThreads = showAll ? sortedThreadIds : sortedThreadIds.slice(0, numInitialThreads);
+	const metadata = useMemo(() => Object.values(allThreads).filter((thread): thread is ThreadType => !!thread).map(toMetadata), [allThreads]);
+	const parentActivityById = useMemo(() => Object.fromEntries(Object.entries(streamState).map(([id, state]) => [id, { isRunning: state?.isRunning, hasError: !!state?.error }])), [streamState]);
+	const orderedRows = useMemo(() => getChatHistoryPresentation(metadata, currentThreadId, parentActivityById, {}), [metadata, currentThreadId, parentActivityById]);
+	const visibleThreadIds = (showAll ? orderedRows : orderedRows.slice(0, numInitialThreads)).map(row => row.id);
+	const childOverviewById = useVisibleThreadChildOverviews(visibleThreadIds);
+	const rows = useMemo(() => getChatHistoryPresentation(metadata, currentThreadId, parentActivityById, childOverviewById), [metadata, currentThreadId, parentActivityById, childOverviewById]);
+	const displayRows = showAll ? rows : rows.slice(0, numInitialThreads);
+	const hasMoreThreads = rows.length > numInitialThreads;
 
 	return (
 		<div className={`flex flex-col mb-2 gap-2 w-full text-nowrap text-void-fg-3 select-none relative ${className}`}>
-			{displayThreads.length === 0 // this should never happen
-				? <></>
-				: displayThreads.map((threadId, i) => {
-					const pastThread = allThreads[threadId];
-					if (!pastThread) {
-						return <div key={i} className="p-1">{`Error accessing chat history.`}</div>;
-					}
-
-					return (
-						<PastThreadElement
-							key={pastThread.id}
-							pastThread={pastThread}
-							idx={i}
-							hoveredIdx={hoveredIdx}
-							setHoveredIdx={setHoveredIdx}
-							isRunning={runningThreadIds[pastThread.id]}
-						/>
-					);
-				})
-			}
+			{displayRows.length === 0 ? <div className='p-1 text-sm'>No previous chats yet.</div> : displayRows.map(row => <PastThreadElement key={row.id} row={row} />)}
 
 			{hasMoreThreads && !showAll && (
-				<div
-					className="text-void-fg-3 opacity-80 hover:opacity-100 hover:brightness-115 cursor-pointer p-1 text-xs"
-					onClick={() => setShowAll(true)}
-				>
-					Show {sortedThreadIds.length - numInitialThreads} more...
-				</div>
+				<button type='button' aria-expanded={false} className="void-focus-ring text-left text-void-fg-3 opacity-80 hover:opacity-100 hover:brightness-115 p-1 text-xs" onClick={() => setShowAll(true)}>Show {rows.length - numInitialThreads} more...</button>
 			)}
 			{hasMoreThreads && showAll && (
-				<div
-					className="text-void-fg-3 opacity-80 hover:opacity-100 hover:brightness-115 cursor-pointer p-1 text-xs"
-					onClick={() => setShowAll(false)}
-				>
-					Show less
-				</div>
+				<button type='button' aria-expanded={true} className="void-focus-ring text-left text-void-fg-3 opacity-80 hover:opacity-100 hover:brightness-115 p-1 text-xs" onClick={() => setShowAll(false)}>Show less</button>
 			)}
 		</div>
 	);
@@ -105,22 +63,21 @@ const formatDate = (date: Date) => {
 	}
 };
 
-// Format time to 12-hour format
-const formatTime = (date: Date) => {
-	return date.toLocaleString('en-US', {
-		hour: 'numeric',
-		minute: '2-digit',
-		hour12: true
-	});
+const toMetadata = (thread: ThreadType): ChatHistoryThreadMetadata => {
+	const firstUserMessage = thread.messages.find(message => message.role === 'user');
+	const title = firstUserMessage?.role === 'user' ? firstUserMessage.displayContent || 'Untitled chat' : 'Untitled chat';
+	return { id: thread.id, title, messageCount: thread.messages.filter(message => message.role === 'assistant' || message.role === 'user').length, lastModified: thread.lastModified };
 };
-
 
 const DuplicateButton = ({ threadId }: { threadId: string }) => {
 	const accessor = useAccessor()
 	const chatThreadsService = accessor.get('IChatThreadService')
 	return <IconShell1
 		Icon={Copy}
-		className='size-[11px]'
+		type='button'
+		aria-label='Duplicate chat'
+		title='Duplicate chat'
+		className='void-focus-ring size-[11px]'
 		onClick={() => { chatThreadsService.duplicateThread(threadId); }}
 		data-tooltip-id='void-tooltip'
 		data-tooltip-place='top'
@@ -142,7 +99,7 @@ const TrashButton = ({ threadId }: { threadId: string }) => {
 		<div className='flex flex-nowrap text-nowrap gap-1'>
 			<IconShell1
 				Icon={X}
-				className='size-[11px]'
+				type='button' aria-label='Cancel delete' title='Cancel delete' className='void-focus-ring size-[11px]'
 				onClick={() => { setIsTrashPressed(false); }}
 				data-tooltip-id='void-tooltip'
 				data-tooltip-place='top'
@@ -150,7 +107,7 @@ const TrashButton = ({ threadId }: { threadId: string }) => {
 			/>
 			<IconShell1
 				Icon={Check}
-				className='size-[11px]'
+				type='button' aria-label='Confirm delete' title='Confirm delete' className='void-focus-ring size-[11px]'
 				onClick={() => { chatThreadsService.deleteThread(threadId); setIsTrashPressed(false); }}
 				data-tooltip-id='void-tooltip'
 				data-tooltip-place='top'
@@ -159,7 +116,7 @@ const TrashButton = ({ threadId }: { threadId: string }) => {
 		</div>
 		: <IconShell1
 			Icon={Trash2}
-			className='size-[11px]'
+			type='button' aria-label='Delete chat' title='Delete chat' className='void-focus-ring size-[11px]'
 			onClick={() => { setIsTrashPressed(true); }}
 			data-tooltip-id='void-tooltip'
 			data-tooltip-place='top'
@@ -168,15 +125,7 @@ const TrashButton = ({ threadId }: { threadId: string }) => {
 	)
 }
 
-const PastThreadElement = ({ pastThread, idx, hoveredIdx, setHoveredIdx, isRunning }: {
-	pastThread: ThreadType,
-	idx: number,
-	hoveredIdx: number | null,
-	setHoveredIdx: (idx: number | null) => void,
-	isRunning: IsRunningType | undefined,
-}
-
-) => {
+const PastThreadElement = ({ row }: { row: ReturnType<typeof getChatHistoryPresentation>[number] }) => {
 
 
 	const accessor = useAccessor()
@@ -207,72 +156,12 @@ const PastThreadElement = ({ pastThread, idx, hoveredIdx, setHoveredIdx, isRunni
 	// 	toolTipName={`Copy As Void Chat`}
 	// />
 
-	let firstMsg = null;
-	const firstUserMsgIdx = pastThread.messages.findIndex((msg) => msg.role === 'user');
-
-	if (firstUserMsgIdx !== -1) {
-		const firsUsertMsgObj = pastThread.messages[firstUserMsgIdx];
-		firstMsg = firsUsertMsgObj.role === 'user' && firsUsertMsgObj.displayContent || '';
-	} else {
-		firstMsg = '""';
-	}
-
-	const numMessages = pastThread.messages.filter((msg) => msg.role === 'assistant' || msg.role === 'user').length;
-
-	const detailsHTML = <span
-	// data-tooltip-id='void-tooltip'
-	// data-tooltip-content={`Last modified ${formatTime(new Date(pastThread.lastModified))}`}
-	// data-tooltip-place='top'
-	>
-		<span className='opacity-60'>{numMessages}</span>
-		{` `}
-		{formatDate(new Date(pastThread.lastModified))}
-		{/* {` messages `} */}
-	</span>
-
-	return <div
-		key={pastThread.id}
-		className={`
-			py-1 px-2 rounded text-sm bg-zinc-700/5 hover:bg-zinc-700/10 dark:bg-zinc-300/5 dark:hover:bg-zinc-300/10 cursor-pointer opacity-80 hover:opacity-100
-		`}
-		onClick={() => {
-			chatThreadsService.switchToThread(pastThread.id);
-		}}
-		onMouseEnter={() => setHoveredIdx(idx)}
-		onMouseLeave={() => setHoveredIdx(null)}
-	>
-		<div className="flex items-center justify-between gap-1">
-			<span className="flex items-center gap-2 min-w-0 overflow-hidden">
-				{/* spinner */}
-				{isRunning === 'LLM' || isRunning === 'tool' || isRunning === 'idle' ? <LoaderCircle className="animate-spin bg-void-stroke-1 flex-shrink-0 flex-grow-0" size={14} />
-					:
-					isRunning === 'awaiting_user' ? <MessageCircleQuestion className="bg-void-stroke-1 flex-shrink-0 flex-grow-0" size={14} />
-						:
-						null}
-				{/* name */}
-				<span className="truncate overflow-hidden text-ellipsis"
-					data-tooltip-id='void-tooltip'
-					data-tooltip-content={numMessages + ' messages'}
-					data-tooltip-place='top'
-				>{firstMsg}</span>
-
-				{/* <span className='opacity-60'>{`(${numMessages})`}</span> */}
-			</span>
-
-			<div className="flex items-center gap-x-1 opacity-60">
-				{idx === hoveredIdx ?
-					<>
-						{/* trash icon */}
-						<DuplicateButton threadId={pastThread.id} />
-
-						{/* trash icon */}
-						<TrashButton threadId={pastThread.id} />
-					</>
-					: <>
-						{detailsHTML}
-					</>
-				}
-			</div>
-		</div>
+	const statusIcon = row.status === 'Running' ? <LoaderCircle aria-hidden='true' className='animate-spin flex-shrink-0' size={14} /> : row.status === 'Needs approval' ? <MessageCircleQuestion aria-hidden='true' className='flex-shrink-0' size={14} /> : row.status === 'Error' || row.status === 'Action required' ? <CircleAlert aria-hidden='true' className='flex-shrink-0' size={14} /> : null;
+	return <div className='flex items-center gap-1 py-1 px-2 rounded text-sm bg-zinc-700/5 hover:bg-zinc-700/10 dark:bg-zinc-300/5 dark:hover:bg-zinc-300/10 opacity-80 hover:opacity-100'>
+		<button type='button' className='void-focus-ring min-w-0 flex-1 text-left' aria-current={row.selected ? 'page' : undefined} aria-label={row.ariaLabel} onClick={() => chatThreadsService.switchToThread(row.id)}>
+			<span className='flex items-center gap-2 min-w-0 overflow-hidden'><span className='truncate overflow-hidden text-ellipsis'>{row.title}</span>{row.selected ? <span className='text-xs'>Current</span> : null}</span>
+			<span className='min-w-0 flex flex-wrap items-center gap-x-1 gap-y-0.5 whitespace-normal text-xs opacity-60'><span>{row.messageCount} {row.messageCount === 1 ? 'message' : 'messages'}</span><span>{formatDate(new Date(row.lastModified))}</span>{row.status ? <><span aria-hidden='true'>{statusIcon}</span><span>{row.status}</span></> : null}</span>
+		</button>
+		<div className='flex items-center gap-x-1'><DuplicateButton threadId={row.id} /><TrashButton threadId={row.id} /></div>
 	</div>
 }
