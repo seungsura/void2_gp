@@ -52,6 +52,15 @@
 	outline-offset: 2px !important;
 }
 
+.void-model-visibility-input:focus-visible + .void-model-visibility-track {
+	outline: 2px solid var(--void-ring-color) !important;
+	outline-offset: 2px !important;
+}
+
+.void-model-visibility-input:checked + .void-model-visibility-track .void-model-visibility-knob {
+	transform: translateX(1rem);
+}
+
 
 
 .inherit-bg-all-restyle > * {

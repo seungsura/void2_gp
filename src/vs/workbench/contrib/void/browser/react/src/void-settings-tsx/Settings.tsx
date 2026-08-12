@@ -493,17 +493,23 @@ export const ModelDump = ({ filteredProviders }: { filteredProviders?: ProviderN
 					{detailAboutModel}
 
 
-					{/* Switch */}
-					<VoidSwitch
-						value={value}
-						onChange={() => { settingsStateService.toggleModelHidden(providerName, modelName); }}
-						disabled={disabled}
-						size='sm'
-
-						data-tooltip-id='void-tooltip'
-						data-tooltip-place='right'
-						data-tooltip-content={tooltipName}
-					/>
+					{/* Model visibility */}
+					<span className='relative h-5 w-9 shrink-0'>
+						<input
+							type='checkbox'
+							checked={value}
+							disabled={disabled}
+							onChange={() => { settingsStateService.toggleModelHidden(providerName, modelName); }}
+							aria-label={`Show ${providerTitle} / ${modelName} in model dropdown`}
+							className='void-model-visibility-input peer absolute inset-0 z-10 h-5 w-9 cursor-pointer opacity-0 disabled:cursor-not-allowed'
+							data-tooltip-id='void-tooltip'
+							data-tooltip-place='right'
+							data-tooltip-content={tooltipName}
+						/>
+						<span aria-hidden='true' className='void-model-visibility-track pointer-events-none flex h-5 w-9 items-center rounded-full bg-white transition-colors duration-200 ease-in-out dark:bg-zinc-600 peer-checked:bg-zinc-900 peer-checked:dark:bg-white peer-disabled:opacity-25'>
+							<span className='void-model-visibility-knob h-3 w-3 translate-x-1 rounded-full bg-white shadow transition-transform duration-200 ease-in-out dark:bg-zinc-900' />
+						</span>
+					</span>
 
 					{/* X button */}
 					<div className={`w-5 flex items-center justify-center`}>
