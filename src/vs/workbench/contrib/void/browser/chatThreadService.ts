@@ -243,6 +243,10 @@ export interface IChatThreadService {
 	// thread selector
 	deleteThread(threadId: string): void;
 	duplicateThread(threadId: string): void;
+	getTransientComposerDraft(threadId: string): string;
+	setTransientComposerDraft(threadId: string, draft: string): void;
+	clearTransientComposerDraft(threadId: string): void;
+	clearSubmittedComposerState(threadId: string): void;
 
 	// exposed getters/setters
 	// these all apply to current thread
@@ -281,7 +285,7 @@ export interface IChatThreadService {
 	editUserMessageAndStreamResponse({ userMessage, messageIdx, threadId }: { userMessage: string, messageIdx: number, threadId: string }): Promise<void>;
 
 	// call to add a message
-	addUserMessageAndStreamResponse({ userMessage, threadId }: { userMessage: string, threadId: string }): Promise<void>;
+	addUserMessageAndStreamResponse({ userMessage, threadId }: { userMessage: string, threadId: string }): Promise<boolean>;
 
 	// approve/reject
 	approveLatestToolRequest(threadId: string): void;
@@ -348,6 +352,18 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	private readonly _instructionTurnOfThread = new Map<string, AgentRuntimeTurnSnapshot>();
 	private readonly _agentControlGeneration = new Map<string, number>();
 	private readonly _agentDelegationAuthorityOfThread = new Map<string, AgentDelegationTurnAuthority>();
+	private readonly _transientComposerDraftOfThread = new Map<string, string>();
+	getTransientComposerDraft(threadId: string): string { return this.state.allThreads[threadId] ? this._transientComposerDraftOfThread.get(threadId) ?? '' : '' }
+	setTransientComposerDraft(threadId: string, draft: string): void {
+		if (!draft) { this.clearTransientComposerDraft(threadId); return }
+		if (!this.state.allThreads[threadId]) return
+		this._transientComposerDraftOfThread.set(threadId, draft)
+	}
+	clearTransientComposerDraft(threadId: string): void { this._transientComposerDraftOfThread.delete(threadId) }
+	clearSubmittedComposerState(threadId: string): void {
+		this.clearTransientComposerDraft(threadId)
+		this._setThreadState(threadId, { stagingSelections: [] }, true)
+	}
 	async getSkillCatalog(threadId = this.state.currentThreadId) {
 		const owner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString();
 		let record = this._agentInstructionSessionOfThread.get(threadId);
@@ -457,6 +473,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		this._agentDelegationAuthorityOfThread.clear()
 		this._agentControlGeneration.clear()
 		this._agentInstructionSessionOfThread.clear()
+		this._transientComposerDraftOfThread.clear()
 		this._restoreInstructionTurns(newState.allThreads)
 		this.state = newState
 		this._onDidChangeCurrentThread.fire()
@@ -467,6 +484,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		this._instructionTurnOfThread.clear()
 		this._agentDelegationAuthorityOfThread.clear()
 		this._agentControlGeneration.clear()
+		this._transientComposerDraftOfThread.clear()
 		this.state = { allThreads: {}, currentThreadId: null as unknown as string } // see constructor
 		this.openNewThread()
 		this._onDidChangeCurrentThread.fire()
@@ -1252,7 +1270,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 	private async _addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string }) {
 		const thread = this.state.allThreads[threadId]
-		if (!thread) return // should never happen
+		if (!thread) return false // should never happen
 		const capturedSelections = [...(_chatSelections ?? thread.state.stagingSelections)]
 		const agentDelegationAllowed = capturedSelections.some(isAgentDelegationSelection)
 		this._agentDelegationAuthorityOfThread.delete(threadId)
@@ -1271,7 +1289,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const capturedOverrides = capturedModel.modelSelection ? { [capturedModel.modelSelection.providerName]: { [capturedModel.modelSelection.modelName]: deepClone(capturedOverride) } } as never : undefined;
 		// This must happen before history changes: a task cannot cross a workspace owner boundary.
 		const instructionSnapshot = await this._beginInstructionTurn(threadId)
-		if (!isCurrentTurn()) return
+		if (!isCurrentTurn()) return false
 		// A failed new admission must not leave a previous turn's runtime authority resumable.
 		this._purgeInstructionTurn(threadId, false)
 
@@ -1280,9 +1298,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		let currSelns: StagingSelectionItem[] = capturedSelections
 		const owner = this._workspaceContextService.getWorkspace().folders[0]?.uri
 		const catalog = await this._agentSkillsService.getCatalog(owner, owner, instructionSnapshot.config)
-		if (!isCurrentTurn()) return
+		if (!isCurrentTurn()) return false
 		const roleCatalog = agentDelegationAllowed ? await this._agentCustomAgentService.getCatalog(owner, owner) : undefined
-		if (!isCurrentTurn()) return
+		if (!isCurrentTurn()) return false
 		const direct = selectExplicitSkills(catalog, instructions)
 		if (!direct.skills) throw new Error(direct.diagnostic?.code ?? 'skill_not_found')
 		const selectedIdentities = new Set<string>(); const normalizedSelections: StagingSelectionItem[] = [];
@@ -1299,7 +1317,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			if (!body.body) throw new Error(body.diagnostic?.code ?? 'skill_body_unreadable')
 			return body.body
 		}))
-		if (!isCurrentTurn()) return
+		if (!isCurrentTurn()) return false
 		if (this._workspaceContextService.getWorkspace().folders[0]?.uri.toString() !== instructionSnapshot.ownerProjectRoot || (!this._workspaceTrustManagementService.isWorkspaceTrusted() && (instructionSnapshot.config.configSources.some(source => source.scope === 'project') || catalog.skills.some(skill => skill.provenance.source === 'repository')))) throw new Error('skill_owner_or_trust_changed')
 		let effectiveReserve = 0
 		if (capturedModel.modelSelection) {
@@ -1314,14 +1332,14 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const runtimeSnapshot = createAgentRuntimeTurnSnapshot(instructionSnapshot, catalog, advertisement, skillSelections.map((selection, index) => ({ identity: selection.identity, skillRoot: selection.skillRoot, bodyRevision: selection.bodyRevision, body: skillBodies[index] })), runtimeModel, this._workspaceTrustManagementService.isWorkspaceTrusted())
 		admitProtectedAgentAuthority(runtimeSnapshot)
 		const userMessageContentBase = await chat_userMessageContent(instructions, currSelns, { directoryStrService: this._directoryStringService, fileService: this._fileService }) // user message + names of files (NOT content)
-		if (!isCurrentTurn()) return
+		if (!isCurrentTurn()) return false
 		const roleAd = roleCatalog ? customAgentAdvertisement(roleCatalog, runtimeModel.hasModel ? Math.min(2_000, Math.max(0, Math.floor(runtimeModel.contextWindow * .01 * 4))) : 2_000) : undefined
 		const userMessageContent = currSelns.some(isAgentDelegationSelection)
 			? `${userMessageContentBase}\n\n[User delegation marker: up to four generic read-only children are available for this turn, with two running concurrently. Named custom agents admitted for this turn (optional exact agent_type): ${roleAd?.text || 'none'}${roleAd?.omitted ? `; ${roleAd.omitted} omitted` : ''}. Call spawn_agent for delegated tasks, then wait_agent for their results; partial child failures do not prevent your synthesis.]`
 			: userMessageContentBase
 		const currentOwner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
 		if (currentOwner !== runtimeSnapshot.ownerProjectRoot || currentOwner !== runtimeSnapshot.runCwd || this._workspaceTrustManagementService.isWorkspaceTrusted() !== runtimeSnapshot.workspaceTrustedAtAdmission) { this._purgeInstructionTurn(threadId, false); throw new Error('skill_owner_or_trust_changed') }
-		if (!isCurrentTurn()) return
+		if (!isCurrentTurn()) return false
 		const agentDelegationAuthority = Object.freeze({ allowed: agentDelegationAllowed, generation: turnGeneration, ...(roleCatalog ? { roles: roleCatalog, settingsState: capturedSettingsState, settingsOfProvider: capturedSettingsOfProvider } : {}) })
 		this._agentDelegationAuthorityOfThread.set(threadId, agentDelegationAuthority)
 		this._rememberInstructionTurn(threadId, runtimeSnapshot)
@@ -1337,15 +1355,12 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		this.state.allThreads[threadId]?.state.mountedInfo?.whenMounted.then(m => {
 			m.scrollToBottom()
 		})
+		return true
 	}
 
 
 	async addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string }) {
-		const thread = this.state.allThreads[threadId];
-		if (!thread) return
-
-		await this._addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId });
-
+		return this._addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId });
 	}
 
 	editUserMessageAndStreamResponse: IChatThreadService['editUserMessageAndStreamResponse'] = async ({ userMessage, messageIdx, threadId }) => {
@@ -1704,6 +1719,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	deleteThread(threadId: string): void {
 		this._agentSubagentService.forgetParent(threadId)
 		this._agentDelegationAuthorityOfThread.delete(threadId); this._agentControlGeneration.delete(threadId)
+		this.clearTransientComposerDraft(threadId)
 		const { allThreads: currentThreads } = this.state
 
 		// delete the thread
@@ -1716,7 +1732,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		this._storeAllThreads(newThreads);
 		this._setState({ ...this.state, allThreads: newThreads })
 	}
-	override dispose(): void { this._agentDelegationAuthorityOfThread.clear(); this._agentControlGeneration.clear(); super.dispose(); }
+	override dispose(): void { this._agentDelegationAuthorityOfThread.clear(); this._agentControlGeneration.clear(); this._transientComposerDraftOfThread.clear(); super.dispose(); }
 
 	duplicateThread(threadId: string) {
 		const { allThreads: currentThreads } = this.state

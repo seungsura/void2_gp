@@ -27,6 +27,7 @@ import { ChatMessage, StagingSelectionItem, ToolMessage } from '../../../../comm
 import { isActiveChildRun } from '../../../../common/agentSubagents.js';
 import { AgentSubagentPresentation, getAgentSubagentPresentation } from '../../../../common/agentSubagentPresentation.js';
 import { canSubmitChatCurrent, ChatCurrentStatusPresentation, getChatCurrentStatusPresentation } from '../../../../common/chatCurrentStatusPresentation.js';
+import { submitChatComposer } from '../../../../common/chatComposerSubmission.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, ToolName, LintErrorItem, ToolApprovalType, toolApprovalTypes } from '../../../../common/toolsServiceTypes.js';
 import { CopyButton, IconShell1, JumpToFileButton, JumpToTerminalButton, StatusIndicator, useApplyStreamState } from '../markdown/ApplyBlockHoverButtons.js';
 import { acceptAllBg, acceptBorder, buttonFontSize, buttonTextColor, rejectAllBg, rejectBg, rejectBorder } from '../../../../common/helpers/colors.js';
@@ -2733,6 +2734,7 @@ export const SidebarChat = () => {
 	const chatThreadsState = useChatThreadsState()
 
 	const currentThread = chatThreadsService.getCurrentThread()
+	const threadId = currentThread.id
 	const previousMessages = currentThread?.messages ?? []
 
 	const selections = currentThread.state.stagingSelections
@@ -2756,8 +2758,9 @@ export const SidebarChat = () => {
 	// ----- SIDEBAR CHAT state (local) -----
 
 	// state of current message
-	const initVal = ''
-	const [instructionsAreEmpty, setInstructionsAreEmpty] = useState(!initVal)
+	const initVal = chatThreadsService.getTransientComposerDraft(currentThread.id)
+	const [draftEmptiness, setDraftEmptiness] = useState({ threadId, isEmpty: !initVal })
+	const instructionsAreEmpty = draftEmptiness.threadId === threadId ? draftEmptiness.isEmpty : !initVal
 
 	const hasDraft = !instructionsAreEmpty
 	const chatModelUnavailable = !!isFeatureNameDisabled('Chat', settingsState)
@@ -2781,17 +2784,22 @@ export const SidebarChat = () => {
 		const userMessage = _forceSubmit || textAreaRef.current?.value || ''
 
 		try {
-			await chatThreadsService.addUserMessageAndStreamResponse({ userMessage, threadId })
+			await submitChatComposer({
+				threadId,
+				submit: () => chatThreadsService.addUserMessageAndStreamResponse({ userMessage, threadId }),
+				clearSubmittedState: submittedThreadId => chatThreadsService.clearSubmittedComposerState(submittedThreadId),
+				getCurrentThreadId: () => chatThreadsService.state.currentThreadId,
+				clearCurrentInput: () => {
+					textAreaFnsRef.current?.setValue('')
+					textAreaRef.current?.focus()
+				},
+			})
 		} catch (e) {
 			console.error('Error while sending message in chat:', e)
 			return
 		}
 
-		setSelections([]) // clear staging
-		textAreaFnsRef.current?.setValue('')
-		textAreaRef.current?.focus() // focus input after submit
-
-	}, [chatThreadsService, isAnyRunning, hasDraft, chatModelUnavailable, setSelections])
+	}, [chatThreadsService, isAnyRunning, hasDraft, chatModelUnavailable])
 
 	const onAbort = async () => {
 		const threadId = currentThread.id
@@ -2799,8 +2807,6 @@ export const SidebarChat = () => {
 	}
 
 	const keybindingString = accessor.get('IKeybindingService').lookupKeybinding(VOID_CTRL_L_ACTION_ID)?.getLabel()
-
-	const threadId = currentThread.id
 
 	// resolve mount info
 	const isResolved = chatThreadsState.allThreads[threadId]?.state.mountedInfo?.mountedIsResolvedRef.current
@@ -2896,8 +2902,10 @@ export const SidebarChat = () => {
 
 
 	const onChangeText = useCallback((newStr: string) => {
-		setInstructionsAreEmpty(!newStr)
-	}, [setInstructionsAreEmpty])
+		chatThreadsService.setTransientComposerDraft(threadId, newStr)
+		const isEmpty = !newStr
+		setDraftEmptiness(previous => previous.threadId === threadId && previous.isEmpty === isEmpty ? previous : { threadId, isEmpty })
+	}, [chatThreadsService, threadId])
 	const onKeyDown = useCallback((e: KeyboardEvent<HTMLTextAreaElement>) => {
 		if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229 || e.repeat) return
 		if (e.key === 'Enter' && !e.shiftKey) {
@@ -2932,6 +2940,7 @@ export const SidebarChat = () => {
 		onClickAnywhere={() => { textAreaRef.current?.focus() }}
 	>
 		<VoidInputBox2
+			initValue={initVal}
 			enableAtToMention
 			ariaLabel={currentStatusPresentation.textarea.ariaLabel}
 			ariaDescribedBy={currentStatusPresentation.textarea.ariaDescribedBy}

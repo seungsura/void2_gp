@@ -169,23 +169,17 @@ registerAction2(class extends Action2 {
 		const oldThreadId = chatThreadsService.state.currentThreadId
 		const oldThread = chatThreadsService.state.allThreads[oldThreadId]
 
-		const oldUI = await oldThread?.state.mountedInfo?.whenMounted
-
 		const oldSelns = oldThread?.state.stagingSelections
-		const oldVal = oldUI?.textAreaRef?.current?.value
+		const oldVal = chatThreadsService.getTransientComposerDraft(oldThreadId)
 
 		// open and focus new thread
 		chatThreadsService.openNewThread()
-		await chatThreadsService.focusCurrentChat()
-
-
-		// set new thread values
 		const newThreadId = chatThreadsService.state.currentThreadId
-		const newThread = chatThreadsService.state.allThreads[newThreadId]
-
-		const newUI = await newThread?.state.mountedInfo?.whenMounted
-		chatThreadsService.setCurrentThreadState({ stagingSelections: oldSelns, })
-		if (newUI?.textAreaRef?.current && oldVal) newUI.textAreaRef.current.value = oldVal
+		const existingNewThreadSelections = chatThreadsService.state.allThreads[newThreadId]?.state.stagingSelections ?? []
+		const existingNewThreadDraft = chatThreadsService.getTransientComposerDraft(newThreadId)
+		if (!existingNewThreadDraft) chatThreadsService.setTransientComposerDraft(newThreadId, oldVal)
+		if (existingNewThreadSelections.length === 0 && oldSelns?.length) chatThreadsService.setCurrentThreadState({ stagingSelections: oldSelns })
+		await chatThreadsService.focusCurrentChat()
 
 
 		// if has selection, add it
