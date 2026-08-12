@@ -748,6 +748,7 @@ export const SelectedFiles = (
 				</div>
 
 			})}
+			{type === 'staging' && selections.some(selection => selection.type === 'Agent') ? <div className='basis-full text-xs text-void-fg-3 pt-1'>Agent delegation is explicit: this requests delegation, but does not start a child. The parent decides whether and when to delegate.</div> : null}
 
 
 		</div>
@@ -2605,7 +2606,6 @@ const CommandBarInChat = () => {
 				</div>
 			)
 			})}
-			{type === 'staging' && selections.some(selection => selection.type === 'Agent') ? <div className='basis-full text-xs text-void-fg-3 pt-1'>Agent delegation is explicit: this requests delegation, but does not start a child. The parent decides whether and when to delegate.</div> : null}
 		</div>
 
 	const fileDetailsButton = (
