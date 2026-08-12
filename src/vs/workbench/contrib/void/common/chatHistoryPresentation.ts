@@ -9,7 +9,7 @@ export type ChatHistoryChildOverview = Readonly<{ running: boolean; queued: bool
 export type ChatHistoryChildRun = Readonly<{ status: string }>;
 export type ChatHistoryChildDiagnostics = Readonly<{ events: readonly Readonly<{ kind: string; diagnostic?: string }>[] }>;
 export type ChatHistoryStatus = 'Error' | 'Action required' | 'Needs approval' | 'Running' | 'Queued';
-export type ChatHistoryRow = Readonly<{ id: string; title: string; messageCount: number; lastModified: string; selected: boolean; status?: ChatHistoryStatus; ariaLabel: string }>;
+export type ChatHistoryRow = Readonly<{ id: string; title: string; messageCount: number; lastModified: string; selected: boolean; status?: ChatHistoryStatus; canDelete: boolean; ariaLabel: string }>;
 
 const statusFor = (parent: ChatHistoryParentActivity | undefined, child: ChatHistoryChildOverview | undefined): ChatHistoryStatus | undefined => {
 	if (parent?.hasError) return 'Error';
@@ -36,8 +36,15 @@ export const getChatHistoryPresentation = (
 		.sort((left, right) => Date.parse(right.lastModified) - Date.parse(left.lastModified) || left.id.localeCompare(right.id))
 		.map(thread => {
 			const selected = thread.id === currentThreadId;
-			const status = statusFor(parentActivityById[thread.id], childOverviewById[thread.id]);
+			const parentActivity = parentActivityById[thread.id];
+			const childOverview = childOverviewById[thread.id];
+			const status = statusFor(parentActivity, childOverview);
+			const canDelete = !selected
+				&& parentActivity?.isRunning === undefined
+				&& childOverview?.running !== true
+				&& childOverview?.queued !== true
+				&& childOverview?.actionRequired !== true;
 			const ariaLabel = `${thread.title}, ${thread.messageCount} messages, ${selected ? 'Current' : 'Previous chat'}${status ? `, ${status}` : ''}`;
-			return Object.freeze({ ...thread, selected, ...(status ? { status } : {}), ariaLabel });
+			return Object.freeze({ ...thread, selected, ...(status ? { status } : {}), canDelete, ariaLabel });
 		}),
 );

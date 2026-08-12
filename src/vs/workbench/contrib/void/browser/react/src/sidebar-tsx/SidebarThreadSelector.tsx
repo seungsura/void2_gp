@@ -3,7 +3,7 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { IconShell1 } from '../markdown/ApplyBlockHoverButtons.js';
 import { useAccessor, useChatThreadsState, useFullChatThreadsStreamState, useVisibleThreadChildOverviews } from '../util/services.js';
 import { Check, CircleAlert, Copy, LoaderCircle, MessageCircleQuestion, Trash2, X } from 'lucide-react';
@@ -15,6 +15,9 @@ const numInitialThreads = 3
 
 export const PastThreadsList = ({ className = '' }: { className?: string }) => {
 	const [showAll, setShowAll] = useState(false);
+	const listRef = useRef<HTMLDivElement>(null);
+	const accessor = useAccessor();
+	const chatThreadsService = accessor.get('IChatThreadService');
 
 	const threadsState = useChatThreadsState()
 	const streamState = useFullChatThreadsStreamState()
@@ -28,10 +31,23 @@ export const PastThreadsList = ({ className = '' }: { className?: string }) => {
 	const rows = useMemo(() => getChatHistoryPresentation(metadata, currentThreadId, parentActivityById, childOverviewById), [metadata, currentThreadId, parentActivityById, childOverviewById]);
 	const displayRows = showAll ? rows : rows.slice(0, numInitialThreads);
 	const hasMoreThreads = rows.length > numInitialThreads;
+	const deleteThreadAndMoveFocus = (threadId: string) => {
+		const deletedIndex = displayRows.findIndex(row => row.id === threadId);
+		const nextFocusId = displayRows[deletedIndex + 1]?.id ?? displayRows[deletedIndex - 1]?.id;
+		chatThreadsService.deleteThread(threadId);
+		requestAnimationFrame(() => {
+			const list = listRef.current;
+			if (!list) return;
+			const nextRow = nextFocusId
+				? Array.from(list.querySelectorAll<HTMLButtonElement>('button[data-chat-history-thread-id]')).find(button => button.dataset.chatHistoryThreadId === nextFocusId)
+				: undefined;
+			(nextRow ?? list).focus();
+		});
+	};
 
 	return (
-		<div className={`flex flex-col mb-2 gap-2 w-full text-nowrap text-void-fg-3 select-none relative ${className}`}>
-			{displayRows.length === 0 ? <div className='p-1 text-sm'>No previous chats yet.</div> : displayRows.map(row => <PastThreadElement key={row.id} row={row} />)}
+		<div ref={listRef} role='group' aria-label='Chat history' tabIndex={-1} className={`focus-ring flex flex-col mb-2 gap-2 w-full text-nowrap text-void-fg-3 select-none relative ${className}`}>
+			{displayRows.length === 0 ? <div className='p-1 text-sm'>No previous chats yet.</div> : displayRows.map((row, index) => <PastThreadElement key={row.id} row={row} position={index + 1} onConfirmDelete={deleteThreadAndMoveFocus} />)}
 
 			{hasMoreThreads && !showAll && (
 				<button type='button' aria-expanded={false} className="focus-ring text-left text-void-fg-3 opacity-80 hover:opacity-100 hover:brightness-115 p-1 text-xs" onClick={() => setShowAll(true)}>Show {rows.length - numInitialThreads} more...</button>
@@ -69,63 +85,76 @@ const toMetadata = (thread: ThreadType): ChatHistoryThreadMetadata => {
 	return { id: thread.id, title, messageCount: thread.messages.filter(message => message.role === 'assistant' || message.role === 'user').length, lastModified: thread.lastModified };
 };
 
-const DuplicateButton = ({ threadId }: { threadId: string }) => {
+const DuplicateButton = ({ threadId, chatTitle, position }: { threadId: string; chatTitle: string; position: number }) => {
 	const accessor = useAccessor()
 	const chatThreadsService = accessor.get('IChatThreadService')
+	const accessibleName = `Duplicate chat: ${chatTitle}, row ${position}`;
 	return <IconShell1
 		Icon={Copy}
 		type='button'
-		aria-label='Duplicate chat'
-		title='Duplicate chat'
+		aria-label={accessibleName}
+		title={accessibleName}
 		className='focus-ring size-[11px]'
 		onClick={() => { chatThreadsService.duplicateThread(threadId); }}
 		data-tooltip-id='void-tooltip'
 		data-tooltip-place='top'
-		data-tooltip-content='Duplicate thread'
+		data-tooltip-content={accessibleName}
 	>
 	</IconShell1>
 
 }
 
-const TrashButton = ({ threadId }: { threadId: string }) => {
-
-	const accessor = useAccessor()
-	const chatThreadsService = accessor.get('IChatThreadService')
-
-
+const TrashButton = ({ threadId, chatTitle, position, onConfirmDelete }: { threadId: string; chatTitle: string; position: number; onConfirmDelete: (threadId: string) => void }) => {
 	const [isTrashPressed, setIsTrashPressed] = useState(false)
+	const controlsRef = useRef<HTMLDivElement>(null)
+	const focusAfterSwapRef = useRef(false)
 
-	return (isTrashPressed ?
-		<div className='flex flex-nowrap text-nowrap gap-1'>
+	useEffect(() => {
+		if (!focusAfterSwapRef.current) return;
+		focusAfterSwapRef.current = false;
+		controlsRef.current?.querySelector<HTMLButtonElement>('button')?.focus();
+	}, [isTrashPressed]);
+
+	const swapControlsAndMoveFocus = (pressed: boolean) => {
+		focusAfterSwapRef.current = true;
+		setIsTrashPressed(pressed);
+	};
+
+	const deleteName = `Delete chat: ${chatTitle}, row ${position}`;
+	const cancelName = `Cancel delete: ${chatTitle}, row ${position}`;
+	const confirmName = `Confirm delete: ${chatTitle}, row ${position}`;
+
+	return <div ref={controlsRef} className='flex flex-nowrap text-nowrap gap-1'>
+		{isTrashPressed ? <>
 			<IconShell1
 				Icon={X}
-				type='button' aria-label='Cancel delete' title='Cancel delete' className='focus-ring size-[11px]'
-				onClick={() => { setIsTrashPressed(false); }}
+				type='button' aria-label={cancelName} title={cancelName} className='focus-ring size-[11px]'
+				onClick={() => { swapControlsAndMoveFocus(false); }}
 				data-tooltip-id='void-tooltip'
 				data-tooltip-place='top'
-				data-tooltip-content='Cancel'
+				data-tooltip-content={cancelName}
 			/>
 			<IconShell1
 				Icon={Check}
-				type='button' aria-label='Confirm delete' title='Confirm delete' className='focus-ring size-[11px]'
-				onClick={() => { chatThreadsService.deleteThread(threadId); setIsTrashPressed(false); }}
+				type='button' aria-label={confirmName} title={confirmName} className='focus-ring size-[11px]'
+				onClick={() => { onConfirmDelete(threadId); }}
 				data-tooltip-id='void-tooltip'
 				data-tooltip-place='top'
-				data-tooltip-content='Confirm'
+				data-tooltip-content={confirmName}
 			/>
-		</div>
-		: <IconShell1
+		</> : <IconShell1
 			Icon={Trash2}
-			type='button' aria-label='Delete chat' title='Delete chat' className='focus-ring size-[11px]'
-			onClick={() => { setIsTrashPressed(true); }}
+			type='button' aria-label={deleteName} title={deleteName} className='focus-ring size-[11px]'
+			onClick={() => { swapControlsAndMoveFocus(true); }}
 			data-tooltip-id='void-tooltip'
 			data-tooltip-place='top'
-			data-tooltip-content='Delete thread'
+			data-tooltip-content={deleteName}
 		/>
-	)
+		}
+	</div>
 }
 
-const PastThreadElement = ({ row }: { row: ReturnType<typeof getChatHistoryPresentation>[number] }) => {
+const PastThreadElement = ({ row, position, onConfirmDelete }: { row: ReturnType<typeof getChatHistoryPresentation>[number]; position: number; onConfirmDelete: (threadId: string) => void }) => {
 
 
 	const accessor = useAccessor()
@@ -158,10 +187,10 @@ const PastThreadElement = ({ row }: { row: ReturnType<typeof getChatHistoryPrese
 
 	const statusIcon = row.status === 'Running' ? <LoaderCircle aria-hidden='true' className='animate-spin flex-shrink-0' size={14} /> : row.status === 'Needs approval' ? <MessageCircleQuestion aria-hidden='true' className='flex-shrink-0' size={14} /> : row.status === 'Error' || row.status === 'Action required' ? <CircleAlert aria-hidden='true' className='flex-shrink-0' size={14} /> : null;
 	return <div className='flex items-center gap-1 py-1 px-2 rounded text-sm bg-zinc-700/5 hover:bg-zinc-700/10 dark:bg-zinc-300/5 dark:hover:bg-zinc-300/10 opacity-80 hover:opacity-100'>
-		<button type='button' className='focus-ring min-w-0 flex-1 text-left' aria-current={row.selected ? 'page' : undefined} aria-label={row.ariaLabel} onClick={() => chatThreadsService.switchToThread(row.id)}>
+		<button type='button' className='focus-ring min-w-0 flex-1 text-left' data-chat-history-thread-id={row.id} aria-current={row.selected ? 'page' : undefined} aria-label={row.ariaLabel} onClick={() => chatThreadsService.switchToThread(row.id)}>
 			<span className='flex items-center gap-2 min-w-0 overflow-hidden'><span className='truncate overflow-hidden text-ellipsis'>{row.title}</span>{row.selected ? <span className='text-xs'>Current</span> : null}</span>
 			<span className='min-w-0 flex flex-wrap items-center gap-x-1 gap-y-0.5 whitespace-normal text-xs opacity-60'><span>{row.messageCount} {row.messageCount === 1 ? 'message' : 'messages'}</span><span>{formatDate(new Date(row.lastModified))}</span>{row.status ? <><span aria-hidden='true'>{statusIcon}</span><span>{row.status}</span></> : null}</span>
 		</button>
-		<div className='flex items-center gap-x-1'><DuplicateButton threadId={row.id} /><TrashButton threadId={row.id} /></div>
+		<div className='flex items-center gap-x-1'><DuplicateButton threadId={row.id} chatTitle={row.title} position={position} />{row.canDelete ? <TrashButton threadId={row.id} chatTitle={row.title} position={position} onConfirmDelete={onConfirmDelete} /> : null}</div>
 	</div>
 }
