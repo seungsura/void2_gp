@@ -12,6 +12,7 @@ import { RawToolParamsObj } from '../sendLLMMessageTypes.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, BuiltinToolResultType, ToolName } from '../toolsServiceTypes.js';
 import { ChatMode } from '../voidSettingsTypes.js';
 import { ToolExecutionProfile, agentSubagentToolSchemas, isAgentSubagentControlName, isToolAllowedByProfile, readOnlyChildBuiltinSchemas } from '../agentSubagents.js';
+import { isReadSkillResourceToolName, readSkillResourceToolSchema } from '../agentSkills.js';
 
 // Triple backtick wrapper used throughout the prompts for code blocks
 export const tripleTick = ['```', '```']
@@ -361,6 +362,19 @@ export const agentSubagentControlTools: readonly InternalToolInfo[] = Object.fre
 	agentSubagentControlTool({ name: 'interrupt_agent', description: 'Cancel the current direct child by its id.', params: { target: { description: 'The direct child id.' } }, schema: agentSubagentToolSchemas.interrupt_agent }),
 ]);
 
+/** Parent-Agent-only application read; ChatThreadService intercepts it before builtin/MCP dispatch. */
+export const agentSkillResourceTools: readonly InternalToolInfo[] = Object.freeze([
+	Object.freeze({
+		name: 'read_skill_resource',
+		description: 'Read one UTF-8 supporting resource from an exact Skill selected in this top-level turn. Supply only that selected Skill identity and a relative path below its Skill root. The read is exact-or-fail and grants no write or execution authority.',
+		params: Object.freeze({
+			skill: Object.freeze({ description: 'The exact selected Skill identity.' }),
+			resource_path: Object.freeze({ description: 'The relative resource path below that Skill root.' }),
+		}),
+		schema: readSkillResourceToolSchema,
+	}),
+]);
+
 
 
 
@@ -376,12 +390,14 @@ export const availableTools = (chatMode: ChatMode | null, mcpTools: InternalTool
 		? { ...builtinTools[toolName], schema: readOnlyChildBuiltinSchemas[toolName] }
 		: builtinTools[toolName]) ?? undefined
 	// A child is intentionally not allowed to serialize live MCP tools, even if present.
-	const effectiveMCPTools = chatMode === 'agent' && toolExecutionProfile === 'default-parent' ? mcpTools?.filter(tool => !isAgentSubagentControlName(tool.name)) : undefined
+	const effectiveMCPTools = chatMode === 'agent' && toolExecutionProfile === 'default-parent' ? mcpTools?.filter(tool => !isAgentSubagentControlName(tool.name) && !isReadSkillResourceToolName(tool.name)) : undefined
 
 	const controlTools = chatMode === 'agent' && toolExecutionProfile === 'default-parent' && agentDelegationAllowed ? agentSubagentControlTools : []
-	const tools: InternalToolInfo[] | undefined = !(builtinToolNames || mcpTools || controlTools.length) ? undefined
+	const skillResourceTools = chatMode === 'agent' && toolExecutionProfile === 'default-parent' ? agentSkillResourceTools : []
+	const tools: InternalToolInfo[] | undefined = !(builtinToolNames || mcpTools || controlTools.length || skillResourceTools.length) ? undefined
 		: [
 			...effectiveBuiltinTools ?? [],
+			...skillResourceTools,
 			...controlTools,
 			...effectiveMCPTools ?? [],
 		]

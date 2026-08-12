@@ -3,6 +3,7 @@
  *  service never scans caches, VSIX files, or marketplaces on its own.
  *--------------------------------------------------------------------------------------------*/
 import { URI } from '../../../../base/common/uri.js';
+import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { isEqualOrParent } from '../../../../base/common/resources.js';
 import { FileOperationError, FileOperationResult, IFileService, IFileStat } from '../../../../platform/files/common/files.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
@@ -10,10 +11,11 @@ import { InstantiationType, registerSingleton } from '../../../../platform/insta
 import { IPathService } from '../../../services/path/common/pathService.js';
 import { IWorkspaceTrustManagementService } from '../../../../platform/workspace/common/workspaceTrust.js';
 import { IExtensionService } from '../../../services/extensions/common/extensions.js';
-import { AgentSkillCatalog, createSkillCatalog, rebuildAgentSkillCatalog, resolveSkillResourceSegments, SkillCandidate, SkillDiagnostic } from '../common/agentSkills.js';
+import { AgentSkillCatalog, AgentSkillSelection, createSkillCatalog, rebuildAgentSkillCatalog, resolveSkillResourceSegments, SkillCandidate, SkillDiagnostic, skillBodyRevision } from '../common/agentSkills.js';
 import { AgentInstructionsConfig } from '../common/agentInstructions.js';
 
 const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+const encoder = new TextEncoder();
 const pluginName = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const freeze = <T>(value: T): T => Object.freeze(value);
 
@@ -25,11 +27,12 @@ export interface IAgentSkillsService {
 	readonly _serviceBrand: undefined;
 	getCatalog(ownerRoot: URI | undefined, cwd: URI | undefined, config?: AgentInstructionsConfig): Promise<AgentSkillCatalog>;
 	readSkillBody(skillRoot: string, expectedRevision: string): Promise<{ body?: string; diagnostic?: SkillDiagnostic }>;
-	readSkillResource(skillRoot: string, expectedRevision: string, resourcePath: string): Promise<{ body?: string; diagnostic?: SkillDiagnostic }>;
+	readSkillResource(selection: AgentSkillSelection, resourcePath: string, options: AgentSkillResourceReadOptions): Promise<{ body?: string; diagnostic?: SkillDiagnostic }>;
 }
 export const IAgentSkillsService = createDecorator<IAgentSkillsService>('voidAgentSkillsService');
 
-type ReadResult = { bytes?: Uint8Array; missing: boolean };
+export type AgentSkillResourceReadOptions = Readonly<{ maxResourceBytes: number; token: CancellationToken }>;
+type ReadResult = { bytes?: Uint8Array; missing: boolean; tooLarge?: boolean; cancelled?: boolean };
 type StatResult = { stat?: IFileStat; missing: boolean };
 
 export class AgentSkillsService implements IAgentSkillsService {
@@ -43,8 +46,13 @@ export class AgentSkillsService implements IAgentSkillsService {
 		private readonly bundledRoots: BundledSkillRootProvider = noBundledSkillRoots,
 	) { }
 	private _missing(error: unknown): boolean { return error instanceof FileOperationError && error.fileOperationResult === FileOperationResult.FILE_NOT_FOUND; }
+	private _tooLarge(error: unknown): boolean { return error instanceof FileOperationError && error.fileOperationResult === FileOperationResult.FILE_TOO_LARGE; }
 	private async _stat(uri: URI): Promise<StatResult> { try { return { stat: await this.fileService.resolve(uri), missing: false }; } catch (error) { return { missing: this._missing(error) }; } }
-	private async _read(uri: URI): Promise<ReadResult> { try { return { bytes: (await this.fileService.readFile(uri)).value.buffer.slice(), missing: false }; } catch (error) { return { missing: this._missing(error) }; } }
+	private async _read(uri: URI, maxBytes?: number, token: CancellationToken = CancellationToken.None): Promise<ReadResult> {
+		if (token.isCancellationRequested) return { missing: false, cancelled: true };
+		try { return { bytes: (await this.fileService.readFile(uri, maxBytes === undefined ? undefined : { limits: { size: maxBytes } }, token)).value.buffer.slice(), missing: false }; }
+		catch (error) { return { missing: this._missing(error), ...(this._tooLarge(error) ? { tooLarge: true } : {}), ...(token.isCancellationRequested ? { cancelled: true } : {}) }; }
+	}
 	private _diagnostic(code: string, detail: string): SkillDiagnostic { return freeze({ code, detail }); }
 	private async _safeDirectory(root: URI, segments: readonly string[] = []): Promise<StatResult> {
 		let current = root;
@@ -56,15 +64,27 @@ export class AgentSkillsService implements IAgentSkillsService {
 		}
 		return result;
 	}
-	private async _readSafeFile(root: URI, segments: readonly string[]): Promise<ReadResult> {
+	private async _readSafeFile(root: URI, segments: readonly string[], maxBytes?: number, token: CancellationToken = CancellationToken.None): Promise<ReadResult> {
 		if (!segments.length) return { missing: false };
+		if (token.isCancellationRequested) return { missing: false, cancelled: true };
 		const parent = await this._safeDirectory(root, segments.slice(0, -1));
-		if (!parent.stat) return { missing: parent.missing };
+		if (!parent.stat || !parent.stat.isDirectory || parent.stat.isSymbolicLink) return { missing: parent.missing };
 		const target = URI.joinPath(root, ...segments);
 		const stat = await this._stat(target);
 		if (!stat.stat) return { missing: stat.missing };
 		if (!stat.stat.isFile || stat.stat.isSymbolicLink) return { missing: false };
-		return this._read(target);
+		if (maxBytes !== undefined && typeof stat.stat.size === 'number' && stat.stat.size > maxBytes) return { missing: false, tooLarge: true };
+		const read = await this._read(target, maxBytes, token);
+		if (!read.bytes) return read;
+		if (token.isCancellationRequested) return { missing: false, cancelled: true };
+		// A directory or target can become a symlink/junction while readFile awaits.
+		// Re-walk the exact root and every ancestor and re-stat the target before
+		// admitting any bytes across the Skill-root boundary.
+		const parentAfterRead = await this._safeDirectory(root, segments.slice(0, -1));
+		if (!parentAfterRead.stat || !parentAfterRead.stat.isDirectory || parentAfterRead.stat.isSymbolicLink) return { missing: parentAfterRead.missing };
+		const targetAfterRead = await this._stat(target);
+		if (!targetAfterRead.stat || !targetAfterRead.stat.isFile || targetAfterRead.stat.isSymbolicLink) return { missing: targetAfterRead.missing };
+		return read;
 	}
 	private async _skillCandidates(root: URI, source: SkillCandidate['source'], rank: number, plugin?: string): Promise<{ candidates: SkillCandidate[]; diagnostics: SkillDiagnostic[] }> {
 		const checked = await this._safeDirectory(root);
@@ -156,11 +176,25 @@ export class AgentSkillsService implements IAgentSkillsService {
 		if (!validated || validated.bodyRevision !== expectedRevision) return freeze({ diagnostic: this._diagnostic('skill_stale', skillRoot) });
 		return freeze({ body });
 	}
-	async readSkillResource(skillRoot: string, expectedRevision: string, resourcePath: string): Promise<{ body?: string; diagnostic?: SkillDiagnostic }> {
-		const segments = resolveSkillResourceSegments(resourcePath); if (!segments) return freeze({ diagnostic: this._diagnostic('skill_resource_outside_root', skillRoot) });
-		const body = await this.readSkillBody(skillRoot, expectedRevision); if (!body.body) return freeze({ diagnostic: body.diagnostic });
-		const read = await this._readAdmitted(skillRoot, expectedRevision, segments); if (!read.bytes) return freeze(read);
-		try { return freeze({ body: decoder.decode(read.bytes) }); } catch { return freeze({ diagnostic: this._diagnostic('skill_resource_unreadable', skillRoot) }); }
+	async readSkillResource(selection: AgentSkillSelection, resourcePath: string, options: AgentSkillResourceReadOptions): Promise<{ body?: string; diagnostic?: SkillDiagnostic }> {
+		const detail = typeof selection?.skillRoot === 'string' ? selection.skillRoot : '';
+		const segments = resolveSkillResourceSegments(resourcePath); if (!segments) return freeze({ diagnostic: this._diagnostic('skill_resource_outside_root', detail) });
+		if (!selection || typeof selection.identity !== 'string' || !selection.identity || typeof selection.skillRoot !== 'string' || !selection.skillRoot || typeof selection.bodyRevision !== 'string' || !selection.bodyRevision || typeof selection.body !== 'string' || skillBodyRevision(selection.body) !== selection.bodyRevision) return freeze({ diagnostic: this._diagnostic('skill_stale', detail) });
+		if (!options || !Number.isSafeInteger(options.maxResourceBytes) || options.maxResourceBytes < 0 || !options.token) return freeze({ diagnostic: this._diagnostic('skill_resource_context_admission_failed', detail) });
+		let root: URI;
+		try { root = URI.parse(selection.skillRoot, true); } catch { return freeze({ diagnostic: this._diagnostic('skill_resource_not_found', detail) }); }
+		if (!root.scheme || (!root.path.startsWith('/') && !root.authority)) return freeze({ diagnostic: this._diagnostic('skill_resource_not_found', detail) });
+		const expectedSkillBytes = Math.min(Number.MAX_SAFE_INTEGER, encoder.encode(selection.body).byteLength + 3);
+		const currentSkill = await this._readSafeFile(root, ['SKILL.md'], expectedSkillBytes, options.token);
+		if (currentSkill.tooLarge) return freeze({ diagnostic: this._diagnostic('skill_resource_context_admission_failed', detail) });
+		if (!currentSkill.bytes) return freeze({ diagnostic: this._diagnostic(currentSkill.missing ? 'skill_resource_not_found' : 'skill_resource_unreadable', detail) });
+		let currentBody: string;
+		try { currentBody = decoder.decode(currentSkill.bytes); } catch { return freeze({ diagnostic: this._diagnostic('skill_invalid_utf8', detail) }); }
+		if (currentBody !== selection.body || skillBodyRevision(currentBody) !== selection.bodyRevision) return freeze({ diagnostic: this._diagnostic('skill_stale', detail) });
+		const read = await this._readSafeFile(root, segments, options.maxResourceBytes, options.token);
+		if (read.tooLarge) return freeze({ diagnostic: this._diagnostic('skill_resource_context_admission_failed', detail) });
+		if (!read.bytes) return freeze({ diagnostic: this._diagnostic(read.missing ? 'skill_resource_not_found' : 'skill_resource_unreadable', detail) });
+		try { return freeze({ body: decoder.decode(read.bytes) }); } catch { return freeze({ diagnostic: this._diagnostic('skill_resource_unreadable', detail) }); }
 	}
 }
 registerSingleton(IAgentSkillsService, AgentSkillsService as unknown as new (...services: any[]) => IAgentSkillsService, InstantiationType.Eager);

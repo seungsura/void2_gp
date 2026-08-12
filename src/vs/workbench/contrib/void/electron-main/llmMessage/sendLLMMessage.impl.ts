@@ -233,7 +233,7 @@ const toOpenAICompatibleTool = (toolInfo: InternalToolInfo) => {
 	} satisfies OpenAI.Chat.Completions.ChatCompletionTool
 }
 
-const openAITools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined, toolExecutionProfile: ToolExecutionProfile = 'default-parent', agentDelegationAllowed = false) => {
+export const openAITools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined, toolExecutionProfile: ToolExecutionProfile = 'default-parent', agentDelegationAllowed = false) => {
 	const allowedTools = availableTools(chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed)
 	if (!allowedTools || Object.keys(allowedTools).length === 0) return null
 
@@ -484,7 +484,7 @@ const toAnthropicTool = (toolInfo: InternalToolInfo) => {
 	} satisfies Anthropic.Messages.Tool
 }
 
-const anthropicTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined, toolExecutionProfile: ToolExecutionProfile = 'default-parent', agentDelegationAllowed = false) => {
+export const anthropicTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined, toolExecutionProfile: ToolExecutionProfile = 'default-parent', agentDelegationAllowed = false) => {
 	const allowedTools = availableTools(chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed)
 	if (!allowedTools || Object.keys(allowedTools).length === 0) return null
 
@@ -762,7 +762,7 @@ const toGeminiFunctionDecl = (toolInfo: InternalToolInfo) => {
 	} satisfies FunctionDeclaration
 }
 
-const geminiTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined, toolExecutionProfile: ToolExecutionProfile = 'default-parent', agentDelegationAllowed = false): GeminiTool[] | null => {
+export const geminiTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined, toolExecutionProfile: ToolExecutionProfile = 'default-parent', agentDelegationAllowed = false): GeminiTool[] | null => {
 	const allowedTools = availableTools(chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed)
 	if (!allowedTools || Object.keys(allowedTools).length === 0) return null
 	const functionDecls: FunctionDeclaration[] = []

@@ -16,7 +16,7 @@ import { ITerminalToolService } from './terminalToolService.js';
 import { ToolName } from '../common/toolsServiceTypes.js';
 import { IMCPService } from '../common/mcpService.js';
 import { AgentInstructionTurnSnapshot, assembleAgentInstructionText, routeAgentInstructionAuthority } from '../common/agentInstructions.js';
-import { AgentRuntimeTurnSnapshot, assembleProtectedAgentAuthority } from '../common/agentSkills.js';
+import { AgentRuntimeTurnSnapshot, assembleProtectedAgentAuthority, isReadSkillResourceToolName } from '../common/agentSkills.js';
 import { ToolExecutionProfile } from '../common/agentSubagents.js';
 
 export const EMPTY_MESSAGE = '(empty message)'
@@ -29,6 +29,8 @@ type SimpleLLMMessage = {
 	id: string;
 	name: ToolName;
 	rawParams: RawToolParamsObj;
+	/** Exact selected-Skill resource evidence; generic history trimming must not alter it. */
+	protectedSkillResource?: boolean;
 } | {
 	role: 'user';
 	content: string;
@@ -46,6 +48,7 @@ const TRIM_TO_LEN = 120
 // This deliberately mirrors the conservative character estimator used by prepareMessages.
 // It is state-free so tool execution can derive a bound without serializing or mutating history.
 export const estimateHistoryTokensForReadBudget = (history: readonly unknown[]) => Math.ceil(JSON.stringify(history).length / CHARS_PER_TOKEN)
+export const protectedSkillResourceHistoryLength = (history: readonly ChatMessage[]) => history.reduce((total, message) => total + (message.role === 'tool' && message.type === 'success' && isReadSkillResourceToolName(message.name) ? message.content.length : 0), 0)
 
 
 
@@ -278,7 +281,7 @@ const prepareOpenAIOrAnthropicMessages = ({
 		contextWindow * 1 / 2, // reserve at least 1/4 of the token window length
 		reservedOutputTokenSpace ?? 4_096 // defaults to 4096
 	)
-	let messages: (SimpleLLMMessage | { role: 'system', content: string; protectedSkillAuthority?: boolean })[] = deepClone(messages_)
+	let messages: (SimpleLLMMessage | { role: 'system', content: string; protectedSkillAuthority?: boolean; protectedSkillResource?: boolean })[] = deepClone(messages_)
 
 	// ================ system message ================
 	// A COMPLETE HACK: last message is system message for context purposes
@@ -327,7 +330,7 @@ const prepareOpenAIOrAnthropicMessages = ({
 		let largestWeight = -Infinity
 		for (let i = 0; i < messages.length; i += 1) {
 			const m = messages[i]
-			if (protectedSkillAuthority && 'protectedSkillAuthority' in m && m.protectedSkillAuthority) continue
+			if (protectedSkillAuthority && (('protectedSkillAuthority' in m && m.protectedSkillAuthority) || ('protectedSkillResource' in m && m.protectedSkillResource))) continue
 			const w = weight(m, messages_, i)
 			if (w > largestWeight) {
 				largestWeight = w
@@ -340,8 +343,9 @@ const prepareOpenAIOrAnthropicMessages = ({
 	let totalLen = 0
 	for (const m of messages) { totalLen += m.content.length }
 	const exactInputBudget = Math.max(0, (contextWindow - reservedOutputTokenSpace) * CHARS_PER_TOKEN)
-	const protectedLength = protectedSkillAuthority ? (messages.find(message => 'protectedSkillAuthority' in message && message.protectedSkillAuthority)?.content.length ?? 0) : 0
-	if (protectedSkillAuthority && protectedLength > exactInputBudget) throw new Error('skill_context_admission_failed')
+	const protectedResourceLength = protectedSkillAuthority ? messages.reduce((total, message) => total + ('protectedSkillResource' in message && message.protectedSkillResource ? message.content.length : 0), 0) : 0
+	const protectedLength = protectedSkillAuthority ? messages.reduce((total, message) => total + ((('protectedSkillAuthority' in message && message.protectedSkillAuthority) || ('protectedSkillResource' in message && message.protectedSkillResource)) ? message.content.length : 0), 0) : 0
+	if (protectedSkillAuthority && protectedLength > exactInputBudget) throw new Error(protectedResourceLength ? 'skill_resource_context_admission_failed' : 'skill_context_admission_failed')
 	const mutableBudget = protectedSkillAuthority ? exactInputBudget - protectedLength : 0
 	const mutableLength = protectedSkillAuthority ? totalLen - protectedLength : totalLen
 	const charsNeedToTrim = (protectedSkillAuthority ? mutableLength - mutableBudget : totalLen - Math.max(
@@ -365,7 +369,7 @@ const prepareOpenAIOrAnthropicMessages = ({
 		const trimIdx = _findLargestByWeight(messages)
 		if (trimIdx < 0) throw new Error('skill_context_admission_failed')
 		const m = messages[trimIdx]
-		if ('protectedSkillAuthority' in m && m.protectedSkillAuthority) { alreadyTrimmedIdxes.add(trimIdx); continue }
+		if (('protectedSkillAuthority' in m && m.protectedSkillAuthority) || ('protectedSkillResource' in m && m.protectedSkillResource)) { alreadyTrimmedIdxes.add(trimIdx); continue }
 
 		// if can finish here, do
 		const minimumLength = protectedSkillAuthority ? 0 : TRIM_TO_LEN
@@ -619,6 +623,7 @@ export class ConvertToLLMMessageService extends Disposable implements IConvertTo
 					name: m.name,
 					id: m.id,
 					rawParams: m.rawParams,
+					protectedSkillResource: m.type === 'success' && isReadSkillResourceToolName(m.name),
 				})
 			}
 			else if (m.role === 'user') {
@@ -680,7 +685,7 @@ export class ConvertToLLMMessageService extends Disposable implements IConvertTo
 
 		const modelSelectionOptions = runtime?.model.hasModel ? runtime.model.modelSelectionOptions : this.voidSettingsService.state.optionsOfModelSelection['Chat'][modelSelection.providerName]?.[modelSelection.modelName]
 
-		const agentInstructions = runtime ? assembleProtectedAgentAuthority(runtime) : assembleAgentInstructionText(instructionSnapshot as AgentInstructionTurnSnapshot);
+		const agentInstructions = runtime ? assembleProtectedAgentAuthority(runtime, toolExecutionProfile !== 'read-only-child') : assembleAgentInstructionText(instructionSnapshot as AgentInstructionTurnSnapshot);
 		const isReasoningEnabled = getIsReasoningEnabledState('Chat', providerName, modelName, modelSelectionOptions, overridesOfModel)
 		const contextWindow = runtime?.model.hasModel ? runtime.model.contextWindow : liveContextWindow
 		const reservedOutputTokenSpace = runtime?.model.hasModel ? runtime.model.reservedOutputTokens : getReservedOutputTokenSpace(providerName, modelName, { isReasoningEnabled, overridesOfModel })

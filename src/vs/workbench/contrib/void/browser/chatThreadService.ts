@@ -17,11 +17,11 @@ import { generateUuid } from '../../../../base/common/uuid.js';
 import { FeatureName, ModelSelection, ModelSelectionOptions } from '../common/voidSettingsTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { getIsReasoningEnabledState, getModelCapabilities, getReservedOutputTokenSpace } from '../common/modelCapabilities.js';
-import { estimateHistoryTokensForReadBudget } from './convertToLLMMessageService.js';
+import { estimateHistoryTokensForReadBudget, protectedSkillResourceHistoryLength } from './convertToLLMMessageService.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolResultType, ToolCallParams, ToolName, ToolResult } from '../common/toolsServiceTypes.js';
 import { computeMaxReadOutputTokens, isBoundedReadHistory, isBoundedReadHistoryString } from '../common/readFileReliability.js';
 import { IToolsService } from './toolsServiceInterface.js';
-import { CancellationToken } from '../../../../base/common/cancellation.js';
+import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
 import { ILanguageFeaturesService } from '../../../../editor/common/services/languageFeatures.js';
 import { ChatMessage, CodespanLocationLink, isAgentDelegationSelection, StagingSelectionItem, ToolMessage } from '../common/chatThreadServiceTypes.js';
 import { Position } from '../../../../editor/common/core/position.js';
@@ -44,7 +44,7 @@ import { RawMCPToolCall } from '../common/mcpServiceTypes.js';
 import { IAgentInstructionsService } from './agentInstructionsService.js';
 import { IAgentSkillsService } from './agentSkillsService.js';
 import { AgentInstructionTaskSession, AgentInstructionTurnSnapshot } from '../common/agentInstructions.js';
-import { AgentRuntimeTurnSnapshot, admitProtectedAgentAuthority, createAgentRuntimeTurnSnapshot, reviveAgentRuntimeTurnSnapshot, runtimeModelFingerprint, selectExplicitSkills, skillAdvertisement } from '../common/agentSkills.js';
+import { AgentRuntimeTurnSnapshot, admitProtectedAgentAuthority, admitSkillResourceContext, assembleProtectedAgentAuthority, createAgentRuntimeTurnSnapshot, isReadSkillResourceToolName, reviveAgentRuntimeTurnSnapshot, runtimeModelFingerprint, selectExplicitSkills, skillAdvertisement, validateReadSkillResourceToolParams } from '../common/agentSkills.js';
 import { isAgentSubagentControlName, validateAgentSubagentControlParams } from '../common/agentSubagents.js';
 import { IAgentSubagentService } from './agentSubagentService.js';
 
@@ -662,8 +662,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		this._setStreamState(threadId, undefined)
 	}
 
-	private _computeMCPServerOfToolName = (toolName: string) => {
-		if (isAgentSubagentControlName(toolName)) return undefined
+	private _computeMCPServerOfToolName(toolName: string) {
+		if (isAgentSubagentControlName(toolName) || isReadSkillResourceToolName(toolName)) return undefined
 		return this._mcpService.getMCPTools()?.find(t => t.name === toolName)?.mcpServerName
 	}
 
@@ -724,6 +724,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		opts: { preapproved: true, unvalidatedToolParams: RawToolParamsObj, validatedParams: ToolCallParams<ToolName> } | { preapproved: false, unvalidatedToolParams: RawToolParamsObj },
 		instructionSnapshot: AgentRuntimeTurnSnapshot,
 		agentDelegationAuthority?: AgentDelegationTurnAuthority,
+		agentSkillResourceReadAllowed = false,
+		agentRunGeneration?: number,
 	): Promise<{ awaitingUserApproval?: boolean, interrupted?: boolean }> {
 
 		// compute these below
@@ -737,6 +739,100 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			const message = `${toolName} is no longer supported; use write_file with native structured arguments.`
 			this._addMessageToThread(threadId, { role: 'tool', type: 'invalid_params', rawParams: opts.unvalidatedToolParams, result: null, name: toolName, content: message, id: toolId, mcpServerName })
 			return {}
+		}
+		// This application read is deliberately not a builtin or MCP call. It is
+		// parent-Agent-only, never asks for approval, and resolves authority only
+		// from the immutable selected entries of this exact runtime snapshot.
+		if (isReadSkillResourceToolName(toolName)) {
+			const sameGeneration = () => agentRunGeneration !== undefined && (this._agentControlGeneration.get(threadId) ?? 0) === agentRunGeneration;
+			if (!sameGeneration()) return { interrupted: true };
+			const currentOwnerAndTrustMatch = () => {
+				const currentOwner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString();
+				return instructionSnapshot.ownerProjectRoot === currentOwner && instructionSnapshot.runCwd === currentOwner && instructionSnapshot.workspaceTrustedAtAdmission === this._workspaceTrustManagementService.isWorkspaceTrusted();
+			};
+			const sameRememberedSnapshot = () => this._instructionTurnOfThread.get(threadId) === instructionSnapshot;
+			const sameResourceAuthority = () => sameGeneration() && sameRememberedSnapshot() && currentOwnerAndTrustMatch();
+			const addFailure = (type: 'invalid_params' | 'tool_error', content: string) => {
+				if (type === 'invalid_params') this._addMessageToThread(threadId, { role: 'tool', type, rawParams: opts.unvalidatedToolParams, result: null, name: toolName, content, id: toolId, mcpServerName: undefined });
+				else this._addMessageToThread(threadId, { role: 'tool', type, rawParams: opts.unvalidatedToolParams, params: opts.unvalidatedToolParams, result: content, name: toolName, content, id: toolId, mcpServerName: undefined });
+			};
+			if (!sameResourceAuthority()) {
+				if (sameRememberedSnapshot()) this._purgeInstructionTurn(threadId);
+				if (this.state.allThreads[threadId] && !this._instructionTurnOfThread.has(threadId)) addFailure('tool_error', 'skill_owner_or_trust_changed');
+				return { interrupted: true };
+			}
+			if (!agentSkillResourceReadAllowed) { addFailure('invalid_params', 'read_skill_resource_not_available'); return {}; }
+			let params: ReturnType<typeof validateReadSkillResourceToolParams>;
+			try { params = validateReadSkillResourceToolParams(opts.unvalidatedToolParams); }
+			catch (error) { addFailure('invalid_params', getErrorMessage(error)); return {}; }
+			const selection = instructionSnapshot.selected.find(item => item.identity === params.skill);
+			if (!selection) { addFailure('tool_error', 'skill_not_selected'); return {}; }
+			const historyAtRead = this.state.allThreads[threadId]?.messages ?? [];
+			const maxReadOutputTokens = instructionSnapshot.model.hasModel
+				? computeMaxReadOutputTokens(instructionSnapshot.model.contextWindow, instructionSnapshot.model.reservedOutputTokens, estimateHistoryTokensForReadBudget(historyAtRead))
+				: 0;
+			const exactInputBudgetChars = instructionSnapshot.model.hasModel ? Math.max(0, instructionSnapshot.model.contextWindow - instructionSnapshot.model.reservedOutputTokens) * 4 : 0;
+			const protectedCharsRemaining = Math.max(0, exactInputBudgetChars - assembleProtectedAgentAuthority(instructionSnapshot).length - protectedSkillResourceHistoryLength(historyAtRead));
+			const maxResourceChars = Math.min(maxReadOutputTokens * 4, protectedCharsRemaining);
+			const maxResourceBytes = maxResourceChars > 0 ? Math.min(Number.MAX_SAFE_INTEGER, maxResourceChars * 3 + 3) : 0;
+			const applicationParams = opts.unvalidatedToolParams;
+			if (!sameResourceAuthority()) return { interrupted: true };
+			this._updateLatestTool(threadId, { role: 'tool', type: 'running_now', name: toolName, params: applicationParams, content: '(value not received yet...)', result: null, id: toolId, rawParams: applicationParams, mcpServerName: undefined });
+			let interrupted = false;
+			const readCancellation = new CancellationTokenSource();
+			let resolveInterruptor: (interruptor: () => void) => void = () => { };
+			const interruptorPromise = new Promise<() => void>(resolve => { resolveInterruptor = resolve; });
+			this._setStreamState(threadId, { isRunning: 'tool', interrupt: interruptorPromise, toolInfo: { toolName, toolParams: applicationParams, id: toolId, content: 'interrupted...', rawParams: applicationParams, mcpServerName: undefined } });
+			resolveInterruptor(() => { interrupted = true; readCancellation.cancel(); });
+			try {
+				const cancelled = Object.freeze({ cancelled: true as const });
+				const cancellationRace = new Promise<typeof cancelled>(resolve => readCancellation.token.onCancellationRequested(() => resolve(cancelled)));
+				const read = await Promise.race([this._agentSkillsService.readSkillResource(selection, params.resourcePath, { maxResourceBytes, token: readCancellation.token }), cancellationRace]);
+				if ('cancelled' in read || interrupted || !sameGeneration()) return { interrupted: true };
+				if (!sameResourceAuthority()) {
+					if (sameRememberedSnapshot()) {
+						this._purgeInstructionTurn(threadId);
+						this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: applicationParams, result: 'skill_owner_or_trust_changed', name: toolName, content: 'skill_owner_or_trust_changed', id: toolId, rawParams: applicationParams, mcpServerName: undefined });
+					}
+					return { interrupted: true };
+				}
+				if (read.body === undefined) throw new Error(read.diagnostic?.code ?? 'skill_resource_unreadable');
+				const resource = admitSkillResourceContext(read.body, maxReadOutputTokens);
+				const successMessage: ChatMessage & { role: 'tool' } = { role: 'tool', type: 'success', params: applicationParams, result: resource as never, name: toolName, content: resource, id: toolId, rawParams: applicationParams, mcpServerName: undefined };
+				const currentMessages = this.state.allThreads[threadId]?.messages ?? [];
+				const prospectiveMessages = [...currentMessages];
+				if (prospectiveMessages[prospectiveMessages.length - 1]?.role === 'tool' && (prospectiveMessages[prospectiveMessages.length - 1] as ToolMessage<ToolName>).id === toolId) prospectiveMessages[prospectiveMessages.length - 1] = successMessage;
+				else prospectiveMessages.push(successMessage);
+				try {
+					if (!instructionSnapshot.model.hasModel) throw new Error('skill_resource_context_admission_failed');
+					await this._convertToLLMMessagesService.prepareLLMChatMessages({ chatMessages: prospectiveMessages, chatMode: 'agent', modelSelection: { providerName: instructionSnapshot.model.providerName as ModelSelection['providerName'], modelName: instructionSnapshot.model.modelName }, instructionSnapshot, agentDelegationAllowed: !!agentDelegationAuthority?.allowed });
+				} catch { throw new Error('skill_resource_context_admission_failed'); }
+				if (interrupted || !sameGeneration()) return { interrupted: true };
+				if (!sameResourceAuthority()) {
+					if (sameRememberedSnapshot()) {
+						this._purgeInstructionTurn(threadId);
+						this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: applicationParams, result: 'skill_owner_or_trust_changed', name: toolName, content: 'skill_owner_or_trust_changed', id: toolId, rawParams: applicationParams, mcpServerName: undefined });
+					}
+					return { interrupted: true };
+				}
+				this._updateLatestTool(threadId, successMessage);
+				return {};
+			} catch (error) {
+				if (interrupted || !sameGeneration()) return { interrupted: true };
+				if (!sameResourceAuthority()) {
+					if (sameRememberedSnapshot()) {
+						this._purgeInstructionTurn(threadId);
+						this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: applicationParams, result: 'skill_owner_or_trust_changed', name: toolName, content: 'skill_owner_or_trust_changed', id: toolId, rawParams: applicationParams, mcpServerName: undefined });
+					}
+					return { interrupted: true };
+				}
+				const errorMessage = getErrorMessage(error);
+				const content = errorMessage.includes('skill_resource_context_admission_failed') ? 'skill_resource_context_admission_failed' : errorMessage;
+				this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: applicationParams, result: content, name: toolName, content, id: toolId, rawParams: applicationParams, mcpServerName: undefined });
+				return {};
+			} finally {
+				readCancellation.dispose();
+			}
 		}
 		// These application controls are intentionally routed before builtin/MCP
 		// classification. Their exact-key validation is authoritative and they never ask
@@ -912,7 +1008,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		agentDelegationAuthority?: AgentDelegationTurnAuthority,
 	}) {
 
-
+		// Every invocation, including persisted approval continuation, owns the
+		// generation current at its own entry. It never inherits ephemeral @Agent state.
+		const agentRunGeneration = this._agentControlGeneration.get(threadId) ?? 0;
 		let interruptedWhenIdle = false
 		const idleInterruptor = Promise.resolve(() => { interruptedWhenIdle = true })
 		// _runToolCall does not need setStreamState({idle}) before it, but it needs it after it. (handles its own setStreamState)
@@ -928,7 +1026,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 		// before enter loop, call tool
 		if (callThisToolFirst) {
-			const { interrupted } = await this._runToolCall(threadId, callThisToolFirst.name, callThisToolFirst.id, callThisToolFirst.mcpServerName, { preapproved: true, unvalidatedToolParams: callThisToolFirst.rawParams, validatedParams: callThisToolFirst.params }, snapshot, agentDelegationAuthority)
+			const { interrupted } = await this._runToolCall(threadId, callThisToolFirst.name, callThisToolFirst.id, callThisToolFirst.mcpServerName, { preapproved: true, unvalidatedToolParams: callThisToolFirst.rawParams, validatedParams: callThisToolFirst.params }, snapshot, agentDelegationAuthority, chatMode === 'agent', agentRunGeneration)
 			if (interrupted) {
 				this._setStreamState(threadId, undefined)
 				return
@@ -1055,9 +1153,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 				// call tool if there is one
 				if (toolCall) {
-					const mcpTool = isAgentSubagentControlName(toolCall.name) ? undefined : this._mcpService.getMCPTools()?.find(t => t.name === toolCall.name)
+					const mcpTool = isAgentSubagentControlName(toolCall.name) || isReadSkillResourceToolName(toolCall.name) ? undefined : this._mcpService.getMCPTools()?.find(t => t.name === toolCall.name)
 
-					const { awaitingUserApproval, interrupted } = await this._runToolCall(threadId, toolCall.name, toolCall.id, mcpTool?.mcpServerName, { preapproved: false, unvalidatedToolParams: toolCall.rawParams }, snapshot, agentDelegationAuthority)
+					const { awaitingUserApproval, interrupted } = await this._runToolCall(threadId, toolCall.name, toolCall.id, mcpTool?.mcpServerName, { preapproved: false, unvalidatedToolParams: toolCall.rawParams }, snapshot, agentDelegationAuthority, chatMode === 'agent', agentRunGeneration)
 					if (interrupted) {
 						this._setStreamState(threadId, undefined)
 						return

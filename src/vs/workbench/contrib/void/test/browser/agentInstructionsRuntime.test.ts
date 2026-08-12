@@ -269,6 +269,7 @@ suite('AGENTS instruction runtime paths', () => {
 		const streamState: Record<string, unknown> = {};
 		const receiver = {
 			state: { allThreads: { task: thread }, overridesOfModel: {} },
+			_agentControlGeneration: new Map<string, number>(),
 			streamState,
 			_settingsService: { state: { globalSettings: { chatMode: 'agent' }, overridesOfModel: {} } },
 			_setStreamState(threadId: string, value: unknown) { streamState[threadId] = value; },

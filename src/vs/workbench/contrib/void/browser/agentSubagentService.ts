@@ -70,7 +70,7 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 			if (admission.token.isCancellationRequested || this.pending.get(parentId) !== admission) throw new Error('agent_child_cancelled');
 			if (!this.matchesParent(parent)) throw new Error('agent_child_owner_or_trust_changed');
 			const snapshot = createAgentRuntimeTurnSnapshot(parent.instructions, parent.catalog, skillAdvertisement(parent.catalog, parent.model.contextWindow), bodies, parent.model, parent.workspaceTrustedAtAdmission);
-			admitProtectedAgentAuthority(snapshot);
+			admitProtectedAgentAuthority(snapshot, false);
 			const run: ChildRun = { id: generateUuid(), parentId, snapshot, lifecycle: new AgentSubagentLifecycle(), cancellation: new CancellationTokenSource(), settingsOfProvider, summary: '' };
 			this.runs.set(parentId, run); this.pending.delete(parentId); admission.dispose();
 			this._onDidChangeRun.fire({ parentId, id: run.id, status: run.lifecycle.status });

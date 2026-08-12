@@ -2,9 +2,10 @@ import assert from 'assert';
 import { URI } from '../../../../../base/common/uri.js';
 import { AgentSubagentService } from '../../browser/agentSubagentService.js';
 import { ToolsService } from '../../browser/toolsService.js';
-import { createAgentRuntimeTurnSnapshot, createSkillCatalog, skillAdvertisement } from '../../common/agentSkills.js';
+import { assembleProtectedAgentAuthority, createAgentRuntimeTurnSnapshot, createSkillCatalog, skillAdvertisement } from '../../common/agentSkills.js';
 import { projectAgentConfig, resolveAgentInstructions, stableAgentInstructionRevision } from '../../common/agentInstructions.js';
-import { assertCanonicalAgentChildRawUri } from '../../common/agentSubagents.js';
+import { assertCanonicalAgentChildRawUri, readOnlyChildToolNames } from '../../common/agentSubagents.js';
+import { availableTools } from '../../common/prompt/prompts.js';
 
 const bytes = (value: string) => new TextEncoder().encode(value);
 const skillText = (name: string) => `---\nname: ${name}\ndescription: ${name}\n---\nbody-${name}`;
@@ -95,6 +96,8 @@ suite('Void AgentSubagentService', () => {
 		const terminal = await f.service.wait('parent', 1_000); assert.strictEqual(terminal.status, 'completed');
 		const first = f.converterCalls[0]; assert.strictEqual(first.chatMessages.length, 1); assert.strictEqual(first.chatMessages[0].content, '$other delegated task');
 		assert.deepStrictEqual(first.instructionSnapshot.selected.map((item: any) => item.identity), ['other']); assert.strictEqual(first.instructionSnapshot.selected.some((item: any) => item.body.includes('body-demo')), false);
+		const childAuthority = assembleProtectedAgentAuthority(first.instructionSnapshot, false); assert.strictEqual(childAuthority.split(skillText('other')).length - 1, 1); assert.strictEqual(childAuthority.includes('read_skill_resource'), false);
+		assert.deepStrictEqual(availableTools('agent', undefined, 'read-only-child')!.map(tool => tool.name), [...readOnlyChildToolNames]);
 		assert.deepStrictEqual(first.instructionSnapshot.model, snapshot().model); assert.strictEqual(first.toolExecutionProfile, 'read-only-child'); assert.strictEqual(first.childRoot, 'file:///workspace');
 		assert.strictEqual(f.providerCalls[0].settingsOfProviderOverride.openAI.apiKey, 'captured-key'); assert.strictEqual(f.providerCalls[0].settingsOfProviderOverride.openAI.endpoint, 'https://captured.invalid'); assert.strictEqual(f.providerCalls[0].modelSelectionOptions.reasoningEnabled, true); assert.strictEqual(f.providerCalls[0].overridesOfModel.openAI['gpt-4.1'].temperature, .2); assert.strictEqual(f.service.getRunView('parent')?.id, child.id);
 		for (const owner of [URI.file('C:\\workspace').toString(), 'vscode-remote://ssh-remote%2Bexample/workspace']) {

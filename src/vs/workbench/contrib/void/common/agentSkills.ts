@@ -22,6 +22,7 @@ export type AgentSkill = Readonly<{
 }>;
 export type AgentSkillCatalog = Readonly<{ revision: string; skills: readonly AgentSkill[]; diagnostics: readonly SkillDiagnostic[] }>;
 export type SkillCandidate = Readonly<{ source: SkillSource; rank: number; root: string; skillRoot: string; directoryName: string; bytes: Uint8Array; pluginName?: string; openaiMetadata?: Uint8Array }>;
+export type AgentSkillSelection = Readonly<{ identity: string; skillRoot: string; bodyRevision: string; body: string }>;
 
 const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 const encoder = new TextEncoder();
@@ -37,10 +38,43 @@ export const skillBodyRevision = (body: string): string => hash([body]);
 
 /** Pure containment check; the browser service owns the eventual file read and missing-file semantics. */
 export const resolveSkillResourceSegments = (resourcePath: string): readonly string[] | undefined => {
-	if (!resourcePath || resourcePath.includes('\\') || resourcePath.startsWith('/') || /^[A-Za-z]:/.test(resourcePath) || /%2f|%5c/i.test(resourcePath)) return undefined;
+	const invalid = (value: string) => !value
+		|| value.includes('\\')
+		|| value.startsWith('/')
+		|| /^[A-Za-z][A-Za-z0-9+.-]*:/.test(value)
+		|| /[?#]/.test(value)
+		|| /%2f|%5c/i.test(value);
+	if (invalid(resourcePath)) return undefined;
 	try { resourcePath = decodeURIComponent(resourcePath); } catch { return undefined; }
+	if (invalid(resourcePath)) return undefined;
 	const segments = resourcePath.split('/');
 	return segments.some(segment => !segment || segment === '.' || segment === '..') ? undefined : freeze(segments);
+};
+
+export const READ_SKILL_RESOURCE_TOOL_NAME = 'read_skill_resource' as const;
+export const readSkillResourceToolSchema = freeze({
+	type: 'object',
+	additionalProperties: false,
+	required: freeze(['skill', 'resource_path']),
+	properties: freeze({
+		skill: freeze({ type: 'string', description: 'The exact identity of a Skill selected in this top-level turn.' }),
+		resource_path: freeze({ type: 'string', description: 'A relative path below that selected Skill root. Absolute paths and traversal are forbidden.' }),
+	}),
+});
+export type ReadSkillResourceToolParams = Readonly<{ skill: string; resourcePath: string }>;
+export const isReadSkillResourceToolName = (name: string): name is typeof READ_SKILL_RESOURCE_TOOL_NAME => name === READ_SKILL_RESOURCE_TOOL_NAME;
+export const validateReadSkillResourceToolParams = (value: unknown): ReadSkillResourceToolParams => {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('read_skill_resource_invalid_params');
+	const raw = value as Record<string, unknown>; const keys = Object.keys(raw).sort();
+	if (keys.length !== 2 || keys[0] !== 'resource_path' || keys[1] !== 'skill' || typeof raw.skill !== 'string' || !raw.skill.trim() || typeof raw.resource_path !== 'string' || !raw.resource_path.trim()) throw new Error('read_skill_resource_invalid_params');
+	if (!resolveSkillResourceSegments(raw.resource_path)) throw new Error('skill_resource_outside_root');
+	return freeze({ skill: raw.skill, resourcePath: raw.resource_path });
+};
+
+/** Resource reads are exact-or-fail: unlike read_file, they never return a partial page. */
+export const admitSkillResourceContext = (body: string, maxReadOutputTokens: number): string => {
+	if (!Number.isSafeInteger(maxReadOutputTokens) || maxReadOutputTokens < 0 || body.length > maxReadOutputTokens * 4) throw new Error('skill_resource_context_admission_failed');
+	return body;
 };
 
 export const strictSkillFromCandidate = (candidate: SkillCandidate): { skill?: AgentSkill; diagnostics: readonly SkillDiagnostic[] } => {
@@ -142,7 +176,7 @@ export type AgentRuntimeTurnSnapshot = Readonly<{
 	instructions: AgentInstructionTurnSnapshot;
 	catalog: AgentSkillCatalog;
 	advertisement: SkillAdvertisement;
-	selected: readonly Readonly<{ identity: string; skillRoot: string; bodyRevision: string; body: string }> [];
+	selected: readonly AgentSkillSelection[];
 	model: RuntimeModel;
 	ownerProjectRoot: string | undefined;
 	runCwd: string | undefined;
@@ -173,7 +207,7 @@ const normalizeRuntimeModelOptions = (value: unknown): RuntimeModelOptions | und
 };
 const canonicalJson = (value: RuntimeJsonValue): string => typeof value === 'object' && value !== null ? Array.isArray(value) ? `[${value.map(canonicalJson).join(',')}]` : `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson((value as Readonly<{ [key: string]: RuntimeJsonValue }>)[key])}`).join(',')}}` : JSON.stringify(value);
 export const runtimeModelFingerprint = (model: Omit<Extract<RuntimeModel, { hasModel: true }>, 'fingerprint' | 'hasModel'>): string => hash([model.providerName, model.modelName, String(model.contextWindow), String(model.reservedOutputTokens), canonicalJson(model.modelSelectionOptions as RuntimeJsonValue), canonicalJson(model.selectedModelOverrides)]);
-export const createAgentRuntimeTurnSnapshot = (instructions: AgentInstructionTurnSnapshot, catalog: AgentSkillCatalog, _advertisement: SkillAdvertisement, selected: readonly Readonly<{ identity: string; skillRoot: string; bodyRevision: string; body: string }> [], model: Omit<Extract<RuntimeModel, { hasModel: true }>, 'fingerprint'> | { hasModel: false }, workspaceTrustedAtAdmission: boolean): AgentRuntimeTurnSnapshot => {
+export const createAgentRuntimeTurnSnapshot = (instructions: AgentInstructionTurnSnapshot, catalog: AgentSkillCatalog, _advertisement: SkillAdvertisement, selected: readonly AgentSkillSelection[], model: Omit<Extract<RuntimeModel, { hasModel: true }>, 'fingerprint'> | { hasModel: false }, workspaceTrustedAtAdmission: boolean): AgentRuntimeTurnSnapshot => {
 	if (typeof workspaceTrustedAtAdmission !== 'boolean') throw new Error('skill_runtime_trust_invalid');
 	const revivedInstructions = reviveAgentInstructionTurnSnapshot(instructions);
 	if (!revivedInstructions) throw new Error('agent_instruction_snapshot_invalid');
@@ -235,9 +269,12 @@ export const skillAdvertisement = (catalog: AgentSkillCatalog, contextWindow: nu
 };
 
 /** Authority is immutable and admitted before history mutation; bodies remain byte-for-byte text. */
-export const assembleProtectedAgentAuthority = (snapshot: AgentRuntimeTurnSnapshot): string => [snapshot.instructions.developerInstructions, snapshot.instructions.agentsInstructions, ...snapshot.selected.map(selection => selection.body), snapshot.advertisement.text].filter(Boolean).join('\n\n');
-export const admitProtectedAgentAuthority = (snapshot: AgentRuntimeTurnSnapshot): string => {
-	const authority = assembleProtectedAgentAuthority(snapshot);
+export const selectedSkillIdentityManifest = (snapshot: AgentRuntimeTurnSnapshot): string => snapshot.selected.length
+	? `Selected Skill identities for read_skill_resource (use one exact value):\n${snapshot.selected.map(selection => selection.identity).join('\n')}`
+	: '';
+export const assembleProtectedAgentAuthority = (snapshot: AgentRuntimeTurnSnapshot, includeResourceManifest = true): string => [snapshot.instructions.developerInstructions, snapshot.instructions.agentsInstructions, ...snapshot.selected.map(selection => selection.body), includeResourceManifest ? selectedSkillIdentityManifest(snapshot) : '', snapshot.advertisement.text].filter(Boolean).join('\n\n');
+export const admitProtectedAgentAuthority = (snapshot: AgentRuntimeTurnSnapshot, includeResourceManifest = true): string => {
+	const authority = assembleProtectedAgentAuthority(snapshot, includeResourceManifest);
 	if (!snapshot.model.hasModel) { if (snapshot.selected.length) throw new Error('skill_context_admission_failed'); return authority; }
 	if (authority.length > Math.max(0, snapshot.model.contextWindow - snapshot.model.reservedOutputTokens) * 4) throw new Error('skill_context_admission_failed');
 	return authority;
