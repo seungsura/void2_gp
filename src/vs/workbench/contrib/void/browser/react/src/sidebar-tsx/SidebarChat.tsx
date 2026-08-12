@@ -3,7 +3,7 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import React, { ButtonHTMLAttributes, FormEvent, FormHTMLAttributes, Fragment, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { ButtonHTMLAttributes, FormEvent, FormHTMLAttributes, Fragment, KeyboardEvent, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 
 
 import { useAccessor, useAgentSubagentBudget, useAgentSubagentDiagnostics, useAgentSubagentRuns, useChatThreadsState, useChatThreadsStreamState, useSettingsState, useActiveURI, useCommandBarState } from '../util/services.js';
@@ -799,6 +799,7 @@ type ToolHeaderParams = {
 	children?: React.ReactNode;
 	bottomChildren?: React.ReactNode;
 	onClick?: () => void;
+	onToggle?: () => void;
 	desc2OnClick?: () => void;
 	isOpen?: boolean;
 	className?: string;
@@ -818,6 +819,7 @@ const ToolHeaderWrapper = ({
 	bottomChildren,
 	isError,
 	onClick,
+	onToggle,
 	desc2OnClick,
 	isOpen,
 	isRejected,
@@ -826,17 +828,29 @@ const ToolHeaderWrapper = ({
 
 	const [isOpen_, setIsOpen] = useState(false);
 	const isExpanded = isOpen !== undefined ? isOpen : isOpen_
+	const childrenId = useId()
 
 	const isDropdown = children !== undefined // null ALLOWS dropdown
-	const isClickable = !!(isDropdown || onClick)
+	const canToggleDropdown = isDropdown && (isOpen === undefined || onToggle !== undefined)
+	const disclosureLabel = `${isExpanded ? 'Hide' : 'Show'} details for ${typeof title === 'string' ? title : 'tool'}`
 
 	const isDesc1Clickable = !!desc1OnClick
 
-	const desc1HTML = <span
-		className={`text-void-fg-4 text-xs italic truncate ml-2
-			${isDesc1Clickable ? 'cursor-pointer hover:brightness-125 transition-all duration-150' : ''}
-		`}
+	const desc1ClassName = `text-void-fg-4 text-xs italic truncate ml-2
+		${isDesc1Clickable ? 'cursor-pointer hover:brightness-125 transition-all duration-150 void-focus-ring' : ''}
+	`
+	const desc1HTML = isDesc1Clickable ? <button
+		type="button"
+		className={desc1ClassName}
 		onClick={desc1OnClick}
+		{...desc1Info ? {
+			'data-tooltip-id': 'void-tooltip',
+			'data-tooltip-content': desc1Info,
+			'data-tooltip-place': 'top',
+			'data-tooltip-delay-show': 1000,
+		} : {}}
+	>{desc1}</button> : <span
+		className='text-void-fg-4 text-xs italic truncate ml-2'
 		{...desc1Info ? {
 			'data-tooltip-id': 'void-tooltip',
 			'data-tooltip-content': desc1Info,
@@ -850,30 +864,36 @@ const ToolHeaderWrapper = ({
 			{/* header */}
 			<div className={`select-none flex items-center min-h-[24px]`}>
 				<div className={`flex items-center w-full gap-x-2 overflow-hidden justify-between ${isRejected ? 'line-through' : ''}`}>
-					{/* left */}
-					<div // container for if desc1 is clickable
-						className='ml-1 flex items-center overflow-hidden'
-					>
-						{/* title eg "> Edited File" */}
-						<div className={`
-							flex items-center min-w-0 overflow-hidden grow
-							${isClickable ? 'cursor-pointer hover:brightness-125 transition-all duration-150' : ''}
-						`}
-							onClick={() => {
-								if (isDropdown) { setIsOpen(v => !v); }
-								if (onClick) { onClick(); }
-							}}
+					<div className='ml-1 flex items-center min-w-0 overflow-hidden'>
+						{isDropdown && (canToggleDropdown ? <button
+							type="button"
+							className='flex items-center min-w-0 overflow-hidden cursor-pointer hover:brightness-125 transition-all duration-150 void-focus-ring'
+							onClick={() => onToggle ? onToggle() : setIsOpen(v => !v)}
+							aria-expanded={isExpanded}
+							aria-controls={childrenId}
+							aria-label={disclosureLabel}
 						>
-							{isDropdown && (<ChevronRight
+							<ChevronRight
 								className={`
 								text-void-fg-3 mr-0.5 h-4 w-4 flex-shrink-0 transition-transform duration-100 ease-[cubic-bezier(0.4,0,0.2,1)]
 								${isExpanded ? 'rotate-90' : ''}
 							`}
-							/>)}
-							<span className="text-void-fg-3 flex-shrink-0">{title}</span>
-
-							{!isDesc1Clickable && desc1HTML}
-						</div>
+							/>
+							{!onClick && <span className="text-void-fg-3 flex-shrink-0">{title}</span>}
+						</button> : <ChevronRight
+							className={`
+							text-void-fg-3 mr-0.5 h-4 w-4 flex-shrink-0
+							${isExpanded ? 'rotate-90' : ''}
+						`}
+						/>)}
+						{onClick ? <button
+							type="button"
+							className='text-void-fg-3 flex-shrink-0 cursor-pointer hover:brightness-125 transition-all duration-150 void-focus-ring'
+							onClick={onClick}
+						>
+							{title}
+						</button> : (!isDropdown || !canToggleDropdown) && <span className="text-void-fg-3 flex-shrink-0">{title}</span>}
+						{!isDesc1Clickable && desc1HTML}
 						{isDesc1Clickable && desc1HTML}
 					</div>
 
@@ -902,9 +922,7 @@ const ToolHeaderWrapper = ({
 							data-tooltip-content={'Canceled'}
 							data-tooltip-place='top'
 						/>}
-						{desc2 && <span className="text-void-fg-4 text-xs" onClick={desc2OnClick}>
-							{desc2}
-						</span>}
+						{desc2 && (desc2OnClick ? <button type="button" className="text-void-fg-4 text-xs void-focus-ring" onClick={desc2OnClick}>{desc2}</button> : <span className="text-void-fg-4 text-xs">{desc2}</span>)}
 						{numResults !== undefined && (
 							<span className="text-void-fg-4 text-xs ml-auto mr-1">
 								{`${numResults}${hasNextPage ? '+' : ''} result${numResults !== 1 ? 's' : ''}`}
@@ -914,11 +932,10 @@ const ToolHeaderWrapper = ({
 				</div>
 			</div>
 			{/* children */}
-			{<div
-				className={`overflow-hidden transition-all duration-200 ease-in-out ${isExpanded ? 'opacity-100 py-1' : 'max-h-0 opacity-0'}
-					text-void-fg-4 rounded-sm overflow-x-auto
-				  `}
-			//    bg-black bg-opacity-10 border border-void-border-4 border-opacity-50
+			{isDropdown && <div
+				id={childrenId}
+				hidden={!isExpanded}
+				className='py-1 text-void-fg-4 rounded-sm overflow-x-auto'
 			>
 				{children}
 			</div>}
@@ -1349,7 +1366,7 @@ const ReasoningWrapper = ({ isDoneReasoning, isStreaming, children }: { isDoneRe
 	useEffect(() => {
 		if (!isWriting) setIsOpen(false) // if just finished reasoning, close
 	}, [isWriting])
-	return <ToolHeaderWrapper title='Reasoning' desc1={isWriting ? <IconLoading /> : ''} isOpen={isOpen} onClick={() => setIsOpen(v => !v)}>
+	return <ToolHeaderWrapper title='Reasoning' desc1={isWriting ? <IconLoading /> : ''} isOpen={isOpen} onToggle={() => setIsOpen(v => !v)}>
 		<ToolChildrenWrapper>
 			<div className='!select-text cursor-auto'>
 				{children}
@@ -1646,21 +1663,28 @@ const LintErrorChildren = ({ lintErrors }: { lintErrors: LintErrorItem[] }) => {
 
 const BottomChildren = ({ children, title }: { children: React.ReactNode, title: string }) => {
 	const [isOpen, setIsOpen] = useState(false);
+	const childrenId = useId();
 	if (!children) return null;
 	return (
 		<div className="w-full px-2 mt-0.5">
-			<div
-				className={`flex items-center cursor-pointer select-none transition-colors duration-150 pl-0 py-0.5 rounded group`}
+			<button
+				type="button"
+				className="flex items-center cursor-pointer select-none transition-colors duration-150 pl-0 py-0.5 rounded group void-focus-ring"
 				onClick={() => setIsOpen(o => !o)}
+				aria-expanded={isOpen}
+				aria-controls={childrenId}
+				aria-label={`${isOpen ? 'Hide' : 'Show'} ${title} details`}
 				style={{ background: 'none' }}
 			>
 				<ChevronRight
 					className={`mr-1 h-3 w-3 flex-shrink-0 transition-transform duration-100 text-void-fg-4 group-hover:text-void-fg-3 ${isOpen ? 'rotate-90' : ''}`}
 				/>
 				<span className="font-medium text-void-fg-4 group-hover:text-void-fg-3 text-xs">{title}</span>
-			</div>
+			</button>
 			<div
-				className={`overflow-hidden transition-all duration-200 ease-in-out ${isOpen ? 'opacity-100' : 'max-h-0 opacity-0'} text-xs pl-4`}
+				id={childrenId}
+				hidden={!isOpen}
+				className="text-xs pl-4"
 			>
 				<div className="overflow-x-auto text-void-fg-4 opacity-90 border-l-2 border-void-warning px-2 py-0.5">
 					{children}
