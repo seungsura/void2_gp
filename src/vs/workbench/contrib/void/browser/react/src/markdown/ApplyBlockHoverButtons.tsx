@@ -530,6 +530,7 @@ export const BlockCodeApplyWrapper = ({
 			name={<span className='not-italic'>{getBasename(uri.fsPath)}</span>}
 			isSmall={true}
 			showDot={false}
+			ariaLabel={`Open file ${getBasename(uri.fsPath)}`}
 			onClick={() => { voidOpenFileFn(uri, accessor) }}
 		/>
 		: <span>{language}</span>

@@ -1637,18 +1637,28 @@ export const CodeChildren = ({ children, className }: { children: React.ReactNod
 	</div>
 }
 
-export const ListableToolItem = ({ name, onClick, isSmall, className, showDot }: { name: React.ReactNode, onClick?: () => void, isSmall?: boolean, className?: string, showDot?: boolean }) => {
-	return <div
-		className={`
-			${onClick ? 'hover:brightness-125 hover:cursor-pointer transition-all duration-200 ' : ''}
-			flex items-center flex-nowrap whitespace-nowrap
-			${className ? className : ''}
-			`}
+export const ListableToolItem = ({ name, onClick, isSmall, className, showDot, ariaLabel }: { name: React.ReactNode, onClick?: () => void, isSmall?: boolean, className?: string, showDot?: boolean, ariaLabel?: string }) => {
+	const children = <>
+		{showDot === false ? null : <span className="flex-shrink-0"><svg className="w-1 h-1 opacity-60 mr-1.5 fill-current" viewBox="0 0 100 40"><rect x="0" y="15" width="100" height="10" /></svg></span>}
+		<span className={`${isSmall ? 'italic text-void-fg-4 flex items-center' : ''}`}>{name}</span>
+	</>
+	const classes = `
+		${onClick ? 'hover:brightness-125 hover:cursor-pointer transition-all duration-200 ' : ''}
+		flex items-center flex-nowrap whitespace-nowrap
+		${className ? className : ''}
+		`
+
+	if (onClick) return <button
+		type='button'
+		className={`${classes} void-focus-ring appearance-none border-0 bg-transparent p-0 text-left text-inherit`}
 		onClick={onClick}
+		aria-label={ariaLabel}
+		title={ariaLabel}
 	>
-		{showDot === false ? null : <div className="flex-shrink-0"><svg className="w-1 h-1 opacity-60 mr-1.5 fill-current" viewBox="0 0 100 40"><rect x="0" y="15" width="100" height="10" /></svg></div>}
-		<div className={`${isSmall ? 'italic text-void-fg-4 flex items-center' : ''}`}>{name}</div>
-	</div>
+		{children}
+	</button>
+
+	return <div className={classes}>{children}</div>
 }
 
 
@@ -2006,6 +2016,7 @@ const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapper: Res
 						{result.children.map((child, i) => (<ListableToolItem key={i}
 							name={`${child.name}${child.isDirectory ? '/' : ''}`}
 							className='w-full overflow-auto'
+							ariaLabel={`Open ${child.isDirectory ? 'folder' : 'file'} ${child.name}`}
 							onClick={() => {
 								voidOpenFileFn(child.uri, accessor)
 								// commandService.executeCommand('workbench.view.explorer'); // open in explorer folders view instead
@@ -2058,6 +2069,7 @@ const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapper: Res
 						{result.uris.map((uri, i) => (<ListableToolItem key={i}
 							name={getBasename(uri.fsPath)}
 							className='w-full overflow-auto'
+							ariaLabel={`Open file ${getBasename(uri.fsPath)}`}
 							onClick={() => { voidOpenFileFn(uri, accessor) }}
 						/>))}
 						{result.hasNextPage &&
@@ -2113,6 +2125,7 @@ const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapper: Res
 						{result.uris.map((uri, i) => (<ListableToolItem key={i}
 							name={getBasename(uri.fsPath)}
 							className='w-full overflow-auto'
+							ariaLabel={`Open file ${getBasename(uri.fsPath)}`}
 							onClick={() => { voidOpenFileFn(uri, accessor) }}
 						/>))}
 						{result.hasNextPage &&
