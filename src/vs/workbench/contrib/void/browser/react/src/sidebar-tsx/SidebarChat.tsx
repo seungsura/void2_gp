@@ -173,14 +173,17 @@ const ReasoningOptionSlider = ({ featureName }: { featureName: FeatureName }) =>
 	if (canTurnOffReasoning && !reasoningBudgetSlider) { // if it's just a on/off toggle without a power slider
 		return <div className='flex items-center gap-x-2'>
 			<span className='text-void-fg-3 text-xs pointer-events-none inline-block w-10 pr-1'>Thinking</span>
-			<VoidSwitch
-				size='xxs'
-				value={isReasoningEnabled}
-				onChange={(newVal) => {
-					const isOff = canTurnOffReasoning && !newVal
-					voidSettingsService.setOptionsOfModelSelection(featureName, modelSelection.providerName, modelSelection.modelName, { reasoningEnabled: !isOff })
-				}}
-			/>
+			<span onClick={(event) => event.stopPropagation()}>
+				<VoidSwitch
+					ariaLabel={`Thinking for ${featureName}`}
+					size='xxs'
+					value={isReasoningEnabled}
+					onChange={(newVal) => {
+						const isOff = canTurnOffReasoning && !newVal
+						voidSettingsService.setOptionsOfModelSelection(featureName, modelSelection.providerName, modelSelection.modelName, { reasoningEnabled: !isOff })
+					}}
+				/>
+			</span>
 		</div>
 	}
 

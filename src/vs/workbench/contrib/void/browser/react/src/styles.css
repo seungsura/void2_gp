@@ -52,6 +52,11 @@
 	outline-offset: 2px !important;
 }
 
+.void-switch-input:focus-visible + .void-switch-track {
+	outline: 2px solid var(--void-ring-color) !important;
+	outline-offset: 2px !important;
+}
+
 .void-model-visibility-input:focus-visible + .void-model-visibility-track {
 	outline: 2px solid var(--void-ring-color) !important;
 	outline-offset: 2px !important;

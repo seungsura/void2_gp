@@ -217,6 +217,7 @@ const SimpleModelSettingsDialog = ({
 	if (!isOpen || !modelInfo) return null;
 
 	const { modelName, providerName, type } = modelInfo;
+	const { title: providerTitle } = displayInfoOfProviderName(providerName)
 	const accessor = useAccessor()
 	const settingsState = useSettingsState()
 	const mouseDownInsideModal = useRef(false); // Ref to track mousedown origin
@@ -330,7 +331,7 @@ const SimpleModelSettingsDialog = ({
 
 				{/* override toggle */}
 				<div className="flex items-center gap-2 mb-4">
-					<VoidSwitch size='xs' value={overrideEnabled} onChange={setOverrideEnabled} />
+					<VoidSwitch ariaLabel={`Override model defaults for ${providerTitle} / ${modelName}`} size='xs' value={overrideEnabled} onChange={setOverrideEnabled} />
 					<span className="text-void-fg-3 text-sm">Override model defaults</span>
 				</div>
 
@@ -785,6 +786,7 @@ export const AutoDetectLocalModelsToggle = () => {
 
 	return <ButtonLeftTextRightOption
 		leftButton={<VoidSwitch
+			ariaLabel="Automatically detect local providers and models"
 			size='xxs'
 			value={enabled}
 			onChange={(newVal) => {
@@ -872,6 +874,7 @@ export const ToolApprovalTypeSwitch = ({ approvalType, size, desc }: { approvalT
 
 	return <>
 		<VoidSwitch
+			ariaLabel={desc}
 			size={size}
 			value={voidSettingsState.globalSettings.autoApprove[approvalType] ?? false}
 			onChange={(newVal) => onToggleAutoApprove(approvalType, newVal)}
@@ -953,6 +956,7 @@ const MCPServerComponent = ({ name, server }: { name: string, server: MCPServer 
 
 				{/* Right side - power toggle switch */}
 				<VoidSwitch
+					ariaLabel={`Enable MCP server ${name}`}
 					value={isOn ?? false}
 					size='xs'
 					disabled={server.status === 'error'}
@@ -1228,6 +1232,7 @@ export const Settings = () => {
 													{/* Sync to Chat Switch */}
 													<div className='flex items-center gap-x-2 my-2'>
 														<VoidSwitch
+															ariaLabel="Use Chat model for Apply"
 															size='xs'
 															value={settingsState.globalSettings.syncApplyToChat}
 															onChange={(newVal) => voidSettingsService.setGlobalSetting('syncApplyToChat', newVal)}
@@ -1276,6 +1281,7 @@ export const Settings = () => {
 
 													<div className='flex items-center gap-x-2 my-2'>
 														<VoidSwitch
+															ariaLabel="Fix lint errors"
 															size='xs'
 															value={settingsState.globalSettings.includeToolLintErrors}
 															onChange={(newVal) => voidSettingsService.setGlobalSetting('includeToolLintErrors', newVal)}
@@ -1288,6 +1294,7 @@ export const Settings = () => {
 												<ErrorBoundary>
 													<div className='flex items-center gap-x-2 my-2'>
 														<VoidSwitch
+															ariaLabel="Auto-accept LLM changes"
 															size='xs'
 															value={settingsState.globalSettings.autoAcceptLLMChanges}
 															onChange={(newVal) => voidSettingsService.setGlobalSetting('autoAcceptLLMChanges', newVal)}
@@ -1309,6 +1316,7 @@ export const Settings = () => {
 												<ErrorBoundary>
 													<div className='flex items-center gap-x-2 my-2'>
 														<VoidSwitch
+															ariaLabel="Show suggestions on select"
 															size='xs'
 															value={settingsState.globalSettings.showInlineSuggestions}
 															onChange={(newVal) => voidSettingsService.setGlobalSetting('showInlineSuggestions', newVal)}
@@ -1330,6 +1338,7 @@ export const Settings = () => {
 													{/* Sync to Chat Switch */}
 													<div className='flex items-center gap-x-2 my-2'>
 														<VoidSwitch
+															ariaLabel="Use Chat model for SCM"
 															size='xs'
 															value={settingsState.globalSettings.syncSCMToChat}
 															onChange={(newVal) => voidSettingsService.setGlobalSetting('syncSCMToChat', newVal)}
@@ -1443,6 +1452,7 @@ export const Settings = () => {
 										<ErrorBoundary>
 											<div className='flex items-center gap-x-2 my-2'>
 												<VoidSwitch
+													ariaLabel="Opt-out (requires restart)"
 													size='xs'
 													value={isOptedOut}
 													onChange={(newVal) => {

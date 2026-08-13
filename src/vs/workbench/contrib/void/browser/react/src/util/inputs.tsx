@@ -1196,21 +1196,32 @@ export const VoidSlider = ({
 export const VoidSwitch = ({
 	value,
 	onChange,
+	ariaLabel,
 	size = 'md',
 	disabled = false,
 	...props
 }: {
 	value: boolean;
 	onChange: (value: boolean) => void;
+	ariaLabel: string;
 	disabled?: boolean;
 	size?: 'xxs' | 'xs' | 'sm' | 'sm+' | 'md';
 }) => {
 	return (
-		<label className="inline-flex items-center" {...props}>
-			<div
-				onClick={() => !disabled && onChange(!value)}
+		<label className={`relative inline-flex items-center ${disabled ? 'cursor-not-allowed' : 'cursor-pointer'}`} {...props}>
+			<input
+				type="checkbox"
+				role="switch"
+				aria-label={ariaLabel}
+				checked={value}
+				disabled={disabled}
+				onChange={(e) => onChange(e.currentTarget.checked)}
+				className={`switch-input absolute inset-0 z-10 m-0 h-full w-full opacity-0 ${disabled ? 'cursor-not-allowed' : 'cursor-pointer'}`}
+			/>
+			<span
+				aria-hidden="true"
 				className={`
-			cursor-pointer
+			switch-track pointer-events-none
 			relative inline-flex items-center rounded-full transition-colors duration-200 ease-in-out
 			${value ? 'bg-zinc-900 dark:bg-white' : 'bg-white dark:bg-zinc-600'}
 			${disabled ? 'opacity-25' : ''}
@@ -1236,7 +1247,7 @@ export const VoidSwitch = ({
 			  ${size === 'md' ? (value ? 'translate-x-6' : 'translate-x-1') : ''}
 			`}
 				/>
-			</div>
+			</span>
 		</label>
 	);
 };
