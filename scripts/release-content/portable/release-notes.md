@@ -18,7 +18,7 @@
 
 ## OpenAI-compatible transport
 
-OpenAI-compatible Agent의 flat tool schema는 conditional composition에 의존하지 않습니다. Stream이 completion 전에 닫히면 tool success로 처리하지 않고 configured route, tool/schema posture와 stream phase를 구분하는 진단을 표시할 수 있습니다. 진단 기록에는 credential, custom header와 request content를 복사하지 마세요.
+OpenAI-compatible Agent의 flat tool schema는 conditional composition에 의존하지 않습니다. Stream이 completion 전에 닫히면 tool success로 처리하지 않고 configured route, tool/schema posture와 stream phase를 구분하는 진단을 표시할 수 있습니다. 진단 기록에는 credential, provider header values와 request content를 복사하지 마세요.
 
 ## Agent instructions, Skills와 custom agents
 
