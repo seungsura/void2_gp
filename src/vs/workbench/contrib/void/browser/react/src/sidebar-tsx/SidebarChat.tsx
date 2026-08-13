@@ -867,7 +867,7 @@ const ToolHeaderWrapper = ({
 					<div className='ml-1 flex items-center min-w-0 overflow-hidden'>
 						{isDropdown && (canToggleDropdown ? <button
 							type="button"
-							className='flex items-center min-w-0 overflow-hidden cursor-pointer hover:brightness-125 transition-all duration-150 void-focus-ring'
+							className='flex items-center min-w-0 overflow-hidden cursor-pointer hover:brightness-125 transition-all duration-150 focus-ring'
 							onClick={() => onToggle ? onToggle() : setIsOpen(v => !v)}
 							aria-expanded={isExpanded}
 							aria-controls={childrenId}
@@ -888,7 +888,7 @@ const ToolHeaderWrapper = ({
 						/>)}
 						{onClick ? <button
 							type="button"
-							className='text-void-fg-3 flex-shrink-0 cursor-pointer hover:brightness-125 transition-all duration-150 void-focus-ring'
+							className='text-void-fg-3 flex-shrink-0 cursor-pointer hover:brightness-125 transition-all duration-150 focus-ring'
 							onClick={onClick}
 						>
 							{title}
@@ -922,7 +922,7 @@ const ToolHeaderWrapper = ({
 							data-tooltip-content={'Canceled'}
 							data-tooltip-place='top'
 						/>}
-						{desc2 && (desc2OnClick ? <button type="button" className="text-void-fg-4 text-xs void-focus-ring" onClick={desc2OnClick}>{desc2}</button> : <span className="text-void-fg-4 text-xs">{desc2}</span>)}
+						{desc2 && (desc2OnClick ? <button type="button" className="text-void-fg-4 text-xs focus-ring" onClick={desc2OnClick}>{desc2}</button> : <span className="text-void-fg-4 text-xs">{desc2}</span>)}
 						{numResults !== undefined && (
 							<span className="text-void-fg-4 text-xs ml-auto mr-1">
 								{`${numResults}${hasNextPage ? '+' : ''} result${numResults !== 1 ? 's' : ''}`}
@@ -1650,7 +1650,7 @@ export const ListableToolItem = ({ name, onClick, isSmall, className, showDot, a
 
 	if (onClick) return <button
 		type='button'
-		className={`${classes} void-focus-ring appearance-none border-0 bg-transparent p-0 text-left text-inherit`}
+		className={`${classes} focus-ring appearance-none border-0 bg-transparent p-0 text-left text-inherit`}
 		onClick={onClick}
 		aria-label={ariaLabel}
 		title={ariaLabel}
@@ -1679,7 +1679,7 @@ const BottomChildren = ({ children, title }: { children: React.ReactNode, title:
 		<div className="w-full px-2 mt-0.5">
 			<button
 				type="button"
-				className="flex items-center cursor-pointer select-none transition-colors duration-150 pl-0 py-0.5 rounded group void-focus-ring"
+				className="flex items-center cursor-pointer select-none transition-colors duration-150 pl-0 py-0.5 rounded group focus-ring"
 				onClick={() => setIsOpen(o => !o)}
 				aria-expanded={isOpen}
 				aria-controls={childrenId}
