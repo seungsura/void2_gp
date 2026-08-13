@@ -14,7 +14,7 @@ import { Tool as GeminiTool, FunctionDeclaration, GoogleGenAI, ThinkingConfig, S
 import { GoogleAuth } from 'google-auth-library'
 /* eslint-enable */
 
-import { AnthropicLLMChatMessage, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, ModelListParams, OllamaModelResponse, OnError, OnFinalMessage, OnText, RawToolCallObj, RawToolParamsObj } from '../../common/sendLLMMessageTypes.js';
+import { AnthropicLLMChatMessage, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, LLMRequestProfile, ModelListParams, OllamaModelResponse, OnError, OnFinalMessage, OnText, RawToolCallObj, RawToolParamsObj } from '../../common/sendLLMMessageTypes.js';
 import { ChatMode, displayInfoOfProviderName, ModelSelectionOptions, OverridesOfModel, ProviderName, SettingsOfProvider } from '../../common/voidSettingsTypes.js';
 import { getSendableReasoningInfo, getModelCapabilities, getProviderCapabilities, defaultProviderSettings, getReservedOutputTokenSpace } from '../../common/modelCapabilities.js';
 import { extractReasoningWrapper, extractXMLToolsWrapper } from './extractGrammar.js';
@@ -53,6 +53,7 @@ type SendChatParams_Internal = InternalCommonMessageParams & {
 	mcpTools: InternalToolInfo[] | undefined;
 	toolExecutionProfile?: ToolExecutionProfile;
 	agentDelegationAllowed?: boolean;
+	requestProfile?: LLMRequestProfile;
 }
 type SendFIMParams_Internal = InternalCommonMessageParams & { messages: LLMFIMMessage; separateSystemMessage: string | undefined; }
 export type ListParams_Internal<ModelResponse> = ModelListParams<ModelResponse>
@@ -272,8 +273,10 @@ const rawToolCallObjOfAnthropicParams = (toolBlock: Anthropic.Messages.ToolUseBl
 
 // ------------ OPENAI-COMPATIBLE ------------
 
+const GHOST_CHAT_MAX_COMPLETION_TOKENS = 256
 
-const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions, modelName: modelName_, _setAborter, providerName, chatMode, separateSystemMessage, overridesOfModel, mcpTools, toolExecutionProfile, agentDelegationAllowed }: SendChatParams_Internal) => {
+const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions, modelName: modelName_, _setAborter, providerName, chatMode, separateSystemMessage, overridesOfModel, mcpTools, toolExecutionProfile, agentDelegationAllowed, requestProfile }: SendChatParams_Internal) => {
+	const isGhostChat = requestProfile === 'ghost-chat'
 	const {
 		modelName,
 		specialToolFormat,
@@ -291,13 +294,13 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 	const { canIOReasoning, openSourceThinkTags } = reasoningCapabilities || {}
 	const reasoningInfo = getSendableReasoningInfo('Chat', providerName, modelName_, modelSelectionOptions, overridesOfModel) // user's modelName_ here
 
-	const includeInPayload = {
+	const includeInPayload = isGhostChat ? {} : {
 		...providerReasoningIOSettings?.input?.includeInPayload?.(reasoningInfo),
 		...additionalOpenAIPayload
 	}
 
 	// tools
-	const potentialTools = openAITools(chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed)
+	const potentialTools = isGhostChat ? null : openAITools(chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed)
 	const nativeToolsObj = potentialTools && specialToolFormat === 'openai-style' ?
 		{ tools: potentialTools } as const
 		: {}
@@ -308,14 +311,15 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 		// Required to select the model
 		(openai as AzureOpenAI).deploymentName = modelName;
 	}
-	const options: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming = {
+	const options = {
 		model: modelName,
 		messages: messages as any,
 		stream: true,
 		...nativeToolsObj,
-		...additionalOpenAIPayload
+		...(isGhostChat ? {} : additionalOpenAIPayload),
+		...(isGhostChat ? { reasoning_effort: 'none', max_completion_tokens: GHOST_CHAT_MAX_COMPLETION_TOKENS } : {})
 		// max_completion_tokens: maxTokens,
-	}
+	} as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming
 
 	// open source models - manually parse think tokens
 	const { needsManualParse: needsManualReasoningParse, nameOfFieldInDelta: nameOfReasoningFieldInDelta } = providerReasoningIOSettings?.output ?? {}
@@ -327,7 +331,7 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 	}
 
 	// manually parse out tool results if XML
-	if (!specialToolFormat) {
+	if (!isGhostChat && !specialToolFormat) {
 		const { newOnText, newOnFinalMessage } = extractXMLToolsWrapper(onText, onFinalMessage, chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed)
 		onText = newOnText
 		onFinalMessage = newOnFinalMessage
@@ -339,9 +343,14 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 	let toolName = ''
 	let toolId = ''
 	let toolParamsStr = ''
+	const requestController = new AbortController()
+	_setAborter(() => requestController.abort())
 
 	const consumeResponse = async (response: AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk> & { controller: AbortController }, diagnostics: OpenAICompatibleStreamDiagnostics | undefined) => {
-			_setAborter(() => response.controller.abort())
+			_setAborter(() => {
+				requestController.abort()
+				response.controller.abort()
+			})
 			// when receive text
 			for await (const chunk of response) {
 				diagnostics && (diagnostics.firstParsedStreamEvent = true);
@@ -408,22 +417,25 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 			requestId: undefined,
 			firstParsedStreamEvent: false,
 		};
-		openai.chat.completions
-			.create(options)
-			.withResponse()
-			.then(async ({ data: response, response: rawResponse, request_id }) => {
-				diagnostics.responseHeadersReceived = true;
-				diagnostics.httpStatus = rawResponse.status;
-				diagnostics.requestId = request_id ?? undefined;
-				await consumeResponse(response, diagnostics);
-			})
-			.catch(error => onErrorFromStream(error, diagnostics));
+		try {
+			const { data: response, response: rawResponse, request_id } = await openai.chat.completions.create(options, { signal: requestController.signal }).withResponse()
+			diagnostics.responseHeadersReceived = true;
+			diagnostics.httpStatus = rawResponse.status;
+			diagnostics.requestId = request_id ?? undefined;
+			await consumeResponse(response, diagnostics);
+		}
+		catch (error) {
+			onErrorFromStream(error, diagnostics)
+		}
 	}
 	else {
-		openai.chat.completions
-			.create(options)
-			.then(response => consumeResponse(response, undefined))
-			.catch(error => onErrorFromStream(error, undefined));
+		try {
+			const response = await openai.chat.completions.create(options, { signal: requestController.signal })
+			await consumeResponse(response, undefined)
+		}
+		catch (error) {
+			onErrorFromStream(error, undefined)
+		}
 	}
 }
 

@@ -95,6 +95,7 @@ export type OnFinalMessage = (p: { fullText: string; fullReasoning: string; tool
 export type OnError = (p: { message: string; fullError: Error | null }) => void
 export type OnAbort = () => void
 export type AbortRef = { current: (() => void) | null }
+export type LLMRequestProfile = 'ghost-chat'
 
 
 // service types
@@ -121,6 +122,8 @@ export type ServiceSendLLMMessageParams = {
 	toolExecutionProfile?: ToolExecutionProfile;
 	/** Ephemeral authority from the current typed @Agent selection; never persisted. */
 	agentDelegationAllowed?: boolean;
+	/** Narrow, non-persisted transport contract for an internal caller. */
+	requestProfile?: LLMRequestProfile;
 	/** In-memory frozen child-run routing only; the normal parent path keeps live settings. */
 	settingsOfProviderOverride?: SettingsOfProvider;
 } & SendLLMType;
@@ -138,6 +141,7 @@ export type SendLLMMessageParams = {
 	overridesOfModel: OverridesOfModel | undefined;
 	toolExecutionProfile?: ToolExecutionProfile;
 	agentDelegationAllowed?: boolean;
+	requestProfile?: LLMRequestProfile;
 
 	settingsOfProvider: SettingsOfProvider;
 	mcpTools: InternalToolInfo[] | undefined;

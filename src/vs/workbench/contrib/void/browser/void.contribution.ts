@@ -17,6 +17,7 @@ import './quickEditActions.js'
 
 // register Autocomplete
 import './autocompleteService.js'
+import './ghostChatService.js'
 
 // register Context services
 // import './contextGatheringService.js'

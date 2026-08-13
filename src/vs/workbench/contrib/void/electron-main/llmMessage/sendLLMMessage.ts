@@ -27,6 +27,7 @@ export const sendLLMMessage = async ({
 	mcpTools,
 	toolExecutionProfile,
 	agentDelegationAllowed,
+	requestProfile,
 }: SendLLMMessageParams,
 
 	metricsService: IMetricsService
@@ -100,6 +101,28 @@ export const sendLLMMessage = async ({
 	}
 	abortRef_.current = onAbort
 
+	if (requestProfile === 'ghost-chat') {
+		const isSingleUserMessage = messagesType === 'chatMessages'
+			&& messages_.length === 1
+			&& messages_[0].role === 'user'
+			&& 'content' in messages_[0]
+			&& typeof messages_[0].content === 'string'
+		const isGhostChatContract = providerName === 'openAICompatible'
+			&& modelName === 'gpt-4.1'
+			&& isSingleUserMessage
+			&& chatMode === null
+			&& separateSystemMessage === undefined
+			&& Array.isArray(mcpTools) && mcpTools.length === 0
+			&& toolExecutionProfile === undefined
+			&& agentDelegationAllowed !== true
+			&& modelSelectionOptions === undefined
+			&& overridesOfModel === undefined
+		if (!isGhostChatContract) {
+			onError({ message: 'Ghost Chat request rejected: provider, model, message, or authority profile did not match the fixed internal contract.', fullError: null })
+			return
+		}
+	}
+
 
 	if (messagesType === 'chatMessages')
 		captureLLMEvent(`${loggingName} - Sending Message`, {})
@@ -115,7 +138,7 @@ export const sendLLMMessage = async ({
 		}
 		const { sendFIM, sendChat } = implementation
 		if (messagesType === 'chatMessages') {
-			await sendChat({ messages: messages_, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions, overridesOfModel, modelName, _setAborter, providerName, separateSystemMessage, chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed })
+			await sendChat({ messages: messages_, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions, overridesOfModel, modelName, _setAborter, providerName, separateSystemMessage, chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed, requestProfile })
 			return
 		}
 		if (messagesType === 'FIMMessage') {
