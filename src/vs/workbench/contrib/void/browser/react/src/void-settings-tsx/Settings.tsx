@@ -478,11 +478,14 @@ export const ModelDump = ({ filteredProviders }: { filteredProviders?: ProviderN
 					{disabled ? null : (
 						<div className="w-5 flex items-center justify-center">
 							<button
+								type='button'
 								onClick={() => { setOpenSettingsModel({ modelName, providerName, type }) }}
+								aria-label={`Open advanced settings for ${providerTitle} / ${modelName}`}
+								title={`Open advanced settings for ${providerTitle} / ${modelName}`}
 								data-tooltip-id='void-tooltip'
 								data-tooltip-place='right'
 								data-tooltip-content='Advanced Settings'
-								className={`${hasOverrides ? '' : 'opacity-0 group-hover:opacity-100'} transition-opacity`}
+								className={`${hasOverrides ? '' : 'opacity-0 group-hover:opacity-100'} focus-visible:opacity-100 focus-ring transition-opacity`}
 							>
 								<Plus size={12} className="text-void-fg-3 opacity-50" />
 							</button>
@@ -514,11 +517,14 @@ export const ModelDump = ({ filteredProviders }: { filteredProviders?: ProviderN
 					{/* X button */}
 					<div className={`w-5 flex items-center justify-center`}>
 						{type === 'default' || type === 'autodetected' ? null : <button
+							type='button'
 							onClick={() => { settingsStateService.deleteModel(providerName, modelName); }}
+							aria-label={`Delete ${providerTitle} / ${modelName}`}
+							title={`Delete ${providerTitle} / ${modelName}`}
 							data-tooltip-id='void-tooltip'
 							data-tooltip-place='right'
 							data-tooltip-content='Delete'
-							className={`${hasOverrides ? '' : 'opacity-0 group-hover:opacity-100'} transition-opacity`}
+							className={`${hasOverrides ? '' : 'opacity-0 group-hover:opacity-100'} focus-visible:opacity-100 focus-ring transition-opacity`}
 						>
 							<X size={12} className="text-void-fg-3 opacity-50" />
 						</button>}
@@ -607,11 +613,13 @@ export const ModelDump = ({ filteredProviders }: { filteredProviders?: ProviderN
 		)}
 
 		{/* Model Settings Dialog */}
-		<SimpleModelSettingsDialog
-			isOpen={openSettingsModel !== null}
-			onClose={() => setOpenSettingsModel(null)}
-			modelInfo={openSettingsModel}
-		/>
+		{openSettingsModel !== null ? (
+			<SimpleModelSettingsDialog
+				isOpen={true}
+				onClose={() => setOpenSettingsModel(null)}
+				modelInfo={openSettingsModel}
+			/>
+		) : null}
 	</div>
 }
 
