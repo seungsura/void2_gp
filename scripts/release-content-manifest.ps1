@@ -249,6 +249,25 @@ function Get-ReleaseContentManifest {
     }
 }
 
+function Get-ReleaseContent8ad348eContractSnapshot {
+    $entries = @(
+        [pscustomobject]@{ Source = 'README.md'; OuterPath = 'README.md'; PortablePath = $null; Materialization = 'outer-metadata' }
+        [pscustomobject]@{ Source = 'portable/README.md'; OuterPath = $null; PortablePath = 'docs/README.md'; Materialization = 'copy' }
+        [pscustomobject]@{ Source = 'portable/getting-started.md'; OuterPath = $null; PortablePath = 'docs/getting-started.md'; Materialization = 'copy' }
+        [pscustomobject]@{ Source = 'portable/release-notes.md'; OuterPath = $null; PortablePath = 'docs/release-notes.md'; Materialization = 'product-version' }
+        [pscustomobject]@{ Source = 'guides/write-tool-guide.md'; OuterPath = 'guides/write-tool-guide.md'; PortablePath = 'docs/guides/write-tool-guide.md'; Materialization = 'copy' }
+        [pscustomobject]@{ Source = 'guides/read-tool-guide.md'; OuterPath = 'guides/read-tool-guide.md'; PortablePath = 'docs/guides/read-tool-guide.md'; Materialization = 'copy' }
+        [pscustomobject]@{ Source = 'prompts/write-tool-test-prompts.md'; OuterPath = 'prompts/write-tool-test-prompts.md'; PortablePath = 'docs/prompts/write-tool-test-prompts.md'; Materialization = 'copy' }
+        [pscustomobject]@{ Source = 'prompts/read-tool-test-prompts.md'; OuterPath = 'prompts/read-tool-test-prompts.md'; PortablePath = 'docs/prompts/read-tool-test-prompts.md'; Materialization = 'copy' }
+    )
+    [pscustomobject]@{
+        Layout = '8ad348e'
+        Entries = @($entries)
+        OuterEntries = @($entries | Where-Object { $null -ne $_.OuterPath })
+        PortableEntries = @($entries | Where-Object { $null -ne $_.PortablePath })
+    }
+}
+
 function Get-ReleaseContentMaterializedBytes {
     param(
         [Parameter(Mandatory = $true)]$Entry,
@@ -400,6 +419,7 @@ function Assert-ReleaseContentArchiveDocsContract {
         [Parameter(Mandatory = $true)][string]$ProductVersion,
         [int[]]$AllowedContracts = @(0, 1),
         [int]$RequiredContract = -1,
+        [ValidateSet('current', '8ad348e')][string]$RequiredLayout,
         [switch]$HistoricalArchive
     )
 
@@ -409,10 +429,42 @@ function Assert-ReleaseContentArchiveDocsContract {
         throw "Portable docs contract $contract is not allowed; required=$RequiredContract allowed=[$($AllowedContracts -join ',')]."
     }
     if ($contract -eq 0) {
-        return [pscustomobject]@{ Contract = 0; Count = 0; Entries = @() }
+        if (-not $HistoricalArchive -or -not [string]::IsNullOrWhiteSpace($RequiredLayout)) {
+            throw 'Portable docs contract 0 is allowed only for a historical archive without a docs layout requirement.'
+        }
+        return [pscustomobject]@{ Contract = 0; Layout = $null; Count = 0; Entries = @() }
     }
 
-    $expected = @(Get-ReleaseContentPlan $Manifest Portable -ProductVersion $ProductVersion)
+    $currentExpected = @(Get-ReleaseContentPlan $Manifest Portable -ProductVersion $ProductVersion)
+    $historicalSnapshot = Get-ReleaseContent8ad348eContractSnapshot
+    $historicalExpected = @($historicalSnapshot.PortableEntries | ForEach-Object {
+        [pscustomobject]@{ Path = $_.PortablePath; Source = $_.Source; Materialization = $_.Materialization }
+    })
+    $matchesExactPaths = {
+        param([object[]]$Expected)
+        $paths = @($Expected | ForEach-Object { $_.Path })
+        $actualDocs.Count -eq $paths.Count -and
+            @($paths | Where-Object { $actualDocs -cnotcontains $_ }).Count -eq 0 -and
+            @($actualDocs | Where-Object { $paths -cnotcontains $_ }).Count -eq 0
+    }
+    $layout = if (& $matchesExactPaths $currentExpected) {
+        'current'
+    } elseif ($HistoricalArchive -and (& $matchesExactPaths $historicalExpected)) {
+        '8ad348e'
+    } else {
+        $expectedForError = if ($HistoricalArchive) { @($currentExpected) + @($historicalExpected) } else { @($currentExpected) }
+        $knownPaths = @($expectedForError | ForEach-Object { $_.Path } | Select-Object -Unique)
+        $missing = @($knownPaths | Where-Object { $actualDocs -cnotcontains $_ })
+        $extra = @($actualDocs | Where-Object { $knownPaths -cnotcontains $_ })
+        throw "Portable docs contract is partial, unlisted, or not an exact allowed layout. Missing=[$($missing -join ', ')] Extra=[$($extra -join ', ')]"
+    }
+    if (-not $HistoricalArchive -and $layout -cne 'current') {
+        throw "Current portable docs validation requires the current layout, got $layout."
+    }
+    if (-not [string]::IsNullOrWhiteSpace($RequiredLayout) -and $layout -cne $RequiredLayout) {
+        throw "Portable docs layout $layout does not match required layout $RequiredLayout."
+    }
+    $expected = if ($layout -ceq 'current') { $currentExpected } else { $historicalExpected }
     $expectedPaths = @($expected | ForEach-Object { $_.Path })
     $missing = @($expectedPaths | Where-Object { $actualDocs -cnotcontains $_ })
     $extra = @($actualDocs | Where-Object { $expectedPaths -cnotcontains $_ })
@@ -438,7 +490,7 @@ function Assert-ReleaseContentArchiveDocsContract {
         }
         [void]$verified.Add([pscustomobject]@{ Path = $item.Path; Length = $actualBytes.Length; Sha256 = $actualHash; Source = $item.Source })
     }
-    [pscustomobject]@{ Contract = 1; Count = $verified.Count; Entries = @($verified) }
+    [pscustomobject]@{ Contract = 1; Layout = $layout; Count = $verified.Count; Entries = @($verified) }
 }
 
 function Assert-ReleaseContentNoArtifactCollisions {

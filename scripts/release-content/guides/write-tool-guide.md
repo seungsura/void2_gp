@@ -17,18 +17,16 @@
 
 `modify`에는 같은 파일의 최신 `read_file` receipt가 필요합니다. receipt는 URI, owner thread, live model identity/version, snapshot과 묶이며 승인 대기 또는 hook 전후에도 stale 여부를 다시 확인합니다. 문서가 바뀌면 `stale_read`로 mutation 없이 실패합니다.
 
-## OpenAI-compatible streaming repair와 privacy
+## OpenAI-compatible stream과 privacy
 
-이전 root `oneOf`-only schema는 일부 OpenAI-compatible validator에서 거부됐고, stream이 완료 event 없이 닫히면 `ERR_STREAM_PREMATURE_CLOSE`로 보일 수 있었습니다. 현재 flat schema는 이 호환 문제를 피하고 runtime 검증으로 파일 안전 경계를 유지합니다.
-
-현재 flat schema가 이를 피하지만 실제 provider/UI E2E는 새 package에서 미검증입니다. diagnostic error는 configured endpoint path(관찰된 path: `/chat/completions`), tool mode/schema posture, stream phase를 표시할 수 있습니다. 민감한 설정값이나 요청 내용은 진단 기록에 복사하지 말고 Void의 실제 chat과 tool trace만 관찰하세요.
+현재 flat schema는 OpenAI-compatible transport에서 conditional composition에 의존하지 않으면서 runtime 검증으로 파일 안전 경계를 유지합니다. Stream이 completion 전에 닫히면 tool success로 처리하지 않고 configured route, tool/schema posture와 stream phase를 구분하는 진단을 표시할 수 있습니다. 민감한 설정값이나 요청 내용은 진단 기록에 복사하지 말고 Void의 실제 chat과 tool trace만 관찰하세요.
 
 ## 사용자가 직접 확인할 것
 
 1. 새 OpenAI-compatible Agent chat에서 먼저 간단한 `1`을 보내 stream completion을 확인합니다.
 2. 새 파일 `create`, 최신 read receipt를 사용한 existing-file `modify`, stale receipt rejection을 별도 임시 workspace에서 관찰합니다.
 3. tool success 문구만 믿지 말고 editor, disk, Undo, tool trace를 함께 확인합니다.
-4. 실패 시 raw premature-close 문자열이 아니라 endpoint path/tool mode/schema posture/stream phase가 포함된 diagnostic error인지 기록합니다.
+4. 불완전한 stream이 성공으로 표시되지 않고 route/tool/schema/phase를 구분하는 diagnostic error로 끝나는지 기록합니다.
 
 requested alias와 observed actual route는 provider routing에 따라 다를 수 있습니다. 차이가 보이면 configured/effective route 불일치라는 관찰로만 기록하고 일반적인 model alias 동작으로 단정하지 마세요.
 

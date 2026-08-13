@@ -34,6 +34,12 @@
 			"materialization": "copy"
 		},
 		{
+			"source": "guides/agent-instructions-guide.md",
+			"outerPath": "guides/agent-instructions-guide.md",
+			"portablePath": "docs/guides/agent-instructions-guide.md",
+			"materialization": "copy"
+		},
+		{
 			"source": "prompts/write-tool-test-prompts.md",
 			"outerPath": "prompts/write-tool-test-prompts.md",
 			"portablePath": "docs/prompts/write-tool-test-prompts.md",
@@ -43,6 +49,24 @@
 			"source": "prompts/read-tool-test-prompts.md",
 			"outerPath": "prompts/read-tool-test-prompts.md",
 			"portablePath": "docs/prompts/read-tool-test-prompts.md",
+			"materialization": "copy"
+		},
+		{
+			"source": "prompts/agent-instructions-test-prompts.md",
+			"outerPath": "prompts/agent-instructions-test-prompts.md",
+			"portablePath": "docs/prompts/agent-instructions-test-prompts.md",
+			"materialization": "copy"
+		},
+		{
+			"source": "guides/ghost-chat-guide.md",
+			"outerPath": "guides/ghost-chat-guide.md",
+			"portablePath": "docs/guides/ghost-chat-guide.md",
+			"materialization": "copy"
+		},
+		{
+			"source": "prompts/ghost-chat-test-prompts.md",
+			"outerPath": "prompts/ghost-chat-test-prompts.md",
+			"portablePath": "docs/prompts/ghost-chat-test-prompts.md",
 			"materialization": "copy"
 		}
 	]

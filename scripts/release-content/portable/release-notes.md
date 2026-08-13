@@ -1,40 +1,57 @@
 # Void {{PRODUCT_VERSION}} 현재 릴리스 노트
 
-이 문서는 이 portable의 현재 동작만 설명합니다. 누적 변경 이력, 내부 장애 기록 또는 향후 계획을 담지 않습니다.
+이 문서는 이 portable의 현재 사용자 동작과 검증 경계만 설명합니다. 누적 변경 이력, 내부 장애 기록 또는 향후 계획은 포함하지 않습니다.
 
-## 이전 Void와 현재 배포본
+## Native file tools
 
 ### `write_file`
 
-- 이전: marker/XML 형식의 별도 edit/rewrite 도구와 모호한 적용 흐름이 있었습니다.
-- 현재: native structured `write_file` 하나가 create와 snapshot 기반 modify를 처리합니다. exact/unique edit, stale receipt와 atomic 적용을 runtime에서 검사하고, 수정은 editor review와 Undo 가능한 transaction을 거칩니다.
+- native structured `write_file` 하나가 create와 snapshot 기반 modify를 처리합니다.
+- model-facing schema는 flat root object와 `create`/`modify` operation을 사용합니다. branch별 required·forbidden 조합, unknown key, exact/unique edit와 current read receipt는 runtime이 검사합니다.
+- 수정은 editor review와 Undo 가능한 transaction으로 적용됩니다. stale receipt, ambiguous match와 invalid branch는 mutation 전에 거부됩니다.
 
 ### `read_file`
 
-- 원래 upstream Void: 한 페이지에서 최대 500,000 characters를 반환했고, snapshot receipt나 stale/history 안전 gate가 없었습니다.
-- 중간 repair package: bounded paginator를 먼저 도입했지만 출력 여유가 0일 때 진행 없는 성공을 반환하거나, 짧은 이전 줄 다음의 oversized line 경계에서 separator를 빠뜨릴 수 있었습니다. 이 두 결함은 원래 upstream 동작이 아니라 중간 package에만 있었습니다.
-- 현재: 1-based inclusive line 범위, UTF-8 byte continuation, 동적 출력 한도, live editor snapshot receipt와 stale rejection을 사용합니다. 진행할 수 없는 page는 성공처럼 반환하지 않고 명시적으로 거부합니다.
+- 1-based inclusive line 범위, UTF-8 byte continuation과 동적 output cap을 사용합니다.
+- 가능한 경우 saved disk가 아니라 current live editor snapshot을 읽고, owner·document version·range가 연결된 opaque receipt를 반환합니다.
+- 진행할 수 없는 page, invalid cursor와 history budget 초과를 성공처럼 반환하지 않습니다. 변경 또는 Undo 뒤에는 새 read와 새 receipt가 필요합니다.
 
-### OpenAI-compatible schema와 진단
+## OpenAI-compatible transport
 
-- 이전: `write_file`의 composed root schema를 일부 OpenAI-compatible validator가 거부했고, streaming 연결이 완료 marker 없이 닫히면 원인이 가려질 수 있었습니다.
-- 현재: model-facing schema는 flat root object를 사용하고 branch 안전성은 runtime validator가 강제합니다. 오류는 요청 내용이나 인증 정보를 노출하지 않으면서 endpoint 단계, tool/schema posture와 stream phase를 구분하도록 보강됐습니다.
+OpenAI-compatible Agent의 flat tool schema는 conditional composition에 의존하지 않습니다. Stream이 completion 전에 닫히면 tool success로 처리하지 않고 configured route, tool/schema posture와 stream phase를 구분하는 진단을 표시할 수 있습니다. 진단 기록에는 credential, custom header와 request content를 복사하지 마세요.
 
-### portable 패키징
+## Agent instructions, Skills와 custom agents
 
-- 이전: native runtime 누락, portable data README 누락과 게시 중간 상태가 실행 실패 또는 모호한 산출물로 이어질 수 있었습니다.
-- 현재: x64 native payload, 필수 파일, 생성 사용자 데이터 제외, ZIP hash/entry와 transactional rollback을 검증합니다. standalone portable 안에도 이 `docs/` 트리가 포함되며 outer 묶음은 같은 안내서와 정확히 같은 portable ZIP을 담습니다.
+- active owner Project의 `AGENTS.md` chain은 top-level user turn마다 reload되고 같은 turn에는 동일 revision을 유지합니다.
+- user와 trusted Project의 `.codex/config.toml`에서 제한된 developer instruction과 Skill enable/disable 설정을 읽습니다.
+- repository/user/plugin `.agents/skills/<name>/SKILL.md` catalog는 exact full-body admission과 confined lazy resource read를 사용합니다.
+- user와 trusted Project의 `.codex/agents/*.toml`은 strict named direct-child role을 제공합니다. Role은 required metadata와 read-only boundary를 검증한 뒤 admit됩니다.
 
-## 이 릴리스에 포함된 사용자 기능
+## Bounded read-only subagent와 current Chat UI
 
-- 직접 파일을 생성하거나 수정할 때는 `write_file`을 사용하며, formatter와 대규모 기계적 변환을 제외하고 terminal을 파일 생성·수정의 우회 수단으로 사용하지 않습니다.
-- repaired `write_file`와 editor review/Undo 흐름
-- bounded `read_file` continuation과 receipt 기반 안전 경계
-- OpenAI-compatible flat tool schema와 단계별 streaming 진단
-- 검증된 Windows x64 portable 패키징과 내장 사용자 문서
+- Agent mode의 parent generation마다 최대 4 accepted direct child, 동시에 최대 2 running과 FIFO queue를 사용합니다.
+- Child depth는 1입니다. Child에는 `read_file`, `ls_dir`, `search_pathnames_only`, `search_for_files`, `search_in_file`만 노출되며 terminal/write/MCP/app tool은 없습니다.
+- `wait_agent`는 전체 또는 선택 target의 결과를 spawn order로 전달하고, `interrupt_agent`는 선택한 queued/running child만 취소합니다.
+- transient Child Run panel은 capacity, state, timing과 failure를 표시합니다. Local trace는 first 128 lifecycle events와 이후 dropped count만 보존하며 provider usage가 없으면 `Usage unavailable`을 표시합니다.
+- Chat history는 Current와 background Running/action-required 상태를 분리합니다. Current composer는 Error, Needs approval, Running, unavailable과 idle에 맞는 Send/Stop 상태를 사용합니다. Chat별 unsent draft는 이동 뒤 복원되지만 restart에는 persist하지 않습니다.
 
-## 아직 검증되거나 배포되지 않은 범위
+## Ghost Chat code suggestions
 
-- 실제 provider에서의 전체 chat/tool/UI E2E는 아직 검증되지 않았습니다.
-- `read_file`의 실제 사용 환경 성능은 아직 검증되지 않았습니다.
-- AGENTS, Skills, subagents는 이 릴리스에 아직 배포되지 않았습니다. 관련 manual도 shipped 기능으로 제공하지 않습니다.
+- OpenAI-Compatible endpoint에 exact custom `gpt-4.1`을 설정하고 **Settings > Feature Options > Editor**에서 켭니다. Toggle 기본값은 off입니다.
+- Request-local profile은 fixed `/chat/completions`, wire `gpt-4.1`, reasoning `none`이며 tool이나 child delegation을 사용하지 않습니다.
+- Writable editor의 empty caret에서 qualifying edit 뒤 750ms idle이면 automatic request를 admit합니다. Active request는 최대 하나입니다.
+- Tab은 bounded one-line suggestion 전체를 한 번 수용하고 Escape는 문서를 바꾸지 않고 거부합니다. Edit, caret/selection 변경과 toggle-off는 active request를 취소하고 stale result를 숨깁니다.
+- Partial acceptance, cache, automatic retry와 legacy FIM `/completions` fallback은 없습니다.
+
+## Portable package contract
+
+- 정식 package는 manifest에 선언된 x64 runtime payload와 필수 `Void.exe`, `resources/app/product.json`, `data/README.txt`를 검증합니다.
+- 생성 사용자 데이터인 `data/argv.json`과 `data/user-data/`는 ZIP에서 제외합니다.
+- 내장 `docs/`는 release-content manifest exact whitelist, UTF-8/non-empty, Windows-safe path와 outer/portable shared-byte identity를 통과해야 합니다.
+- 새 portable과 outer 묶음의 SHA-256, entry 목록과 embedded portable identity가 모두 일치해야 게시할 수 있습니다.
+
+## 확인된 범위와 남은 관찰
+
+Focused schema/planner/service/UI tests는 위 source 계약을 확인합니다. 현재 source의 Ghost Chat core actual-product 관찰에서는 toggle-off 요청 0건, toggle-on physical typing 뒤 약 815ms와 824ms의 admission, exact wire profile, native ghost text, Tab 한 번 삽입과 Undo 복원이 확인됐습니다. 두 timing은 성능 보장이 아닙니다.
+
+Ghost Chat max-one overlap과 toggle-off cancellation은 focused tests를 통과했지만 actual-product follow-on 관찰은 아직 완료되지 않았습니다. 전체 chat/tool/UI provider E2E, `read_file`의 실제 환경 성능, nested child, persistent child group/restart replay, full child transcript history와 arbitrary provider/MCP/terminal/write permission override는 검증 또는 지원 범위를 넘어섭니다. 동봉 prompt의 예상 결과를 통과 사실로 간주하지 말고 실제 환경에서 별도로 기록하세요.

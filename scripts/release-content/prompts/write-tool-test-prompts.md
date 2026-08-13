@@ -107,12 +107,12 @@
 - Expected B: non-empty snapshot 또는 multiple edits의 empty old_text는 plan/mutation 없이 거부됩니다.
 - Pass/fail record: `EXPLORATORY` / setup A/B / exact raw tool args가 보이면 기록 / mutation count / final bytes / error.
 
-## 13. premature-close 실패 기록
+## 13. incomplete stream 실패 기록
 
 - Setup: tool을 제공하는 Agent chat에서 실제 close/failure가 재현될 때만 시행합니다.
 - Exact prompt: “`failure-observation.txt`를 새로 만들고 `observe only`를 넣어 주세요.”
-- Expected: raw `ERR_STREAM_PREMATURE_CLOSE`만 남기지 않고 diagnostic error가 endpoint path, tool mode/schema posture, stream phase를 포함합니다. 민감한 설정값이나 요청 내용은 보이거나 기록되면 안 됩니다.
-- Record: `EXPLORATORY` / endpoint path / stream phase / schema posture / tool mode / HTTP-visible status가 있으면 그것만 / 민감한 설정값 미기록 / retry 여부. 이 기록은 endpoint 직접 요청을 허용하지 않습니다.
+- Expected: completion 전에 닫힌 stream을 tool success로 처리하지 않고 diagnostic error가 route, tool mode/schema posture와 stream phase를 구분합니다. 민감한 설정값이나 요청 내용은 보이거나 기록되면 안 됩니다.
+- Record: `EXPLORATORY` / route category / stream phase / schema posture / tool mode / 민감한 설정값 미기록 / retry 여부. 이 기록은 endpoint 직접 요청을 허용하지 않습니다.
 
 ## 해석 주의
 

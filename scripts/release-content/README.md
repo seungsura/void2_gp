@@ -1,15 +1,17 @@
 # Void 1.99.3 Windows x64 배포 묶음
 
-이 묶음은 사용자 문서가 내장된 portable 제품 ZIP과 `write_file`/`read_file` 안내서, 그리고 실제 제품 관찰용 프롬프트를 함께 전달합니다. 이 README의 값은 assembler가 실제 새 portable을 만든 뒤에만 확정합니다. placeholder를 hash 또는 통과 사실로 해석하지 마세요.
+이 묶음은 사용자 문서가 내장된 portable 제품 ZIP과 `write_file`/`read_file`/Agent/Ghost Chat 안내서, 그리고 실제 제품 관찰용 프롬프트를 함께 전달합니다. 이 README의 값은 assembler가 실제 새 portable을 만든 뒤에만 확정합니다. placeholder를 hash 또는 통과 사실로 해석하지 마세요.
 
 ## 포함 파일
 
 - `Void-1.99.3-win32-x64-portable.zip`: portable 제품 ZIP
 - `SHA256SUMS.txt`: assembler가 placeholder 치환 뒤 생성하는 manifest
-- `guides/write-tool-guide.md`, `guides/read-tool-guide.md`: 도구 계약과 안전 경계
-- `prompts/write-tool-test-prompts.md`, `prompts/read-tool-test-prompts.md`: 탐색적 제품 테스트 절차
+- `guides/write-tool-guide.md`, `guides/read-tool-guide.md`: 파일 도구 계약과 안전 경계
+- `guides/agent-instructions-guide.md`: `AGENTS.md`, config, Skills, custom agents와 bounded read-only subagent 사용 안내
+- `guides/ghost-chat-guide.md`: default-off Ghost Chat 설정, 자동 제안, 수용과 취소 경계
+- `prompts/write-tool-test-prompts.md`, `prompts/read-tool-test-prompts.md`, `prompts/agent-instructions-test-prompts.md`, `prompts/ghost-chat-test-prompts.md`: 탐색적 제품 테스트 절차
 
-portable ZIP 자체의 `docs/`에도 시작 안내, current-only release notes와 위 guide/prompt의 동일한 bytes가 들어 있습니다. release notes는 누적 내부 이력이 아니라 해당 portable에서 실제 shipped된 동작만 설명하며, 아직 배포되지 않은 기능은 manual이나 사용 가능 기능으로 표시하지 않습니다.
+portable ZIP 자체의 `docs/`에도 시작 안내, current-only release notes와 위 guide/prompt의 동일한 bytes가 들어 있습니다. release notes는 누적 내부 이력이 아니라 해당 portable에서 shipped되는 현재 동작만 설명합니다.
 
 ## 새 portable 정보 — assembler가 채울 값
 
@@ -29,26 +31,36 @@ Expand-Archive .\Void-1.99.3-win32-x64-portable.zip .\Void-1.99.3-portable
 .\Void-1.99.3-portable\Void.exe
 ```
 
-## OpenAI-compatible streaming repair
+## Agent instructions, Skills, custom agents와 bounded subagent
 
-OpenAI-compatible Agent에서 관찰된 `ERR_STREAM_PREMATURE_CLOSE`의 확정 원인은 이전 `write_file` root schema가 `oneOf`만 가지고 root `type: object`가 없었던 점입니다. 사내 LiteLLM/OpenAI schema validation이 그 형태를 거부했습니다. non-stream 요청은 outer 500/inner 502로 실패했고, stream 요청은 200 SSE headers 뒤 `data:` 또는 `[DONE]` 없이 close됐습니다. OpenAI SDK와 local loopback fixture는 정상 동작했으므로 SDK가 원인은 아닙니다.
+이 릴리스는 Agent mode에서 `AGENTS.md`, user/trusted Project `.codex/config.toml`의 제한된 instruction 설정, `.agents/skills` 기반 Skills와 user/trusted Project `.codex/agents/*.toml` custom role을 제공합니다. Typed `@Agent` authority 아래 parent generation마다 최대 4 accepted, 2 running direct child와 FIFO queue를 사용하며 `wait_agent`와 `interrupt_agent`로 결과 전달과 선택 취소를 제어합니다. Child는 application-level exact-five read-only tool만 받고 nesting은 허용하지 않습니다.
 
-현재 repair는 root `type: object`, `create`/`modify` operation enum, optional branch fields를 가진 flat model-facing schema입니다. `oneOf`, `anyOf`, `allOf`, `if`, `then`, `else`, `const`는 사용하지 않습니다. 이것은 model-facing transport compatibility repair일 뿐입니다. create/modify의 required/forbidden 조합, unknown key 거부, receipt/stale 검증, immutable snapshot planner는 runtime이 계속 엄격하게 강제합니다.
+Child Run UI는 capacity/status, 실패와 bounded timing/timeline을 표시합니다. Local trace는 first 128 events와 이후 dropped count만 보존하고 provider usage가 없으면 `Usage unavailable`로 표시합니다. Chat history의 Current/Running/action-required 상태, current composer의 Send/Stop/announcement와 per-chat memory-only draft도 현재 UI에 포함됩니다. 정확한 지원 경계와 직접 관찰 절차는 `guides/agent-instructions-guide.md`와 `prompts/agent-instructions-test-prompts.md`를 확인하세요.
 
-진단 오류는 endpoint path(관찰된 설정은 `/chat/completions`), tool mode/schema posture, stream phase를 포함할 수 있지만 API key나 custom headers를 기록하지 않습니다. endpoint로 직접 요청하지 마세요.
+focused tests, compile·React·Windows build와 visible artifact smoke는 actual provider/network E2E 증거가 아닙니다. prompt의 예상 결과를 미리 통과 사실로 기록하지 마세요.
 
-## 해결된 과거 패키징 문제와 게시 gate
+## Ghost Chat
 
-- shared runtime manifest의 native payload 24/24가 x64 artifact와 ZIP에서 모두 존재하고 nonzero인지 검증합니다.
-- 누락됐던 native payload를 복구했으며 창 생성 전 종료의 강한 원인 후보였던 `@vscode/policy-watcher`도 포함합니다.
-- MSVC `14.44.35207` Spectre x86+x64 libraries와 Visual Studio component가 정상 설치된 prerequisite에서 native module을 빌드합니다. `node_modules`의 `SpectreMitigation`을 지우는 patch는 사용하지 않습니다.
-- portable `data/README.txt`는 deterministic template에서 생성하여 package 누락을 막습니다.
-- publish는 임시 ZIP을 먼저 검증하고 final 교체 전에 backup을 보존합니다. sharing/lock 오류에는 제한된 retry를 적용하며 final/backup 동시 잔존 같은 모호한 상태는 fail-closed합니다. 검증 완료 후에만 backup을 정리합니다.
+Ghost Chat은 OpenAI-Compatible endpoint에 custom `gpt-4.1` model을 설정한 뒤 **Settings > Feature Options > Editor**의 **Enable Ghost Chat code suggestions**에서 켭니다. 기본값은 off입니다. On 상태에서 writable editor의 empty caret가 750ms idle이면 automatic request를 admit하고, active request는 최대 하나입니다. Tab은 full suggestion을 한 번 수용하고 Escape는 문서를 바꾸지 않고 거부합니다. Edit, caret/selection 변경과 toggle-off는 active request를 취소하고 stale result를 숨깁니다.
 
-위 항목은 새 portable의 실제 artifact/ZIP 검증이 성공한 뒤 assembler가 확인·게시할 gate입니다. placeholder 상태의 이 staging 문서 자체가 새 portable 성공을 뜻하지 않습니다.
+이 request는 `/chat/completions`, wire `gpt-4.1`, reasoning `none`으로 고정되며 결과는 bounded one-line plain insertion입니다. Partial acceptance, cache와 automatic retry는 없고 legacy FIM 또는 `/completions`를 다시 사용하지 않습니다. 설정·취소·수용 절차와 검증 한계는 `guides/ghost-chat-guide.md`, 실제 관찰 순서는 `prompts/ghost-chat-test-prompts.md`를 확인하세요.
+
+## OpenAI-compatible file tool contract
+
+OpenAI-compatible Agent의 `write_file`은 root `type: object`, `create`/`modify` operation enum과 optional branch fields를 가진 flat model-facing schema를 사용합니다. `oneOf`, `anyOf`, `allOf`, `if`, `then`, `else`, `const`는 사용하지 않습니다. create/modify의 required·forbidden 조합, unknown key 거부, current read receipt와 stale snapshot 검사는 runtime이 계속 엄격하게 강제합니다.
+
+완료 전에 닫힌 stream은 tool success로 처리하지 않습니다. 사용자에게 보이는 진단은 configured route, tool/schema posture와 stream phase를 구분할 수 있으며 API key, custom headers, request content를 기록하지 않아야 합니다. 중요한 파일을 변경하기 전 작은 임시 workspace에서 실제 chat, tool trace, editor 결과와 Undo를 함께 확인하세요.
+
+## 현재 패키지 gate
+
+정식 assembler는 manifest에 선언된 x64 runtime payload가 artifact와 ZIP에 모두 있고 non-empty인지, `Void.exe`, `resources/app/product.json`, `data/README.txt`가 존재하는지 확인합니다. 생성 사용자 데이터는 제외하고, 사용자 문서는 manifest exact whitelist·UTF-8·Windows-safe path·shared outer/portable byte identity를 통과해야 합니다. 새 portable과 outer 묶음의 hash, entry와 embedded ZIP identity가 모두 검증된 뒤에만 게시합니다.
+
+이 항목은 새 portable의 실제 artifact/ZIP 검증이 성공한 뒤 확정되는 gate입니다. placeholder 상태의 이 staging 문서 자체가 새 portable 성공을 뜻하지 않습니다.
 
 ## 확인된 범위와 남은 경계
 
-focused schema/planner/diagnostic tests와 local SDK loopback은 확인됐지만, 실제 provider/UI E2E는 새 portable에서 아직 미검증입니다. 실제 chat/provider request, 승인 UI, create/modify 적용과 Undo는 아래 prompt를 사용해 관찰해야 합니다. `read_file`의 실제 provider/UI E2E와 read performance/closed-file streaming gate도 이 package에서는 아직 미검증입니다.
+focused schema/planner/diagnostic, Agent orchestration과 Ghost Chat source tests는 현재 계약을 확인하지만 전체 actual-provider/UI E2E를 대신하지 않습니다. 현재 source의 Ghost Chat core 관찰에서는 toggle-off 요청 0건, toggle-on physical typing 뒤 약 815ms와 824ms의 admission, exact wire profile, native ghost text, Tab 한 번 삽입과 Undo 복원이 확인됐습니다. 이 두 timing은 성능 보장이 아닙니다. Max-one과 toggle-off cancellation은 focused tests를 통과했지만 actual-product follow-on 관찰은 아직 완료되지 않았습니다.
+
+실제 chat/provider request, 승인 UI, create/modify 적용과 Undo, AGENTS/Skill/custom-agent/subagent 동작은 동봉 prompt를 사용해 확인하세요. `read_file`의 실제 provider/UI E2E와 read performance/closed-file streaming gate도 미검증입니다.
 
 프롬프트는 탐색적 테스트이지 통과 사실이 아닙니다. 실제 결과, provider/model, tool trace, UI 상태를 기록한 경우에만 해당 환경의 관찰 증거가 됩니다.
