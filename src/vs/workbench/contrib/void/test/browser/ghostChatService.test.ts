@@ -10,7 +10,10 @@ import { Position } from '../../../../../editor/common/core/position.js';
 import { Selection } from '../../../../../editor/common/core/selection.js';
 import { InlineCompletionContext, InlineCompletionTriggerKind } from '../../../../../editor/common/languages.js';
 import { createTextModel } from '../../../../../editor/test/common/testTextModel.js';
-import { buildGhostChatPrompt, captureGhostChatSnapshot, GhostChatService, isGhostChatDevelopmentEnvironment, isGhostChatSnapshotCurrent, validateGhostChatInsertion } from '../../browser/ghostChatService.js';
+import { CommandsRegistry } from '../../../../../platform/commands/common/commands.js';
+import { buildGhostChatPrompt, captureGhostChatSnapshot, GHOST_CHAT_ACCEPT_COMMAND_ID, GHOST_CHAT_DEBOUNCE_DELAY_MS, GHOST_CHAT_LIFECYCLE_RECORD_LIMIT, GhostChatService, isGhostChatDevelopmentEnvironment, isGhostChatSnapshotCurrent, validateGhostChatInsertion } from '../../browser/ghostChatService.js';
+import { LLMMessageService } from '../../common/sendLLMMessageService.js';
+import { defaultGlobalSettings } from '../../common/voidSettingsTypes.js';
 
 const context = (triggerKind: InlineCompletionTriggerKind): InlineCompletionContext => ({
 	triggerKind,
@@ -19,7 +22,7 @@ const context = (triggerKind: InlineCompletionTriggerKind): InlineCompletionCont
 	includeInlineCompletions: true,
 });
 
-const fixture = (timeoutMs = 1_000, initialReadOnly = false) => {
+const fixture = (timeoutMs = 1_000, initialReadOnly = false, initialGhostChatEnabled = false) => {
 	const disposables = new DisposableStore();
 	const model = disposables.add(createTextModel('const value = foo;', 'typescript'));
 	let position = new Position(1, model.getLineMaxColumn(1) - 1);
@@ -28,6 +31,7 @@ const fixture = (timeoutMs = 1_000, initialReadOnly = false) => {
 	const selectionEmitter = disposables.add(new Emitter<any>());
 	const modelEmitter = disposables.add(new Emitter<any>());
 	const configurationEmitter = disposables.add(new Emitter<any>());
+	const settingsEmitter = disposables.add(new Emitter<void>());
 	let readOnly = initialReadOnly;
 	const editor = {
 		getModel: () => model,
@@ -101,7 +105,11 @@ const fixture = (timeoutMs = 1_000, initialReadOnly = false) => {
 		},
 	};
 	const codeEditors = { getActiveCodeEditor: () => editor };
-	const service = disposables.add(new GhostChatService(languageFeatures as any, llm as any, codeEditors as any, commands as any));
+	const settings = {
+		state: { globalSettings: { enableGhostChat: initialGhostChatEnabled } },
+		onDidChangeState: settingsEmitter.event,
+	};
+	const service = disposables.add(new GhostChatService(languageFeatures as any, llm as any, codeEditors as any, commands as any, settings as any));
 	(service as any).timeoutMs = timeoutMs;
 
 	return {
@@ -114,6 +122,11 @@ const fixture = (timeoutMs = 1_000, initialReadOnly = false) => {
 		results,
 		commandIds,
 		provider: () => provider,
+		setGhostChatEnabled(value: boolean) {
+			settings.state.globalSettings.enableGhostChat = value;
+			settingsEmitter.fire();
+		},
+		fireUnrelatedSettingsChange() { settingsEmitter.fire(); },
 		setBeforeRequestId(value: (() => void) | undefined) { beforeRequestId = value; },
 		setProviderToken(value: CancellationToken) { providerToken = value; },
 	};
@@ -125,6 +138,75 @@ const flushAsync = async () => {
 };
 
 suite('Void Ghost Chat manual gate', () => {
+	test('Ghost Chat is separately default-off and the provider owns the exact native debounce', () => {
+		const f = fixture();
+		try {
+			assert.strictEqual(defaultGlobalSettings.enableGhostChat, false);
+			assert.strictEqual(f.provider().debounceDelayMs, undefined, 'disabled Ghost must not delay other inline providers');
+			f.setGhostChatEnabled(true);
+			assert.strictEqual(f.provider().debounceDelayMs, GHOST_CHAT_DEBOUNCE_DELAY_MS);
+			f.setGhostChatEnabled(false);
+			assert.strictEqual(f.provider().debounceDelayMs, undefined);
+			assert.strictEqual(GHOST_CHAT_DEBOUNCE_DELAY_MS, 750);
+			assert.strictEqual(GHOST_CHAT_LIFECYCLE_RECORD_LIMIT, 64);
+		}
+		finally { f.disposables.dispose(); }
+	});
+
+	test('renderer suppresses only Ghost raw error JSON while both error callbacks still run', () => {
+		const disposables = new DisposableStore();
+		const emitters = new Map<string, Emitter<any>>();
+		const calls: Array<{ command: string; params: any }> = [];
+		const channel = {
+			listen(event: string) {
+				let emitter = emitters.get(event);
+				if (!emitter) {
+					emitter = disposables.add(new Emitter<any>());
+					emitters.set(event, emitter);
+				}
+				return emitter.event;
+			},
+			call(command: string, params: any) {
+				calls.push({ command, params });
+				return Promise.resolve();
+			},
+		};
+		const service = disposables.add(new LLMMessageService(
+			{ getChannel: () => channel } as never,
+			{ state: { settingsOfProvider: {} } } as never,
+			{ getMCPTools: () => [] } as never,
+		));
+		const base: any = {
+			messagesType: 'chatMessages', messages: [{ role: 'user', content: 'fixture' }], separateSystemMessage: undefined,
+			chatMode: null, logging: { loggingName: 'fixture' }, modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' },
+			modelSelectionOptions: undefined, overridesOfModel: undefined, onText() { }, onFinalMessage() { }, onAbort() { },
+		};
+		let ordinaryErrors = 0;
+		let ghostErrors = 0;
+		const consoleErrors: unknown[][] = [];
+		const originalConsoleError = console.error;
+		console.error = (...args: unknown[]) => { consoleErrors.push(args); };
+		try {
+			service.sendLLMMessage({ ...base, onError: () => ordinaryErrors++ });
+			service.sendLLMMessage({ ...base, requestProfile: 'ghost-chat', onError: () => ghostErrors++ });
+			const sends = calls.filter(call => call.command === 'sendLLMMessage');
+			assert.strictEqual(sends.length, 2);
+			const errorEmitter = emitters.get('onError_sendLLMMessage');
+			assert.ok(errorEmitter);
+			errorEmitter!.fire({ requestId: sends[0].params.requestId, message: 'ordinary raw error', fullError: null });
+			errorEmitter!.fire({ requestId: sends[1].params.requestId, message: 'private ghost raw error', fullError: new Error('private ghost raw error') });
+			assert.strictEqual(ordinaryErrors, 1);
+			assert.strictEqual(ghostErrors, 1);
+			assert.strictEqual(consoleErrors.length, 1);
+			assert.ok(JSON.stringify(consoleErrors[0]).includes('ordinary raw error'));
+			assert.strictEqual(JSON.stringify(consoleErrors).includes('private ghost raw error'), false);
+		}
+		finally {
+			console.error = originalConsoleError;
+			disposables.dispose();
+		}
+	});
+
 	test('only an armed explicit request dispatches; automatic triggers dispatch zero', async () => {
 		const f = fixture();
 		try {
@@ -153,6 +235,55 @@ suite('Void Ghost Chat manual gate', () => {
 			const range = f.results[0].items[0].range;
 			assert.strictEqual(range.startLineNumber, range.endLineNumber);
 			assert.strictEqual(range.startColumn, range.endColumn);
+		}
+		finally { f.disposables.dispose(); }
+	});
+
+	test('enabled automatic admission captures current provider state and dispatches once', async () => {
+		const f = fixture(1_000, false, true);
+		try {
+			const call = f.provider().provideInlineCompletions(f.model, f.editor.getPosition(), context(InlineCompletionTriggerKind.Automatic), CancellationToken.None);
+			assert.strictEqual(f.requests.length, 1);
+			f.requests[0].params.onFinalMessage({ fullText: 'bar', fullReasoning: '', anthropicReasoning: null });
+			const result = await call;
+			assert.strictEqual(result.items[0].insertText, 'bar');
+			assert.strictEqual(result.items[0].command.id, GHOST_CHAT_ACCEPT_COMMAND_ID);
+			assert.strictEqual(f.service.getDiagnosticsView().requestCount, 1);
+		}
+		finally { f.disposables.dispose(); }
+	});
+
+	test('each admitted automatic request aborts its predecessor once and stays max-one', async () => {
+		const f = fixture(1_000, false, true);
+		try {
+			const first = f.provider().provideInlineCompletions(f.model, f.editor.getPosition(), context(InlineCompletionTriggerKind.Automatic), CancellationToken.None);
+			const second = f.provider().provideInlineCompletions(f.model, f.editor.getPosition(), context(InlineCompletionTriggerKind.Automatic), CancellationToken.None);
+			assert.strictEqual(f.requests.length, 2);
+			assert.deepStrictEqual(f.aborts, ['request-1']);
+			f.requests[1].params.onFinalMessage({ fullText: 'new', fullReasoning: '', anthropicReasoning: null });
+			assert.deepStrictEqual((await first).items, []);
+			assert.strictEqual((await second).items[0].insertText, 'new');
+			const diagnostics = f.service.getDiagnosticsView();
+			assert.strictEqual(diagnostics.activeRequests, 0);
+			assert.strictEqual(diagnostics.maxConcurrentRequests, 1);
+			assert.strictEqual(diagnostics.abortCount, 1);
+		}
+		finally { f.disposables.dispose(); }
+	});
+
+	test('only the enabled-to-off setting transition hides and aborts automatic work', async () => {
+		const f = fixture(1_000, false, true);
+		try {
+			const call = f.provider().provideInlineCompletions(f.model, f.editor.getPosition(), context(InlineCompletionTriggerKind.Automatic), CancellationToken.None);
+			f.fireUnrelatedSettingsChange();
+			assert.deepStrictEqual(f.aborts, []);
+			f.setGhostChatEnabled(false);
+			assert.deepStrictEqual(f.aborts, ['request-1']);
+			assert.ok(f.commandIds.includes('editor.action.inlineSuggest.hide'));
+			assert.deepStrictEqual((await call).items, []);
+			const afterOff = await f.provider().provideInlineCompletions(f.model, f.editor.getPosition(), context(InlineCompletionTriggerKind.Automatic), CancellationToken.None);
+			assert.deepStrictEqual(afterOff.items, []);
+			assert.strictEqual(f.requests.length, 1);
 		}
 		finally { f.disposables.dispose(); }
 	});
@@ -260,6 +391,96 @@ suite('Void Ghost Chat manual gate', () => {
 		finally { f.disposables.dispose(); }
 	});
 
+	test('native show, rejection, free and post-edit command have distinct idempotent semantics', async () => {
+		const accepted = fixture();
+		const rejected = fixture();
+		try {
+			const acceptedCall = accepted.service.triggerManual();
+			await flushAsync();
+			accepted.requests[0].params.onFinalMessage({ fullText: 'accepted', fullReasoning: '', anthropicReasoning: null });
+			await acceptedCall;
+			const acceptedCompletions = accepted.results[0];
+			const acceptedItem = acceptedCompletions.items[0];
+			accepted.provider().handleItemDidShow(acceptedCompletions, acceptedItem, 'accepted');
+			accepted.provider().handleItemDidShow(acceptedCompletions, acceptedItem, 'accepted');
+			accepted.provider().freeInlineCompletions(acceptedCompletions);
+
+			// Native full acceptance applies the edit before invoking this internal command.
+			accepted.model.setValue('const value = fooaccepted;');
+			const acceptCommand = CommandsRegistry.getCommand(GHOST_CHAT_ACCEPT_COMMAND_ID);
+			assert.ok(acceptCommand);
+			const accessor = { get: () => accepted.service } as any;
+			acceptCommand!.handler(accessor, ...(acceptedItem.command.arguments ?? []));
+			acceptCommand!.handler(accessor, ...(acceptedItem.command.arguments ?? []));
+			assert.deepStrictEqual(
+				{ shown: accepted.service.getDiagnosticsView().shownCount, accepted: accepted.service.getDiagnosticsView().acceptedCount },
+				{ shown: 1, accepted: 1 },
+			);
+			assert.notStrictEqual(accepted.service.getDiagnosticsView().lastFirstSuggestionLatencyMs, null);
+			assert.ok(accepted.service.getDiagnosticsView().totalFirstSuggestionLatencyMs >= 0);
+			assert.ok(accepted.service.getDiagnosticsView().maxFirstSuggestionLatencyMs >= 0);
+
+			const rejectedCall = rejected.service.triggerManual();
+			await flushAsync();
+			rejected.requests[0].params.onFinalMessage({ fullText: 'rejected', fullReasoning: '', anthropicReasoning: null });
+			await rejectedCall;
+			const rejectedCompletions = rejected.results[0];
+			const rejectedItem = rejectedCompletions.items[0];
+			rejected.provider().handleItemDidShow(rejectedCompletions, rejectedItem, 'rejected');
+			rejected.provider().freeInlineCompletions(rejectedCompletions);
+			assert.strictEqual(rejected.service.getDiagnosticsView().acceptedCount, 0, 'free must not imply acceptance');
+			rejected.provider().handleRejection(rejectedCompletions, rejectedItem);
+			rejected.provider().handleRejection(rejectedCompletions, rejectedItem);
+			assert.strictEqual(rejected.service.getDiagnosticsView().rejectedCount, 1);
+		}
+		finally { accepted.disposables.dispose(); rejected.disposables.dispose(); }
+	});
+
+	test('diagnostics are frozen scalar-only copies and count empty, invalid, error and stale suppression', async () => {
+		const f = fixture();
+		try {
+			const emptyCall = f.service.triggerManual();
+			await flushAsync();
+			f.requests[0].params.onFinalMessage({ fullText: '', fullReasoning: '', anthropicReasoning: null });
+			await emptyCall;
+
+			const invalidCall = f.service.triggerManual();
+			await flushAsync();
+			f.requests[1].params.onFinalMessage({ fullText: 'one\ntwo', fullReasoning: '', anthropicReasoning: null });
+			await invalidCall;
+
+			const errorCall = f.service.triggerManual();
+			await flushAsync();
+			f.requests[2].params.onError({ message: 'private failure', fullError: new Error('private failure') });
+			await errorCall;
+
+			const staleCall = f.service.triggerManual();
+			await flushAsync();
+			f.editor.setPosition(new Position(1, 2));
+			await staleCall;
+			f.requests[3].params.onFinalMessage({ fullText: 'late private completion', fullReasoning: '', anthropicReasoning: null });
+
+			const view = f.service.getDiagnosticsView();
+			assert.strictEqual(Object.isFrozen(view), true);
+			assert.strictEqual(view.requestCount, 4);
+			assert.strictEqual(view.emptyCount, 1);
+			assert.strictEqual(view.invalidCount, 1);
+			assert.strictEqual(view.errorCount, 1);
+			assert.strictEqual(view.staleSuppressedCount, 1);
+			assert.strictEqual(view.staleDisplayedCount, 0);
+			assert.strictEqual(view.retryCount, 0);
+			assert.strictEqual(view.activeRequests, 0);
+			assert.strictEqual(view.maxConcurrentRequests, 1);
+			assert.ok(view.requestBytes > 0);
+			assert.strictEqual(view.estimatedRequestTokens, Math.ceil(view.requestBytes / 4));
+			assert.strictEqual(view.cancelToTransportCloseMs, null);
+			assert.ok(Object.values(view).every(value => value === null || typeof value === 'number'), 'diagnostics must contain no prompt, completion, URI, error, or other string');
+			assert.notStrictEqual(view, f.service.getDiagnosticsView());
+			assert.throws(() => { (view as any).requestCount = 99; });
+		}
+		finally { f.disposables.dispose(); }
+	});
+
 	test('cancellation before request id is latched and aborts the late id once', async () => {
 		const f = fixture();
 		try {
@@ -327,6 +548,8 @@ suite('Void Ghost Chat manual gate', () => {
 			await f.service.triggerManual();
 			assert.deepStrictEqual(f.aborts, ['request-1']);
 			assert.deepStrictEqual(f.results[0].items, []);
+			assert.strictEqual(f.service.getDiagnosticsView().timeoutCount, 1);
+			assert.strictEqual(f.service.getDiagnosticsView().abortCount, 1);
 		}
 		finally { f.disposables.dispose(); }
 	});

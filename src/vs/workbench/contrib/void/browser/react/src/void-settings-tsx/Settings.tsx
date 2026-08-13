@@ -1312,6 +1312,21 @@ export const Settings = () => {
 											<div className='text-sm text-void-fg-3 mt-1'>{`Settings that control the visibility of Void suggestions in the code editor.`}</div>
 
 											<div className='my-2'>
+												<ErrorBoundary>
+													<div className='flex items-start gap-x-2 my-2'>
+														<VoidSwitch
+															ariaLabel="Enable Ghost Chat code suggestions"
+															size='xs'
+															value={settingsState.globalSettings.enableGhostChat}
+															onChange={(newVal) => voidSettingsService.setGlobalSetting('enableGhostChat', newVal)}
+														/>
+														<div>
+															<div className='text-void-fg-3 text-xs pointer-events-none'>Enable Ghost Chat code suggestions</div>
+															<div className='text-void-fg-3 text-xs mt-1 pointer-events-none'>Uses the configured OpenAI-Compatible endpoint with wire gpt-4.1 and inserts the full suggestion with Tab.</div>
+														</div>
+													</div>
+												</ErrorBoundary>
+
 												{/* Auto Accept Switch */}
 												<ErrorBoundary>
 													<div className='flex items-center gap-x-2 my-2'>

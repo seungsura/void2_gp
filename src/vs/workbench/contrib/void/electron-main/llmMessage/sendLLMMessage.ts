@@ -35,10 +35,11 @@ export const sendLLMMessage = async ({
 
 
 	const { providerName, modelName } = modelSelection
+	const isGhostChatRequest = requestProfile === 'ghost-chat'
 
 	// only captures number of messages and message "shape", no actual code, instructions, prompts, etc
 	const captureLLMEvent = (eventId: string, extras?: object) => {
-
+		if (isGhostChatRequest) return
 
 		metricsService.capture(eventId, {
 			providerName,
@@ -80,7 +81,7 @@ export const sendLLMMessage = async ({
 
 	const onError: OnError = ({ message: errorMessage, fullError }) => {
 		if (_didAbort) return
-		console.error('sendLLMMessage onError:', errorMessage)
+		if (!isGhostChatRequest) console.error('sendLLMMessage onError:', errorMessage)
 
 		// handle failed to fetch errors, which give 0 information by design
 		if (errorMessage === 'TypeError: fetch failed')

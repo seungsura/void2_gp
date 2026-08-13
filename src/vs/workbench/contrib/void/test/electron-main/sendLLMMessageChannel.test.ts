@@ -63,6 +63,30 @@ suite('Void LLM message channel lifecycle', () => {
 		} finally { implementation.sendChat = original; }
 	});
 
+	test('ghost wrapper emits no external metrics or raw console error while preserving its error callback', async () => {
+		const implementation = sendLLMMessageToProviderImplementation.openAICompatible; const original = implementation.sendChat;
+		const captured: any[] = []; const consoleErrors: unknown[][] = []; let callbackMessage = '';
+		const originalConsoleError = console.error;
+		implementation.sendChat = async options => { options.onError({ message: 'raw private ghost failure', fullError: new Error('raw private ghost failure') }); };
+		console.error = (...args: unknown[]) => { consoleErrors.push(args); };
+		try {
+			await sendLLMMessage({
+				...ghostParams('private-error'),
+				abortRef: { current: null },
+				onText: () => { },
+				onFinalMessage: () => assert.fail('unexpected final'),
+				onError: ({ message }: { message: string }) => callbackMessage = message,
+			} as any, { capture: (event: string, values: any) => captured.push({ event, values }) } as any);
+			assert.strictEqual(callbackMessage, 'raw private ghost failure');
+			assert.deepStrictEqual(captured, []);
+			assert.deepStrictEqual(consoleErrors, []);
+		}
+		finally {
+			console.error = originalConsoleError;
+			implementation.sendChat = original;
+		}
+	});
+
 	test('ghost-chat profile fails closed on provider or model mismatch before dispatch', async () => {
 		const implementation = sendLLMMessageToProviderImplementation.openAICompatible; const original = implementation.sendChat;
 		let dispatches = 0;

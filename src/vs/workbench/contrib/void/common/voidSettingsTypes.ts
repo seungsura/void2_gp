@@ -443,6 +443,7 @@ export type GlobalSettings = {
 	autoRefreshModels: boolean;
 	aiInstructions: string;
 	enableAutocomplete: boolean;
+	enableGhostChat: boolean;
 	syncApplyToChat: boolean;
 	syncSCMToChat: boolean;
 	enableFastApply: boolean;
@@ -460,6 +461,7 @@ export const defaultGlobalSettings: GlobalSettings = {
 	autoRefreshModels: true,
 	aiInstructions: '',
 	enableAutocomplete: false,
+	enableGhostChat: false,
 	syncApplyToChat: true,
 	syncSCMToChat: true,
 	enableFastApply: true,

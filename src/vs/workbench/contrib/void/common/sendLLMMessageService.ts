@@ -43,6 +43,7 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 		onError: {} as { [eventId: string]: ((params: EventLLMMessageOnErrorParams) => void) },
 		onAbort: {} as { [eventId: string]: (() => void) }, // NOT sent over the channel, result is instant when we call .abort()
 	}
+	private readonly suppressErrorLogOfRequestId: { [requestId: string]: true | undefined } = {}
 
 	// list hooks
 	private readonly listHooks = {
@@ -83,9 +84,10 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 			this._clearChannelHooks(e.requestId)
 		}))
 		this._register((this.channel.listen('onError_sendLLMMessage') satisfies Event<EventLLMMessageOnErrorParams>)(e => {
+			const suppressErrorLog = this.suppressErrorLogOfRequestId[e.requestId] === true;
 			this.llmMessageHooks.onError[e.requestId]?.(e);
 			this._clearChannelHooks(e.requestId);
-			console.error('Error in LLMMessageService:', JSON.stringify(e))
+			if (!suppressErrorLog) console.error('Error in LLMMessageService:', JSON.stringify(e))
 		}))
 		// .list()
 		this._register((this.channel.listen('onSuccess_list_ollama') satisfies Event<EventModelListOnSuccessParams<OllamaModelResponse>>)(e => {
@@ -134,6 +136,7 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 		this.llmMessageHooks.onFinalMessage[requestId] = onFinalMessage
 		this.llmMessageHooks.onError[requestId] = onError
 		this.llmMessageHooks.onAbort[requestId] = onAbort // used internally only
+		if (params.requestProfile === 'ghost-chat') this.suppressErrorLogOfRequestId[requestId] = true
 
 		// params will be stripped of all its functions over the IPC channel
 		this.channel.call('sendLLMMessage', {
@@ -199,6 +202,7 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 		delete this.llmMessageHooks.onFinalMessage[requestId]
 		delete this.llmMessageHooks.onError[requestId]
 		delete this.llmMessageHooks.onAbort[requestId]
+		delete this.suppressErrorLogOfRequestId[requestId]
 
 		delete this.listHooks.ollama.success[requestId]
 		delete this.listHooks.ollama.error[requestId]
