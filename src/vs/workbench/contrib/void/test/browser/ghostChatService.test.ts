@@ -11,7 +11,9 @@ import { Selection } from '../../../../../editor/common/core/selection.js';
 import { InlineCompletionContext, InlineCompletionTriggerKind } from '../../../../../editor/common/languages.js';
 import { createTextModel } from '../../../../../editor/test/common/testTextModel.js';
 import { CommandsRegistry } from '../../../../../platform/commands/common/commands.js';
-import { buildGhostChatPrompt, captureGhostChatSnapshot, GHOST_CHAT_ACCEPT_COMMAND_ID, GHOST_CHAT_DEBOUNCE_DELAY_MS, GHOST_CHAT_LIFECYCLE_RECORD_LIMIT, GhostChatService, isGhostChatDevelopmentEnvironment, isGhostChatSnapshotCurrent, validateGhostChatInsertion } from '../../browser/ghostChatService.js';
+import { _util } from '../../../../../platform/instantiation/common/instantiation.js';
+import { WorkbenchContributionsRegistry, WorkbenchPhase } from '../../../../common/contributions.js';
+import { buildGhostChatPrompt, captureGhostChatSnapshot, GHOST_CHAT_ACCEPT_COMMAND_ID, GHOST_CHAT_DEBOUNCE_DELAY_MS, GHOST_CHAT_LIFECYCLE_RECORD_LIMIT, GhostChatService, GhostChatStartupContribution, IGhostChatService, isGhostChatDevelopmentEnvironment, isGhostChatSnapshotCurrent, validateGhostChatInsertion } from '../../browser/ghostChatService.js';
 import { LLMMessageService } from '../../common/sendLLMMessageService.js';
 import { defaultGlobalSettings } from '../../common/voidSettingsTypes.js';
 
@@ -138,6 +140,22 @@ const flushAsync = async () => {
 };
 
 suite('Void Ghost Chat manual gate', () => {
+	test('startup contribution consumes the singleton at BlockRestore', () => {
+		const registry = WorkbenchContributionsRegistry.INSTANCE as unknown as {
+			contributionsByPhase: Map<WorkbenchPhase, Array<{ id: string | undefined; ctor: unknown }>>;
+		};
+		const registration = registry.contributionsByPhase
+			.get(WorkbenchPhase.BlockRestore)
+			?.find(candidate => candidate.id === GhostChatStartupContribution.ID);
+		assert.ok(registration);
+		assert.strictEqual(registration.ctor, GhostChatStartupContribution);
+
+		const dependencies = _util.getServiceDependencies(GhostChatStartupContribution);
+		assert.strictEqual(dependencies.length, 1);
+		assert.strictEqual(dependencies[0].id, IGhostChatService);
+		assert.strictEqual(dependencies[0].index, 0);
+	});
+
 	test('Ghost Chat is separately default-off and the provider owns the exact native debounce', () => {
 		const f = fixture();
 		try {

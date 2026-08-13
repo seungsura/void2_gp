@@ -22,6 +22,7 @@ import { IsDevelopmentContext } from '../../../../platform/contextkey/common/con
 import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
 import { createDecorator, ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
+import { IWorkbenchContribution, registerWorkbenchContribution2, WorkbenchPhase } from '../../../common/contributions.js';
 import { ILLMMessageService } from '../common/sendLLMMessageService.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
 
@@ -582,7 +583,14 @@ export class GhostChatService extends Disposable implements IGhostChatService {
 	}
 }
 
+export class GhostChatStartupContribution implements IWorkbenchContribution {
+	static readonly ID = 'workbench.contrib.void.ghostChatStartup';
+
+	constructor(@IGhostChatService _ghostChatService: IGhostChatService) { }
+}
+
 registerSingleton(IGhostChatService, GhostChatService, InstantiationType.Eager);
+registerWorkbenchContribution2(GhostChatStartupContribution.ID, GhostChatStartupContribution, WorkbenchPhase.BlockRestore);
 
 CommandsRegistry.registerCommand(GHOST_CHAT_ACCEPT_COMMAND_ID, (accessor, generation: unknown) => {
 	if (typeof generation !== 'number' || !Number.isSafeInteger(generation) || generation < 0) return;
