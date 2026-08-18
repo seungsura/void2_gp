@@ -23,6 +23,7 @@ import { MCPServer } from '../../../../common/mcpServiceTypes.js';
 import { useMCPServiceState } from '../util/services.js';
 import { OPT_OUT_KEY } from '../../../../common/storageKeys.js';
 import { StorageScope, StorageTarget } from '../../../../../../../platform/storage/common/storage.js';
+import { isGhostChatDevelopmentEnvironment, isSelectionHelperDevelopmentEnvironment } from '../../../../common/automaticSuggestionEnvironment.js';
 
 type Tab =
 	| 'models'
@@ -1054,6 +1055,8 @@ export const Settings = () => {
 	const accessor = useAccessor()
 	const commandService = accessor.get('ICommandService')
 	const environmentService = accessor.get('IEnvironmentService')
+	const showGhostChatSetting = isGhostChatDevelopmentEnvironment(environmentService)
+	const showSelectionHelperSetting = isSelectionHelperDevelopmentEnvironment(environmentService)
 	const nativeHostService = accessor.get('INativeHostService')
 	const settingsState = useSettingsState()
 	const voidSettingsService = accessor.get('IVoidSettingsService')
@@ -1312,7 +1315,7 @@ export const Settings = () => {
 											<div className='text-sm text-void-fg-3 mt-1'>{`Settings that control the visibility of Void suggestions in the code editor.`}</div>
 
 											<div className='my-2'>
-												<ErrorBoundary>
+												{showGhostChatSetting && <ErrorBoundary>
 													<div className='flex items-start gap-x-2 my-2'>
 														<VoidSwitch
 															ariaLabel="Enable Ghost Chat code suggestions"
@@ -1325,10 +1328,10 @@ export const Settings = () => {
 															<div className='text-void-fg-3 text-xs mt-1 pointer-events-none'>Uses the configured OpenAI-Compatible endpoint with wire gpt-4.1 and inserts the full suggestion with Tab.</div>
 														</div>
 													</div>
-												</ErrorBoundary>
+												</ErrorBoundary>}
 
 												{/* Auto Accept Switch */}
-												<ErrorBoundary>
+												{showSelectionHelperSetting && <ErrorBoundary>
 													<div className='flex items-center gap-x-2 my-2'>
 														<VoidSwitch
 															ariaLabel="Show suggestions on select"
@@ -1338,7 +1341,7 @@ export const Settings = () => {
 														/>
 														<span className='text-void-fg-3 text-xs pointer-events-none'>{settingsState.globalSettings.showInlineSuggestions ? 'Show suggestions on select' : 'Show suggestions on select'}</span>
 													</div>
-												</ErrorBoundary>
+												</ErrorBoundary>}
 											</div>
 										</div>
 

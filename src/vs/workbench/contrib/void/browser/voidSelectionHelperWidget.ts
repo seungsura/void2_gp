@@ -13,7 +13,9 @@ import { RunOnceScheduler } from '../../../../base/common/async.js';
 import * as dom from '../../../../base/browser/dom.js';
 import { mountVoidSelectionHelper } from './react/out/void-editor-widgets-tsx/index.js';
 import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
+import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
+import { isSelectionHelperDevelopmentEnvironment } from '../common/automaticSuggestionEnvironment.js';
 import { EditorOption } from '../../../../editor/common/config/editorOptions.js';
 import { getLengthOfTextPx } from './editCodeService.js';
 
@@ -30,22 +32,24 @@ export type VoidSelectionHelperProps = {
 export class SelectionHelperContribution extends Disposable implements IEditorContribution, IOverlayWidget {
 	public static readonly ID = 'editor.contrib.voidSelectionHelper';
 	// react
-	private _rootHTML: HTMLElement;
+	private _rootHTML: HTMLElement | undefined;
 	private _rerender: (props?: any) => void = () => { };
 	private _rerenderKey: number = 0;
 	private _reactComponentDisposable: IDisposable | null = null;
 
 	// internal
 	private _isVisible = false;
-	private _showScheduler: RunOnceScheduler;
+	private _showScheduler: RunOnceScheduler | undefined;
 	private _lastSelection: Selection | null = null;
 
 	constructor(
 		private readonly _editor: ICodeEditor,
 		@IInstantiationService private readonly _instantiationService: IInstantiationService,
-		@IVoidSettingsService private readonly _voidSettingsService: IVoidSettingsService
+		@IVoidSettingsService private readonly _voidSettingsService: IVoidSettingsService,
+		@IEnvironmentService environmentService: IEnvironmentService,
 	) {
 		super();
+		if (!isSelectionHelperDevelopmentEnvironment(environmentService)) return;
 
 		// Create the container element for React component
 		const { root, content } = dom.h('div@root', [
@@ -115,7 +119,7 @@ export class SelectionHelperContribution extends Disposable implements IEditorCo
 	}
 
 	public getDomNode(): HTMLElement {
-		return this._rootHTML;
+		return this._rootHTML!;
 	}
 
 	public getPosition(): IOverlayWidgetPosition | null {
@@ -153,12 +157,13 @@ export class SelectionHelperContribution extends Disposable implements IEditorCo
 			selection.endColumn
 		);
 
-		this._showScheduler.schedule();
+		this._showScheduler?.schedule();
 	}
 
 	// Update the _showHelperForSelection method to work with the React component
 	private _showHelperForSelection(selection: Selection): void {
-		if (!this._editor.hasModel()) {
+		const rootHTML = this._rootHTML;
+		if (!rootHTML || !this._editor.hasModel()) {
 			return;
 		}
 
@@ -235,9 +240,9 @@ export class SelectionHelperContribution extends Disposable implements IEditorCo
 		const yPosition = boxPos.top;
 
 		// Update the React component position
-		this._rootHTML.style.left = `${xPosition}px`;
-		this._rootHTML.style.top = `${yPosition}px`;
-		this._rootHTML.style.display = 'flex'; // Show the container
+		rootHTML.style.left = `${xPosition}px`;
+		rootHTML.style.top = `${yPosition}px`;
+		rootHTML.style.display = 'flex'; // Show the container
 
 		this._isVisible = true;
 
@@ -254,7 +259,7 @@ export class SelectionHelperContribution extends Disposable implements IEditorCo
 	}
 
 	private _hideHelper(): void {
-		this._rootHTML.style.display = 'none';
+		if (this._rootHTML) this._rootHTML.style.display = 'none';
 		this._isVisible = false;
 		this._lastSelection = null;
 	}
@@ -272,8 +277,8 @@ export class SelectionHelperContribution extends Disposable implements IEditorCo
 		if (this._reactComponentDisposable) {
 			this._reactComponentDisposable.dispose();
 		}
-		this._editor.removeOverlayWidget(this);
-		this._showScheduler.dispose();
+		if (this._rootHTML) this._editor.removeOverlayWidget(this);
+		this._showScheduler?.dispose();
 		super.dispose();
 	}
 }

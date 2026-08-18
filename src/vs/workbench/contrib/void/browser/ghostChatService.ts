@@ -25,6 +25,9 @@ import { createDecorator, ServicesAccessor } from '../../../../platform/instanti
 import { IWorkbenchContribution, registerWorkbenchContribution2, WorkbenchPhase } from '../../../common/contributions.js';
 import { ILLMMessageService } from '../common/sendLLMMessageService.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
+import { isGhostChatDevelopmentEnvironment } from '../common/automaticSuggestionEnvironment.js';
+
+export { isGhostChatDevelopmentEnvironment } from '../common/automaticSuggestionEnvironment.js';
 
 export const GHOST_CHAT_COMMAND_ID = 'void.ghostChat.generateInternal';
 export const GHOST_CHAT_ACCEPT_COMMAND_ID = 'void.ghostChat.acceptInternal';
@@ -34,7 +37,6 @@ export const GHOST_CHAT_INSERT_MAX_CHARS = 1_000;
 export const GHOST_CHAT_TIMEOUT_MS = 15_000;
 export const GHOST_CHAT_DEBOUNCE_DELAY_MS = 750;
 export const GHOST_CHAT_LIFECYCLE_RECORD_LIMIT = 64;
-export const isGhostChatDevelopmentEnvironment = (environment: Pick<IEnvironmentService, 'isBuilt' | 'isExtensionDevelopment'>): boolean => !environment.isBuilt || !!environment.isExtensionDevelopment;
 
 const INLINE_SUGGEST_TRIGGER_COMMAND_ID = 'editor.action.inlineSuggest.trigger';
 const INLINE_SUGGEST_HIDE_COMMAND_ID = 'editor.action.inlineSuggest.hide';
@@ -231,6 +233,7 @@ export class GhostChatService extends Disposable implements IGhostChatService {
 	private timeoutMs = GHOST_CHAT_TIMEOUT_MS;
 	private didDispose = false;
 	private ghostChatEnabled: boolean;
+	private readonly automaticEnvironmentEnabled: boolean;
 	private readonly lifecycleRecords = new Map<number, GhostChatLifecycleRecord>();
 	private readonly lifecycleOrder: number[] = [];
 	private readonly diagnostics = {
@@ -258,9 +261,11 @@ export class GhostChatService extends Disposable implements IGhostChatService {
 		@ICodeEditorService private readonly codeEditorService: ICodeEditorService,
 		@ICommandService private readonly commandService: ICommandService,
 		@IVoidSettingsService private readonly voidSettingsService: IVoidSettingsService,
+		@IEnvironmentService environmentService: IEnvironmentService,
 	) {
 		super();
-		this.ghostChatEnabled = !!this.voidSettingsService.state.globalSettings.enableGhostChat;
+		this.automaticEnvironmentEnabled = isGhostChatDevelopmentEnvironment(environmentService);
+		this.ghostChatEnabled = this.automaticEnvironmentEnabled && !!this.voidSettingsService.state.globalSettings.enableGhostChat;
 		const thisService = this;
 		const provider: InlineCompletionsProvider<GhostChatInlineCompletions> = {
 			get debounceDelayMs(): number | undefined { return thisService.ghostChatEnabled ? GHOST_CHAT_DEBOUNCE_DELAY_MS : undefined; },
@@ -273,7 +278,7 @@ export class GhostChatService extends Disposable implements IGhostChatService {
 		this._register(languageFeaturesService.inlineCompletionsProvider.register('*', provider));
 		this._register(this.voidSettingsService.onDidChangeState(() => {
 			const wasEnabled = this.ghostChatEnabled;
-			this.ghostChatEnabled = !!this.voidSettingsService.state.globalSettings.enableGhostChat;
+			this.ghostChatEnabled = this.automaticEnvironmentEnabled && !!this.voidSettingsService.state.globalSettings.enableGhostChat;
 			if (!wasEnabled || this.ghostChatEnabled) return;
 			this.invalidateActive();
 			void this.commandService.executeCommand(INLINE_SUGGEST_HIDE_COMMAND_ID).then(undefined, () => { });

@@ -25,8 +25,6 @@ Expand-Archive .\Void-*-win32-x64-portable.zip .\Void-portable
 
 조직 또는 서비스가 제공한 정확한 endpoint와 model 이름을 사용하세요. OpenAI-compatible provider는 기본 model 목록이 비어 있어 model을 직접 추가해야 할 수 있습니다. 화면에 설정한 model 이름과 실제 service route가 같다고 가정하지 말고, 첫 대화와 도구 호출 결과를 확인한 뒤 중요한 파일 작업을 시작하세요.
 
-Ghost Chat을 사용할 계획이라면 같은 OpenAI-Compatible provider에 exact custom model `gpt-4.1`을 추가하세요. Ghost Chat은 current Chat model 선택을 상속하지 않고 fixed wire `gpt-4.1`을 요구합니다.
-
 자동 retry나 다른 chat mode로의 묵시적 전환을 기대하지 마세요. 연결 오류가 나면 표시된 진단 단계와 provider/model 설정을 기록하고, 같은 요청을 반복하기 전에 원인을 확인하세요.
 
 ## 4. Agent instructions를 작은 workspace에서 확인
@@ -35,11 +33,11 @@ Ghost Chat을 사용할 계획이라면 같은 OpenAI-Compatible provider에 exa
 
 지원 경로와 precedence, top-level turn reload, Skill selector, custom role과 4 accepted·2 running·FIFO read-only child 경계는 [Agent instructions 안내](guides/agent-instructions-guide.md)를 먼저 읽으세요. 이어 [직접 테스트 프롬프트](prompts/agent-instructions-test-prompts.md)에서 AGENTS next-turn reload, Skill admission/resource, named `@Agent`, targeted `wait_agent`/`interrupt_agent`, bounded Child Run과 current Chat UI를 작은 fixture로 관찰하세요.
 
-## 5. Ghost Chat을 선택적으로 켜기
+## 5. Production editor suggestion 상태 확인
 
-Ghost Chat은 기본값이 off입니다. 사용하려면 **Settings > Feature Options > Editor**에서 **Enable Ghost Chat code suggestions**를 켜세요. Writable editor에서 한 empty caret를 두고 typing을 멈추면 750ms idle 뒤 automatic request가 admit됩니다. Tab은 full suggestion을 수용하고 Escape는 거부합니다. 새 edit, caret/selection 이동 또는 toggle-off는 active request를 취소하고 stale result를 숨깁니다.
+Built production Settings에는 **Enable Ghost Chat code suggestions**와 **Show suggestions on select**가 표시되지 않습니다. 이전 portable의 profile에 해당 setting이 `true`로 남아 있어도 무시되며 automatic Ghost request, Ghost debounce와 selection helper widget은 사용할 수 없습니다.
 
-먼저 [Ghost Chat 안내](guides/ghost-chat-guide.md)를 읽고 disposable file에서 [직접 테스트 프롬프트](prompts/ghost-chat-test-prompts.md)를 실행하세요. 750ms는 debounce일 뿐 total latency 보장이 아닙니다. Partial acceptance, cache, automatic retry와 legacy FIM fallback은 없습니다.
+이 비활성 경계는 Chat sidebar, Quick Edit와 Agent에 적용되지 않습니다. [Ghost Chat 안내](guides/ghost-chat-guide.md)를 읽고 [production 확인 프롬프트](prompts/ghost-chat-test-prompts.md)로 설정 부재와 zero automatic behavior만 확인하세요.
 
 ## 6. 파일 도구를 검토하며 사용
 
@@ -49,4 +47,4 @@ Ghost Chat은 기본값이 off입니다. 사용하려면 **Settings > Feature Op
 4. 승인한 뒤 실제 파일 결과를 다시 읽습니다. 예상과 다르면 Undo로 되돌리고 원인을 확인합니다.
 5. 큰 파일과 중요한 파일은 안내서의 탐색적 prompt로 작은 사례부터 검증합니다.
 
-현재 배포본의 실제 provider/network/UI 전체 E2E, automatic Ghost Chat의 환경별 동작과 `read_file` 성능은 별도 관찰 대상입니다. focused tests, build와 artifact smoke 성공을 사용 환경의 provider 검증이나 성능 증명으로 확대 해석하지 마세요.
+현재 배포본의 실제 provider/network/UI 전체 E2E와 `read_file` 성능은 별도 관찰 대상입니다. focused tests, build와 artifact smoke 성공을 사용 환경의 provider 검증이나 성능 증명으로 확대 해석하지 마세요.

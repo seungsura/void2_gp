@@ -8,8 +8,8 @@
 - `SHA256SUMS.txt`: assembler가 placeholder 치환 뒤 생성하는 manifest
 - `guides/write-tool-guide.md`, `guides/read-tool-guide.md`: 파일 도구 계약과 안전 경계
 - `guides/agent-instructions-guide.md`: `AGENTS.md`, config, Skills, custom agents와 bounded read-only subagent 사용 안내
-- `guides/ghost-chat-guide.md`: default-off Ghost Chat 설정, 자동 제안, 수용과 취소 경계
-- `prompts/write-tool-test-prompts.md`, `prompts/read-tool-test-prompts.md`, `prompts/agent-instructions-test-prompts.md`, `prompts/ghost-chat-test-prompts.md`: 탐색적 제품 테스트 절차
+- `guides/ghost-chat-guide.md`: production Ghost Chat과 selection helper 비활성 상태 및 영향받지 않는 기능
+- `prompts/write-tool-test-prompts.md`, `prompts/read-tool-test-prompts.md`, `prompts/agent-instructions-test-prompts.md`, `prompts/ghost-chat-test-prompts.md`: 탐색적 제품 테스트와 production suggestion 부재 확인 절차
 
 portable ZIP 자체의 `docs/`에도 시작 안내, current-only release notes와 위 guide/prompt의 동일한 bytes가 들어 있습니다. release notes는 누적 내부 이력이 아니라 해당 portable에서 shipped되는 현재 동작만 설명합니다.
 
@@ -41,9 +41,9 @@ focused tests, compile·React·Windows build와 visible artifact smoke는 actual
 
 ## Ghost Chat
 
-Ghost Chat은 OpenAI-Compatible endpoint에 custom `gpt-4.1` model을 설정한 뒤 **Settings > Feature Options > Editor**의 **Enable Ghost Chat code suggestions**에서 켭니다. 기본값은 off입니다. On 상태에서 writable editor의 empty caret가 750ms idle이면 automatic request를 admit하고, active request는 최대 하나입니다. Tab은 full suggestion을 한 번 수용하고 Escape는 문서를 바꾸지 않고 거부합니다. Edit, caret/selection 변경과 toggle-off는 active request를 취소하고 stale result를 숨깁니다.
+현재 built production에서는 **production automatic suggestions are unavailable**입니다. Settings는 **Enable Ghost Chat code suggestions**와 **Show suggestions on select**를 모두 표시하지 않습니다. 이전 profile에 두 setting의 `true` 값이 남아 있어도 무시되며 automatic Ghost request, Ghost debounce와 selection helper widget은 활성화되지 않습니다.
 
-이 request는 `/chat/completions`, wire `gpt-4.1`, reasoning `none`으로 고정되며 결과는 bounded one-line plain insertion입니다. Partial acceptance, cache와 automatic retry는 없고 legacy FIM 또는 `/completions`를 다시 사용하지 않습니다. 설정·취소·수용 절차와 검증 한계는 `guides/ghost-chat-guide.md`, 실제 관찰 순서는 `prompts/ghost-chat-test-prompts.md`를 확인하세요.
+이 변경은 Chat sidebar, Quick Edit와 Agent 기능을 비활성화하지 않습니다. Production에서 두 설정과 자동 editor suggestion이 나타나지 않는지 확인하려면 `guides/ghost-chat-guide.md`와 `prompts/ghost-chat-test-prompts.md`를 사용하세요. Legacy FIM `/completions` retirement도 그대로 유지됩니다.
 
 ## OpenAI-compatible file tool contract
 
@@ -59,7 +59,7 @@ OpenAI-compatible Agent의 `write_file`은 root `type: object`, `create`/`modify
 
 ## 확인된 범위와 남은 경계
 
-focused schema/planner/diagnostic, Agent orchestration과 Ghost Chat source tests는 현재 계약을 확인하지만 전체 actual-provider/UI E2E를 대신하지 않습니다. 현재 source의 Ghost Chat core 관찰에서는 toggle-off 요청 0건, toggle-on physical typing 뒤 약 815ms와 824ms의 admission, exact wire profile, native ghost text, Tab 한 번 삽입과 Undo 복원이 확인됐습니다. 이 두 timing은 성능 보장이 아닙니다. Max-one과 toggle-off cancellation은 focused tests를 통과했지만 actual-product follow-on 관찰은 아직 완료되지 않았습니다.
+focused schema/planner/diagnostic, Agent orchestration과 production suggestion admission tests는 현재 source 계약을 확인하지만 전체 actual-provider/UI E2E를 대신하지 않습니다. Built production에서는 persisted setting 값과 관계없이 automatic Ghost request와 selection helper UI가 0이어야 합니다.
 
 실제 chat/provider request, 승인 UI, create/modify 적용과 Undo, AGENTS/Skill/custom-agent/subagent 동작은 동봉 prompt를 사용해 확인하세요. `read_file`의 실제 provider/UI E2E와 read performance/closed-file streaming gate도 미검증입니다.
 

@@ -24,7 +24,7 @@ const context = (triggerKind: InlineCompletionTriggerKind): InlineCompletionCont
 	includeInlineCompletions: true,
 });
 
-const fixture = (timeoutMs = 1_000, initialReadOnly = false, initialGhostChatEnabled = false) => {
+const fixture = (timeoutMs = 1_000, initialReadOnly = false, initialGhostChatEnabled = false, environment = { isBuilt: false, isExtensionDevelopment: false }) => {
 	const disposables = new DisposableStore();
 	const model = disposables.add(createTextModel('const value = foo;', 'typescript'));
 	let position = new Position(1, model.getLineMaxColumn(1) - 1);
@@ -111,7 +111,7 @@ const fixture = (timeoutMs = 1_000, initialReadOnly = false, initialGhostChatEna
 		state: { globalSettings: { enableGhostChat: initialGhostChatEnabled } },
 		onDidChangeState: settingsEmitter.event,
 	};
-	const service = disposables.add(new GhostChatService(languageFeatures as any, llm as any, codeEditors as any, commands as any, settings as any));
+	const service = disposables.add(new GhostChatService(languageFeatures as any, llm as any, codeEditors as any, commands as any, settings as any, environment as any));
 	(service as any).timeoutMs = timeoutMs;
 
 	return {
@@ -167,6 +167,25 @@ suite('Void Ghost Chat manual gate', () => {
 			assert.strictEqual(f.provider().debounceDelayMs, undefined);
 			assert.strictEqual(GHOST_CHAT_DEBOUNCE_DELAY_MS, 750);
 			assert.strictEqual(GHOST_CHAT_LIFECYCLE_RECORD_LIMIT, 64);
+		}
+		finally { f.disposables.dispose(); }
+	});
+
+	test('built production ignores persisted Ghost enable before debounce, automatic request and widget diagnostics', async () => {
+		const f = fixture(1_000, false, true, { isBuilt: true, isExtensionDevelopment: false });
+		try {
+			assert.strictEqual(f.provider().debounceDelayMs, undefined);
+			const result = await f.provider().provideInlineCompletions(f.model, f.editor.getPosition(), context(InlineCompletionTriggerKind.Automatic), CancellationToken.None);
+			assert.deepStrictEqual(result.items, []);
+			assert.strictEqual(f.requests.length, 0);
+			assert.strictEqual(f.results.length, 0);
+			assert.strictEqual(f.commandIds.length, 0);
+			assert.deepStrictEqual(
+				{ requests: f.service.getDiagnosticsView().requestCount, shown: f.service.getDiagnosticsView().shownCount },
+				{ requests: 0, shown: 0 },
+			);
+			f.fireUnrelatedSettingsChange();
+			assert.strictEqual(f.provider().debounceDelayMs, undefined);
 		}
 		finally { f.disposables.dispose(); }
 	});

@@ -37,11 +37,10 @@ OpenAI-compatible Agent의 flat tool schema는 conditional composition에 의존
 
 ## Ghost Chat code suggestions
 
-- OpenAI-Compatible endpoint에 exact custom `gpt-4.1`을 설정하고 **Settings > Feature Options > Editor**에서 켭니다. Toggle 기본값은 off입니다.
-- Request-local profile은 fixed `/chat/completions`, wire `gpt-4.1`, reasoning `none`이며 tool이나 child delegation을 사용하지 않습니다.
-- Writable editor의 empty caret에서 qualifying edit 뒤 750ms idle이면 automatic request를 admit합니다. Active request는 최대 하나입니다.
-- Tab은 bounded one-line suggestion 전체를 한 번 수용하고 Escape는 문서를 바꾸지 않고 거부합니다. Edit, caret/selection 변경과 toggle-off는 active request를 취소하고 stale result를 숨깁니다.
-- Partial acceptance, cache, automatic retry와 legacy FIM `/completions` fallback은 없습니다.
+- Built production Settings는 **Enable Ghost Chat code suggestions**와 **Show suggestions on select**를 표시하지 않습니다.
+- 이전 profile에 persisted `true`가 남아 있어도 automatic Ghost request, Ghost debounce와 selection helper widget은 활성화되지 않습니다.
+- **production automatic suggestions are unavailable**이며 legacy FIM `/completions` retirement도 유지됩니다.
+- Chat sidebar, Quick Edit와 Agent는 이 비활성 경계의 영향을 받지 않습니다.
 
 ## Portable package contract
 
@@ -52,6 +51,4 @@ OpenAI-compatible Agent의 flat tool schema는 conditional composition에 의존
 
 ## 확인된 범위와 남은 관찰
 
-Focused schema/planner/service/UI tests는 위 source 계약을 확인합니다. 현재 source의 Ghost Chat core actual-product 관찰에서는 toggle-off 요청 0건, toggle-on physical typing 뒤 약 815ms와 824ms의 admission, exact wire profile, native ghost text, Tab 한 번 삽입과 Undo 복원이 확인됐습니다. 두 timing은 성능 보장이 아닙니다.
-
-Ghost Chat max-one overlap과 toggle-off cancellation은 focused tests를 통과했지만 actual-product follow-on 관찰은 아직 완료되지 않았습니다. 전체 chat/tool/UI provider E2E, `read_file`의 실제 환경 성능, nested child, persistent child group/restart replay, full child transcript history와 arbitrary provider/MCP/terminal/write permission override는 검증 또는 지원 범위를 넘어섭니다. 동봉 prompt의 예상 결과를 통과 사실로 간주하지 말고 실제 환경에서 별도로 기록하세요.
+Focused schema/planner/service/UI tests는 위 source 계약을 확인합니다. 전체 chat/tool/UI provider E2E, `read_file`의 실제 환경 성능, nested child, persistent child group/restart replay, full child transcript history와 arbitrary provider/MCP/terminal/write permission override는 검증 또는 지원 범위를 넘어섭니다. 동봉 prompt의 예상 결과를 통과 사실로 간주하지 말고 실제 환경에서 별도로 기록하세요.
