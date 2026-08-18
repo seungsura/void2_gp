@@ -39,6 +39,7 @@ import { persistentTerminalNameOfId } from '../../../terminalToolService.js';
 import { removeMCPToolNamePrefix } from '../../../../common/mcpServiceTypes.js';
 import { applicationToolPresentation, applicationToolRoute, shouldOfferGenericToolApproval } from '../../../../common/applicationToolPresentation.js';
 import { assistantMessagePresentation } from '../../../../common/assistantMessagePresentation.js';
+import { shouldShowPersistentChatHistory } from '../../../../common/chatHistoryPresentation.js';
 
 
 
@@ -3077,6 +3078,7 @@ export const SidebarChat = () => {
 		<div className='pt-8 mb-2 text-void-fg-3 text-root select-none pointer-events-none'>Chat history</div>
 		<PastThreadsList />
 	</ErrorBoundary>
+	const showPersistentChatHistory = shouldShowPersistentChatHistory(isLandingPage ? 'landing' : 'current')
 
 	const landingPageContent = <div
 		ref={sidebarRef}
@@ -3091,7 +3093,7 @@ export const SidebarChat = () => {
 				<div className='pt-8 mb-2 text-void-fg-3 text-root select-none pointer-events-none'>Suggestions</div>
 				{initiallySuggestedPromptsHTML}
 			</ErrorBoundary>}
-		{chatHistorySection}
+		{showPersistentChatHistory && chatHistorySection}
 	</div>
 
 
@@ -3119,9 +3121,9 @@ export const SidebarChat = () => {
 		<ErrorBoundary>
 			{threadPageInput}
 		</ErrorBoundary>
-		<div className='px-4 overflow-auto'>
+		{showPersistentChatHistory && <div className='px-4 overflow-auto'>
 			{chatHistorySection}
-		</div>
+		</div>}
 	</div>
 
 

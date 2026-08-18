@@ -11,6 +11,10 @@ export type ChatHistoryChildDiagnostics = Readonly<{ events: readonly Readonly<{
 export type ChatHistoryStatus = 'Error' | 'Action required' | 'Needs approval' | 'Running' | 'Queued';
 export type ChatHistoryRow = Readonly<{ id: string; title: string; messageCount: number; lastModified: string; selected: boolean; status?: ChatHistoryStatus; canDelete: boolean; ariaLabel: string }>;
 
+export type ChatHistorySurface = 'landing' | 'current';
+
+export const shouldShowPersistentChatHistory = (surface: ChatHistorySurface): boolean => surface === 'landing';
+
 const statusFor = (parent: ChatHistoryParentActivity | undefined, child: ChatHistoryChildOverview | undefined): ChatHistoryStatus | undefined => {
 	if (parent?.hasError) return 'Error';
 	if (child?.actionRequired) return 'Action required';

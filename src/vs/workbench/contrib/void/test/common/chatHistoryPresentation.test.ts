@@ -4,13 +4,17 @@
  *--------------------------------------------------------------------------------------*/
 
 import * as assert from 'assert';
-import { ChatHistoryChildOverview, ChatHistoryParentActivity, ChatHistoryThreadMetadata, getChatHistoryPresentation, hasActionRequiredChild } from '../../common/chatHistoryPresentation.js';
+import { ChatHistoryChildOverview, ChatHistoryParentActivity, ChatHistoryThreadMetadata, getChatHistoryPresentation, hasActionRequiredChild, shouldShowPersistentChatHistory } from '../../common/chatHistoryPresentation.js';
 
 const thread = (id: string, overrides: Partial<ChatHistoryThreadMetadata> = {}): ChatHistoryThreadMetadata => ({ id, title: `Chat ${id}`, messageCount: 1, lastModified: '2026-08-12T00:00:00.000Z', ...overrides });
 const parent = (overrides: ChatHistoryParentActivity = {}): Readonly<Record<string, ChatHistoryParentActivity | undefined>> => ({ a: overrides });
 const child = (overrides: ChatHistoryChildOverview): Readonly<Record<string, ChatHistoryChildOverview | undefined>> => ({ a: overrides });
 
 suite('Void ChatHistoryPresentation', () => {
+	test('shows persistent Chat history on landing but not below the current Chat composer', () => {
+		assert.strictEqual(shouldShowPersistentChatHistory('landing'), true);
+		assert.strictEqual(shouldShowPersistentChatHistory('current'), false);
+	});
 	test('returns an empty frozen list for no visible chats', () => assert.ok(Object.isFrozen(getChatHistoryPresentation([], '', {}, {}))));
 	test('filters zero-message chats and sorts descending by modification time', () => {
 		const value = getChatHistoryPresentation([thread('old', { lastModified: '2026-08-10T00:00:00.000Z' }), thread('empty', { messageCount: 0 }), thread('new', { lastModified: '2026-08-11T00:00:00.000Z' })], '', {}, {});
