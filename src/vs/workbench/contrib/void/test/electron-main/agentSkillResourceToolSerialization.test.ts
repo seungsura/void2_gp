@@ -2,9 +2,15 @@ import * as assert from 'assert';
 import { anthropicTools, geminiTools, openAITools } from '../../electron-main/llmMessage/sendLLMMessage.impl.js';
 import { availableTools, chat_systemMessage } from '../../common/prompt/prompts.js';
 import { extractXMLToolsWrapper } from '../../electron-main/llmMessage/extractGrammar.js';
-import { validateAgentSubagentControlParams } from '../../common/agentSubagents.js';
+import { isNativeAgentToolFormat, validateAgentSubagentControlParams } from '../../common/agentSubagents.js';
+
 
 suite('Void selected Skill resource production serialization', () => {
+	test('serializes no-marker native Agent authority through every production provider path', () => {
+		const authority = isNativeAgentToolFormat('openai-style'); assert.strictEqual(authority, true); assert.strictEqual(isNativeAgentToolFormat(undefined), false);
+		const emitted = [openAITools('agent', undefined, 'default-parent', authority)!.map(tool => tool.function.name), anthropicTools('agent', undefined, 'default-parent', authority)!.map(tool => tool.name), geminiTools('agent', undefined, 'default-parent', authority)![0].functionDeclarations!.map(tool => tool.name)];
+		for (const names of emitted) for (const name of ['spawn_agent', 'wait_agent', 'interrupt_agent']) assert.ok(names.includes(name));
+	});
 	test('serializes bounded wait_agent targets through every parent provider path and omits controls for children', () => {
 		const registry = availableTools('agent', undefined, 'default-parent', true)!.find(tool => tool.name === 'wait_agent')!;
 		const spawnRegistry = availableTools('agent', undefined, 'default-parent', true)!.find(tool => tool.name === 'spawn_agent')!;

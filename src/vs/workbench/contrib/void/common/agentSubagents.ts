@@ -12,6 +12,10 @@ import { URI } from '../../../../base/common/uri.js';
 
 export type ToolExecutionProfile = 'default-parent' | 'read-only-child';
 
+/** The parent exposes child controls only through these tested native provider serializers. */
+export const isNativeAgentToolFormat = (format: unknown): format is 'openai-style' | 'anthropic-style' | 'gemini-style' =>
+	format === 'openai-style' || format === 'anthropic-style' || format === 'gemini-style';
+
 export const readOnlyChildToolNames = Object.freeze([
 	'read_file', 'ls_dir', 'search_pathnames_only', 'search_for_files', 'search_in_file',
 ] as const);

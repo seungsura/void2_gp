@@ -45,7 +45,7 @@ import { IAgentInstructionsService } from './agentInstructionsService.js';
 import { IAgentSkillsService } from './agentSkillsService.js';
 import { AgentInstructionTaskSession, AgentInstructionTurnSnapshot } from '../common/agentInstructions.js';
 import { AgentRuntimeTurnSnapshot, admitProtectedAgentAuthority, admitSkillResourceContext, assembleProtectedAgentAuthority, createAgentRuntimeTurnSnapshot, isReadSkillResourceToolName, reviveAgentRuntimeTurnSnapshot, runtimeModelFingerprint, selectExplicitSkills, skillAdvertisement, validateReadSkillResourceToolParams } from '../common/agentSkills.js';
-import { isAgentSubagentControlName, validateAgentSubagentControlParams } from '../common/agentSubagents.js';
+import { isAgentSubagentControlName, isNativeAgentToolFormat, validateAgentSubagentControlParams } from '../common/agentSubagents.js';
 import { IAgentSubagentService } from './agentSubagentService.js';
 import { IAgentCustomAgentService } from './agentCustomAgentService.js';
 import { CustomAgentCatalog, customAgentAdvertisement } from '../common/agentCustomAgents.js';
@@ -1272,7 +1272,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return false // should never happen
 		const capturedSelections = [...(_chatSelections ?? thread.state.stagingSelections)]
-		const agentDelegationAllowed = capturedSelections.some(isAgentDelegationSelection)
+		const agentDelegationIntent = capturedSelections.some(isAgentDelegationSelection)
 		this._agentDelegationAuthorityOfThread.delete(threadId)
 		this._agentControlGeneration.set(threadId, (this._agentControlGeneration.get(threadId) ?? 0) + 1); this._agentSubagentService.forgetParent(threadId)
 		// interrupt existing stream
@@ -1283,9 +1283,20 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const isCurrentTurn = () => (this._agentControlGeneration.get(threadId) ?? 0) === turnGeneration
 		// Capture every model-dependent input before any async catalog/instruction resolution.
 		const capturedModel = this._currentModelSelectionProps();
+		const capturedOverride = capturedModel.modelSelection ? this._settingsService.state.overridesOfModel[capturedModel.modelSelection.providerName]?.[capturedModel.modelSelection.modelName] ?? {} : {};
+		const nativeToolFormat = capturedModel.modelSelection ? getModelCapabilities(capturedModel.modelSelection.providerName, capturedModel.modelSelection.modelName, { [capturedModel.modelSelection.providerName]: { [capturedModel.modelSelection.modelName]: capturedOverride } } as never).specialToolFormat : undefined;
+		const isAgentChat = this._settingsService.state.globalSettings.chatMode === 'agent';
+		const agentDelegationAllowed = isAgentChat && isNativeAgentToolFormat(nativeToolFormat);
+		if (isAgentChat && !capturedModel.modelSelection) {
+			this._setStreamState(threadId, { isRunning: undefined, error: { message: 'Agent chat requires a selected Chat model with native Agent tools. Select a supported model before sending.', fullError: null } });
+			return false;
+		}
+		if (isAgentChat && !agentDelegationAllowed) {
+			this._setStreamState(threadId, { isRunning: undefined, error: { message: 'The selected Chat model does not support native Agent tools. Select a supported model before sending.', fullError: null } });
+			return false;
+		}
 		const capturedSettingsState = agentDelegationAllowed ? deepClone(this._settingsService.state) : undefined;
 		const capturedSettingsOfProvider = agentDelegationAllowed ? this._llmMessageService.captureSettingsOfProvider() : undefined;
-		const capturedOverride = capturedModel.modelSelection ? this._settingsService.state.overridesOfModel[capturedModel.modelSelection.providerName]?.[capturedModel.modelSelection.modelName] ?? {} : {};
 		const capturedOverrides = capturedModel.modelSelection ? { [capturedModel.modelSelection.providerName]: { [capturedModel.modelSelection.modelName]: deepClone(capturedOverride) } } as never : undefined;
 		// This must happen before history changes: a task cannot cross a workspace owner boundary.
 		const instructionSnapshot = await this._beginInstructionTurn(threadId)
@@ -1299,7 +1310,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const owner = this._workspaceContextService.getWorkspace().folders[0]?.uri
 		const catalog = await this._agentSkillsService.getCatalog(owner, owner, instructionSnapshot.config)
 		if (!isCurrentTurn()) return false
-		const roleCatalog = agentDelegationAllowed ? await this._agentCustomAgentService.getCatalog(owner, owner) : undefined
+		const roleCatalog = agentDelegationIntent && agentDelegationAllowed ? await this._agentCustomAgentService.getCatalog(owner, owner) : undefined
 		if (!isCurrentTurn()) return false
 		const direct = selectExplicitSkills(catalog, instructions)
 		if (!direct.skills) throw new Error(direct.diagnostic?.code ?? 'skill_not_found')
@@ -1334,7 +1345,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const userMessageContentBase = await chat_userMessageContent(instructions, currSelns, { directoryStrService: this._directoryStringService, fileService: this._fileService }) // user message + names of files (NOT content)
 		if (!isCurrentTurn()) return false
 		const roleAd = roleCatalog ? customAgentAdvertisement(roleCatalog, runtimeModel.hasModel ? Math.min(2_000, Math.max(0, Math.floor(runtimeModel.contextWindow * .01 * 4))) : 2_000) : undefined
-		const userMessageContent = currSelns.some(isAgentDelegationSelection)
+		const userMessageContent = agentDelegationIntent
 			? `${userMessageContentBase}\n\n[User delegation marker: up to four generic read-only children are available for this turn, with two running concurrently. Named custom agents admitted for this turn (optional exact agent_type): ${roleAd?.text || 'none'}${roleAd?.omitted ? `; ${roleAd.omitted} omitted` : ''}. Call spawn_agent for delegated tasks, then wait_agent for their results; partial child failures do not prevent your synthesis.]`
 			: userMessageContentBase
 		const currentOwner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
