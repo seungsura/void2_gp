@@ -49,6 +49,7 @@ import { AgentSubagentToolBroker, AgentSubagentToolBrokerRequest, AgentSubagentT
 import { IAgentSubagentService } from './agentSubagentService.js';
 import { IAgentCustomAgentService } from './agentCustomAgentService.js';
 import { CustomAgentCatalog, customAgentAdvertisement } from '../common/agentCustomAgents.js';
+import { sanitizeAssistantDisplayContent } from '../common/assistantMessagePresentation.js';
 
 
 // related to retrying when LLM message has error
@@ -544,7 +545,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			const legacyMessages = legacyThread.messages as unknown[];
 			legacyThread.messages = legacyMessages.filter((message): message is ChatMessage => {
 				return !(typeof message === 'object' && message !== null && (message as { role?: unknown }).role === 'checkpoint');
-			});
+			}).map(message => message.role === 'assistant'
+				? { ...message, displayContent: sanitizeAssistantDisplayContent(message.displayContent) }
+				: message);
 			delete legacyThread.state.currCheckpointIdx;
 		}
 
@@ -1233,7 +1236,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 					logging: { loggingName: `Chat - ${chatMode}`, loggingExtras: { threadId, nMessagesSent, chatMode } },
 					separateSystemMessage: separateSystemMessage,
 					onText: ({ fullText, fullReasoning, toolCall }) => {
-						this._setStreamState(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: fullText, reasoningSoFar: fullReasoning, toolCallSoFar: toolCall ?? null }, interrupt: Promise.resolve(() => { if (llmCancelToken) this._llmMessageService.abort(llmCancelToken) }) })
+						this._setStreamState(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: sanitizeAssistantDisplayContent(fullText, true), reasoningSoFar: fullReasoning, toolCallSoFar: toolCall ?? null }, interrupt: Promise.resolve(() => { if (llmCancelToken) this._llmMessageService.abort(llmCancelToken) }) })
 					},
 					onFinalMessage: async ({ fullText, fullReasoning, toolCall, anthropicReasoning, }) => {
 						resMessageIsDonePromise({ type: 'llmDone', toolCall, info: { fullText, fullReasoning, anthropicReasoning } }) // resolve with tool calls
@@ -1918,6 +1921,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const oldThread = allThreads[threadId]
 		if (!oldThread) return // should never happen
 		// update state and store it
+		const storedMessage = message.role === 'assistant'
+			? { ...message, displayContent: sanitizeAssistantDisplayContent(message.displayContent) }
+			: message
 		const newThreads = {
 			...allThreads,
 			[oldThread.id]: {
@@ -1925,7 +1931,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				lastModified: new Date().toISOString(),
 				messages: [
 					...oldThread.messages,
-					message
+					storedMessage
 				],
 			}
 		}

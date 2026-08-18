@@ -33,6 +33,7 @@ import { AgentDelegationLimits, appendAgentInstructionDeveloperInstructions } fr
 import { computeMaxReadOutputTokens } from '../common/readFileReliability.js';
 import { estimateHistoryTokensForReadBudget, protectedSkillResourceHistoryLength } from './convertToLLMMessageService.js';
 import { isABuiltinToolName } from '../common/prompt/prompts.js';
+import { sanitizeAssistantDisplayContent } from '../common/assistantMessagePresentation.js';
 
 const MAX_CHILD_TURNS = 16;
 const MAX_CHILD_SUMMARY = 8_000;
@@ -182,8 +183,9 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 			run.requestId = undefined; // cancellation must never keep a completed provider request as an active lease.
 			if (!this.isCurrent(run)) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; }
 			if (response.error) { this.settle(run, run.cancellation.token.isCancellationRequested ? 'cancelled' : 'failed', response.error); return; }
-			history.push({ role: 'assistant', displayContent: response.text ?? '', reasoning: '', anthropicReasoning: null });
-			if (!response.tool) { this.settle(run, 'completed', (response.text ?? '').slice(0, MAX_CHILD_SUMMARY)); return; }
+			const responseText = sanitizeAssistantDisplayContent(response.text ?? '');
+			history.push({ role: 'assistant', displayContent: responseText, reasoning: '', anthropicReasoning: null });
+			if (!response.tool) { this.settle(run, 'completed', responseText.slice(0, MAX_CHILD_SUMMARY)); return; }
 			if (isAgentSubagentControlName(response.tool.name)) {
 				try {
 					const control = validateAgentSubagentControlParams(response.tool.name, response.tool.rawParams);

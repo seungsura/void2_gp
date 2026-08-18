@@ -8,6 +8,7 @@ import { UndoRedoService } from '../../../../../platform/undoRedo/common/undoRed
 import { createTextModel } from '../../../../../editor/test/common/testTextModel.js';
 import { AgentSubagentService } from '../../browser/agentSubagentService.js';
 import { ChatThreadService } from '../../browser/chatThreadService.js';
+import { ConvertToLLMMessageService } from '../../browser/convertToLLMMessageService.js';
 import { ToolsService } from '../../browser/toolsService.js';
 import '../../browser/editCodeService.js';
 import { IEditCodeService } from '../../browser/editCodeServiceInterface.js';
@@ -16,6 +17,7 @@ import { projectAgentConfig, resolveAgentInstructions, stableAgentInstructionRev
 import { assertCanonicalAgentChildRawUri, readOnlyChildToolNames } from '../../common/agentSubagents.js';
 import { availableTools, captureParentModelToolSnapshot } from '../../common/prompt/prompts.js';
 import { IMCPService } from '../../common/mcpService.js';
+import { INTERNAL_EMPTY_MESSAGE_SENTINEL } from '../../common/assistantMessagePresentation.js';
 
 const bytes = (value: string) => new TextEncoder().encode(value);
 const skillText = (name: string) => `---\nname: ${name}\ndescription: ${name}\n---\nbody-${name}`;
@@ -96,6 +98,60 @@ const bindManualApproval = (receiver: any) => {
 };
 
 suite('Void AgentSubagentService', () => {
+	test('removes the exact empty sentinel from child continuation history, outbound request, and summary', async () => {
+		const f = fixture({
+			callTool: async () => ({ entries: [] }),
+			send: (options, turn) => {
+				queueMicrotask(() => options.onFinalMessage(turn === 1
+					? { fullText: INTERNAL_EMPTY_MESSAGE_SENTINEL, fullReasoning: '', anthropicReasoning: null, toolCall: { id: 'tool-1', name: 'ls_dir', rawParams: { uri: 'file:///workspace' } } }
+					: { fullText: INTERNAL_EMPTY_MESSAGE_SENTINEL, fullReasoning: '', anthropicReasoning: null }));
+				return `sentinel-${turn}`;
+			},
+		});
+		const converter = new ConvertToLLMMessageService(
+			{ getModels: () => [] } as never,
+			{ getWorkspace: () => ({ folders: [] }) } as never,
+			{ activeEditor: undefined } as never,
+			{ getAllDirectoriesStr: async () => '' } as never,
+			{ listPersistentTerminalIds: () => [] } as never,
+			{ state: { overridesOfModel: {}, globalSettings: {}, optionsOfModelSelection: { Chat: { openAI: {} } } } } as never,
+			{ getMCPTools: () => [] } as never,
+		);
+		(converter as any)._generateChatMessagesSystemMessage = async () => 'child fixture system';
+		const injected = await converter.prepareLLMChatMessages({
+			chatMessages: [
+				{ role: 'user', content: 'inspect', displayContent: 'inspect', selections: [], state: { stagingSelections: [], isBeingEdited: false } },
+				{ role: 'assistant', displayContent: INTERNAL_EMPTY_MESSAGE_SENTINEL, reasoning: '', anthropicReasoning: null },
+				{ role: 'tool', type: 'success', content: '[]', id: 'injected-tool', rawParams: { uri: 'file:///workspace' }, mcpServerName: undefined, name: 'ls_dir', params: { uri: 'file:///workspace' }, result: [] },
+			] as any,
+			chatMode: 'agent',
+			modelSelection: { providerName: 'openAI', modelName: 'gpt-4.1' },
+			instructionSnapshot: snapshot(),
+		});
+		assert.strictEqual(JSON.stringify(injected.messages).includes(INTERNAL_EMPTY_MESSAGE_SENTINEL), false);
+		assert.strictEqual((injected.messages.find((message: any) => message.role === 'assistant') as any).content, '');
+		const converted: any[] = [];
+		(f.service as any).converter = { prepareLLMChatMessages: async (options: any) => { const value = await converter.prepareLLMChatMessages(options); converted.push({ history: options.chatMessages, value }); return value; } };
+
+		await f.service.spawn('sentinel-child', 'inspect', snapshot());
+		const waited = await f.service.wait('sentinel-child', 1_000);
+		assert.strictEqual(f.providerCalls.length, 2);
+		assert.strictEqual(converted.length, 2);
+		assert.strictEqual(JSON.stringify(converted).includes(INTERNAL_EMPTY_MESSAGE_SENTINEL), false);
+		assert.strictEqual(JSON.stringify(f.providerCalls[1].messages).includes(INTERNAL_EMPTY_MESSAGE_SENTINEL), false);
+		const outboundAssistant = f.providerCalls[1].messages.find((message: any) => message.role === 'assistant');
+		assert.strictEqual(outboundAssistant.content, '');
+		assert.deepStrictEqual(outboundAssistant.tool_calls, [{ type: 'function', id: 'tool-1', function: { name: 'ls_dir', arguments: '{"uri":"file:///workspace"}' } }]);
+		assert.strictEqual(f.service.getRunView('sentinel-child')?.summary, undefined);
+		assert.strictEqual(waited.receipt?.summary, '');
+
+		const surrounding = `keep ${INTERNAL_EMPTY_MESSAGE_SENTINEL} as text`;
+		const preserved = fixture({ send: options => { final(options, surrounding); return 'surrounding'; } });
+		await preserved.service.spawn('surrounding-child', 'inspect', snapshot());
+		const preservedWait = await preserved.service.wait('surrounding-child', 1_000);
+		assert.strictEqual(preservedWait.receipt?.summary, surrounding);
+	});
+
 	test('broker cancellation before write preparation settles without a mutation', async () => {
 		const runtime = snapshot(); const parentTools = captureParentModelToolSnapshot('agent', [], true); const authority: any = Object.freeze({ allowed: true, generation: 4, runtimeSnapshot: runtime, parentTools, autoApprove: Object.freeze({ edits: true, terminal: true, mcp: true }) });
 		let prepared = 0, executed = 0, releasePrepare!: (value: any) => void; const prepare = new Promise<any>(resolve => releasePrepare = resolve);

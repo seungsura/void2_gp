@@ -22,6 +22,25 @@ const ghostParams = (requestId: string, endpoint = 'http://127.0.0.1:1/v1') => (
 	toolExecutionProfile: undefined,
 	agentDelegationAllowed: false,
 }) as any;
+const emptyToolParams = (requestId: string, endpoint: string) => ({
+	requestId,
+	messagesType: 'chatMessages',
+	messages: [
+		{ role: 'user', content: 'use fixture_tool' },
+		{ role: 'assistant', content: '', tool_calls: [{ type: 'function', id: 'tool-1', function: { name: 'fixture_tool', arguments: '{"value":"alpha"}' } }] },
+		{ role: 'tool', tool_call_id: 'tool-1', content: 'alpha' },
+	],
+	separateSystemMessage: undefined,
+	chatMode: 'agent',
+	logging: { loggingName: 'Empty assistant tool loopback' },
+	settingsOfProvider: { openAICompatible: { endpoint, apiKey: 'fixture-key', headersJSON: '{}' } },
+	modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' },
+	modelSelectionOptions: undefined,
+	overridesOfModel: undefined,
+	mcpTools: [],
+	toolExecutionProfile: undefined,
+	agentDelegationAllowed: false,
+}) as any;
 const metrics = { capture() { } } as any;
 
 suite('Void LLM message channel lifecycle', () => {
@@ -162,6 +181,50 @@ suite('Void LLM message channel lifecycle', () => {
 		}
 		finally {
 			release();
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
+	});
+
+	test('OpenAI-Compatible loopback preserves native empty assistant tool-call content and reasoning-only response', async () => {
+		let requestBody: any;
+		const server = createServer((request, response) => {
+			const chunks: Buffer[] = [];
+			request.on('data', chunk => chunks.push(Buffer.from(chunk)));
+			request.on('end', () => {
+				requestBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+				const assistant = requestBody.messages.find((message: any) => message.role === 'assistant' && message.tool_calls?.length === 1);
+				response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'x-request-id': 'empty-tool-loopback' });
+				response.write(`data: ${JSON.stringify({ id: 'chatcmpl-empty-tool', object: 'chat.completion.chunk', created: 0, model: 'gpt-4.1', choices: [{ index: 0, delta: { role: 'assistant', content: assistant.content, reasoning_content: 'loopback reasoning' }, finish_reason: null }] })}\n\n`);
+				response.write(`data: ${JSON.stringify({ id: 'chatcmpl-empty-tool', object: 'chat.completion.chunk', created: 0, model: 'gpt-4.1', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
+				response.end('data: [DONE]\n\n');
+			});
+		});
+		await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+		try {
+			const address = server.address() as AddressInfo;
+			const channel = new LLMMessageChannel(metrics);
+			let finalText: string | undefined;
+			let finalReasoning: string | undefined;
+			const final = new Promise<void>((resolve, reject) => {
+				const timer = setTimeout(() => reject(new Error('empty tool loopback timed out')), 2_000);
+				channel.listen(undefined, 'onFinalMessage_sendLLMMessage')(event => {
+					if (event.requestId !== 'empty-tool-loopback') return;
+					clearTimeout(timer);
+					finalText = event.fullText;
+					finalReasoning = event.fullReasoning;
+					resolve();
+				});
+			});
+			(channel as any)._callSendLLMMessage(emptyToolParams('empty-tool-loopback', `http://127.0.0.1:${address.port}/v1`));
+			await final;
+			const assistant = requestBody.messages.find((message: any) => message.role === 'assistant' && message.tool_calls?.length === 1);
+			assert.deepStrictEqual(assistant, { role: 'assistant', content: '', tool_calls: [{ type: 'function', id: 'tool-1', function: { name: 'fixture_tool', arguments: '{"value":"alpha"}' } }] });
+			assert.strictEqual(finalText, '');
+			assert.strictEqual(finalReasoning, 'loopback reasoning');
+			assert.strictEqual((channel as any)._infoOfRunningRequest['empty-tool-loopback'], undefined);
+		}
+		finally {
+			server.closeAllConnections?.();
 			await new Promise<void>(resolve => server.close(() => resolve()));
 		}
 	});

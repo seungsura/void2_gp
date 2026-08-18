@@ -30,6 +30,15 @@ const runtimeHelpers = ChatThreadService.prototype as unknown as {
 const beginInstructionTurn = runtimeHelpers._beginInstructionTurn;
 const purgeInstructionTurn = runtimeHelpers._purgeInstructionTurn;
 const rememberInstructionTurn = runtimeHelpers._rememberInstructionTurn;
+const revokeAgentDelegation = (ChatThreadService.prototype as unknown as { _revokeAgentDelegation: (threadId: string, forget?: boolean) => void })._revokeAgentDelegation;
+const delegationLifecycleFixture = () => ({
+	_revokeAgentDelegation: revokeAgentDelegation,
+	_cancelChildToolApprovalsForParent() { },
+	_agentControlGeneration: new Map<string, number>(),
+	_agentDelegationAuthorityOfThread: new Map<string, unknown>(),
+	_agentSubagentService: { cancelParent() { }, forgetParent() { } },
+});
+const nonAgentSettingsFixture = () => ({ state: { overridesOfModel: {}, globalSettings: { chatMode: 'chat' } } });
 
 suite('AGENTS instruction runtime paths', () => {
 	test('restores a persisted snapshot and resumes approval with that exact revived turn', () => {
@@ -37,6 +46,7 @@ suite('AGENTS instruction runtime paths', () => {
 		const thread = { messages: [pendingTool()], state: { stagingSelections: [], focusedMessageIdx: undefined, linksOfMessageIdx: {}, agentInstructionTurnSnapshot: persisted }, filesWithUserChanges: new Set<string>() };
 		let resumed: unknown;
 		const receiver = {
+			...delegationLifecycleFixture(),
 			_purgeInstructionTurn: purgeInstructionTurn,
 			_instructionTurnOfThread: new Map<string, unknown>(),
 			_workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: { toString: () => 'file:///workspace' } }] }) },
@@ -65,6 +75,7 @@ suite('AGENTS instruction runtime paths', () => {
 			let rejected: unknown;
 			let cleared = false;
 			const receiver = {
+				...delegationLifecycleFixture(),
 				_purgeInstructionTurn: purgeInstructionTurn,
 				_instructionTurnOfThread: new Map<string, unknown>(),
 				_workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: { toString: () => 'file:///workspace' } }] }) },
@@ -91,6 +102,7 @@ suite('AGENTS instruction runtime paths', () => {
 		let rejected: unknown;
 		let cleared = false;
 		const receiver = {
+			...delegationLifecycleFixture(),
 			_purgeInstructionTurn: purgeInstructionTurn,
 			_instructionTurnOfThread: new Map<string, unknown>(),
 			_workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: { toString: () => 'file:///workspace-b' } }] }) },
@@ -120,6 +132,7 @@ suite('AGENTS instruction runtime paths', () => {
 		let rejected: unknown;
 		let cleared = false;
 		const receiver = {
+			...delegationLifecycleFixture(),
 			_purgeInstructionTurn: purgeInstructionTurn,
 			_agentInstructionSessionOfThread: new Map<string, unknown>(), _instructionTurnOfThread: new Map<string, unknown>(),
 			_workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: { toString: () => 'file:///workspace' } }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => false },
@@ -143,12 +156,13 @@ suite('AGENTS instruction runtime paths', () => {
 		let providerCalls = 0;
 		let stored = 0;
 		const receiver = {
+			...delegationLifecycleFixture(),
 			_beginInstructionTurn: beginInstructionTurn, _purgeInstructionTurn: purgeInstructionTurn,
-			_agentControlGeneration: new Map<string, number>(), _agentDelegationAuthorityOfThread: new Map(), _agentSubagentService: { cancelParent() { }, forgetParent() { } },
 			_agentInstructionSessionOfThread: new Map([['task', { ownerProjectRoot: 'file:///workspace-a', trustedAtStart: true, session: {} }]]),
 			_instructionTurnOfThread: new Map<string, unknown>(), state: { allThreads: { task: thread } },
 			_workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: { toString: () => 'file:///workspace-b' } }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => true },
 			_agentInstructionsService: { beginTaskSession() { configCalls++; return Promise.resolve({}); }, beginTopLevelTurn() { turnCalls++; return Promise.resolve(snapshot()); } },
+			_settingsService: nonAgentSettingsFixture(),
 			_storeAllThreads() { stored++; }, _runChatAgent() { providerCalls++; return Promise.resolve(); }, _wrapRunAgentToNotify() { }, _currentModelSelectionProps() { return {}; },
 			_directoryStringService: {}, _fileService: {}, streamState: {},
 		};
@@ -176,14 +190,15 @@ suite('AGENTS instruction runtime paths', () => {
 		const started = new Promise<void>(resolve => { turnStarted = resolve; });
 		const delayedTurn = new Promise<typeof originalSnapshot>(resolve => { finishTurn = resolve; });
 		const receiver = {
+			...delegationLifecycleFixture(),
 			_beginInstructionTurn: beginInstructionTurn, _purgeInstructionTurn: purgeInstructionTurn,
-			_agentControlGeneration: new Map<string, number>(), _agentDelegationAuthorityOfThread: new Map(), _agentSubagentService: { cancelParent() { }, forgetParent() { } },
 			_agentInstructionSessionOfThread: new Map<string, unknown>(), _instructionTurnOfThread: new Map<string, unknown>(), state: { allThreads: { task: thread } },
 			_workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: { toString: () => owner } }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => true },
 			_agentInstructionsService: {
 				beginTaskSession() { configCalls++; return Promise.resolve(originalSnapshot.config); },
 				beginTopLevelTurn() { turnCalls++; turnStarted(); return delayedTurn; },
 			},
+			_settingsService: nonAgentSettingsFixture(),
 			_storeAllThreads() { stored++; }, _runChatAgent() { providerCalls++; return Promise.resolve(); }, _wrapRunAgentToNotify() { }, _currentModelSelectionProps() { return {}; },
 			_directoryStringService: {}, _fileService: {}, streamState: {},
 		};

@@ -63,7 +63,7 @@ export type DecorativeCanceledTool = {
 export type ChatMessage =
 	| {
 		role: 'user';
-		content: string; // content displayed to the LLM on future calls - allowed to be '', will be replaced with (empty)
+		content: string; // content displayed to the LLM on future calls; allowed to be empty without fabricating display text
 		displayContent: string; // content displayed to user  - allowed to be '', will be ignored
 		selections: StagingSelectionItem[] | null; // the user's selection
 		state: {
@@ -72,7 +72,7 @@ export type ChatMessage =
 		}
 	} | {
 		role: 'assistant';
-		displayContent: string; // content received from LLM  - allowed to be '', will be replaced with (empty)
+		displayContent: string; // content received from LLM; allowed to be empty while reasoning remains visible
 		reasoning: string; // reasoning from the LLM, used for step-by-step thinking
 
 		anthropicReasoning: AnthropicReasoning[] | null; // anthropic reasoning

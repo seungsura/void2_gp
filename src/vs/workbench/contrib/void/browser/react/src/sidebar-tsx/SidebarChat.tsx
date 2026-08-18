@@ -38,6 +38,7 @@ import { ToolApprovalTypeSwitch } from '../void-settings-tsx/Settings.js';
 import { persistentTerminalNameOfId } from '../../../terminalToolService.js';
 import { removeMCPToolNamePrefix } from '../../../../common/mcpServiceTypes.js';
 import { applicationToolPresentation, applicationToolRoute, shouldOfferGenericToolApproval } from '../../../../common/applicationToolPresentation.js';
+import { assistantMessagePresentation } from '../../../../common/assistantMessagePresentation.js';
 
 
 
@@ -1315,9 +1316,7 @@ const AssistantMessageComponent = ({ chatMessage, isCommitted, messageIdx }: { c
 	const accessor = useAccessor()
 	const chatThreadsService = accessor.get('IChatThreadService')
 
-	const reasoningStr = chatMessage.reasoning?.trim() || null
-	const hasReasoning = !!reasoningStr
-	const isDoneReasoning = !!chatMessage.displayContent
+	const { renderDisplay, renderReasoning, hasReasoning, isDoneReasoning, isEmpty } = assistantMessagePresentation(chatMessage, !isCommitted)
 	const thread = chatThreadsService.getCurrentThread()
 
 
@@ -1326,7 +1325,6 @@ const AssistantMessageComponent = ({ chatMessage, isCommitted, messageIdx }: { c
 		messageIdx: messageIdx,
 	}
 
-	const isEmpty = !chatMessage.displayContent && !chatMessage.reasoning
 	if (isEmpty) return null
 
 	return <>
@@ -1336,7 +1334,7 @@ const AssistantMessageComponent = ({ chatMessage, isCommitted, messageIdx }: { c
 				<ReasoningWrapper isDoneReasoning={isDoneReasoning} isStreaming={!isCommitted}>
 					<SmallProseWrapper>
 						<ChatMarkdownRender
-							string={reasoningStr}
+							string={renderReasoning}
 							chatMessageLocation={chatMessageLocation}
 							isApplyEnabled={false}
 							isLinkDetectionEnabled={true}
@@ -1347,11 +1345,11 @@ const AssistantMessageComponent = ({ chatMessage, isCommitted, messageIdx }: { c
 		}
 
 		{/* assistant message */}
-		{chatMessage.displayContent &&
+		{renderDisplay &&
 			<div>
 				<ProseWrapper>
 					<ChatMarkdownRender
-						string={chatMessage.displayContent || ''}
+						string={renderDisplay}
 						chatMessageLocation={chatMessageLocation}
 						isApplyEnabled={true}
 						isLinkDetectionEnabled={true}

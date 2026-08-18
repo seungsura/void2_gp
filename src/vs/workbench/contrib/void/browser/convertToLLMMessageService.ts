@@ -18,10 +18,7 @@ import { IMCPService } from '../common/mcpService.js';
 import { AgentInstructionTurnSnapshot, assembleAgentInstructionText, routeAgentInstructionAuthority } from '../common/agentInstructions.js';
 import { AgentRuntimeTurnSnapshot, assembleProtectedAgentAuthority, isReadSkillResourceToolName } from '../common/agentSkills.js';
 import { AgentSubagentToolSnapshot, ToolExecutionProfile } from '../common/agentSubagents.js';
-
-export const EMPTY_MESSAGE = '(empty message)'
-
-
+import { sanitizeAssistantDisplayContent } from '../common/assistantMessagePresentation.js';
 
 type SimpleLLMMessage = {
 	role: 'tool';
@@ -184,7 +181,7 @@ const prepareMessages_anthropic_tools = (messages: SimpleLLMMessage[], supportsA
 
 			// make it so the assistant called the tool
 			if (prevMsg?.role === 'assistant') {
-				if (typeof prevMsg.content === 'string') prevMsg.content = [{ type: 'text', text: prevMsg.content }]
+				if (typeof prevMsg.content === 'string') prevMsg.content = prevMsg.content ? [{ type: 'text', text: prevMsg.content }] : []
 				prevMsg.content.push({ type: 'tool_use', id: currMsg.id, name: currMsg.name, input: currMsg.rawParams })
 			}
 
@@ -408,6 +405,12 @@ const prepareOpenAIOrAnthropicMessages = ({
 	else if (specialToolFormat === 'openai-style') {
 		llmChatMessages = prepareMessages_openai_tools(messages as SimpleLLMMessage[])
 	}
+	llmChatMessages = llmChatMessages.filter(message => {
+		if (message.role !== 'assistant') return true
+		if ('tool_calls' in message && message.tool_calls?.length) return true
+		if (typeof message.content === 'string') return message.content.length > 0
+		return message.content.some(part => part.type !== 'text' || !!part.text)
+	})
 	const llmMessages = llmChatMessages
 
 
@@ -436,33 +439,6 @@ const prepareOpenAIOrAnthropicMessages = ({
 
 	// Keep source-generated system context separate from user/project instruction authority.
 	// Developer-capable Chat Completions routes receive this as a developer message.
-
-	// ================ no empty message ================
-	for (let i = 0; i < llmMessages.length; i += 1) {
-		const currMsg: AnthropicOrOpenAILLMMessage = llmMessages[i]
-		const nextMsg: AnthropicOrOpenAILLMMessage | undefined = llmMessages[i + 1]
-
-		if (currMsg.role === 'tool') continue
-
-		// if content is a string, replace string with empty msg
-		if (typeof currMsg.content === 'string') {
-			currMsg.content = currMsg.content || EMPTY_MESSAGE
-		}
-		else {
-			// allowed to be empty if has a tool in it or following it
-			if (currMsg.content.find(c => c.type === 'tool_result' || c.type === 'tool_use')) {
-				currMsg.content = currMsg.content.filter(c => !(c.type === 'text' && !c.text)) as any
-				continue
-			}
-			if (nextMsg?.role === 'tool') continue
-
-			// replace any empty text entries with empty msg, and make sure there's at least 1 entry
-			for (const c of currMsg.content) {
-				if (c.type === 'text') c.text = c.text || EMPTY_MESSAGE
-			}
-			if (currMsg.content.length === 0) currMsg.content = [{ type: 'text', text: EMPTY_MESSAGE }]
-		}
-	}
 
 	return {
 		messages: llmMessages,
@@ -612,7 +588,7 @@ export class ConvertToLLMMessageService extends Disposable implements IConvertTo
 			if (m.role === 'assistant') {
 				simpleLLMMessages.push({
 					role: m.role,
-					content: m.displayContent,
+					content: sanitizeAssistantDisplayContent(m.displayContent),
 					anthropicReasoning: m.anthropicReasoning,
 				})
 			}
