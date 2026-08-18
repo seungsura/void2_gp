@@ -7,7 +7,7 @@
 - `Void-1.99.3-win32-x64-portable.zip`: portable 제품 ZIP
 - `SHA256SUMS.txt`: assembler가 placeholder 치환 뒤 생성하는 manifest
 - `guides/write-tool-guide.md`, `guides/read-tool-guide.md`: 파일 도구 계약과 안전 경계
-- `guides/agent-instructions-guide.md`: `AGENTS.md`, config, Skills, custom agents와 bounded read-only subagent 사용 안내
+- `guides/agent-instructions-guide.md`: `AGENTS.md`, config, Skills, custom agents와 profile-aware bounded subagent 사용 안내
 - `guides/ghost-chat-guide.md`: production Ghost Chat과 selection helper 비활성 상태 및 영향받지 않는 기능
 - `prompts/write-tool-test-prompts.md`, `prompts/read-tool-test-prompts.md`, `prompts/agent-instructions-test-prompts.md`, `prompts/ghost-chat-test-prompts.md`: 탐색적 제품 테스트와 production suggestion 부재 확인 절차
 
@@ -33,9 +33,17 @@ Expand-Archive .\Void-1.99.3-win32-x64-portable.zip .\Void-1.99.3-portable
 
 ## Agent instructions, Skills, custom agents와 bounded subagent
 
-이 릴리스는 Agent mode에서 `AGENTS.md`, user/trusted Project `.codex/config.toml`의 제한된 instruction 설정, `.agents/skills` 기반 Skills와 user/trusted Project `.codex/agents/*.toml` custom role을 제공합니다. Typed `@Agent` authority 아래 parent generation마다 최대 4 accepted, 2 running direct child와 FIFO queue를 사용하며 `wait_agent`와 `interrupt_agent`로 결과 전달과 선택 취소를 제어합니다. Child는 application-level exact-five read-only tool만 받고 nesting은 허용하지 않습니다.
+이 릴리스는 Agent mode에서 `AGENTS.md`, user/trusted Project `.codex/config.toml`, `.agents/skills` catalog와 user/trusted Project `.codex/agents/*.toml` custom role을 제공합니다. Native Agent route에서는 child control이 marker 없이 generic하게 제공됩니다. `@Agent`는 optional generic/named intent이며 named role selection은 exact `agent_type`을 고정합니다. 지원하지 않는 provider format이나 사용할 model이 없는 경우에는 history/provider send 전에 bounded diagnostic으로 중단합니다.
 
-Child Run UI는 capacity/status, 실패와 bounded timing/timeline을 표시합니다. Local trace는 first 128 events와 이후 dropped count만 보존하고 provider usage가 없으면 `Usage unavailable`로 표시합니다. Chat history의 Current/Running/action-required 상태, current composer의 Send/Stop/announcement와 per-chat memory-only draft도 현재 UI에 포함됩니다. 정확한 지원 경계와 직접 관찰 절차는 `guides/agent-instructions-guide.md`와 `prompts/agent-instructions-test-prompts.md`를 확인하세요.
+`[agents]`의 `max_accepted_children`, `max_concurrent_threads_per_session`, `max_depth`는 각각 `1..8`, `1..4`(accepted 이하), `1..2`이고 default는 `4`, `2`, `1`입니다. Trusted Project 값이 user 값을 override합니다. FIFO와 shared nested group budget을 사용하며 `wait_agent`는 target `1..8`개를 받을 수 있습니다.
+
+Role의 `read_only` profile은 exact five read tools만 제공하고 terminal, MCP와 mutation을 제공하지 않습니다. `inherit_parent_write` profile은 parent가 turn admission 때 가진 frozen parent tool snapshot만 broker를 통해 사용합니다. Child Run은 available tools, required approval categories와 Undo 가능 여부를 표시합니다. Captured parent approval policy가 적용되며 manual approval policy에서는 그 card가 settle될 때까지 기다립니다. Mutation-capable child는 한 번에 하나만 실행되고 nested child도 같은 group budget과 cancellation을 공유하며 live authority 또는 독립 elevation을 얻지 않습니다.
+
+`$`는 `@`의 기존 Skills catalog를 그대로 열어 filter하고 `$bare` 또는 `$qualified:identity`를 canonical selector text로 남깁니다. Markdown code의 selector-looking text는 literal이며 missing/ambiguous selection은 draft와 staging을 보존한 채 visible error로 중단합니다. `read_skill_resource`, `spawn_agent`, `wait_agent`, `interrupt_agent`는 exact application cards로 표시되며 MCP fallback이나 generic approval UI를 빌리지 않습니다.
+
+Child Run UI는 capacity/status, 실패와 bounded timing/timeline을 표시합니다. Local trace는 first 128 events와 이후 dropped count만 보존하고 provider usage가 없으면 `Usage unavailable`로 표시합니다. Landing의 non-empty Chat history는 newest-first이며 persistent history is not rendered below the current Chat composer. Header의 `View Past Chats`가 landing access path입니다. 정확한 지원 경계와 직접 관찰 절차는 `guides/agent-instructions-guide.md`와 `prompts/agent-instructions-test-prompts.md`를 확인하세요.
+
+Provider/tool loop의 native empty tool-call content는 fake display text로 바꾸지 않습니다. Exact `(empty message)` sentinel은 parent/child outbound history, persisted display와 renderer에 남지 않으며 non-empty reasoning-only content는 reasoning bubble로 계속 보입니다.
 
 focused tests, compile·React·Windows build와 visible artifact smoke는 actual provider/network E2E 증거가 아닙니다. prompt의 예상 결과를 미리 통과 사실로 기록하지 마세요.
 
@@ -44,6 +52,10 @@ focused tests, compile·React·Windows build와 visible artifact smoke는 actual
 현재 built production에서는 **production automatic suggestions are unavailable**입니다. Settings는 **Enable Ghost Chat code suggestions**와 **Show suggestions on select**를 모두 표시하지 않습니다. 이전 profile에 두 setting의 `true` 값이 남아 있어도 무시되며 automatic Ghost request, Ghost debounce와 selection helper widget은 활성화되지 않습니다.
 
 이 변경은 Chat sidebar, Quick Edit와 Agent 기능을 비활성화하지 않습니다. Production에서 두 설정과 자동 editor suggestion이 나타나지 않는지 확인하려면 `guides/ghost-chat-guide.md`와 `prompts/ghost-chat-test-prompts.md`를 사용하세요. Legacy FIM `/completions` retirement도 그대로 유지됩니다.
+
+## Settings switch 표시 경계
+
+Settings의 shared switch는 실제 native checkbox를 interaction owner로 유지하고, `role=switch`가 필요한 곳의 checked/disabled/Space와 accessible name을 보존합니다. 독립 Settings entry가 scoped CSS를 먼저 전달해 normal/dark와 Chromium `forced-colors` emulation에서 track, knob와 하나의 focus ring을 표시합니다. Windows OS High Contrast는 packaged product에서 직접 관찰해야 하는 boundary이며 source fixture 통과 사실로 대신하지 않습니다.
 
 ## OpenAI-compatible file tool contract
 

@@ -23,17 +23,25 @@ OpenAI-compatible Agent의 flat tool schema는 conditional composition에 의존
 ## Agent instructions, Skills와 custom agents
 
 - active owner Project의 `AGENTS.md` chain은 top-level user turn마다 reload되고 같은 turn에는 동일 revision을 유지합니다.
-- user와 trusted Project의 `.codex/config.toml`에서 제한된 developer instruction과 Skill enable/disable 설정을 읽습니다.
-- repository/user/plugin `.agents/skills/<name>/SKILL.md` catalog는 exact full-body admission과 confined lazy resource read를 사용합니다.
-- user와 trusted Project의 `.codex/agents/*.toml`은 strict named direct-child role을 제공합니다. Role은 required metadata와 read-only boundary를 검증한 뒤 admit됩니다.
+- user와 trusted Project의 `.codex/config.toml`에서 제한된 developer instruction, Skill enable/disable과 `[agents]` limits를 읽습니다. `max_accepted_children`, `max_concurrent_threads_per_session`, `max_depth`의 범위는 `1..8`, `1..4`(accepted 이하), `1..2`이고 default는 `4`, `2`, `1`입니다. Trusted Project 값이 우선합니다.
+- `$` direct selector와 `@` menu는 같은 repository/user/plugin `.agents/skills/<name>/SKILL.md` catalog를 사용합니다. Markdown code는 literal이고 missing/ambiguous selection은 draft/staging을 보존한 visible error로 중단합니다.
+- user와 trusted Project의 `.codex/agents/*.toml`은 strict named role을 제공합니다. Duplicate/invalid role은 bounded diagnostic으로 격리되며 stale selection은 provider send 전에 reselect를 요구합니다.
+- Native Agent route는 generic child controls를 marker 없이 제공합니다. `@Agent`는 optional intent이며 named selection은 exact `agent_type`을 고정합니다. Unsupported/no-model route는 provider send 전에 진단됩니다.
 
-## Bounded read-only subagent와 current Chat UI
+## Profile-aware bounded subagent와 current Chat UI
 
-- Agent mode의 parent generation마다 최대 4 accepted direct child, 동시에 최대 2 running과 FIFO queue를 사용합니다.
-- Child depth는 1입니다. Child에는 `read_file`, `ls_dir`, `search_pathnames_only`, `search_for_files`, `search_in_file`만 노출되며 terminal/write/MCP/app tool은 없습니다.
-- `wait_agent`는 전체 또는 선택 target의 결과를 spawn order로 전달하고, `interrupt_agent`는 선택한 queued/running child만 취소합니다.
+- Default group limit은 accepted `4`, concurrent `2`, depth `1`이고 configurable ceiling은 `8`, `4`, `2`입니다. FIFO와 shared nested group budget을 사용하고 `wait_agent` targets는 `1..8`개입니다.
+- `read_only` role은 `read_file`, `ls_dir`, `search_pathnames_only`, `search_for_files`, `search_in_file`만 노출하며 exact copy는 **Void application-level read-only — terminal disabled, no OS sandbox**입니다.
+- `inherit_parent_write` role은 frozen parent tool snapshot을 broker로 사용합니다. Child Run은 tools, required approval categories와 Undo availability를 표시합니다. Captured parent approval policy가 적용되며 manual approval policy에서는 card settlement를 기다립니다. One mutation-capable child만 동시에 실행되며 nested child도 같은 group budget/cancellation을 공유하고 live authority를 얻지 않습니다.
+- `read_skill_resource`, `spawn_agent`, `wait_agent`, `interrupt_agent`는 각각 **Read Skill resource**, **Start child Agent**, **Wait for child Agent**, **Interrupt child Agent** application card를 사용합니다. Running/Completed/Failed/Rejected/Invalid request/Cancelled/Requested 상태를 표시하고 MCP fallback이나 generic approval을 사용하지 않습니다.
 - transient Child Run panel은 capacity, state, timing과 failure를 표시합니다. Local trace는 first 128 lifecycle events와 이후 dropped count만 보존하며 provider usage가 없으면 `Usage unavailable`을 표시합니다.
-- Chat history는 Current와 background Running/action-required 상태를 분리합니다. Current composer는 Error, Needs approval, Running, unavailable과 idle에 맞는 Send/Stop 상태를 사용합니다. Chat별 unsent draft는 이동 뒤 복원되지만 restart에는 persist하지 않습니다.
+- Landing의 non-empty Chat history는 newest-first로 Current와 background Running/action-required 상태를 분리합니다. Persistent history is not rendered below the current Chat composer; header의 `View Past Chats`로 landing에 돌아갑니다. Current/active row의 Delete guard와 focus handoff를 유지하며 Chat별 unsent draft는 이동 뒤 복원되지만 restart에는 persist하지 않습니다.
+
+## Assistant message 표시
+
+- Native OpenAI tool-call assistant는 empty content와 tool calls를 유지하고 Anthropic/Gemini tool-only form에도 fake text를 넣지 않습니다.
+- Exact `(empty message)` sentinel은 outbound parent/child history, persisted `displayContent`와 visible renderer에 남지 않습니다. Surrounding legitimate text는 보존합니다.
+- Non-empty reasoning-only response는 display text가 없어도 reasoning bubble로 보입니다. Whitespace-only edge를 일반화하지 않으며 actual provider behavior는 별도 관찰 대상입니다.
 
 ## Controlled Search fallback
 
@@ -49,6 +57,12 @@ OpenAI-compatible Agent의 flat tool schema는 conditional composition에 의존
 - **production automatic suggestions are unavailable**이며 legacy FIM `/completions` retirement도 유지됩니다.
 - Chat sidebar, Quick Edit와 Agent는 이 비활성 경계의 영향을 받지 않습니다.
 
+## Settings switch styling
+
+- Shared switch는 native checkbox를 interaction owner로 유지하고 필요한 곳에서 `role=switch`, checked/disabled/Space와 accessible name을 보존합니다.
+- Independent Settings entry의 scoped CSS는 normal/dark와 Chromium `forced-colors` emulation에서 track, knob와 한 focus ring을 제공합니다.
+- Windows OS High Contrast는 final product에서 직접 관찰해야 하며 source fixture 결과만으로 통과했다고 기록하지 않습니다.
+
 ## Portable package contract
 
 - 정식 package는 manifest에 선언된 x64 runtime payload와 필수 `Void.exe`, `resources/app/product.json`, `data/README.txt`를 검증합니다.
@@ -58,4 +72,4 @@ OpenAI-compatible Agent의 flat tool schema는 conditional composition에 의존
 
 ## 확인된 범위와 남은 관찰
 
-Focused schema/planner/service/UI tests는 위 source 계약을 확인합니다. 전체 chat/tool/UI provider E2E, `read_file`의 실제 환경 성능, nested child, persistent child group/restart replay, full child transcript history와 arbitrary provider/MCP/terminal/write permission override는 검증 또는 지원 범위를 넘어섭니다. 동봉 prompt의 예상 결과를 통과 사실로 간주하지 말고 실제 환경에서 별도로 기록하세요.
+Focused schema/planner/service/UI tests는 위 source 계약을 확인합니다. 전체 chat/tool/UI provider E2E, `read_file`의 실제 환경 성능, persistent child group/restart replay, full child transcript history와 arbitrary live provider/tool/permission elevation은 검증 또는 지원 범위를 넘어섭니다. Configured depth-2 nesting과 inherited frozen-parent profile을 arbitrary child authority로 확대 해석하지 마세요. 동봉 prompt의 예상 결과를 통과 사실로 간주하지 말고 실제 환경에서 별도로 기록하세요.

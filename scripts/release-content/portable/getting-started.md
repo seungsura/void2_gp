@@ -31,7 +31,20 @@ Expand-Archive .\Void-*-win32-x64-portable.zip .\Void-portable
 
 중요한 Project에 적용하기 전에 별도 임시 workspace를 Agent mode로 여세요. Project root의 `AGENTS.md`, user `$HOME/.codex/config.toml`, trusted Project의 `<root>/.codex/config.toml`, `.agents/skills/<name>/SKILL.md`와 필요한 `.codex/agents/<name>.toml` role을 작은 범위로 작성합니다. legacy `.voidrules`가 자동으로 옮겨지거나 새 instruction으로 읽힐 것이라 기대하지 마세요.
 
-지원 경로와 precedence, top-level turn reload, Skill selector, custom role과 4 accepted·2 running·FIFO read-only child 경계는 [Agent instructions 안내](guides/agent-instructions-guide.md)를 먼저 읽으세요. 이어 [직접 테스트 프롬프트](prompts/agent-instructions-test-prompts.md)에서 AGENTS next-turn reload, Skill admission/resource, named `@Agent`, targeted `wait_agent`/`interrupt_agent`, bounded Child Run과 current Chat UI를 작은 fixture로 관찰하세요.
+Child limit을 바꾸려면 user 또는 trusted Project config에 다음 table을 둡니다. Trusted Project 값이 user 값을 override하며 변경은 새 Task/session에서 확인하세요.
+
+```toml
+[agents]
+max_accepted_children = 4
+max_concurrent_threads_per_session = 2
+max_depth = 1
+```
+
+허용 범위는 각각 `1..8`, `1..4`(accepted 이하), `1..2`입니다. 위 값은 default와 같습니다. 범위를 벗어난 값, unknown key와 concurrent가 accepted를 넘는 조합은 bounded diagnostic을 만들며 authority를 확대하지 않습니다.
+
+Custom role은 `capability_profile = "read_only"` 또는 `capability_profile = "inherit_parent_write"`를 사용할 수 있습니다. 먼저 `read_only`와 작은 read task로 role을 확인하세요. Inherited profile을 확인할 때에는 폐기 가능한 fixture file 하나만 사용하고, Child Run의 frozen tool list·manual approval·Undo를 읽은 뒤 원래 bytes로 되돌리세요. 중요한 workspace에서 permission 경계를 처음 시험하지 마세요.
+
+지원 경로와 precedence, top-level turn reload, `$`/`@` Skill selector, optional `@Agent`, custom role, default/override limits와 shared nested group budget은 [Agent instructions 안내](guides/agent-instructions-guide.md)를 먼저 읽으세요. 이어 [직접 테스트 프롬프트](prompts/agent-instructions-test-prompts.md)에서 named role, targeted `wait_agent`/`interrupt_agent`, read-only와 inherited profile, current Chat layout을 작은 fixture로 관찰하세요.
 
 ## 5. Production editor suggestion 상태 확인
 
@@ -48,3 +61,7 @@ Built production Settings에는 **Enable Ghost Chat code suggestions**와 **Show
 5. 큰 파일과 중요한 파일은 안내서의 탐색적 prompt로 작은 사례부터 검증합니다.
 
 현재 배포본의 실제 provider/network/UI 전체 E2E와 `read_file` 성능은 별도 관찰 대상입니다. focused tests, build와 artifact smoke 성공을 사용 환경의 provider 검증이나 성능 증명으로 확대 해석하지 마세요.
+
+## 7. Settings switch를 확인할 때
+
+Settings의 visible switch는 native checkbox가 click/Space interaction을 소유합니다. Reversible하고 중요하지 않은 setting 하나에서 accessible name, checked 변화와 disabled inert 상태를 확인한 뒤 원래 값으로 되돌리세요. Normal/dark theme의 track·knob·focus ring은 확인할 수 있지만 Chromium `forced-colors` fixture는 Windows OS High Contrast product 관찰을 대신하지 않습니다.
