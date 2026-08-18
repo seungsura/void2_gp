@@ -4,8 +4,8 @@
  *--------------------------------------------------------------------------------------*/
 
 import { mountFnGenerator } from '../util/mountFnGenerator.js'
+import '../styles.css'
 import { Settings } from './Settings.js'
 
 export const mountVoidSettings = mountFnGenerator(Settings)
-
 
