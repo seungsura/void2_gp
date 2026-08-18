@@ -20,8 +20,9 @@ import * as types from '../../../../base/common/types.js';
 import { URI } from '../../../../base/common/uri.js';
 import { Promises } from '../../../../base/node/pfs.js';
 import { IFileQuery, IFolderQuery, IProgressMessage, ISearchEngineStats, IRawFileMatch, ISearchEngine, ISearchEngineSuccess, isFilePatternMatch, hasSiblingFn } from '../common/search.js';
-import { spawnRipgrepCmd } from './ripgrepFileSearch.js';
+import { assertBundledRipgrepFileSearchAvailable, spawnRipgrepCmd } from './ripgrepFileSearch.js';
 import { prepareQuery } from '../../../../base/common/fuzzyScorer.js';
+import { classifyBundledRipgrepSpawnError } from './ripgrepBinaryAvailability.js';
 
 interface IDirectoryEntry extends IRawFileMatch {
 	base: string;
@@ -33,10 +34,27 @@ interface IDirectoryTree {
 	pathToEntries: { [relativePath: string]: IDirectoryEntry[] };
 }
 
-const killCmds = new Set<() => void>();
+const processExitKillCmds = new Set<() => void>();
 process.on('exit', () => {
-	killCmds.forEach(cmd => cmd());
+	processExitKillCmds.forEach(cmd => cmd());
 });
+
+export class FileSearchProcessKillScope {
+	private readonly killCmds = new Set<() => void>();
+
+	register(killCmd: () => void): () => void {
+		this.killCmds.add(killCmd);
+		processExitKillCmds.add(killCmd);
+		return () => {
+			this.killCmds.delete(killCmd);
+			processExitKillCmds.delete(killCmd);
+		};
+	}
+
+	cancel(): void {
+		this.killCmds.forEach(killCmd => killCmd());
+	}
+}
 
 export class FileWalker {
 	private config: IFileQuery;
@@ -55,6 +73,7 @@ export class FileWalker {
 	private errors: string[];
 	private cmdSW: StopWatch | null = null;
 	private cmdResultCount: number = 0;
+	private readonly processKillScope = new FileSearchProcessKillScope();
 
 	private folderExcludePatterns: Map<string, AbsoluteAndRelativeParsedExpression>;
 	private globalExcludePattern: glob.ParsedExpression | undefined;
@@ -110,7 +129,7 @@ export class FileWalker {
 
 	cancel(): void {
 		this.isCanceled = true;
-		killCmds.forEach(cmd => cmd());
+		this.processKillScope.cancel();
 	}
 
 	walk(folderQueries: IFolderQuery[], extraFiles: URI[], numThreads: number | undefined, onResult: (result: IRawFileMatch) => void, onMessage: (message: IProgressMessage) => void, done: (error: Error | null, isLimitHit: boolean) => void): void {
@@ -190,14 +209,15 @@ export class FileWalker {
 	}
 
 	private cmdTraversal(folderQuery: IFolderQuery, numThreads: number | undefined, onResult: (result: IRawFileMatch) => void, onMessage: (message: IProgressMessage) => void, cb: (err?: Error) => void): void {
+		assertBundledRipgrepFileSearchAvailable();
 		const rootFolder = folderQuery.folder.fsPath;
 		const isMac = platform.isMacintosh;
 
 		const killCmd = () => cmd && cmd.kill();
-		killCmds.add(killCmd);
+		const unregisterKillCmd = this.processKillScope.register(killCmd);
 
 		let done = (err?: Error) => {
-			killCmds.delete(killCmd);
+			unregisterKillCmd();
 			done = () => { };
 			cb(err);
 		};
@@ -221,7 +241,7 @@ export class FileWalker {
 		this.cmdResultCount = 0;
 		this.collectStdout(cmd, 'utf8', onMessage, (err: Error | null, stdout?: string, last?: boolean) => {
 			if (err) {
-				done(err);
+				done(classifyBundledRipgrepSpawnError(err));
 				return;
 			}
 			if (this.isLimitHit) {

@@ -247,7 +247,7 @@ suite('Void AgentSubagentService', () => {
 			{ state: { globalSettings: { autoAcceptLLMChanges: false } } }, voidModels, {},
 		);
 		const safeFile: any = { resolve: async (value: URI) => ({ resource: value, isSymbolicLink: false, isDirectory: true }), stat: async (value: URI) => ({ resource: value, isSymbolicLink: false, size: model.getValueLength() }) };
-		const tools = new ToolsService(safeFile, { getWorkspace: () => ({ folders: [{ uri: URI.parse('file:///workspace') }] }) } as never, {} as never, { createInstance: () => ({}) } as never, voidModels, { state: { globalSettings: {} } } as never, editCode, {} as never, { getStreamState: () => undefined } as never, {} as never, { read: () => [] } as never);
+		const tools = new ToolsService(safeFile, { getWorkspace: () => ({ folders: [{ uri: URI.parse('file:///workspace') }] }) } as never, {} as never, { search: async () => ({ ok: false, code: 'search_backend_unavailable', trace: 'terminal-fallback-unavailable' }) } as never, { createInstance: () => ({}) } as never, voidModels, { state: { globalSettings: {} } } as never, editCode, {} as never, { getStreamState: () => undefined } as never, {} as never, { read: () => [] } as never);
 		const childContext: any = { ownerThreadId: 'child', childId: 'child', ownerRoot: URI.parse('file:///workspace'), maxReadOutputTokens: 1024, maxFileSize: 1_048_576, maxResults: 100 };
 		const read = await tools.callTool.read_file({ uri, startLine: 1, endLine: null, lineByteOffset: 0 }, childContext);
 		const receipt = (await read.result).receipt.id;
@@ -701,7 +701,7 @@ suite('Void AgentSubagentService', () => {
 
 		const owner = URI.parse('file:///workspace'); const target = URI.parse('file:///workspace/a');
 		const safeFile = { resolve: async (uri: URI) => ({ resource: uri, isSymbolicLink: false }), stat: async (uri: URI) => ({ resource: uri, isSymbolicLink: false, size: 12 }) };
-		const makeRealTools = (fileService: any, voidModelService: any, searchService: any = {}, queryBuilder: any = {}) => new ToolsService(fileService, { getWorkspace: () => ({ folders: [{ uri: owner }] }) } as never, searchService, { createInstance: () => queryBuilder } as never, voidModelService, { state: { globalSettings: {} } } as never, {} as never, {} as never, {} as never, {} as never, { read: () => [] } as never);
+		const makeRealTools = (fileService: any, voidModelService: any, searchService: any = {}, queryBuilder: any = {}) => new ToolsService(fileService, { getWorkspace: () => ({ folders: [{ uri: owner }] }) } as never, searchService, { search: async () => ({ ok: false, code: 'search_backend_unavailable', trace: 'terminal-fallback-unavailable' }) } as never, { createInstance: () => queryBuilder } as never, voidModelService, { state: { globalSettings: {} } } as never, {} as never, {} as never, {} as never, {} as never, { read: () => [] } as never);
 		const childContext = { ownerThreadId: 'child', childId: 'child', ownerRoot: owner, maxReadOutputTokens: 1024, maxFileSize: 1_048_576, maxResults: 100 } as const;
 		let initializes = 0;
 		const oversizedTools = makeRealTools({ ...safeFile, stat: async (uri: URI) => ({ resource: uri, isSymbolicLink: false, size: 1_048_577 }) }, { initializeModel: async () => { initializes++; }, getModelSafe: async () => ({ model: null }) });

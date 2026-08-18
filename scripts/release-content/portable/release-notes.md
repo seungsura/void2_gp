@@ -35,6 +35,13 @@ OpenAI-compatible Agent의 flat tool schema는 conditional composition에 의존
 - transient Child Run panel은 capacity, state, timing과 failure를 표시합니다. Local trace는 first 128 lifecycle events와 이후 dropped count만 보존하며 provider usage가 없으면 `Usage unavailable`을 표시합니다.
 - Chat history는 Current와 background Running/action-required 상태를 분리합니다. Current composer는 Error, Needs approval, Running, unavailable과 idle에 맞는 Send/Stop 상태를 사용합니다. Chat별 unsent draft는 이동 뒤 복원되지만 restart에는 persist하지 않습니다.
 
+## Controlled Search fallback
+
+- `search_pathnames_only`와 `search_for_files`는 bundled Search backend를 먼저 사용하며, 그 executable을 시작할 수 없을 때만 automatic controlled fallback이 system ripgrep을 사용합니다.
+- fallback은 terminal capability를 부여하거나 extra approval을 요구하지 않습니다. system ripgrep도 없으면 stable `search_backend_unavailable` 오류를 반환합니다. `search_in_file`은 기존 in-process 경로를 유지합니다.
+- fallback은 saved-disk 결과이므로 unsaved editor buffer를 합치지 않습니다. pathname fuzzy matching/order와 모든 exclude/config 동작은 bundled primary보다 degraded될 수 있습니다.
+- content primary의 bounded raw-match budget 때문에 later file page를 확정할 수 없으면 false empty 대신 `search_output_limit`를 반환합니다.
+
 ## Ghost Chat code suggestions
 
 - Built production Settings는 **Enable Ghost Chat code suggestions**와 **Show suggestions on select**를 표시하지 않습니다.

@@ -159,6 +159,18 @@ Void를 정상 종료하고 같은 portable data로 다시 시작합니다. Expe
 
 Record: A/B draft / Current row / background status / Delete visibility / composer announcement·Send·Stop / restart 뒤 draft.
 
+## 9. Bundled Search와 automatic fallback 경계
+
+현재 Project에 이름이 `search-probe-alpha.txt`인 작은 saved file을 만들고 본문에 `SEARCH-PROBE-CONTENT`를 저장한 뒤, Agent가 `search_pathnames_only`와 `search_for_files`로 각각 찾게 하세요.
+
+Expected: 정상 설치에서는 bundled Search backend 결과가 반환됩니다. Search fallback은 terminal tool이나 별도 approval을 노출하지 않습니다. fallback을 관찰하려고 설치 파일을 직접 이동하거나 수정하지 마세요. packaged release smoke가 recoverable copy에서 automatic controlled fallback을 별도로 검증합니다. 두 backend가 실제로 모두 unavailable인 환경이면 raw process output이나 command text 대신 exact `search_backend_unavailable`만 기록합니다.
+
+검색 전에 editor에서 본문을 저장하세요. fallback은 saved-disk 결과만 다루므로 unsaved buffer, pathname fuzzy order와 모든 exclude/config parity를 검증하는 절차가 아닙니다.
+
+한 file에 match가 매우 많아 bounded raw-match budget이 소진되면 later file page는 false empty가 아니라 `search_output_limit`가 될 수 있습니다. 이 경우 오류를 실제 결과로 기록하고 page가 비었다고 해석하지 마세요.
+
+Record: saved file / pathname result / content result / approval count / terminal tool 노출 여부 / stable unavailable error 여부.
+
 ## 해석 주의
 
 이 릴리스는 direct custom role과 bounded parallel direct children을 지원하지만 nested child, persistent group/restart replay, full child transcript history, arbitrary provider/MCP/terminal/write permission override와 plugin-local custom agent는 지원하지 않습니다. 테스트 중 다른 동작이 보이더라도 지원 계약으로 일반화하지 말고 실제 trace와 재현 조건을 기록하세요. Source fixture, compile, React/Windows build와 visible artifact smoke는 actual provider request, token usage 또는 performance를 증명하지 않습니다.

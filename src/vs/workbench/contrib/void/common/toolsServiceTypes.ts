@@ -2,6 +2,7 @@ import { URI } from '../../../../base/common/uri.js'
 import { RawMCPToolCall } from './mcpServiceTypes.js';
 import { builtinTools } from './prompt/prompts.js';
 import { RawToolParamsObj } from './sendLLMMessageTypes.js';
+import { SearchBackendTrace } from './controlledSearchFallback.js';
 
 
 
@@ -65,8 +66,8 @@ export type BuiltinToolResultType = {
 	'read_file': { fileContents: string, totalFileLen: number, totalNumLines: number, hasNextPage: boolean, startLine: number, endLine: number | null, nextLine: number | null, nextByteOffset?: number, truncated: boolean, eof: boolean, longLineContinuation: boolean, receipt: { id: string, uri: string, documentVersion: number, sourceKind: string, requestedRange: object, returnedRange: object } },
 	'ls_dir': { children: ShallowDirectoryItem[] | null, hasNextPage: boolean, hasPrevPage: boolean, itemsRemaining: number },
 	'get_dir_tree': { str: string, },
-	'search_pathnames_only': { uris: URI[], hasNextPage: boolean },
-	'search_for_files': { uris: URI[], hasNextPage: boolean },
+	'search_pathnames_only': { uris: URI[], hasNextPage: boolean, backendTrace: SearchBackendTrace },
+	'search_for_files': { uris: URI[], hasNextPage: boolean, backendTrace: SearchBackendTrace },
 	'search_in_file': { lines: number[]; boundedContent?: string; },
 	'read_lint_errors': { lintErrors: LintErrorItem[] | null },
 	// ---

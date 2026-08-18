@@ -131,6 +131,14 @@ terminal, file write/edit/delete, MCP와 app tool은 제공하지 않으며 runt
 
 > Void application-level read-only — terminal disabled, no OS sandbox
 
+## Search backend fallback
+
+`search_pathnames_only`와 `search_for_files`는 bundled Search backend를 먼저 사용합니다. 번들 backend를 시작할 수 없을 때만 Search 내부의 automatic controlled fallback이 system ripgrep을 찾습니다. 이 경로는 terminal capability를 child나 model에 추가하지 않고 extra approval도 요구하지 않습니다. 두 backend를 모두 사용할 수 없으면 도구는 안정적인 `search_backend_unavailable` 오류를 반환합니다. `search_in_file`은 이 fallback을 사용하지 않고 현재 in-process 구현을 유지합니다.
+
+Fallback은 saved-disk ripgrep 결과만 사용합니다. 따라서 저장하지 않은 editor buffer를 합치지 않으며 pathname의 fuzzy matching/order와 VS Code의 모든 exclude/config 결과가 bundled primary와 같다고 보장하지 않습니다. regex, ignore, binary 처리와 결과·시간 한도는 ripgrep 경계 안에 유지되지만, fallback 결과는 degraded disk-search evidence로 해석하세요.
+
+Content primary는 bounded raw-match budget을 유지합니다. 한 file의 많은 match가 그 budget을 먼저 소진해 requested later file page를 확정할 수 없으면 빈 terminal page라고 단정하지 않고 `search_output_limit`로 중단합니다.
+
 `wait_agent`는 target을 생략하면 current direct children 전체를 관찰합니다. `targets`를 사용하면 서로 다른 direct child 1~4개만 선택할 수 있습니다. 새 terminal, timeout 또는 removed event에 깨어나고 결과 순서는 spawn order를 유지합니다. 이미 전달한 terminal summary는 다시 주입하지 않습니다. `interrupt_agent`는 current generation의 선택된 queued 또는 running direct child를 취소합니다. parent Stop은 current group 전체에 fanout합니다. Child failure나 cancellation은 다른 child나 parent 전체를 자동 abort하지 않습니다.
 
 Group 한도는 provider send 64회, shared deadline 240초와 stored terminal result 합계 32,000 characters입니다. 각 child는 최대 16 turns, 120초와 terminal summary 8,000 characters를 사용합니다. 자동 retry는 없습니다.

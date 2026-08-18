@@ -525,7 +525,8 @@ export enum SearchErrorCode {
 	invalidLiteral,
 	rgProcessError,
 	other,
-	canceled
+	canceled,
+	rgBinaryMissing
 }
 
 export class SearchError extends Error {

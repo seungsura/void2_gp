@@ -20,6 +20,7 @@ import { rgPath } from '@vscode/ripgrep';
 import { anchorGlob, IOutputChannel, Maybe, rangeToSearchRange, searchRangeToRange } from './ripgrepSearchUtils.js';
 import type { RipgrepTextSearchOptions } from '../common/searchExtTypesInternal.js';
 import { newToOldPreviewOptions } from '../common/searchExtConversionTypes.js';
+import { assertBundledRipgrepAvailable, isBundledRipgrepMissingError, bundledRipgrepMissingError } from './ripgrepBinaryAvailability.js';
 
 // If @vscode/ripgrep is in an .asar file, then the binary is unpacked.
 const rgDiskPath = rgPath.replace(/\bnode_modules\.asar\b/, 'node_modules.asar.unpacked');
@@ -72,11 +73,18 @@ export class RipgrepTextSearchEngine {
 				.join(' ');
 			this.outputChannel.appendLine(`${rgDiskPath} ${escapedArgs}\n - cwd: ${cwd}`);
 
-			let rgProc: Maybe<cp.ChildProcess> = cp.spawn(rgDiskPath, rgArgs, { cwd });
+			let rgProc: Maybe<cp.ChildProcess>;
+			try {
+				assertBundledRipgrepAvailable(rgDiskPath);
+				rgProc = cp.spawn(rgDiskPath, rgArgs, { cwd });
+			} catch (error) {
+				reject(isBundledRipgrepMissingError(error) ? bundledRipgrepMissingError() : error);
+				return;
+			}
 			rgProc.on('error', e => {
 				console.error(e);
 				this.outputChannel.appendLine('Error: ' + (e && e.message));
-				reject(serializeSearchError(new SearchError(e && e.message, SearchErrorCode.rgProcessError)));
+				reject(isBundledRipgrepMissingError(e) ? bundledRipgrepMissingError() : serializeSearchError(new SearchError(e && e.message, SearchErrorCode.rgProcessError)));
 			});
 
 			let gotResult = false;

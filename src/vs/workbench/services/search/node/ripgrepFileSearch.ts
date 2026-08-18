@@ -13,9 +13,12 @@ import * as strings from '../../../../base/common/strings.js';
 import { IFileQuery, IFolderQuery } from '../common/search.js';
 import { anchorGlob } from './ripgrepSearchUtils.js';
 import { rgPath } from '@vscode/ripgrep';
+import { assertBundledRipgrepAvailable } from './ripgrepBinaryAvailability.js';
 
 // If @vscode/ripgrep is in an .asar file, then the binary is unpacked.
 const rgDiskPath = rgPath.replace(/\bnode_modules\.asar\b/, 'node_modules.asar.unpacked');
+
+export const assertBundledRipgrepFileSearchAvailable = () => assertBundledRipgrepAvailable(rgDiskPath);
 
 export function spawnRipgrepCmd(config: IFileQuery, folderQuery: IFolderQuery, includePattern?: glob.IExpression, excludePattern?: glob.IExpression, numThreads?: number) {
 	const rgArgs = getRgArgs(config, folderQuery, includePattern, excludePattern, numThreads);

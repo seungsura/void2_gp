@@ -1,4 +1,4 @@
-import { CancellationToken } from '../../../../base/common/cancellation.js'
+import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js'
 import { URI } from '../../../../base/common/uri.js'
 import { dirname, isEqualOrParent } from '../../../../base/common/resources.js'
 import { FileOperationError, FileOperationResult, IFileService, IFileStat } from '../../../../platform/files/common/files.js'
@@ -6,7 +6,7 @@ import { registerSingleton, InstantiationType } from '../../../../platform/insta
 import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js'
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js'
 import { QueryBuilder } from '../../../services/search/common/queryBuilder.js'
-import { ISearchService } from '../../../services/search/common/search.js'
+import { ISearchService, SearchError, SearchErrorCode } from '../../../services/search/common/search.js'
 import { IEditCodeService } from './editCodeServiceInterface.js'
 import { ITerminalToolService } from './terminalToolService.js'
 import { LintErrorItem, BuiltinToolCallParams, BuiltinToolResultType } from '../common/toolsServiceTypes.js'
@@ -23,10 +23,14 @@ import { generateUuid } from '../../../../base/common/uuid.js'
 import { isWriteFileReceiptCurrent, planWriteFileModify, WriteFileEdit, WriteFileReceipt } from '../common/writeFilePlanner.js'
 import { VSBuffer } from '../../../../base/common/buffer.js'
 import { assertReadFilePageMakesProgress, effectiveReadFileLimits, pageReadFileLineSource, pageReadFileLines, ReadReceiptRegistry, validateReadFileRequest } from '../common/readFileReliability.js'
-import { IToolsService, ToolExecutionContext } from './toolsServiceInterface.js'
+import { IToolsService } from './toolsServiceInterface.js'
+import type { ToolExecutionContext } from './toolsServiceInterface.js'
 import { AGENT_SUBAGENT_MAX_RESULTS, assertCanonicalAgentChildRawUri, assertCanonicalAgentChildUriPath, canonicalAgentChildUri } from '../common/agentSubagents.js'
+import { CONTROLLED_SEARCH_MAX_FILE_BYTES, CONTROLLED_SEARCH_MAX_RESULTS, CONTROLLED_SEARCH_MAX_SKIP_RESULTS, CONTROLLED_SEARCH_MAX_STDOUT_BYTES, ControlledSearchError, ControlledSearchRequest, SearchBackendTrace } from '../common/controlledSearchFallback.js'
+import { IControlledSearchFallbackService } from './controlledSearchFallbackService.js'
 
-export { IToolsService, ToolExecutionContext } from './toolsServiceInterface.js'
+export { IToolsService } from './toolsServiceInterface.js'
+export type { ToolExecutionContext } from './toolsServiceInterface.js'
 
 
 // tool use for AI
@@ -130,6 +134,7 @@ export class ToolsService implements IToolsService {
 		@IFileService fileService: IFileService,
 		@IWorkspaceContextService workspaceContextService: IWorkspaceContextService,
 		@ISearchService searchService: ISearchService,
+		@IControlledSearchFallbackService controlledSearchFallbackService: IControlledSearchFallbackService,
 		@IInstantiationService instantiationService: IInstantiationService,
 		@IVoidModelService voidModelService: IVoidModelService,
 		@IVoidSettingsService private readonly voidSettingsService: IVoidSettingsService,
@@ -369,6 +374,54 @@ export class ToolsService implements IToolsService {
 
 		}
 
+		const validateFallbackRoots = async (roots: readonly URI[], child: ToolExecutionContext | undefined, token: CancellationToken) => {
+			if (token.isCancellationRequested) throw new ControlledSearchError('search_cancelled')
+			for (const root of roots) {
+				if (root.scheme !== 'file') throw new ControlledSearchError('search_backend_unavailable')
+				if (child) await validateChildSearchUri(root, child)
+				else {
+					try { if (!(await fileService.resolve(root)).isDirectory) throw new ControlledSearchError('search_request_invalid') }
+					catch (error) { if (error instanceof ControlledSearchError) throw error; throw new ControlledSearchError('search_request_invalid') }
+				}
+				if (token.isCancellationRequested) throw new ControlledSearchError('search_cancelled')
+			}
+		}
+		const fallbackSearch = async (request: ControlledSearchRequest, roots: readonly URI[], child: ToolExecutionContext | undefined, token: CancellationToken) => {
+			await validateFallbackRoots(roots, child, token)
+			const response = await controlledSearchFallbackService.search(request, token)
+			if (!response.ok) throw new ControlledSearchError(response.code, response.trace)
+			await validateFallbackRoots(roots, child, token)
+			const uris: URI[] = []
+			for (const resultPath of response.paths) {
+				if (token.isCancellationRequested) throw new ControlledSearchError('search_cancelled')
+				const uri = URI.file(resultPath)
+				if (!roots.some(root => isEqualOrParent(uri, root))) throw new ControlledSearchError('search_failed')
+				if (child) await validateChildSearchUri(uri, child)
+				if (token.isCancellationRequested) throw new ControlledSearchError('search_cancelled')
+				uris.push(uri)
+			}
+			if (token.isCancellationRequested) throw new ControlledSearchError('search_cancelled')
+			return { uris, hasMore: response.hasMore, trace: response.trace }
+		}
+		const capSearchPage = (uris: readonly URI[], pageSize: number, hasMore: boolean, child: ToolExecutionContext | undefined, trace: SearchBackendTrace) => {
+			const capped: URI[] = []; let chars = 0
+			for (const uri of uris) {
+				if (capped.length >= pageSize) break
+				const text = child ? uri.toString() : uri.fsPath
+				const additional = VSBuffer.fromString(text).byteLength + (capped.length ? 1 : 0)
+				if (chars + additional > CONTROLLED_SEARCH_MAX_STDOUT_BYTES) throw new ControlledSearchError('search_output_limit', trace)
+				chars += additional; capped.push(uri)
+			}
+			return { uris: capped, hasNextPage: hasMore || capped.length < uris.length, backendTrace: trace }
+		}
+		const fallbackWindow = (pageSize: number, pageNumber: number) => {
+			const effectivePageNumber = Math.max(1, pageNumber)
+			const skipResults = pageSize * (effectivePageNumber - 1)
+			if (!Number.isSafeInteger(skipResults) || skipResults < 0 || skipResults > CONTROLLED_SEARCH_MAX_SKIP_RESULTS) throw new ControlledSearchError('search_request_invalid')
+			return { skipResults, maxResults: pageSize + 1 }
+		}
+		const isBundledRipgrepUnavailable = (error: unknown) => error instanceof SearchError && error.code === SearchErrorCode.rgBinaryMissing
+
 
 		this.callTool = {
 			read_file: async ({ uri, startLine, endLine, lineByteOffset }, context = 'direct') => {
@@ -423,60 +476,90 @@ export class ToolsService implements IToolsService {
 				return { result: { str } }
 			},
 
-			search_pathnames_only: async ({ query: queryStr, includePattern, pageNumber }, context = '') => {
+			search_pathnames_only: ({ query: queryStr, includePattern, pageNumber }, context = '') => {
 				const child = typeof context === 'string' ? undefined : context.childId ? context : undefined
+				const source = new CancellationTokenSource(child?.cancellationToken)
+				const interruptTool = () => source.cancel()
+				const result = (async () => {
+					const effectivePageNumber = Math.max(1, pageNumber)
 				if (child && !child.ownerRoot) throw new Error('agent_child_search_outside_owner')
 				const roots = child ? [child.ownerRoot!] : workspaceContextService.getWorkspace().folders.map(f => f.uri)
 				const pageSize = child ? Math.max(1, Math.min(child.maxResults ?? AGENT_SUBAGENT_MAX_RESULTS, AGENT_SUBAGENT_MAX_RESULTS)) : MAX_CHILDREN_URIs_PAGE
+				const primaryMaxResults = child ? pageSize * effectivePageNumber + 1 : 0
+				if (child && (!Number.isSafeInteger(primaryMaxResults) || primaryMaxResults > CONTROLLED_SEARCH_MAX_RESULTS)) throw new ControlledSearchError('search_request_invalid', 'bundled-rg')
 				if (child) await validateChildSearchUri(roots[0], child)
 
 				const query = queryBuilder.file(roots, {
 					filePattern: queryStr,
 					includePattern: includePattern ?? undefined,
 					sortByScore: true, // makes results 10x better
-					...(child ? { ignoreSymlinks: true, maxResults: pageSize, maxFileSize: child.maxFileSize } as any : {}),
+					...(child ? { ignoreSymlinks: true, maxResults: primaryMaxResults, maxFileSize: child.maxFileSize } as any : {}),
 				})
-				const data = await searchService.fileSearch(query, child?.cancellationToken ?? CancellationToken.None)
+				try {
+				const data = await searchService.fileSearch(query, source.token)
 				if (child) await validateChildSearchUri(roots[0], child)
-				if (child && data.results.length > pageSize) throw new Error('agent_child_search_result_limit')
+				if (child && data.results.length > primaryMaxResults) throw new Error('agent_child_search_result_limit')
 
-				const fromIdx = pageSize * (pageNumber - 1)
-				const toIdx = pageSize * pageNumber - 1
+				const fromIdx = pageSize * (effectivePageNumber - 1)
+				const toIdx = pageSize * effectivePageNumber - 1
+				if (data.limitHit && data.results.length <= fromIdx) throw new ControlledSearchError('search_output_limit', 'bundled-rg')
 				const uris = data.results
 					.slice(fromIdx, toIdx + 1) // paginate
 					.map(({ resource, results }) => resource)
 				if (child) for (const uri of uris) await validateChildSearchUri(uri, child)
 
-				const hasNextPage = (data.results.length - 1) - toIdx >= 1
-				return { result: { uris, hasNextPage } }
+				return capSearchPage(uris, pageSize, !!data.limitHit || (data.results.length - 1) - toIdx >= 1, child, 'bundled-rg')
+				} catch (error) {
+					if (!isBundledRipgrepUnavailable(error)) throw error
+					const window = fallbackWindow(pageSize, effectivePageNumber)
+					const fallback = await fallbackSearch(Object.freeze({ kind: 'pathname', roots: Object.freeze(roots.map(root => root.fsPath)), query: queryStr, isRegex: false, include: includePattern, ...window, maxFileSize: Math.min(child?.maxFileSize ?? CONTROLLED_SEARCH_MAX_FILE_BYTES, CONTROLLED_SEARCH_MAX_FILE_BYTES) }), roots, child, source.token)
+					return capSearchPage(fallback.uris, pageSize, fallback.hasMore, child, fallback.trace)
+				}
+				})().finally(() => source.dispose())
+				return Promise.resolve({ result, interruptTool })
 			},
 
-			search_for_files: async ({ query: queryStr, isRegex, searchInFolder, pageNumber }, context = '') => {
+			search_for_files: ({ query: queryStr, isRegex, searchInFolder, pageNumber }, context = '') => {
 				const child = typeof context === 'string' ? undefined : context.childId ? context : undefined
+				const source = new CancellationTokenSource(child?.cancellationToken)
+				const interruptTool = () => source.cancel()
+				const result = (async () => {
+					const effectivePageNumber = Math.max(1, pageNumber)
 				if (child && !child.ownerRoot) throw new Error('agent_child_search_outside_owner')
 				const searchFolders = child ? [searchInFolder ?? child.ownerRoot!] : searchInFolder === null ?
 					workspaceContextService.getWorkspace().folders.map(f => f.uri)
 					: [searchInFolder]
 				const pageSize = child ? Math.max(1, Math.min(child.maxResults ?? AGENT_SUBAGENT_MAX_RESULTS, AGENT_SUBAGENT_MAX_RESULTS)) : MAX_CHILDREN_URIs_PAGE
+				const primaryMaxResults = child ? pageSize * effectivePageNumber + 1 : 0
+				if (child && (!Number.isSafeInteger(primaryMaxResults) || primaryMaxResults > CONTROLLED_SEARCH_MAX_RESULTS)) throw new ControlledSearchError('search_request_invalid', 'bundled-rg')
 				if (child) await validateChildSearchUri(searchFolders[0], child)
 
 				const query = queryBuilder.text({
 					pattern: queryStr,
 					isRegExp: isRegex,
-				}, searchFolders, child ? { ignoreSymlinks: true, maxResults: pageSize, maxFileSize: child.maxFileSize } as any : undefined)
-				const data = await searchService.textSearch(query, child?.cancellationToken ?? CancellationToken.None)
+				}, searchFolders, child ? { ignoreSymlinks: true, maxResults: primaryMaxResults, maxFileSize: child.maxFileSize } as any : undefined)
+				try {
+				const data = await searchService.textSearch(query, source.token)
 				if (child) await validateChildSearchUri(searchFolders[0], child)
-				if (child && data.results.length > pageSize) throw new Error('agent_child_search_result_limit')
+				if (child && data.results.length > primaryMaxResults) throw new Error('agent_child_search_result_limit')
 
-				const fromIdx = pageSize * (pageNumber - 1)
-				const toIdx = pageSize * pageNumber - 1
+				const fromIdx = pageSize * (effectivePageNumber - 1)
+				const toIdx = pageSize * effectivePageNumber - 1
+				if (data.limitHit && data.results.length <= fromIdx) throw new ControlledSearchError('search_output_limit', 'bundled-rg')
 				const uris = data.results
 					.slice(fromIdx, toIdx + 1) // paginate
 					.map(({ resource, results }) => resource)
 				if (child) for (const uri of uris) await validateChildSearchUri(uri, child)
 
-				const hasNextPage = (data.results.length - 1) - toIdx >= 1
-				return { result: { queryStr, uris, hasNextPage } }
+				return capSearchPage(uris, pageSize, !!data.limitHit || (data.results.length - 1) - toIdx >= 1, child, 'bundled-rg')
+				} catch (error) {
+					if (!isBundledRipgrepUnavailable(error)) throw error
+					const window = fallbackWindow(pageSize, effectivePageNumber)
+					const fallback = await fallbackSearch(Object.freeze({ kind: 'content', roots: Object.freeze(searchFolders.map(root => root.fsPath)), query: queryStr, isRegex, include: null, ...window, maxFileSize: Math.min(child?.maxFileSize ?? CONTROLLED_SEARCH_MAX_FILE_BYTES, CONTROLLED_SEARCH_MAX_FILE_BYTES) }), searchFolders, child, source.token)
+					return capSearchPage(fallback.uris, pageSize, fallback.hasMore, child, fallback.trace)
+				}
+				})().finally(() => source.dispose())
+				return Promise.resolve({ result, interruptTool })
 			},
 			search_in_file: async ({ uri, query, isRegex }, context = '') => {
 				const child = typeof context === 'string' ? undefined : context.childId ? context : undefined

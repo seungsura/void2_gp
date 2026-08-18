@@ -464,8 +464,9 @@ export class SearchService extends Disposable implements ISearchService {
 					err.code === SearchErrorCode.unknownEncoding ? 'encoding' :
 						err.code === SearchErrorCode.globParseError ? 'glob' :
 							err.code === SearchErrorCode.invalidLiteral ? 'literal' :
-								err.code === SearchErrorCode.other ? 'other' :
-									err.code === SearchErrorCode.canceled ? 'canceled' :
+							err.code === SearchErrorCode.other ? 'other' :
+								err.code === SearchErrorCode.canceled ? 'canceled' :
+									err.code === SearchErrorCode.rgBinaryMissing ? 'missing' :
 										'unknown';
 			}
 
