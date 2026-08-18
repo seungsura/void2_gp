@@ -698,7 +698,7 @@ export const SelectedFiles = (
 					{/* tooltip for file path */}
 					<span className="truncate overflow-hidden text-ellipsis"
 						data-tooltip-id='void-tooltip'
-						data-tooltip-content={selection.type === 'Skill' ? selection.identity : selection.type === 'Agent' ? 'Agent' : getRelative(selection.uri, accessor)}
+						data-tooltip-content={selection.type === 'Skill' ? selection.identity : selection.type === 'Agent' ? selection.agentType ?? 'Agent' : getRelative(selection.uri, accessor)}
 						data-tooltip-place='top'
 						data-tooltip-delay-show={3000}
 					>
@@ -748,7 +748,7 @@ export const SelectedFiles = (
 						>
 							{<SelectionIcon size={10} />}
 
-							{selection.type === 'Skill' ? selection.identity : selection.type === 'Agent' ? 'Agent' : getBasename(selection.uri.fsPath) + (selection.type === 'CodeSelection' ? ` (${selection.range[0]}-${selection.range[1]})` : '')}
+							{selection.type === 'Skill' ? selection.identity : selection.type === 'Agent' ? selection.agentType ?? 'Agent' : getBasename(selection.uri.fsPath) + (selection.type === 'CodeSelection' ? ` (${selection.range[0]}-${selection.range[1]})` : '')}
 
 							{selection.type === 'File' && selection.state.wasAddedAsCurrentFile && messageIdx === undefined && currentURI?.fsPath === selection.uri.fsPath ?
 								<span className={`text-[8px] 'void-opacity-60 text-void-fg-4`}>

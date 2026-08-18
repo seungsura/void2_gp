@@ -112,5 +112,12 @@ suite('Void agent subagents', () => {
 		assert.strictEqual(isAgentDelegationSelection({ ...selection, extra: true }), false);
 	});
 
+	test('accepts a frozen named role but rejects partial or malformed role intent', () => {
+		const named = { type: 'Agent', label: AGENT_DELEGATION_SELECTION_LABEL, agentType: 'project-reader', catalogRevision: 'catalog-1', roleRevision: 'role-1', state: undefined } as const;
+		assert.strictEqual(isAgentDelegationSelection(named), true);
+		assert.strictEqual(isAgentDelegationSelection({ ...named, roleRevision: undefined }), false);
+		assert.strictEqual(isAgentDelegationSelection({ ...named, agentType: 'Project Reader' }), false);
+	});
+
 	test('gives URI-less Agent no selection content or authority', async () => { const selection: StagingSelectionItem = { type: 'Agent', label: AGENT_DELEGATION_SELECTION_LABEL }; assert.strictEqual(await messageOfSelection(selection, {} as never), ''); });
 });

@@ -263,6 +263,7 @@ export interface IChatThreadService {
 	popStagingSelections(numPops?: number): void;
 	addNewStagingSelection(newSelection: StagingSelectionItem): void;
 	getSkillCatalog(threadId?: string): Promise<import('../common/agentSkills.js').AgentSkillCatalog>;
+	getCustomAgentCatalog(threadId?: string, token?: CancellationToken): Promise<CustomAgentCatalog>;
 
 	dangerousSetState: (newState: ThreadsState) => void;
 	resetState: () => void;
@@ -372,6 +373,10 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const config = await record.session.getConfig();
 		if (this._workspaceContextService.getWorkspace().folders[0]?.uri.toString() !== owner || (record.trustedAtStart && !this._workspaceTrustManagementService.isWorkspaceTrusted())) { this._agentInstructionSessionOfThread.delete(threadId); throw new Error('skill_owner_or_trust_changed'); }
 		return this._agentSkillsService.getCatalog(owner ? URI.parse(owner) : undefined, owner ? URI.parse(owner) : undefined, config);
+	}
+	async getCustomAgentCatalog(_threadId = this.state.currentThreadId, token = CancellationToken.None): Promise<CustomAgentCatalog> {
+		const owner = this._workspaceContextService.getWorkspace().folders[0]?.uri;
+		return this._agentCustomAgentService.getCatalog(owner, owner, token);
 	}
 	private async _beginInstructionTurn(threadId: string): Promise<AgentInstructionTurnSnapshot> {
 		const currentOwner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
@@ -1272,15 +1277,11 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return false // should never happen
 		const capturedSelections = [...(_chatSelections ?? thread.state.stagingSelections)]
-		const agentDelegationIntent = capturedSelections.some(isAgentDelegationSelection)
-		this._agentDelegationAuthorityOfThread.delete(threadId)
-		this._agentControlGeneration.set(threadId, (this._agentControlGeneration.get(threadId) ?? 0) + 1); this._agentSubagentService.forgetParent(threadId)
-		// interrupt existing stream
-		if (this.streamState[threadId]?.isRunning) {
-			await this.abortRunning(threadId)
-		}
-		const turnGeneration = this._agentControlGeneration.get(threadId) ?? 0
-		const isCurrentTurn = () => (this._agentControlGeneration.get(threadId) ?? 0) === turnGeneration
+		const agentSelections = capturedSelections.filter(isAgentDelegationSelection)
+		if (agentSelections.length > 1) throw new Error('custom_agent_multiple_selections')
+		const agentSelection = agentSelections[0]
+		const agentDelegationIntent = !!agentSelection
+		const preflightGeneration = this._agentControlGeneration.get(threadId) ?? 0
 		// Capture every model-dependent input before any async catalog/instruction resolution.
 		const capturedModel = this._currentModelSelectionProps();
 		const capturedOverride = capturedModel.modelSelection ? this._settingsService.state.overridesOfModel[capturedModel.modelSelection.providerName]?.[capturedModel.modelSelection.modelName] ?? {} : {};
@@ -1295,6 +1296,17 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			this._setStreamState(threadId, { isRunning: undefined, error: { message: 'The selected Chat model does not support native Agent tools. Select a supported model before sending.', fullError: null } });
 			return false;
 		}
+		const owner = this._workspaceContextService.getWorkspace().folders[0]?.uri
+		const roleCatalog = agentDelegationIntent && agentDelegationAllowed ? await this._agentCustomAgentService.getCatalog(owner, owner) : undefined
+		if ((this._agentControlGeneration.get(threadId) ?? 0) !== preflightGeneration) return false
+		if (agentSelection?.agentType && (!roleCatalog || roleCatalog.revision !== agentSelection.catalogRevision || roleCatalog.agents.find(role => role.identity === agentSelection.agentType)?.revision !== agentSelection.roleRevision)) {
+			this._setStreamState(threadId, { isRunning: undefined, error: { message: `The selected Agent role '${agentSelection.agentType}' changed or is no longer available. Select it again before sending.`, fullError: null } }); return false
+		}
+		this._agentDelegationAuthorityOfThread.delete(threadId)
+		this._agentControlGeneration.set(threadId, preflightGeneration + 1); this._agentSubagentService.forgetParent(threadId)
+		if (this.streamState[threadId]?.isRunning) await this.abortRunning(threadId)
+		const turnGeneration = this._agentControlGeneration.get(threadId) ?? 0
+		const isCurrentTurn = () => (this._agentControlGeneration.get(threadId) ?? 0) === turnGeneration
 		const capturedSettingsState = agentDelegationAllowed ? deepClone(this._settingsService.state) : undefined;
 		const capturedSettingsOfProvider = agentDelegationAllowed ? this._llmMessageService.captureSettingsOfProvider() : undefined;
 		const capturedOverrides = capturedModel.modelSelection ? { [capturedModel.modelSelection.providerName]: { [capturedModel.modelSelection.modelName]: deepClone(capturedOverride) } } as never : undefined;
@@ -1307,10 +1319,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		// add user's message to chat history
 		const instructions = userMessage
 		let currSelns: StagingSelectionItem[] = capturedSelections
-		const owner = this._workspaceContextService.getWorkspace().folders[0]?.uri
 		const catalog = await this._agentSkillsService.getCatalog(owner, owner, instructionSnapshot.config)
-		if (!isCurrentTurn()) return false
-		const roleCatalog = agentDelegationIntent && agentDelegationAllowed ? await this._agentCustomAgentService.getCatalog(owner, owner) : undefined
 		if (!isCurrentTurn()) return false
 		const direct = selectExplicitSkills(catalog, instructions)
 		if (!direct.skills) throw new Error(direct.diagnostic?.code ?? 'skill_not_found')
@@ -1346,7 +1355,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		if (!isCurrentTurn()) return false
 		const roleAd = roleCatalog ? customAgentAdvertisement(roleCatalog, runtimeModel.hasModel ? Math.min(2_000, Math.max(0, Math.floor(runtimeModel.contextWindow * .01 * 4))) : 2_000) : undefined
 		const userMessageContent = agentDelegationIntent
-			? `${userMessageContentBase}\n\n[User delegation marker: up to four generic read-only children are available for this turn, with two running concurrently. Named custom agents admitted for this turn (optional exact agent_type): ${roleAd?.text || 'none'}${roleAd?.omitted ? `; ${roleAd.omitted} omitted` : ''}. Call spawn_agent for delegated tasks, then wait_agent for their results; partial child failures do not prevent your synthesis.]`
+			? `${userMessageContentBase}\n\n[User delegation marker: up to four generic read-only children are available for this turn, with two running concurrently. Named custom agents admitted for this turn (optional exact agent_type): ${roleAd?.text || 'none'}${roleAd?.omitted ? `; ${roleAd.omitted} omitted` : ''}.${agentSelection?.agentType ? ` For this selected role, call spawn_agent with agent_type=${agentSelection.agentType} exactly.` : ''} Call spawn_agent for delegated tasks, then wait_agent for their results; partial child failures do not prevent your synthesis.]`
 			: userMessageContentBase
 		const currentOwner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
 		if (currentOwner !== runtimeSnapshot.ownerProjectRoot || currentOwner !== runtimeSnapshot.runCwd || this._workspaceTrustManagementService.isWorkspaceTrusted() !== runtimeSnapshot.workspaceTrustedAtAdmission) { this._purgeInstructionTurn(threadId, false); throw new Error('skill_owner_or_trust_changed') }

@@ -26,6 +26,8 @@ import { IAccessibilitySignalService } from '../../../../../../../platform/acces
 import { IEditorProgressService } from '../../../../../../../platform/progress/common/progress.js';
 import { detectLanguage } from '../../../../common/helpers/languageHelpers.js';
 import { AgentSkill } from '../../../../common/agentSkills.js';
+import { CustomAgentPickerRequestOwner, loadCustomAgentPickerDescriptors } from '../../../../common/agentCustomAgents.js';
+import { CancellationToken } from '../../../../../../../base/common/cancellation.js';
 
 
 // type guard
@@ -58,7 +60,7 @@ export const WidgetComponent = <CtorParams extends any[], Instance>({ ctor, prop
 	return <div ref={containerRef} className={className === undefined ? `w-full` : className}>{children}</div>
 }
 
-type GenerateNextOptions = (optionText: string) => Promise<Option[]>
+type GenerateNextOptions = (optionText: string, token?: CancellationToken) => Promise<Option[]>
 
 type Option = {
 	fullName: string,
@@ -70,7 +72,7 @@ type Option = {
 		| { leafNodeType?: undefined, nextOptions?: undefined, generateNextOptions: GenerateNextOptions, }
 		| { leafNodeType: 'File' | 'Folder', uri: URI, nextOptions?: undefined, generateNextOptions?: undefined, }
 		| { leafNodeType: 'Skill', skill: AgentSkill, catalogRevision: string, nextOptions?: undefined, generateNextOptions?: undefined, }
-		| { leafNodeType: 'Agent', nextOptions?: undefined, generateNextOptions?: undefined, }
+		| { leafNodeType: 'Agent', agentType?: string, catalogRevision?: string, roleRevision?: string, nextOptions?: undefined, generateNextOptions?: undefined, }
 	)
 
 
@@ -190,9 +192,10 @@ const getAbbreviatedName = (relativePath: string) => {
 	return getBasename(relativePath, 1)
 }
 
-const getOptionsAtPath = async (accessor: ReturnType<typeof useAccessor>, path: string[], optionText: string): Promise<Option[]> => {
+const getOptionsAtPath = async (accessor: ReturnType<typeof useAccessor>, path: string[], optionText: string, token: CancellationToken = CancellationToken.None): Promise<Option[]> => {
 
 	const toolsService = accessor.get('IToolsService')
+	const chatThreadService = accessor.get('IChatThreadService')
 
 
 
@@ -307,7 +310,7 @@ const getOptionsAtPath = async (accessor: ReturnType<typeof useAccessor>, path: 
 				return catalog.skills.filter(skill => isSubsequence(skill.identity, t)).map(skill => ({ leafNodeType: 'Skill' as const, skill, catalogRevision: catalog.revision, iconInMenu: File, fullName: skill.identity, abbreviatedName: skill.identity }));
 			},
 		},
-		{ fullName: 'Agent', abbreviatedName: 'Agent', iconInMenu: File, leafNodeType: 'Agent' },
+		{ fullName: 'Agent', abbreviatedName: 'Agent', iconInMenu: File, generateNextOptions: async (t, token) => (await loadCustomAgentPickerDescriptors(() => chatThreadService.getCustomAgentCatalog(undefined, token))).filter(item => item.kind !== 'role' || isSubsequence(item.identity, t)).map(item => item.kind === 'role' ? { fullName: item.identity, abbreviatedName: item.identity, iconInMenu: File, leafNodeType: 'Agent' as const, agentType: item.identity, catalogRevision: item.catalogRevision, roleRevision: item.roleRevision } : item.kind === 'generic' ? { fullName: item.identity, abbreviatedName: item.identity, iconInMenu: File, leafNodeType: 'Agent' as const } : { fullName: item.identity, abbreviatedName: item.identity, iconInMenu: File, disabled: true, nextOptions: [] }) },
 	]
 
 	// follow the path in the optionsTree (until the last path element)
@@ -329,7 +332,7 @@ const getOptionsAtPath = async (accessor: ReturnType<typeof useAccessor>, path: 
 
 	if (generateNextOptionsAtPath) {
 
-		nextOptionsAtPath = await generateNextOptionsAtPath(optionText)
+		nextOptionsAtPath = await generateNextOptionsAtPath(optionText, token)
 	}
 	else if (path.length === 0 && optionText.trim().length > 0) { // (special case): directly search for both files and folders if optionsPath is empty and there's a search term
 		const filesResults = await searchForFilesOrFolders(optionText, 'files') || [];
@@ -393,6 +396,8 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 	const [didLoadInitialOptions, setDidLoadInitialOptions] = useState(false);
 
 	const currentPathRef = useRef<string>(JSON.stringify([]));
+	const optionsRequestOwnerRef = useRef(new CustomAgentPickerRequestOwner());
+	const beginOptionsRequest = (path: string[]) => { const request = optionsRequestOwnerRef.current.begin(); currentPathRef.current = JSON.stringify(path); return { ...request, path: currentPathRef.current }; };
 
 	// dont show breadcrums if first page and user hasnt typed anything
 	const isTypingEnabled = true
@@ -440,7 +445,7 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 		const isLastOption = !option.generateNextOptions && !option.nextOptions
 		setDidLoadInitialOptions(false)
 		if (isLastOption) {
-			setIsMenuOpen(false)
+			onCloseOptionMenu()
 			insertTextAtCursor(option.abbreviatedName)
 
 			let newSelection: StagingSelectionItem
@@ -460,7 +465,7 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 				type: 'Skill', identity: option.skill.identity, catalogRevision: option.catalogRevision, bodyRevision: option.skill.bodyRevision,
 				skillRoot: option.skill.provenance.skillRoot, description: option.skill.description, state: undefined,
 			}
-			else if (option.leafNodeType === 'Agent') newSelection = { type: 'Agent', label: AGENT_DELEGATION_SELECTION_LABEL, state: undefined }
+			else if (option.leafNodeType === 'Agent') newSelection = option.agentType ? { type: 'Agent', label: AGENT_DELEGATION_SELECTION_LABEL, agentType: option.agentType, catalogRevision: option.catalogRevision!, roleRevision: option.roleRevision!, state: undefined } : { type: 'Agent', label: AGENT_DELEGATION_SELECTION_LABEL, state: undefined }
 			else throw new Error(`Unexpected leafNodeType ${option.leafNodeType}`)
 
 			chatThreadService.addNewStagingSelection(newSelection)
@@ -468,9 +473,9 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 		else {
 
 
-			currentPathRef.current = JSON.stringify(newPath);
-			const newOpts = await getOptionsAtPath(accessor, newPath, '') || []
-			if (currentPathRef.current !== JSON.stringify(newPath)) { return; }
+			const request = beginOptionsRequest(newPath);
+			const newOpts = await getOptionsAtPath(accessor, newPath, '', request.token) || []
+			if (!optionsRequestOwnerRef.current.isCurrent(request.key) || currentPathRef.current !== request.path) { return; }
 			setOptionPath(newPath)
 			setOptionText('')
 			setOptionIdx(getEnabledOptionIndex(newOpts, option => option.disabled === true, 0, 1, false) ?? 0)
@@ -481,9 +486,9 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 
 	const onRemoveOption = async () => {
 		const newPath = [...optionPath.slice(0, optionPath.length - 1)]
-		currentPathRef.current = JSON.stringify(newPath);
-		const newOpts = await getOptionsAtPath(accessor, newPath, '') || []
-		if (currentPathRef.current !== JSON.stringify(newPath)) { return; }
+		const request = beginOptionsRequest(newPath);
+		const newOpts = await getOptionsAtPath(accessor, newPath, '', request.token) || []
+		if (!optionsRequestOwnerRef.current.isCurrent(request.key) || currentPathRef.current !== request.path) { return; }
 		setOptionPath(newPath)
 		setOptionText('')
 		setOptionIdx(getEnabledOptionIndex(newOpts, option => option.disabled === true, 0, 1, false) ?? 0)
@@ -492,9 +497,9 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 
 	const onOpenOptionMenu = async () => {
 		const newPath: [] = []
-		currentPathRef.current = JSON.stringify([]);
-		const newOpts = await getOptionsAtPath(accessor, [], '') || []
-		if (currentPathRef.current !== JSON.stringify([])) { return; }
+		const request = beginOptionsRequest([]);
+		const newOpts = await getOptionsAtPath(accessor, [], '', request.token) || []
+		if (!optionsRequestOwnerRef.current.isCurrent(request.key) || currentPathRef.current !== request.path) { return; }
 		setOptionPath(newPath)
 		setOptionText('')
 		setIsMenuOpen(true);
@@ -502,6 +507,7 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 		setOptions(newOpts);
 	}
 	const onCloseOptionMenu = () => {
+		optionsRequestOwnerRef.current.cancel();
 		setIsMenuOpen(false);
 	}
 
@@ -534,6 +540,7 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 	useEffect(() => {
 		// Cleanup function to cancel any pending timeouts when unmounting
 		return () => {
+			optionsRequestOwnerRef.current.cancel();
 			if (debounceTimerRef.current !== null) {
 				window.clearTimeout(debounceTimerRef.current);
 				debounceTimerRef.current = null;
@@ -551,11 +558,11 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 			window.clearTimeout(debounceTimerRef.current);
 		}
 
-		currentPathRef.current = JSON.stringify(optionPath);
+		const request = beginOptionsRequest(optionPath);
 
 		const fetchOptions = async () => {
-			const newOpts = await getOptionsAtPath(accessor, optionPath, newStr) || [];
-			if (currentPathRef.current !== JSON.stringify(optionPath)) { return; }
+			const newOpts = await getOptionsAtPath(accessor, optionPath, newStr, request.token) || [];
+			if (!optionsRequestOwnerRef.current.isCurrent(request.key) || currentPathRef.current !== request.path) { return; }
 			setOptions(newOpts);
 			setOptionIdx(getEnabledOptionIndex(newOpts, option => option.disabled === true, 0, 1, false) ?? 0);
 			debounceTimerRef.current = null;
@@ -705,7 +712,7 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 				(!isReferenceHTMLElement || !reference.contains(target)) &&
 				!floating.contains(target)
 			) {
-				setIsMenuOpen(false);
+				onCloseOptionMenu();
 			}
 		};
 

@@ -103,6 +103,10 @@ export type StagingSelectionItem = {
 	/** Inert user-authority marker; the parent must call spawn_agent explicitly. */
 	type: 'Agent';
 	label: typeof AGENT_DELEGATION_SELECTION_LABEL;
+	/** Optional exact role intent captured from the bounded custom-agent catalog. */
+	agentType?: string;
+	catalogRevision?: string;
+	roleRevision?: string;
 	state?: undefined;
 } | {
 	// A Skill is not a File selection: its immutable catalog/body revisions prevent a stale
@@ -119,7 +123,9 @@ export type StagingSelectionItem = {
 export const isAgentDelegationSelection = (value: unknown): value is Extract<StagingSelectionItem, { type: 'Agent' }> => {
 	if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
 	const record = value as Record<string, unknown>;
-	return record.type === 'Agent' && record.label === AGENT_DELEGATION_SELECTION_LABEL && record.state === undefined && Object.keys(record).every(key => key === 'type' || key === 'label' || key === 'state');
+	if (record.type !== 'Agent' || record.label !== AGENT_DELEGATION_SELECTION_LABEL || record.state !== undefined || !Object.keys(record).every(key => key === 'type' || key === 'label' || key === 'state' || key === 'agentType' || key === 'catalogRevision' || key === 'roleRevision')) return false;
+	const named = record.agentType !== undefined || record.catalogRevision !== undefined || record.roleRevision !== undefined;
+	return !named || (typeof record.agentType === 'string' && /^[a-z][a-z0-9_-]{0,63}$/.test(record.agentType) && typeof record.catalogRevision === 'string' && !!record.catalogRevision && typeof record.roleRevision === 'string' && !!record.roleRevision);
 };
 
 

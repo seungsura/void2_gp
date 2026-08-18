@@ -1,11 +1,23 @@
 /*---------------------------------------------------------------------------------------------
  * Strict, metadata-only custom-agent helpers. Discovery and file I/O live in the browser.
  *--------------------------------------------------------------------------------------------*/
+import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
 export type CustomAgentDiagnostic = Readonly<{ code: string; detail: string; identity?: string }>;
 export type CustomAgentSkillRule = Readonly<{ selector: string; enabled: boolean }>;
 export type CustomAgent = Readonly<{ identity: string; name: string; description: string; developerInstructions: string; model?: string; modelReasoningEffort?: string; skillRules?: readonly CustomAgentSkillRule[]; revision: string; provenance: Readonly<{ scope: 'user' | 'project'; uri: string }> }>;
 export type CustomAgentCatalog = Readonly<{ revision: string; agents: readonly CustomAgent[]; diagnostics: readonly CustomAgentDiagnostic[] }>;
 export type CustomAgentCandidate = Readonly<{ scope: 'user' | 'project'; uri: string; filename: string; text: string; parsed: unknown }>;
+export type CustomAgentPickerDescriptor = Readonly<{ kind: 'generic' | 'role' | 'diagnostic'; identity: string; catalogRevision?: string; roleRevision?: string; disabled?: boolean }>;
+export const loadCustomAgentPickerDescriptors = async (load: () => Promise<CustomAgentCatalog>): Promise<readonly CustomAgentPickerDescriptor[]> => {
+	try { const catalog = await load(); return freeze([{ kind: 'generic', identity: 'generic' }, ...catalog.agents.map(agent => freeze({ kind: 'role' as const, identity: agent.identity, catalogRevision: catalog.revision, roleRevision: agent.revision })), ...catalog.diagnostics.slice(0, 8).map((diagnostic, index) => freeze({ kind: 'diagnostic' as const, identity: `diagnostic-${index}-${diagnostic.identity ? `${diagnostic.identity}-` : ''}${diagnostic.code}`, disabled: true }))]); }
+	catch { return freeze([freeze({ kind: 'diagnostic', identity: 'custom-agent-catalog-unavailable', disabled: true })]); }
+};
+export class CustomAgentPickerRequestOwner {
+	private source: CancellationTokenSource | undefined; private sequence = 0;
+	begin(): Readonly<{ key: number; token: CancellationToken }> { this.cancel(); this.source = new CancellationTokenSource(); return { key: ++this.sequence, token: this.source.token }; }
+	isCurrent(key: number): boolean { return key === this.sequence && !!this.source && !this.source.token.isCancellationRequested; }
+	cancel(): void { this.source?.cancel(); this.source?.dispose(); this.source = undefined; this.sequence++; }
+}
 
 const encoder = new TextEncoder();
 const hash = (values: readonly string[]): string => { let n = 2166136261; for (const value of values) for (const byte of encoder.encode(value)) n = Math.imul(n ^ byte, 16777619); return `agents-${(n >>> 0).toString(16)}`; };

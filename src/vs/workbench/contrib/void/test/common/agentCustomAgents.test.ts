@@ -1,5 +1,5 @@
 import * as assert from 'assert';
-import { applyCustomAgentSkillRules, createCustomAgentCatalog, customAgentAdvertisement } from '../../common/agentCustomAgents.js';
+import { applyCustomAgentSkillRules, createCustomAgentCatalog, customAgentAdvertisement, CustomAgentPickerRequestOwner, loadCustomAgentPickerDescriptors } from '../../common/agentCustomAgents.js';
 
 const candidate = (scope: 'user' | 'project', uri: string, parsed: unknown, text = ''): any => ({ scope, uri, filename: 'file-name', text, parsed });
 const valid = (name = 'researcher'): any => ({ name, description: 'Reads source carefully.', developer_instructions: 'Only inspect.' });
@@ -31,5 +31,13 @@ suite('Void custom agents', () => {
 	test('keeps a deterministic whole-entry bounded role advertisement', () => {
 		const catalog = createCustomAgentCatalog(Array.from({ length: 10 }, (_, i) => candidate('user', `file:///u/${i}.toml`, { ...valid(`role${i}`), description: 'x'.repeat(80) }, String(i))));
 		const ad = customAgentAdvertisement(catalog, 200); assert.ok(ad.text.length <= 200); assert.ok(ad.omitted > 0); assert.strictEqual(ad.text.includes('role0'), true); assert.strictEqual(ad.text.includes('role9'), false);
+	});
+	test('builds bounded picker descriptors from the canonical catalog and contains loader failure', async () => {
+		const catalog = createCustomAgentCatalog(Array.from({ length: 10 }, (_, i) => candidate('user', `file:///u/${i}.toml`, valid(`role${i}`), String(i))), Array.from({ length: 10 }, (_, i) => ({ code: `diagnostic${i}`, detail: 'x' })));
+		const descriptors = await loadCustomAgentPickerDescriptors(async () => catalog); assert.strictEqual(descriptors[0].kind, 'generic'); assert.strictEqual(descriptors.filter(item => item.kind === 'role').length, 10); assert.strictEqual(descriptors.filter(item => item.kind === 'diagnostic').length, 8); assert.ok(descriptors.find(item => item.kind === 'role' && item.catalogRevision === catalog.revision && item.roleRevision));
+		assert.deepStrictEqual(await loadCustomAgentPickerDescriptors(async () => { throw new Error('no'); }), [{ kind: 'diagnostic', identity: 'custom-agent-catalog-unavailable', disabled: true }]);
+	});
+	test('cancels superseded and closed picker requests', () => {
+		const owner = new CustomAgentPickerRequestOwner(); const first = owner.begin(); const second = owner.begin(); assert.strictEqual(first.token.isCancellationRequested, true); assert.strictEqual(owner.isCurrent(first.key), false); assert.strictEqual(owner.isCurrent(second.key), true); owner.cancel(); assert.strictEqual(second.token.isCancellationRequested, true); assert.strictEqual(owner.isCurrent(second.key), false);
 	});
 });
