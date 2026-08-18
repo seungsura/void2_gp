@@ -37,6 +37,7 @@ import { ToolApprovalTypeSwitch } from '../void-settings-tsx/Settings.js';
 
 import { persistentTerminalNameOfId } from '../../../terminalToolService.js';
 import { removeMCPToolNamePrefix } from '../../../../common/mcpServiceTypes.js';
+import { applicationToolPresentation, applicationToolRoute, shouldOfferGenericToolApproval } from '../../../../common/applicationToolPresentation.js';
 
 
 
@@ -1412,9 +1413,20 @@ const titleOfBuiltinToolName = {
 
 const getTitle = (toolMessage: Pick<ChatMessage & { role: 'tool' }, 'name' | 'type' | 'mcpServerName'>): React.ReactNode => {
 	const t = toolMessage
+	const route = applicationToolRoute(t.name, builtinToolNames.includes(t.name as BuiltinToolName))
 
-	// non-built-in title
-	if (!builtinToolNames.includes(t.name as BuiltinToolName)) {
+	// Builtins own their exact presentation before reserved application names.
+	if (route === 'builtin') {
+		const toolName = t.name as BuiltinToolName
+		if (t.type === 'success') return titleOfBuiltinToolName[toolName].done
+		if (t.type === 'running_now') return titleOfBuiltinToolName[toolName].running
+		return titleOfBuiltinToolName[toolName].proposed
+	}
+	const application = route === 'application' ? applicationToolPresentation(t.name, t.type, undefined) : undefined
+	if (application) return t.type === 'running_now' || t.type === 'tool_request' ? loadingTitleWrapper(application.title) : application.title
+
+	// All remaining names are actual MCP presentation.
+	{
 		// descriptor of Running or Ran etc
 		const descriptor =
 			t.type === 'success' ? 'Called'
@@ -1432,13 +1444,6 @@ const getTitle = (toolMessage: Pick<ChatMessage & { role: 'tool' }, 'name' | 'ty
 		return title
 	}
 
-	// built-in title
-	else {
-		const toolName = t.name as BuiltinToolName
-		if (t.type === 'success') return titleOfBuiltinToolName[toolName].done
-		if (t.type === 'running_now') return titleOfBuiltinToolName[toolName].running
-		return titleOfBuiltinToolName[toolName].proposed
-	}
 }
 
 
@@ -1710,25 +1715,24 @@ const BottomChildren = ({ children, title }: { children: React.ReactNode, title:
 
 
 const InvalidTool = ({ toolName, message, mcpServerName }: { toolName: ToolName, message: string, mcpServerName: string | undefined }) => {
-	const accessor = useAccessor()
 	const title = getTitle({ name: toolName, type: 'invalid_params', mcpServerName })
-	const desc1 = 'Invalid parameters'
+	const application = applicationToolPresentation(toolName, 'invalid_params', undefined, message)
+	const desc1 = application?.status ?? 'Invalid parameters'
 	const icon = null
 	const isError = true
 	const componentParams: ToolHeaderParams = { title, desc1, isError, icon }
 
 	componentParams.children = <ToolChildrenWrapper>
 		<CodeChildren className='bg-void-bg-3'>
-			{message}
+			{application?.error ?? message}
 		</CodeChildren>
 	</ToolChildrenWrapper>
 	return <ToolHeaderWrapper {...componentParams} />
 }
 
 const CanceledTool = ({ toolName, mcpServerName }: { toolName: ToolName, mcpServerName: string | undefined }) => {
-	const accessor = useAccessor()
 	const title = getTitle({ name: toolName, type: 'rejected', mcpServerName })
-	const desc1 = ''
+	const desc1 = applicationToolPresentation(toolName, 'interrupted_streaming_tool', undefined)?.status ?? ''
 	const icon = null
 	const isRejected = true
 	const componentParams: ToolHeaderParams = { title, desc1, icon, isRejected }
@@ -1840,6 +1844,16 @@ const CommandTool = ({ toolMessage, type, threadId }: { threadId: string } & ({
 }
 
 type WrapperProps<T extends ToolName> = { toolMessage: Exclude<ToolMessage<T>, { type: 'invalid_params' }>, messageIdx: number, threadId: string }
+const ApplicationToolWrapper = ({ toolMessage }: { toolMessage: any }) => {
+	const params = toolMessage.type === 'invalid_params' ? toolMessage.rawParams : toolMessage.params;
+	const payload = toolMessage.type === 'invalid_params' ? toolMessage.content : toolMessage.type === 'tool_error' ? (toolMessage.content || toolMessage.result) : toolMessage.type === 'success' ? toolMessage.result : undefined;
+	const presentation = applicationToolPresentation(toolMessage.name, toolMessage.type, params, payload);
+	if (!presentation) return null;
+	const componentParams: ToolHeaderParams = { title: presentation.title, desc1: presentation.status, desc1Info: presentation.paramsDetail, isError: !!presentation.error, isRejected: toolMessage.type === 'rejected' };
+	if (presentation.error) componentParams.bottomChildren = <BottomChildren title='Error'><CodeChildren>{presentation.error}</CodeChildren></BottomChildren>;
+	if (presentation.resultDetail !== undefined) componentParams.children = <ToolChildrenWrapper><CodeChildren>{presentation.resultDetail}</CodeChildren></ToolChildrenWrapper>;
+	return <ToolHeaderWrapper {...componentParams} />;
+}
 const MCPToolWrapper = ({ toolMessage }: WrapperProps<string>) => {
 	const accessor = useAccessor()
 	const mcpService = accessor.get('IMCPService')
@@ -2452,13 +2466,18 @@ const _ChatBubble = ({ threadId, chatMessage, isCommitted, messageIdx, _scrollTo
 		/>
 	}
 	else if (role === 'tool') {
-
-		if (chatMessage.type === 'invalid_params') return <InvalidTool toolName={chatMessage.name} message={chatMessage.content} mcpServerName={chatMessage.mcpServerName} />
-
 		const toolName = chatMessage.name
-		const isBuiltInTool = isABuiltinToolName(toolName)
-		const ToolResultWrapper = isBuiltInTool ? builtinToolNameToComponent[toolName]?.resultWrapper as ResultWrapper<ToolName>
-			: MCPToolWrapper as ResultWrapper<ToolName>
+		const isBuiltinTool = isABuiltinToolName(toolName)
+		const route = applicationToolRoute(toolName, isBuiltinTool)
+
+		if (chatMessage.type === 'invalid_params') {
+			if (route === 'application') return <ApplicationToolWrapper toolMessage={chatMessage} />
+			return <InvalidTool toolName={chatMessage.name} message={chatMessage.content} mcpServerName={chatMessage.mcpServerName} />
+		}
+
+		const ToolResultWrapper = isBuiltinTool ? builtinToolNameToComponent[toolName]?.resultWrapper as ResultWrapper<ToolName>
+			: route === 'application' ? ApplicationToolWrapper as ResultWrapper<ToolName>
+				: MCPToolWrapper as ResultWrapper<ToolName>
 
 		if (ToolResultWrapper)
 			return <>
@@ -2469,7 +2488,7 @@ const _ChatBubble = ({ threadId, chatMessage, isCommitted, messageIdx, _scrollTo
 						threadId={threadId}
 					/>
 				</div>
-				{chatMessage.type === 'tool_request' ?
+				{shouldOfferGenericToolApproval(route, chatMessage.type) ?
 					<div>
 						<ToolRequestAcceptRejectButtons toolName={chatMessage.name} />
 					</div> : null}

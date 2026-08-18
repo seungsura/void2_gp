@@ -1,6 +1,7 @@
 import assert from 'assert';
+import { CancellationTokenSource } from '../../../../../base/common/cancellation.js';
 import { parse } from 'smol-toml';
-import { AgentSkillCatalog, AgentRuntimeTurnSnapshot, SkillCandidate, createAgentRuntimeTurnSnapshot, createSkillCatalog, explicitSkillSelectors, resolveSkillSelector, reviveAgentRuntimeTurnSnapshot, selectExplicitSkills, skillAdvertisement, skillBodyRevision, strictSkillFromCandidate } from '../../common/agentSkills.js';
+import { AgentSkillCatalog, AgentRuntimeTurnSnapshot, SkillCandidate, beginSkillPickerQuery, closeSkillComposerDollarSession, createAgentRuntimeTurnSnapshot, createSkillCatalog, createSkillComposerDollarSession, explicitSkillSelectors, initialSkillPickerQueryState, isSkillComposerDollarQueryCharacter, replaceSkillComposerDollarSelection, replaceSkillComposerTrigger, resolveSkillSelector, reviveAgentRuntimeTurnSnapshot, selectExplicitSkills, settleSkillPickerQuery, skillAdvertisement, skillBodyRevision, skillComposerDollarEnterAction, skillComposerTriggerAtCursor, skillPickerDescriptors, strictSkillFromCandidate, updateSkillComposerDollarQuery } from '../../common/agentSkills.js';
 import { parseAgentConfigSource, projectAgentConfig, resolveAgentInstructions, stableAgentInstructionRevision } from '../../common/agentInstructions.js';
 
 const bytes = (text: string) => new TextEncoder().encode(text);
@@ -17,6 +18,62 @@ suite('Agent Skills catalog and runtime', () => {
 	test('preserves loose duplicates while resolving unique bare and qualified names', () => { const value = catalog(candidate('same', 'repository', 0), candidate('same', 'plugin', 1, 'Body', 'plug'), candidate('only')); assert.strictEqual(value.skills.filter(skill => skill.name === 'same').length, 2); assert.strictEqual(resolveSkillSelector(value, 'only').skill!.identity, 'only'); assert.strictEqual(resolveSkillSelector(value, 'plug:same').skill!.identity, 'plug:same'); });
 	test('reports bare and qualified ambiguity plus missing selectors', () => { const value = catalog(candidate('same'), candidate('same', 'repository', 1, 'Body', 'plug'), { ...candidate('same', 'repository', 2, 'Body', 'plug'), skillRoot: 'file:///other/same' }); assert.strictEqual(resolveSkillSelector(value, 'same').diagnostic!.code, 'skill_ambiguous'); assert.strictEqual(resolveSkillSelector(value, 'plug:same').diagnostic!.code, 'skill_ambiguous'); assert.strictEqual(resolveSkillSelector(value, 'missing').diagnostic!.code, 'skill_not_found'); });
 	test('selects dollar tokens in first-seen order deterministically', () => { const value = catalog(candidate('one'), candidate('two')); assert.deepStrictEqual(explicitSkillSelectors('$two then $one then $two'), ['two', 'one']); assert.deepStrictEqual(selectExplicitSkills(value, '$two then $one').skills!.map(skill => skill.identity), ['two', 'one']); });
+	test('keeps dollar literals in inline and fenced code while exposing only plain composer triggers', () => {
+		const text = '$one `literal $two` and ``literal `$three``\n```ts\nconst x = "$four"\n```not-a-close\n$still-fenced\n``` \t\r\n   ~~~md\n$five\n   ~~~\n$plugin:six';
+		assert.deepStrictEqual(explicitSkillSelectors(text), ['one', 'plugin:six']);
+		assert.deepStrictEqual(skillComposerTriggerAtCursor('try $', 5), { index: 4, query: '' });
+		assert.strictEqual(skillComposerTriggerAtCursor('`$literal`', 9), undefined);
+		const fenced = '```\n$\n```'; assert.strictEqual(skillComposerTriggerAtCursor(fenced, fenced.indexOf('$') + 1), undefined);
+	});
+	test('does not open a Skills picker from an earlier selector while the newest dollar is code literal', () => {
+		const inline = '$one `latest $`'; assert.strictEqual(skillComposerTriggerAtCursor(inline, inline.lastIndexOf('$') + 1), undefined);
+		const fence = '````\n` $\n````'; assert.strictEqual(skillComposerTriggerAtCursor(fence, fence.indexOf('$') + 1), undefined);
+	});
+	test('replaces only the dollar trigger with canonical direct text and no selection side effect', () => {
+		assert.deepStrictEqual(replaceSkillComposerTrigger('$', 0, 1, 'demo'), { text: '$demo', cursor: 5 });
+		assert.deepStrictEqual(replaceSkillComposerTrigger('before $ after', 7, 8, 'plugin:demo'), { text: 'before $plugin:demo after', cursor: 19 });
+		assert.deepStrictEqual(replaceSkillComposerTrigger('$demo and $', 10, 11, 'demo'), { text: '$demo and ', cursor: 10 });
+		assert.strictEqual(replaceSkillComposerTrigger('$', 0, 1, 'bad identity'), undefined);
+	});
+	test('mirrors dollar query typing and deletion while close preserves and selection replaces the whole guarded token', async () => {
+		assert.strictEqual(isSkillComposerDollarQueryCharacter('A'), true); assert.strictEqual(isSkillComposerDollarQueryCharacter(':'), true); assert.strictEqual(isSkillComposerDollarQueryCharacter('_'), true); assert.strictEqual(isSkillComposerDollarQueryCharacter(' '), false); assert.strictEqual(isSkillComposerDollarQueryCharacter('.'), false);
+		let sentence = createSkillComposerDollarSession('Use $', 4)!; for (const query of ['d', 'de', 'demo']) sentence = updateSkillComposerDollarQuery(sentence, sentence.text, query)!;
+		assert.strictEqual(updateSkillComposerDollarQuery(sentence, sentence.text, 'demo '), undefined); const delimiterClose = closeSkillComposerDollarSession(sentence, sentence.text)!; const nativeDelimiterText = `${delimiterClose.text} to inspect`; assert.strictEqual(nativeDelimiterText, 'Use $demo to inspect'); assert.deepStrictEqual(explicitSkillSelectors(nativeDelimiterText), ['demo']); assert.deepStrictEqual(explicitSkillSelectors('Use $demo. Then $plugin:other!'), ['demo', 'plugin:other']);
+		let typing = createSkillComposerDollarSession('before $ after', 7)!;
+		for (const query of ['p', 'pl', 'plug', 'plug:']) typing = updateSkillComposerDollarQuery(typing, typing.text, query)!;
+		assert.strictEqual(typing.text, 'before $plug: after');
+		typing = updateSkillComposerDollarQuery(typing, typing.text, 'plug')!; assert.strictEqual(typing.text, 'before $plug after');
+		typing = updateSkillComposerDollarQuery(typing, typing.text, '')!; assert.strictEqual(typing.text, 'before $ after');
+
+		const noResults = updateSkillComposerDollarQuery(createSkillComposerDollarSession('before $ after', 7)!, 'before $ after', 'missing')!;
+		assert.strictEqual((await skillPickerDescriptors(async () => catalog(candidate('demo')))).some(item => item.identity === noResults.query), false);
+		assert.strictEqual(closeSkillComposerDollarSession(noResults, noResults.text)!.text, 'before $missing after');
+		const ambiguous = updateSkillComposerDollarQuery(createSkillComposerDollarSession('before $ after', 7)!, 'before $ after', 'same')!;
+		const ambiguousOptions = await skillPickerDescriptors(async () => catalog(candidate('same'), candidate('same', 'plugin', 1, 'Body', 'plug'))); assert.strictEqual(ambiguousOptions.find(item => item.identity === ambiguous.query)?.kind, 'diagnostic');
+		assert.strictEqual(closeSkillComposerDollarSession(ambiguous, ambiguous.text)!.text, 'before $same after');
+		assert.strictEqual(updateSkillComposerDollarQuery(ambiguous, `${ambiguous.text}!`, 'changed'), undefined);
+
+		const qualifiedQuery = updateSkillComposerDollarQuery(createSkillComposerDollarSession('before $ after', 7)!, 'before $ after', 'plug')!;
+		assert.deepStrictEqual(replaceSkillComposerDollarSelection(qualifiedQuery, qualifiedQuery.text, 'plugin:demo'), { text: 'before $plugin:demo after', cursor: 19 });
+		const duplicateQuery = updateSkillComposerDollarQuery(createSkillComposerDollarSession('$demo and $', 10)!, '$demo and $', 'de')!;
+		assert.deepStrictEqual(replaceSkillComposerDollarSelection(duplicateQuery, duplicateQuery.text, 'demo'), { text: '$demo and ', cursor: 10 });
+		assert.strictEqual(replaceSkillComposerDollarSelection(duplicateQuery, `${duplicateQuery.text} drift`, 'demo'), undefined);
+
+		const stale = beginSkillPickerQuery(initialSkillPickerQueryState, 'demo'); assert.strictEqual(skillComposerDollarEnterAction(stale, 'demo', true), 'submit');
+		const newer = beginSkillPickerQuery(stale, 'demo-two'); assert.strictEqual(settleSkillPickerQuery(newer, stale.revision, stale.query), undefined); assert.strictEqual(skillComposerDollarEnterAction(newer, 'demo-two', true), 'submit');
+		const ready = settleSkillPickerQuery(newer, newer.revision, newer.query)!; assert.strictEqual(skillComposerDollarEnterAction(ready, ready.query, false), 'submit'); assert.strictEqual(skillComposerDollarEnterAction(ready, ready.query, true), 'select');
+	});
+	test('scans every bounded-message selector so a late missing identity fails visibly', () => { const values = Array.from({ length: 40 }, (_, index) => `$skill-${index}`); assert.strictEqual(explicitSkillSelectors(values.join(' ')).length, 40); assert.deepStrictEqual(explicitSkillSelectors(`$${'a'.repeat(65)} $valid`), ['valid']); const value = catalog(...values.slice(0, 33).map((_, index) => candidate(`skill-${index}`, 'repository', index))); const selected = selectExplicitSkills(value, `${values.slice(0, 33).join(' ')} $missing`); assert.strictEqual(selected.skills, undefined); assert.deepStrictEqual(selected.diagnostic, { code: 'skill_not_found', identity: 'missing' }); });
+	test('loads empty, unique, duplicate, and cancelled late Skill picker descriptors canonically', async () => {
+		assert.deepStrictEqual(await skillPickerDescriptors(async () => catalog()), []);
+		const value = catalog(candidate('unique', 'repository', 0), candidate('same', 'repository', 1), candidate('same', 'plugin', 2, 'Body', 'plug'), candidate('qualified', 'plugin', 3, 'Body', 'plugdup'), { ...candidate('qualified', 'plugin', 4, 'Body', 'plugdup'), skillRoot: 'file:///other/qualified' });
+		const descriptors = await skillPickerDescriptors(async () => value);
+		assert.strictEqual(descriptors.length, 4); assert.deepStrictEqual(descriptors.map(item => [item.kind, item.identity]), [['diagnostic', 'same'], ['diagnostic', 'plugdup:qualified'], ['skill', 'unique'], ['skill', 'plug:same']]);
+		const duplicate = descriptors[0]; assert.strictEqual(duplicate.kind === 'diagnostic' && duplicate.disabled, true); assert.strictEqual(duplicate.kind === 'diagnostic' && duplicate.label.length < 200, true); assert.strictEqual(descriptors.filter(item => item.identity === 'same').length, 1);
+		assert.strictEqual(descriptors.find(item => item.identity === 'plug:same')?.kind, 'skill'); assert.strictEqual(descriptors.filter(item => item.identity === 'plugdup:qualified').length, 1); assert.strictEqual(descriptors.find(item => item.identity === 'plugdup:qualified')?.kind, 'diagnostic');
+		let release!: (catalog: AgentSkillCatalog) => void; const deferred = new Promise<AgentSkillCatalog>(resolve => release = resolve); const source = new CancellationTokenSource(); const pending = skillPickerDescriptors(() => deferred, source.token); source.cancel(); release(value); assert.deepStrictEqual(await pending, []); source.dispose();
+		const alreadyCancelled = new CancellationTokenSource(); alreadyCancelled.cancel(); let loads = 0; assert.deepStrictEqual(await skillPickerDescriptors(async () => { loads++; return value; }, alreadyCancelled.token), []); assert.strictEqual(loads, 0); alreadyCancelled.dispose();
+	});
 	test('fails explicit multi-selection atomically', () => { const value = catalog(candidate('one')); const selected = selectExplicitSkills(value, '$one $missing'); assert.strictEqual(selected.skills, undefined); assert.strictEqual(selected.diagnostic!.code, 'skill_not_found'); });
 	test('advertises unknown context at exactly 8000 and known context at the 2 percent character floor', () => { const value = catalog(candidate('demo')); assert.strictEqual(skillAdvertisement(value, undefined).limit, 8000); assert.strictEqual(skillAdvertisement(value, 123).limit, Math.floor(123 * .02 * 4)); });
 	test('shortens descriptions first, omits whole entries, and excludes implicit false from advertisement', () => { const firstDescription = 'x'.repeat(200); const first = strictSkillFromCandidate({ ...candidate('first'), bytes: bytes(`---\nname: first\ndescription: ${firstDescription}\n---`) }).skill!; const later = strictSkillFromCandidate({ ...candidate('later', 'repository', 1), bytes: bytes(`---\nname: later\ndescription: ${'y'.repeat(20)}\n---`) }).skill!; const hidden = strictSkillFromCandidate(candidate('hidden', 'repository', 2, 'Body', undefined, 'policy:\n  allow_implicit_invocation: false')).skill!; const rebuilt: AgentSkillCatalog = Object.freeze({ ...createSkillCatalog([candidate('base')]), skills: Object.freeze([first, later, hidden]) }); const ad = skillAdvertisement(rebuilt, 2000); const firstLine = ad.text.split('\n')[0]; assert.strictEqual(firstLine.includes('identity=first'), true); assert.strictEqual(firstLine.endsWith(firstDescription), false); assert.strictEqual(firstLine.includes('description=' + firstDescription.slice(0, 1)), true); assert.strictEqual(ad.text.includes('identity=later'), false); assert.strictEqual(ad.text.includes('identity=hidden'), false); assert.strictEqual(ad.omitted, 1); assert.strictEqual(ad.used, ad.text.length); assert.strictEqual(ad.limit, 160); assert.deepStrictEqual(ad.diagnostic, { code: 'skill_catalog_omitted', detail: `budget:${ad.used}/${ad.limit}; omitted:1` }); });

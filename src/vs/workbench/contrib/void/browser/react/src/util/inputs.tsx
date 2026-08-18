@@ -25,7 +25,7 @@ import { extractSearchReplaceBlocks, ExtractedSearchReplaceBlock } from '../../.
 import { IAccessibilitySignalService } from '../../../../../../../platform/accessibilitySignal/browser/accessibilitySignalService.js';
 import { IEditorProgressService } from '../../../../../../../platform/progress/common/progress.js';
 import { detectLanguage } from '../../../../common/helpers/languageHelpers.js';
-import { AgentSkill } from '../../../../common/agentSkills.js';
+import { AgentSkill, beginSkillPickerQuery, canSelectSkillPickerQuery, closeSkillComposerDollarSession, createSkillComposerDollarSession, initialSkillPickerQueryState, isSkillComposerDollarQueryCharacter, isSkillComposerMenuRoot, replaceSkillComposerDollarSelection, settleSkillPickerQuery, skillComposerDollarEnterAction, skillComposerMenuPath, skillPickerDescriptors, SkillComposerDollarSession, SkillComposerMenuTrigger, skillComposerTriggerAtCursor, SkillPickerQueryState, updateSkillComposerDollarQuery } from '../../../../common/agentSkills.js';
 import { CustomAgentPickerRequestOwner, loadCustomAgentPickerDescriptors } from '../../../../common/agentCustomAgents.js';
 import { CancellationToken } from '../../../../../../../base/common/cancellation.js';
 
@@ -305,9 +305,11 @@ const getOptionsAtPath = async (accessor: ReturnType<typeof useAccessor>, path: 
 		},
 		{
 			fullName: 'skills', abbreviatedName: 'skills', iconInMenu: File,
-			generateNextOptions: async (t) => {
-				const catalog = await chatThreadService.getSkillCatalog();
-				return catalog.skills.filter(skill => isSubsequence(skill.identity, t)).map(skill => ({ leafNodeType: 'Skill' as const, skill, catalogRevision: catalog.revision, iconInMenu: File, fullName: skill.identity, abbreviatedName: skill.identity }));
+			generateNextOptions: async (_t, token = CancellationToken.None) => {
+				const descriptors = await skillPickerDescriptors(() => chatThreadService.getSkillCatalog(), token);
+				return descriptors.map(item => item.kind === 'skill'
+					? { leafNodeType: 'Skill' as const, skill: item.skill, catalogRevision: item.catalogRevision, iconInMenu: File, fullName: item.identity, abbreviatedName: item.identity }
+					: { fullName: item.identity, abbreviatedName: item.label, iconInMenu: File, disabled: true, nextOptions: [] });
 			},
 		},
 		{ fullName: 'Agent', abbreviatedName: 'Agent', iconInMenu: File, generateNextOptions: async (t, token) => (await loadCustomAgentPickerDescriptors(() => chatThreadService.getCustomAgentCatalog(undefined, token))).filter(item => item.kind !== 'role' || isSubsequence(item.identity, t)).map(item => item.kind === 'role' ? { fullName: item.identity, abbreviatedName: item.identity, iconInMenu: File, leafNodeType: 'Agent' as const, agentType: item.identity, catalogRevision: item.catalogRevision, roleRevision: item.roleRevision } : item.kind === 'generic' ? { fullName: item.identity, abbreviatedName: item.identity, iconInMenu: File, leafNodeType: 'Agent' as const } : { fullName: item.identity, abbreviatedName: item.identity, iconInMenu: File, disabled: true, nextOptions: [] }) },
@@ -396,6 +398,10 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 	const [didLoadInitialOptions, setDidLoadInitialOptions] = useState(false);
 
 	const currentPathRef = useRef<string>(JSON.stringify([]));
+	const menuTriggerRef = useRef<SkillComposerMenuTrigger>('at');
+	const menuTriggerIndexRef = useRef<number | undefined>(undefined);
+	const dollarSessionRef = useRef<SkillComposerDollarSession | undefined>(undefined);
+	const skillPickerQueryRef = useRef<SkillPickerQueryState>(initialSkillPickerQueryState);
 	const optionsRequestOwnerRef = useRef(new CustomAgentPickerRequestOwner());
 	const beginOptionsRequest = (path: string[]) => { const request = optionsRequestOwnerRef.current.begin(); currentPathRef.current = JSON.stringify(path); return { ...request, path: currentPathRef.current }; };
 
@@ -412,18 +418,22 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 
 		// delete the @ and set the cursor position
 		// Get cursor position
-		const startPos = textarea.selectionStart;
-		const endPos = textarea.selectionEnd;
+		const triggerIndex = menuTriggerIndexRef.current;
+		if (triggerIndex === undefined || triggerIndex >= textarea.value.length) return false;
 
 		// Get the text before the cursor, excluding the @ symbol that triggered the menu
-		const textBeforeCursor = textarea.value.substring(0, startPos - 1);
-		const textAfterCursor = textarea.value.substring(endPos);
+		const textBeforeCursor = textarea.value.substring(0, triggerIndex);
+		const textAfterCursor = textarea.value.substring(triggerIndex + 1);
+		const direct = menuTriggerRef.current === 'dollar' && dollarSessionRef.current ? replaceSkillComposerDollarSelection(dollarSessionRef.current, textarea.value, text) : undefined;
+		if (menuTriggerRef.current === 'dollar' && !direct) return false;
+		if (menuTriggerRef.current === 'at' && textarea.value[triggerIndex] !== '@') return false;
 
-		// Replace the text including the @ symbol with the selected option
-		textarea.value = textBeforeCursor + textAfterCursor;
+		// `@` removes its marker before creating a staging chip. `$` retains an exact
+		// canonical token and is resolved during submit without creating a chip.
+		textarea.value = direct?.text ?? (textBeforeCursor + textAfterCursor);
 
-		// Set cursor position after the inserted text
-		const newCursorPos = textBeforeCursor.length;
+		// Set cursor position after the inserted text.
+		const newCursorPos = direct?.cursor ?? textBeforeCursor.length;
 		textarea.setSelectionRange(newCursorPos, newCursorPos);
 
 		// React's onChange relies on a SyntheticEvent system
@@ -432,11 +442,13 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 			onChangeText(textarea.value);
 		}
 		adjustHeight();
+		return true;
 	};
 
 
 	const onSelectOption = async () => {
 
+		if (menuTriggerRef.current === 'dollar' && (!dollarSessionRef.current || optionText !== dollarSessionRef.current.query || !didLoadInitialOptions || !canSelectSkillPickerQuery(skillPickerQueryRef.current, dollarSessionRef.current.query))) return;
 		if (!options.length) { return; }
 
 		const option = options[optionIdx];
@@ -445,8 +457,8 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 		const isLastOption = !option.generateNextOptions && !option.nextOptions
 		setDidLoadInitialOptions(false)
 		if (isLastOption) {
-			onCloseOptionMenu()
-			insertTextAtCursor(option.abbreviatedName)
+			if (menuTriggerRef.current === 'dollar') { if (!insertTextAtCursor(option.abbreviatedName)) return; onCloseOptionMenu(); }
+			else { onCloseOptionMenu(); if (!insertTextAtCursor(option.abbreviatedName)) return; }
 
 			let newSelection: StagingSelectionItem
 			if (option.leafNodeType === 'File') newSelection = {
@@ -468,7 +480,8 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 			else if (option.leafNodeType === 'Agent') newSelection = option.agentType ? { type: 'Agent', label: AGENT_DELEGATION_SELECTION_LABEL, agentType: option.agentType, catalogRevision: option.catalogRevision!, roleRevision: option.roleRevision!, state: undefined } : { type: 'Agent', label: AGENT_DELEGATION_SELECTION_LABEL, state: undefined }
 			else throw new Error(`Unexpected leafNodeType ${option.leafNodeType}`)
 
-			chatThreadService.addNewStagingSelection(newSelection)
+			// A `$skill` selection is direct invocation text, not a second staging chip.
+			if (!(option.leafNodeType === 'Skill' && menuTriggerRef.current === 'dollar')) chatThreadService.addNewStagingSelection(newSelection)
 		}
 		else {
 
@@ -485,6 +498,7 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 	}
 
 	const onRemoveOption = async () => {
+		if (isSkillComposerMenuRoot(optionPath, menuTriggerRef.current)) { onCloseOptionMenu(); return; }
 		const newPath = [...optionPath.slice(0, optionPath.length - 1)]
 		const request = beginOptionsRequest(newPath);
 		const newOpts = await getOptionsAtPath(accessor, newPath, '', request.token) || []
@@ -495,18 +509,34 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 		setOptions(newOpts)
 	}
 
-	const onOpenOptionMenu = async () => {
-		const newPath: [] = []
-		const request = beginOptionsRequest([]);
-		const newOpts = await getOptionsAtPath(accessor, [], '', request.token) || []
-		if (!optionsRequestOwnerRef.current.isCurrent(request.key) || currentPathRef.current !== request.path) { return; }
+	const onOpenOptionMenu = async (trigger: SkillComposerMenuTrigger = 'at', triggerIndex?: number) => {
+		if (trigger === 'dollar') {
+			const textarea = textAreaRef.current; const session = textarea && triggerIndex !== undefined ? createSkillComposerDollarSession(textarea.value, triggerIndex) : undefined;
+			if (!session) return; dollarSessionRef.current = session;
+		} else dollarSessionRef.current = undefined;
+		const pickerQuery = trigger === 'dollar' ? beginSkillPickerQuery(skillPickerQueryRef.current, '') : undefined;
+		if (pickerQuery) skillPickerQueryRef.current = pickerQuery;
+		menuTriggerRef.current = trigger;
+		menuTriggerIndexRef.current = triggerIndex;
+		const newPath = [...skillComposerMenuPath(trigger)]
+		const request = beginOptionsRequest(newPath);
 		setOptionPath(newPath)
 		setOptionText('')
+		setOptions([])
+		setDidLoadInitialOptions(false)
 		setIsMenuOpen(true);
+		const newOpts = await getOptionsAtPath(accessor, newPath, '', request.token) || []
+		if (!optionsRequestOwnerRef.current.isCurrent(request.key) || currentPathRef.current !== request.path) { return; }
+		if (pickerQuery) { const settled = settleSkillPickerQuery(skillPickerQueryRef.current, pickerQuery.revision, pickerQuery.query); if (!settled) return; skillPickerQueryRef.current = settled; }
 		setOptionIdx(getEnabledOptionIndex(newOpts, option => option.disabled === true, 0, 1, false) ?? 0);
 		setOptions(newOpts);
+		setDidLoadInitialOptions(true)
 	}
 	const onCloseOptionMenu = () => {
+		const textarea = textAreaRef.current; const session = dollarSessionRef.current;
+		if (menuTriggerRef.current === 'dollar' && textarea && session) closeSkillComposerDollarSession(session, textarea.value);
+		dollarSessionRef.current = undefined;
+		skillPickerQueryRef.current = initialSkillPickerQueryState;
 		optionsRequestOwnerRef.current.cancel();
 		setIsMenuOpen(false);
 	}
@@ -550,9 +580,16 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 
 	// debounced, but immediate if text is empty
 	const onPathTextChange = useCallback((newStr: string) => {
-
-
+		if (menuTriggerRef.current === 'dollar') {
+			const textarea = textAreaRef.current; const session = dollarSessionRef.current; const next = textarea && session ? updateSkillComposerDollarQuery(session, textarea.value, newStr) : undefined;
+			if (!textarea || !next) { onCloseOptionMenu(); return; }
+			dollarSessionRef.current = next; textarea.value = next.text; const cursor = next.triggerIndex + next.query.length + 1; textarea.setSelectionRange(cursor, cursor); onChangeText?.(next.text); adjustHeight();
+		}
+		const pickerQuery = menuTriggerRef.current === 'dollar' ? beginSkillPickerQuery(skillPickerQueryRef.current, newStr) : undefined;
+		if (pickerQuery) skillPickerQueryRef.current = pickerQuery;
 		setOptionText(newStr);
+		setOptions([]);
+		setDidLoadInitialOptions(false);
 
 		if (debounceTimerRef.current !== null) {
 			window.clearTimeout(debounceTimerRef.current);
@@ -563,8 +600,10 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 		const fetchOptions = async () => {
 			const newOpts = await getOptionsAtPath(accessor, optionPath, newStr, request.token) || [];
 			if (!optionsRequestOwnerRef.current.isCurrent(request.key) || currentPathRef.current !== request.path) { return; }
+			if (pickerQuery) { const settled = settleSkillPickerQuery(skillPickerQueryRef.current, pickerQuery.revision, pickerQuery.query); if (!settled) return; skillPickerQueryRef.current = settled; }
 			setOptions(newOpts);
 			setOptionIdx(getEnabledOptionIndex(newOpts, option => option.disabled === true, 0, 1, false) ?? 0);
+			setDidLoadInitialOptions(true);
 			debounceTimerRef.current = null;
 		};
 
@@ -575,12 +614,13 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 			// Otherwise, set a new timeout to fetch options after a delay
 			debounceTimerRef.current = window.setTimeout(fetchOptions, 300);
 		}
-	}, [optionPath, accessor]);
+	}, [optionPath, accessor, onChangeText, adjustHeight]);
 
 
 	const onMenuKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
 
 		const isCommandKeyPressed = e.altKey || e.ctrlKey || e.metaKey;
+		const currentOptionText = menuTriggerRef.current === 'dollar' ? dollarSessionRef.current?.query ?? optionText : optionText;
 
 		if (e.key === 'ArrowUp') {
 			if (isCommandKeyPressed) {
@@ -607,13 +647,17 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 		} else if (e.key === 'ArrowRight') {
 			onSelectOption();
 		} else if (e.key === 'Enter') {
+			if (menuTriggerRef.current === 'dollar') {
+				const session = dollarSessionRef.current; const option = options[optionIdx]; const action = session ? skillComposerDollarEnterAction(skillPickerQueryRef.current, session.query, optionText === session.query && didLoadInitialOptions && !!option && option.disabled !== true) : 'submit';
+				if (action === 'submit') { onCloseOptionMenu(); e.preventDefault(); e.stopPropagation(); onKeyDown?.(e); return; }
+			}
 			onSelectOption();
 		} else if (e.key === 'Escape') {
 			onCloseOptionMenu()
 		} else if (e.key === 'Backspace') {
 
-			if (!optionText) { // No text remaining
-				if (optionPath.length === 0) {
+			if (!currentOptionText) { // No text remaining
+				if (isSkillComposerMenuRoot(optionPath, menuTriggerRef.current)) {
 					onCloseOptionMenu()
 					return; // don't prevent defaults (backspaces the @ symbol)
 				} else {
@@ -624,15 +668,19 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 				onPathTextChange('')
 			}
 			else { // Backspace
-				onPathTextChange(optionText.slice(0, -1))
+				onPathTextChange(currentOptionText.slice(0, -1))
 			}
 		} else if (e.key.length === 1) {
 			if (isCommandKeyPressed) { // Ctrl+letter
 				// do nothing
 			}
+			else if (menuTriggerRef.current === 'dollar' && !isSkillComposerDollarQueryCharacter(e.key)) {
+				onCloseOptionMenu();
+				return; // native textarea input owns the first delimiter and its onChange callback
+			}
 			else { // letter
 				if (isTypingEnabled) {
-					onPathTextChange(optionText + e.key)
+					onPathTextChange(currentOptionText + e.key)
 				}
 			}
 		}
@@ -793,9 +841,15 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 			onInput={useCallback((event: React.FormEvent<HTMLTextAreaElement>) => {
 				const latestChange = (event.nativeEvent as InputEvent).data;
 
-				if (latestChange === '@') {
-					onOpenOptionMenu()
-				}
+			if (latestChange === '@') {
+				const textarea = textAreaRef.current
+				if (textarea) onOpenOptionMenu('at', textarea.selectionStart - 1)
+			}
+			else if (latestChange === '$') {
+				const textarea = textAreaRef.current
+				const trigger = textarea && skillComposerTriggerAtCursor(textarea.value, textarea.selectionStart)
+				if (trigger) onOpenOptionMenu('dollar', trigger.index)
+			}
 
 			}, [onOpenOptionMenu, accessor])}
 

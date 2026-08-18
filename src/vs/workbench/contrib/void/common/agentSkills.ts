@@ -3,6 +3,7 @@
  *  in the browser service so this module remains deterministic and fixture-friendly.
  *--------------------------------------------------------------------------------------------*/
 import type * as YAML from 'yaml';
+import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { URI } from '../../../../base/common/uri.js';
 // @ts-ignore -- yaml's browser entry intentionally has no separate declaration file.
 import * as YAMLRuntime from '../../../../../../node_modules/yaml/browser/index.js';
@@ -21,6 +22,7 @@ export type AgentSkill = Readonly<{
 	implicit: boolean;
 }>;
 export type AgentSkillCatalog = Readonly<{ revision: string; skills: readonly AgentSkill[]; diagnostics: readonly SkillDiagnostic[] }>;
+export type SkillPickerDescriptor = Readonly<{ kind: 'skill'; identity: string; skill: AgentSkill; catalogRevision: string } | { kind: 'diagnostic'; identity: string; label: string; disabled: true }>;
 export type SkillCandidate = Readonly<{ source: SkillSource; rank: number; root: string; skillRoot: string; directoryName: string; bytes: Uint8Array; pluginName?: string; openaiMetadata?: Uint8Array }>;
 export type AgentSkillSelection = Readonly<{ identity: string; skillRoot: string; bodyRevision: string; body: string }>;
 
@@ -154,13 +156,121 @@ export const resolveSkillSelector = (catalog: AgentSkillCatalog, selector: strin
 	return bare.length === 1 ? freeze({ skill: bare[0] }) : bare.length === 0 ? freeze({ diagnostic: freeze({ code: 'skill_not_found', identity: selector }) }) : freeze({ diagnostic: freeze({ code: 'skill_ambiguous', identity: selector }) });
 };
 
-/** `$qualified-skill` tokens are direct invocations; the first occurrence wins. */
+/** Loads the canonical catalog once and fences late picker results with the caller's token. */
+export const skillPickerDescriptors = async (load: () => Promise<AgentSkillCatalog>, token: CancellationToken = CancellationToken.None): Promise<readonly SkillPickerDescriptor[]> => {
+	if (token.isCancellationRequested) return freeze([]);
+	let catalog: AgentSkillCatalog;
+	try { catalog = await load(); }
+	catch { return token.isCancellationRequested ? freeze([]) : freeze([freeze({ kind: 'diagnostic', identity: 'skill-catalog-unavailable', label: 'Skill catalog unavailable', disabled: true })]); }
+	if (token.isCancellationRequested) return freeze([]);
+	const emitted = new Set<string>(); const diagnostics: SkillPickerDescriptor[] = []; const skills: SkillPickerDescriptor[] = [];
+	for (const skill of catalog.skills) {
+		if (emitted.has(skill.identity)) continue; emitted.add(skill.identity);
+		const resolved = resolveSkillSelector(catalog, skill.identity);
+		if (resolved.skill) skills.push(freeze({ kind: 'skill', identity: skill.identity, skill: resolved.skill, catalogRevision: catalog.revision }));
+		else diagnostics.push(freeze({ kind: 'diagnostic', identity: skill.identity, label: `Ambiguous Skill '${skill.identity}' - choose a unique qualified identity`, disabled: true }));
+	}
+	return freeze([...diagnostics, ...skills]);
+};
+
+const MAX_SKILL_SELECTOR_LENGTH = 129;
+const selectorCharacter = /[a-z0-9:-]/;
+const selectorContinuation = /[A-Za-z0-9_:-]/;
+type MarkdownFence = Readonly<{ marker: '`' | '~'; length: number; end: number }>;
+const fenceAtLineStart = (text: string, index: number): MarkdownFence | undefined => {
+	if (index > 0 && text[index - 1] !== '\n') return undefined;
+	let markerIndex = index; while (markerIndex < index + 3 && text[markerIndex] === ' ') markerIndex++;
+	const marker = text[markerIndex]; if (marker !== '`' && marker !== '~') return undefined;
+	let end = markerIndex; while (text[end] === marker) end++;
+	return end - markerIndex >= 3 ? freeze({ marker, length: end - markerIndex, end }) : undefined;
+};
+const isWhitespaceFenceClose = (text: string, candidate: MarkdownFence): boolean => {
+	for (let index = candidate.end; index < text.length && text[index] !== '\n'; index++) if (text[index] !== ' ' && text[index] !== '\t' && text[index] !== '\r') return false;
+	return true;
+};
+
+/** Shared by composer triggering and submit so code literals can never become invocations. */
+const visitPlainMarkdown = (text: string, visit: (index: number) => void): void => {
+	let index = 0; let fence: MarkdownFence | undefined; let inline = 0;
+	while (index < text.length) {
+		const lineFence = !inline ? fenceAtLineStart(text, index) : undefined;
+		if (!fence && lineFence) { fence = lineFence; index = lineFence.end; continue; }
+		if (fence) {
+			if (lineFence && lineFence.marker === fence.marker && lineFence.length >= fence.length && isWhitespaceFenceClose(text, lineFence)) { index = lineFence.end; fence = undefined; continue; }
+			index++; continue;
+		}
+		if (text[index] === '`') { let count = 0; while (text[index + count] === '`') count++; if (!inline) inline = count; else if (inline === count) inline = 0; index += count; continue; }
+		if (!inline) visit(index);
+		index++;
+	}
+};
+
+const selectorAt = (text: string, dollar: number, end: number): string | undefined => {
+	let index = dollar + 1;
+	while (index < end && selectorCharacter.test(text[index])) {
+		if (index - dollar > MAX_SKILL_SELECTOR_LENGTH) return undefined;
+		index++;
+	}
+	if (index < end && selectorContinuation.test(text[index])) return undefined;
+	const value = text.slice(dollar + 1, index); const parts = value.split(':');
+	return parts.length >= 1 && parts.length <= 2 && parts.every(part => part.length <= 64 && skillName.test(part)) ? value : undefined;
+};
+
+/** `$qualified-skill` tokens are direct invocations outside Markdown code; first occurrence wins. */
 export const explicitSkillSelectors = (text: string): readonly string[] => {
 	const selected: string[] = []; const seen = new Set<string>();
-	for (const match of text.matchAll(/\$([a-z0-9]+(?:-[a-z0-9]+)*(?::[a-z0-9]+(?:-[a-z0-9]+)*)?)/g)) {
-		const selector = match[1]; if (!seen.has(selector)) { seen.add(selector); selected.push(selector); }
-	}
+	visitPlainMarkdown(text, index => {
+		if (text[index] !== '$' || (index > 0 && selectorContinuation.test(text[index - 1]))) return;
+		const selector = selectorAt(text, index, text.length);
+		if (selector && !seen.has(selector)) { seen.add(selector); selected.push(selector); }
+	});
 	return freeze(selected);
+};
+
+export type SkillComposerMenuTrigger = 'at' | 'dollar';
+export type SkillComposerDollarSession = Readonly<{ text: string; triggerIndex: number; query: string }>;
+export type SkillPickerQueryState = Readonly<{ revision: number; query: string; ready: boolean }>;
+export const initialSkillPickerQueryState: SkillPickerQueryState = freeze({ revision: 0, query: '', ready: false });
+export const beginSkillPickerQuery = (previous: SkillPickerQueryState, query: string): SkillPickerQueryState => freeze({ revision: previous.revision + 1, query, ready: false });
+export const settleSkillPickerQuery = (current: SkillPickerQueryState, revision: number, query: string): SkillPickerQueryState | undefined => current.revision === revision && current.query === query ? freeze({ revision, query, ready: true }) : undefined;
+export const canSelectSkillPickerQuery = (current: SkillPickerQueryState, query: string): boolean => current.ready && current.query === query;
+export const skillComposerDollarEnterAction = (current: SkillPickerQueryState, query: string, optionSelectable: boolean): 'select' | 'submit' => canSelectSkillPickerQuery(current, query) && optionSelectable ? 'select' : 'submit';
+export const isSkillComposerDollarQueryCharacter = (value: string): boolean => /^[A-Za-z0-9_:-]$/.test(value);
+export const skillComposerMenuPath = (trigger: SkillComposerMenuTrigger): readonly string[] => freeze(trigger === 'dollar' ? ['skills'] : []);
+export const isSkillComposerMenuRoot = (path: readonly string[], trigger: SkillComposerMenuTrigger): boolean => {
+	const root = skillComposerMenuPath(trigger); return path.length === root.length && path.every((part, index) => part === root[index]);
+};
+
+/** A pure composer seam: the exact newly typed `$` opens the existing Skills submenu only in plain Markdown. */
+export const skillComposerTriggerAtCursor = (text: string, cursor: number): Readonly<{ index: number; query: '' }> | undefined => {
+	if (!Number.isSafeInteger(cursor) || cursor < 0 || cursor > text.length) return undefined;
+	const index = cursor - 1; if (index < 0 || text[index] !== '$' || (index > 0 && selectorContinuation.test(text[index - 1]))) return undefined;
+	let isPlain = false; visitPlainMarkdown(text.slice(0, cursor), position => { if (position === index) isPlain = true; });
+	return isPlain ? freeze({ index, query: '' }) : undefined;
+};
+
+export const createSkillComposerDollarSession = (text: string, triggerIndex: number): SkillComposerDollarSession | undefined => {
+	const trigger = skillComposerTriggerAtCursor(text, triggerIndex + 1);
+	return trigger?.index === triggerIndex ? freeze({ text, triggerIndex, query: '' }) : undefined;
+};
+const isCurrentDollarSession = (session: SkillComposerDollarSession, actualText: string): boolean => actualText === session.text && session.text.slice(session.triggerIndex, session.triggerIndex + session.query.length + 1) === `$${session.query}`;
+export const updateSkillComposerDollarQuery = (session: SkillComposerDollarSession, actualText: string, nextQuery: string): SkillComposerDollarSession | undefined => {
+	if (!isCurrentDollarSession(session, actualText) || !/^[A-Za-z0-9_:-]*$/.test(nextQuery)) return undefined;
+	const queryStart = session.triggerIndex + 1; const queryEnd = queryStart + session.query.length;
+	return freeze({ text: `${actualText.slice(0, queryStart)}${nextQuery}${actualText.slice(queryEnd)}`, triggerIndex: session.triggerIndex, query: nextQuery });
+};
+export const closeSkillComposerDollarSession = (session: SkillComposerDollarSession, actualText: string): Readonly<{ text: string; cursor: number }> | undefined => isCurrentDollarSession(session, actualText) ? freeze({ text: actualText, cursor: session.triggerIndex + session.query.length + 1 }) : undefined;
+export const replaceSkillComposerDollarSelection = (session: SkillComposerDollarSession, actualText: string, identity: string): Readonly<{ text: string; cursor: number }> | undefined => {
+	const parts = identity.split(':'); if (!isCurrentDollarSession(session, actualText) || parts.length < 1 || parts.length > 2 || !parts.every(part => part.length <= 64 && skillName.test(part))) return undefined;
+	const replaceEnd = session.triggerIndex + session.query.length + 1; const withoutQuery = `${actualText.slice(0, session.triggerIndex)}${actualText.slice(replaceEnd)}`;
+	if (explicitSkillSelectors(withoutQuery).includes(identity)) return freeze({ text: withoutQuery, cursor: session.triggerIndex });
+	return freeze({ text: `${actualText.slice(0, session.triggerIndex)}$${identity}${actualText.slice(replaceEnd)}`, cursor: session.triggerIndex + identity.length + 1 });
+};
+
+/** Canonical direct-invocation replacement; UI callers deliberately do not create a chip. */
+export const replaceSkillComposerTrigger = (text: string, triggerIndex: number, replaceEnd: number, identity: string): Readonly<{ text: string; cursor: number }> | undefined => {
+	if (!Number.isSafeInteger(replaceEnd) || replaceEnd !== triggerIndex + 1) return undefined;
+	const session = createSkillComposerDollarSession(text, triggerIndex); return session ? replaceSkillComposerDollarSelection(session, text, identity) : undefined;
 };
 
 export const selectExplicitSkills = (catalog: AgentSkillCatalog, text: string): { skills?: readonly AgentSkill[]; diagnostic?: SkillDiagnostic } => {

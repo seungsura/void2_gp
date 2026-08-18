@@ -5,6 +5,7 @@
 
 import * as assert from 'assert';
 import { ChatThreadService } from '../../browser/chatThreadService.js';
+import { createSkillComposerDollarSession, updateSkillComposerDollarQuery } from '../../common/agentSkills.js';
 import { submitChatComposer } from '../../common/chatComposerSubmission.js';
 
 const thread = (stagingSelections: string[] = []) => ({ id: '', messages: [], state: { stagingSelections }, filesWithUserChanges: new Set() });
@@ -12,6 +13,7 @@ const draftReceiver = () => {
 	const value: any = Object.create(ChatThreadService.prototype);
 	value.state = { allThreads: { A: { ...thread(['selection-a']), id: 'A' }, B: { ...thread(['selection-b']), id: 'B' } }, currentThreadId: 'A' };
 	value._transientComposerDraftOfThread = new Map<string, string>();
+	value._childToolApprovals = new Map<string, unknown>(); value._onDidChangeChildToolApprovals = { fire() { } };
 	value._setState = (partial: any) => { value.state = { ...value.state, ...partial }; };
 	return value;
 };
@@ -41,6 +43,13 @@ suite('Void transient chat composer drafts', () => {
 		assert.strictEqual(value.getTransientComposerDraft('A'), 'draft-a'); assert.deepStrictEqual(value.state.allThreads.A.state.stagingSelections, ['selection-a']); assert.strictEqual(domClears, 0);
 	});
 
+	test('missing Skill admission false keeps exact draft bytes and the staged array identity', async () => {
+		const value = draftReceiver(); const initial = 'before\r\n$ `literal $missing`  \n'; let session = createSkillComposerDollarSession(initial, initial.indexOf('$'))!; for (const query of ['m', 'mi', 'missing']) session = updateSkillComposerDollarQuery(session, session.text, query)!; const draft = session.text; const staged = value.state.allThreads.A.state.stagingSelections; value.setTransientComposerDraft('A', draft); let domClears = 0;
+		assert.strictEqual(draft, 'before\r\n$missing `literal $missing`  \n');
+		assert.strictEqual(await submitChatComposer({ threadId: 'A', submit: async () => false, clearSubmittedState: id => value.clearSubmittedComposerState(id), getCurrentThreadId: () => value.state.currentThreadId, clearCurrentInput: () => domClears++ }), false);
+		assert.strictEqual(value.getTransientComposerDraft('A'), draft); assert.strictEqual(value.state.allThreads.A.state.stagingSelections, staged); assert.deepStrictEqual(staged, ['selection-a']); assert.strictEqual(domClears, 0);
+	});
+
 	test('a superseded admission stays false when a newer admission adds a message', async () => {
 		const value: any = { state: { allThreads: { A: { messages: [] } } } };
 		let resolveSuperseded!: (admitted: boolean) => void;
@@ -62,6 +71,6 @@ suite('Void transient chat composer drafts', () => {
 
 		const duplicated = draftReceiver(); duplicated.setTransientComposerDraft('A', 'draft-a'); Object.assign(duplicated, { _storeAllThreads() { } }); duplicated.duplicateThread('A'); const duplicateId = Object.keys(duplicated.state.allThreads).find(id => id !== 'A' && id !== 'B')!; assert.ok(duplicateId); assert.strictEqual(duplicated.getTransientComposerDraft(duplicateId), ''); assert.strictEqual(duplicated.getTransientComposerDraft('A'), 'draft-a');
 
-		const disposed = draftReceiver(); disposed.setTransientComposerDraft('A', 'draft-a'); Object.assign(disposed, { _agentDelegationAuthorityOfThread: new Map(), _agentControlGeneration: new Map(), _store: { dispose() { } } }); disposed.dispose(); assert.strictEqual(disposed._transientComposerDraftOfThread.size, 0);
+		const disposed = draftReceiver(); disposed.setTransientComposerDraft('A', 'draft-a'); Object.assign(disposed, { _agentSubagentService: { cancelParent() { }, forgetParent() { } }, _agentDelegationAuthorityOfThread: new Map(), _agentControlGeneration: new Map(), _store: { dispose() { } } }); disposed.dispose(); assert.strictEqual(disposed._transientComposerDraftOfThread.size, 0);
 	});
 });

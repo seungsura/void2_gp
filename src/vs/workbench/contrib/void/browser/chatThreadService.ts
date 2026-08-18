@@ -1445,7 +1445,16 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const catalog = await this._agentSkillsService.getCatalog(owner, owner, instructionSnapshot.config)
 		if (!isCurrentTurn()) return false
 		const direct = selectExplicitSkills(catalog, instructions)
-		if (!direct.skills) throw new Error(direct.diagnostic?.code ?? 'skill_not_found')
+		if (!direct.skills) {
+			// Direct `$skill` selectors are user input, not an internal exception. Keep the
+			// draft and chips untouched; do not read bodies, append history, or call a provider.
+			const identity = direct.diagnostic?.identity ?? 'Skill'
+			const message = direct.diagnostic?.code === 'skill_ambiguous'
+				? `The Skill selector '$${identity}' is ambiguous. Use its qualified identity.`
+				: `The Skill selector '$${identity}' was not found. Choose a listed Skill or correct the name.`
+			this._setStreamState(threadId, { isRunning: undefined, error: { message, fullError: null } })
+			return false
+		}
 		const selectedIdentities = new Set<string>(); const normalizedSelections: StagingSelectionItem[] = [];
 		for (const selection of currSelns) {
 			if (selection.type !== 'Skill' || !selectedIdentities.has(selection.identity)) { normalizedSelections.push(selection); if (selection.type === 'Skill') selectedIdentities.add(selection.identity); }
