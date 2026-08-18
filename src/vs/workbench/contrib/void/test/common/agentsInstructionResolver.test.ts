@@ -1,7 +1,7 @@
 import assert from 'assert';
 import { parse } from 'smol-toml';
 import { URI } from '../../../../../base/common/uri.js';
-import { DEFAULT_PROJECT_DOC_MAX_BYTES, agentConfigSourceDescriptors, agentInstructionChain, appendAgentInstructionDeveloperInstructions, parseAgentConfigSource, projectAgentConfig, resolveAgentInstructions, reviveAgentInstructionTurnSnapshot, stableAgentInstructionRevision } from '../../common/agentInstructions.js';
+import { DEFAULT_AGENT_DELEGATION_LIMITS, DEFAULT_PROJECT_DOC_MAX_BYTES, agentConfigSourceDescriptors, agentInstructionChain, appendAgentInstructionDeveloperInstructions, parseAgentConfigSource, projectAgentConfig, resolveAgentInstructions, reviveAgentInstructionTurnSnapshot, stableAgentInstructionRevision } from '../../common/agentInstructions.js';
 
 const encode = (value: string) => new TextEncoder().encode(value);
 const source = (uri: string, value: string) => ({ uri, outcome: Object.freeze({ status: 'bytes' as const, bytes: encode(value) }) });
@@ -111,6 +111,54 @@ suite('AGENTS instruction resolver', () => {
 		assert.deepStrictEqual(overrides.configSources.map(item => [item.uri, item.status, item.projectedKeys]), [['user', 'loaded', ['developer_instructions', 'project_doc_max_bytes']], ['both', 'loaded', ['developer_instructions', 'project_doc_max_bytes']]]);
 	});
 
+	test('resolves bounded user and trusted-project Agent delegation limits per scalar', () => {
+		const user = parseAgentConfigSource('user', 'user', source('user', '[agents]\nmax_accepted_children = 6\nmax_concurrent_threads_per_session = 4\nmax_depth = 2').outcome, parse);
+		const project = parseAgentConfigSource('project', 'project', source('project', '[agents]\nmax_accepted_children = 3\nmax_depth = 1').outcome, parse);
+		const defaults = projectAgentConfig(undefined, undefined);
+		const userOnly = projectAgentConfig(user.projected, undefined, [user.provenance]);
+		const merged = projectAgentConfig(user.projected, project.projected, [user.provenance, project.provenance]);
+		assert.deepStrictEqual(defaults.agentDelegationLimits, DEFAULT_AGENT_DELEGATION_LIMITS);
+		assert.deepStrictEqual(defaults.agentDelegationLimitsSource, { maxAcceptedChildren: 'default', maxConcurrentThreadsPerSession: 'default', maxDepth: 'default' });
+		assert.deepStrictEqual(userOnly.agentDelegationLimits, { maxAcceptedChildren: 6, maxConcurrentThreadsPerSession: 4, maxDepth: 2 });
+		assert.deepStrictEqual(merged.agentDelegationLimits, { maxAcceptedChildren: 3, maxConcurrentThreadsPerSession: 3, maxDepth: 1 });
+		assert.deepStrictEqual(merged.agentDelegationLimitsSource, { maxAcceptedChildren: 'project', maxConcurrentThreadsPerSession: 'user', maxDepth: 'project' });
+		assert.deepStrictEqual(merged.agentDelegationLimitDiagnostics, [{ source: 'user', reason: 'max_concurrent_threads_per_session_clamped', code: 'agent_delegation_limits_invalid' }]);
+		assert.deepStrictEqual(merged.configSources.map(item => item.projectedKeys), [['agents', 'agents.max_accepted_children', 'agents.max_concurrent_threads_per_session', 'agents.max_depth'], ['agents', 'agents.max_accepted_children', 'agents.max_depth']]);
+		assert.strictEqual(Object.isFrozen(merged.agentDelegationLimits), true);
+	});
+
+	test('rejects an over-concurrent value in the same Agent table instead of silently clamping it', () => {
+		const sameTable = parseAgentConfigSource('user', 'user', source('user', '[agents]\nmax_accepted_children = 2\nmax_concurrent_threads_per_session = 4').outcome, parse);
+		const resolved = projectAgentConfig(sameTable.projected, undefined, [sameTable.provenance]);
+		assert.strictEqual(sameTable.projected?.agentMaxConcurrentThreadsPerSession, undefined);
+		assert.deepStrictEqual(sameTable.projected?.agentDelegationLimitDiagnostics, [{ source: 'user', reason: 'max_concurrent_threads_per_session_exceeds_accepted', code: 'agent_delegation_limits_invalid' }]);
+		assert.deepStrictEqual(sameTable.provenance.projectedKeys, ['agents', 'agents.max_accepted_children']);
+		assert.deepStrictEqual(resolved.agentDelegationLimits, { maxAcceptedChildren: 2, maxConcurrentThreadsPerSession: 2, maxDepth: 1 });
+	});
+
+	test('benignly clamps default concurrency for a project-only accepted-child override and revives it', () => {
+		const user = parseAgentConfigSource('user', 'file:///home/.codex/config.toml', { status: 'missing' }, parse);
+		const project = parseAgentConfigSource('project', 'file:///workspace/.codex/config.toml', source('project', '[agents]\nmax_accepted_children = 1').outcome, parse);
+		const config = projectAgentConfig(undefined, project.projected, [user.provenance, project.provenance], 'file:///workspace', 'file:///workspace');
+		const snapshot = resolveAgentInstructions(config, [], stableAgentInstructionRevision(config, []));
+		assert.deepStrictEqual(config.agentDelegationLimits, { maxAcceptedChildren: 1, maxConcurrentThreadsPerSession: 1, maxDepth: 1 });
+		assert.deepStrictEqual(config.agentDelegationLimitsSource, { maxAcceptedChildren: 'project', maxConcurrentThreadsPerSession: 'default', maxDepth: 'default' });
+		assert.deepStrictEqual(config.agentDelegationLimitDiagnostics, []);
+		assert.deepStrictEqual(reviveAgentInstructionTurnSnapshot(JSON.parse(JSON.stringify(snapshot))), snapshot);
+	});
+
+	test('keeps Agent limit diagnostics bounded and falls back safely for invalid agent tables', () => {
+		const invalid = parseAgentConfigSource('user', 'user', source('user', '[agents]\nmax_accepted_children = 0\nmax_concurrent_threads_per_session = 5\nmax_depth = 3\nmax_threads = 1\nunknown_a = 1\nunknown_b = 2\nunknown_c = 3\nunknown_d = 4\nunknown_e = 5\nunknown_f = 6\nunknown_g = 7').outcome, parse);
+		const nonObject = parseAgentConfigSource('project', 'project', source('project', 'agents = 2').outcome, parse);
+		const resolved = projectAgentConfig(invalid.projected, nonObject.projected, [invalid.provenance, nonObject.provenance]);
+		assert.deepStrictEqual(resolved.agentDelegationLimits, DEFAULT_AGENT_DELEGATION_LIMITS);
+		assert.strictEqual(invalid.projected?.agentDelegationLimitDiagnostics?.length, 8);
+		assert.deepStrictEqual(invalid.projected?.agentDelegationLimitDiagnostics?.slice(0, 4).map(item => item.reason), ['unknown_key', 'unknown_key', 'unknown_key', 'unknown_key']);
+		assert.deepStrictEqual(nonObject.projected?.agentDelegationLimitDiagnostics, [{ source: 'project', reason: 'agents_not_object', code: 'agent_delegation_limits_invalid' }]);
+		assert.strictEqual(resolved.agentDelegationLimitDiagnostics.length, 8);
+		assert.deepStrictEqual(resolved.configSources.map(item => item.projectedKeys), [['agents'], ['agents']]);
+	});
+
 	test('uses stable revisions for all snapshot inputs and deeply freezes exposed records', () => {
 		const parsed = parseAgentConfigSource('user', 'user', source('user', 'developer_instructions = "developer"').outcome, parse);
 		const c = projectAgentConfig(parsed.projected, undefined, [parsed.provenance], 'file:///workspace', 'file:///workspace');
@@ -126,6 +174,7 @@ suite('AGENTS instruction resolver', () => {
 		assert.notStrictEqual(stableAgentInstructionRevision(projectAgentConfig(undefined, undefined, [missingProvenance.provenance], c.ownerProjectRoot, c.runCwd), candidates), snapshot.revision);
 		assert.notStrictEqual(stableAgentInstructionRevision(projectAgentConfig(parsed.projected, undefined, [parsed.provenance], 'file:///other-root', c.runCwd), candidates), snapshot.revision);
 		assert.notStrictEqual(stableAgentInstructionRevision(projectAgentConfig(parsed.projected, undefined, [parsed.provenance], c.ownerProjectRoot, 'file:///other-cwd'), candidates), snapshot.revision);
+		assert.notStrictEqual(stableAgentInstructionRevision(projectAgentConfig(parseAgentConfigSource('user', 'user', source('user', '[agents]\nmax_accepted_children = 2').outcome, parse).projected, undefined, [parsed.provenance], c.ownerProjectRoot, c.runCwd), candidates), snapshot.revision);
 		assert.strictEqual(Object.isFrozen(c), true);
 		assert.strictEqual(Object.isFrozen(c.configSources), true);
 		assert.strictEqual(Object.isFrozen(c.configSources[0]), true);
@@ -180,6 +229,8 @@ suite('AGENTS instruction resolver', () => {
 		assert.strictEqual(revive(raw => raw.config.developerInstructionsSource = 'default'), undefined);
 		assert.strictEqual(revive(raw => { delete raw.ownerProjectRoot; delete raw.runCwd; delete raw.config.ownerProjectRoot; delete raw.config.runCwd; raw.config.configSources.push({ ...raw.config.configSources[0], scope: 'project' }); }), undefined);
 		assert.strictEqual(revive(raw => raw.config.configSources[0].projectedKeys = ['invalid_key']), undefined);
+		assert.strictEqual(revive(raw => raw.config.agentDelegationLimits.maxAcceptedChildren = 9), undefined);
+		assert.strictEqual(revive(raw => raw.config.agentDelegationLimitsSource.maxDepth = 'project'), undefined);
 		assert.strictEqual(revive(raw => raw.config.configSources[0].projectedKeys = ['developer_instructions', 'developer_instructions']), undefined);
 		assert.strictEqual(revive(raw => { raw.provenance[0].admittedBytes = raw.provenance[0].rawBytes + 1; }), undefined);
 		assert.strictEqual(revive(raw => { raw.provenance[0].skipReason = 'budget'; raw.provenance[0].truncated = false; }), undefined);

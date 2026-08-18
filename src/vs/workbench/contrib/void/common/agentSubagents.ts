@@ -9,8 +9,62 @@
  * never by itself permission for a child to execute it.
  */
 import { URI } from '../../../../base/common/uri.js';
+import { CancellationToken } from '../../../../base/common/cancellation.js';
 
-export type ToolExecutionProfile = 'default-parent' | 'read-only-child';
+export type ToolExecutionProfile = 'default-parent' | 'read-only-child' | 'inherited-parent-write-child';
+
+/**
+ * A child never re-enumerates the live parent registry. This is the immutable,
+ * model-facing record captured at top-level admission. `approval` is descriptive
+ * only; the parent broker remains the authoritative execution boundary.
+ */
+export type AgentSubagentToolSnapshotEntry = Readonly<{ name: string; description: string; schema?: Readonly<Record<string, unknown>>; params: Readonly<Record<string, Readonly<{ description: string }>>>; kind: 'builtin' | 'mcp' | 'skill_resource'; mcpServerName?: string; approval?: 'edits' | 'terminal' | 'MCP tools'; revision: string }>;
+export type AgentSubagentToolSnapshot = Readonly<{ revision: string; tools: readonly AgentSubagentToolSnapshotEntry[] }>;
+
+/**
+ * The child executor never receives a live parent registry.  An inherited-profile
+ * call crosses this narrow, one-shot boundary back to its owning parent instead.
+ * The exact immutable snapshot entry is carried with the request so a broker
+ * cannot accidentally re-resolve a similarly named live tool. `cancel` is an
+ * acknowledgement: it resolves only once the external operation is quiescent.
+ */
+export type AgentSubagentToolBrokerRequest = Readonly<{ parentId: string; generation: number; childId: string; toolId: string; name: string; tool: AgentSubagentToolSnapshotEntry; rawParams: Readonly<Record<string, unknown>>; snapshotRevision: string; maxReadOutputTokens: number; cancellationToken: CancellationToken }>;
+export type AgentSubagentToolBrokerResult = Readonly<{ ok: true; content: string; result?: unknown }> | Readonly<{ ok: false; error: string }>;
+/** This exact tuple is the only authority a child-tool approval can address. */
+export type ChildToolApprovalKey = Readonly<{ parentId: string; generation: number; childId: string; toolId: string; snapshotRevision: string }>;
+export type ChildToolApprovalView = Readonly<{ key: ChildToolApprovalKey; structuralKey: string; childShortId: string; title: string; toolName: string; toolKind: 'builtin' | 'mcp'; mcpServerName?: string; category: 'edits' | 'terminal' | 'MCP tools'; parameters: string; status: 'awaiting' }>;
+/** JSON tuple avoids ambiguity inherent in delimiter-concatenated IDs. */
+export const childToolApprovalStructuralKey = (key: ChildToolApprovalKey): string => JSON.stringify([key.parentId, key.generation, key.childId, key.toolId, key.snapshotRevision]);
+const boundedApprovalValue = (value: unknown, depth = 0): unknown => {
+	if (depth > 3) return '[truncated]';
+	if (value === null || typeof value === 'boolean' || typeof value === 'number') return value;
+	if (typeof value === 'string') return value.length > 512 ? `${value.slice(0, 512)}...` : value;
+	if (Array.isArray(value)) return value.slice(0, 20).map(item => boundedApprovalValue(item, depth + 1));
+	if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).slice(0, 20).map(([name, item]) => [name, boundedApprovalValue(item, depth + 1)]));
+	return String(value).slice(0, 512);
+};
+const boundedApprovalParameters = (value: unknown): string => {
+	const parameters = JSON.stringify(boundedApprovalValue(value));
+	if (parameters.length <= 4096) return parameters;
+	let preview = parameters.slice(0, 4000); let bounded = JSON.stringify({ truncated: true, preview });
+	while (bounded.length > 4096) { preview = preview.slice(0, Math.max(0, preview.length - (bounded.length - 4096))); bounded = JSON.stringify({ truncated: true, preview }); }
+	return bounded;
+};
+export const createChildToolApprovalView = (request: AgentSubagentToolBrokerRequest): ChildToolApprovalView => {
+	if ((request.tool.kind !== 'builtin' && request.tool.kind !== 'mcp') || !request.tool.approval || (request.tool.kind === 'mcp' && !request.tool.mcpServerName)) throw new Error('child_tool_approval_not_presentable');
+	const key = Object.freeze({ parentId: request.parentId, generation: request.generation, childId: request.childId, toolId: request.toolId, snapshotRevision: request.snapshotRevision });
+	const parameters = boundedApprovalParameters(request.rawParams);
+	const toolName = request.name.slice(0, 128); const mcpServerName = request.tool.mcpServerName?.slice(0, 128); const toolKind = request.tool.kind === 'mcp' ? 'mcp' as const : 'builtin' as const;
+	const title = toolKind === 'mcp' ? `MCP tool — ${mcpServerName} / ${toolName}` : `Built-in tool — ${toolName}`;
+	return Object.freeze({ key, structuralKey: childToolApprovalStructuralKey(key), childShortId: request.childId.slice(0, 8), title, toolName, toolKind, ...(toolKind === 'mcp' && mcpServerName ? { mcpServerName } : {}), category: request.tool.approval as ChildToolApprovalView['category'], parameters, status: 'awaiting' });
+};
+export interface AgentSubagentToolBroker {
+	execute(request: AgentSubagentToolBrokerRequest): Promise<AgentSubagentToolBrokerResult>;
+	cancel(request: AgentSubagentToolBrokerRequest): Promise<void>;
+}
+
+export const isMutationCapableSnapshot = (snapshot: AgentSubagentToolSnapshot | undefined): boolean =>
+	!!snapshot?.tools.some(tool => tool.kind === 'mcp' || tool.approval === 'edits' || tool.approval === 'terminal' || tool.approval === 'MCP tools');
 
 /** The parent exposes child controls only through these tested native provider serializers. */
 export const isNativeAgentToolFormat = (format: unknown): format is 'openai-style' | 'anthropic-style' | 'gemini-style' =>
@@ -21,7 +75,7 @@ export const readOnlyChildToolNames = Object.freeze([
 ] as const);
 
 export const isToolAllowedByProfile = (profile: ToolExecutionProfile, name: string): boolean =>
-	profile === 'default-parent' || (readOnlyChildToolNames as readonly string[]).includes(name);
+	profile === 'default-parent' || profile === 'inherited-parent-write-child' || (readOnlyChildToolNames as readonly string[]).includes(name);
 
 const childRawKeys: Readonly<Record<string, readonly string[]>> = Object.freeze({
 	read_file: Object.freeze(['uri', 'start_line', 'end_line', 'line_byte_offset']), ls_dir: Object.freeze(['uri', 'page_number']),
@@ -54,7 +108,8 @@ export const assertCanonicalReadOnlyChildRawPaths = (name: string, raw: Record<s
 
 export type AgentSubagentStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
 export type AgentSubagentBudgetView = Readonly<{ accepted: number; running: number; queued: number; maxAccepted: number; maxConcurrent: number; providerSends: number; maxProviderSends: number; resultChars: number; maxResultChars: number; deadlineMsRemaining: number; usage: null }>;
-export type AgentSubagentRunView = Readonly<{ id: string; status: AgentSubagentStatus; summary?: string; roleName?: string; roleDescription?: string; queuedMs: number; runningMs: number; totalMs: number; authority: Readonly<{ runtimeRevision: string; instructionsRevision: string; catalogRevision: string; modelFingerprint?: string; roleRevision?: string; selectedSkills: readonly Readonly<{ identity: string; bodyRevision: string }>[] }>; usage: null }>;
+/** Scheduler state is intentionally separate from terminal status: a timed-out wait may be ready to resume but still queued behind another lease. */
+export type AgentSubagentRunView = Readonly<{ id: string; parentRunId?: string; depth: number; remainingDepth: number; status: AgentSubagentStatus; schedulerActivity: 'active' | 'waiting_children' | 'ready_to_resume' | 'quiescing'; summary?: string; roleName?: string; roleDescription?: string; capabilityProfile?: 'read_only' | 'inherit_parent_write'; toolPresentation?: Readonly<{ toolNames: readonly string[]; approvals: readonly string[]; undoAvailable: boolean; applicationBoundary: 'no_os_sandbox' }>; queuedMs: number; runningMs: number; totalMs: number; authority: Readonly<{ runtimeRevision: string; instructionsRevision: string; catalogRevision: string; modelFingerprint?: string; roleRevision?: string; selectedSkills: readonly Readonly<{ identity: string; bodyRevision: string }>[] }>; usage: null }>;
 export type AgentSubagentTraceKind = 'group_created' | 'admission_started' | 'admission_failed' | 'child_queued' | 'child_running' | 'provider_send' | 'child_completed' | 'child_failed' | 'child_cancelled' | 'receipt_delivered' | 'group_cancelled';
 export type AgentSubagentTraceEvent = Readonly<{ sequence: number; parentId: string; generation: number; childId?: string; kind: AgentSubagentTraceKind; timestamp: number; elapsedMs: number; status?: Exclude<AgentSubagentStatus, 'queued' | 'running'>; diagnostic?: AgentSubagentTraceDiagnostic; budget: Readonly<{ accepted: number; running: number; queued: number; providerSends: number; resultChars: number }> }>;
 export type AgentSubagentTraceDiagnostic = 'cancelled' | 'model_missing' | 'provider_invalid' | 'owner_changed' | 'role_not_found' | 'role_stale' | 'skill_unavailable' | 'budget_exhausted' | 'provider_error' | 'timeout' | 'turn_limit' | 'unknown';
@@ -69,6 +124,8 @@ export const AGENT_SUBAGENT_DEFAULT_WAIT_MS = 10_000;
 export const AGENT_SUBAGENT_MAX_RESULTS = 100;
 export const AGENT_SUBAGENT_MAX_CONCURRENT = 2;
 export const AGENT_SUBAGENT_MAX_ACCEPTED = 4;
+/** Protocol ceiling; a turn's configured accepted-child limit can be lower. */
+export const AGENT_SUBAGENT_MAX_WAIT_TARGETS = 8;
 export const AGENT_SUBAGENT_MAX_GROUP_PROVIDER_SENDS = 64;
 export const AGENT_SUBAGENT_MAX_GROUP_RUN_MS = 240_000;
 export const AGENT_SUBAGENT_MAX_AGGREGATE_RESULT_CHARS = 32_000;
@@ -83,7 +140,7 @@ const deepFreeze = <T>(value: T): T => { if (value && typeof value === 'object' 
 /** Flat schemas are intentionally dialect-conservative. Runtime validation below is authoritative. */
 export const agentSubagentToolSchemas = deepFreeze({
 	spawn_agent: flatObject({ message: { type: 'string', minLength: 1, maxLength: AGENT_SUBAGENT_MAX_MESSAGE_CHARS }, agent_type: { type: 'string', minLength: 1, maxLength: 64 } }, ['message']),
-	wait_agent: flatObject({ timeout_ms: { type: 'integer', minimum: 0, maximum: AGENT_SUBAGENT_MAX_WAIT_MS }, targets: { type: 'array', minItems: 1, maxItems: AGENT_SUBAGENT_MAX_ACCEPTED, items: { type: 'string', minLength: 1, maxLength: 256 } } }),
+	wait_agent: flatObject({ timeout_ms: { type: 'integer', minimum: 0, maximum: AGENT_SUBAGENT_MAX_WAIT_MS }, targets: { type: 'array', minItems: 1, maxItems: AGENT_SUBAGENT_MAX_WAIT_TARGETS, items: { type: 'string', minLength: 1, maxLength: 256 } } }),
 	interrupt_agent: flatObject({ target: { type: 'string', minLength: 1, maxLength: 256 } }, ['target']),
 });
 
@@ -116,7 +173,7 @@ export const validateAgentSubagentControlParams = (name: AgentSubagentControlNam
 		const timeoutMs = raw.timeout_ms === undefined ? AGENT_SUBAGENT_DEFAULT_WAIT_MS : raw.timeout_ms;
 		if (!Number.isSafeInteger(timeoutMs) || (timeoutMs as number) < 0 || (timeoutMs as number) > AGENT_SUBAGENT_MAX_WAIT_MS) throw new Error('wait_agent_invalid_params');
 		const targets = raw.targets;
-		if (targets !== undefined && (!Array.isArray(targets) || targets.length < 1 || targets.length > AGENT_SUBAGENT_MAX_ACCEPTED || targets.some(target => typeof target !== 'string' || !target.trim() || target.length > 256) || new Set(targets).size !== targets.length)) throw new Error('wait_agent_invalid_params');
+		if (targets !== undefined && (!Array.isArray(targets) || targets.length < 1 || targets.length > AGENT_SUBAGENT_MAX_WAIT_TARGETS || targets.some(target => typeof target !== 'string' || !target.trim() || target.length > 256) || new Set(targets).size !== targets.length)) throw new Error('wait_agent_invalid_params');
 		return { name, timeoutMs: timeoutMs as number, ...(targets === undefined ? {} : { targets: Object.freeze([...targets]) }) };
 	}
 	if (!exactKeys(raw, ['target']) || typeof raw.target !== 'string' || !raw.target.trim() || raw.target.length > 256) throw new Error('interrupt_agent_invalid_params');

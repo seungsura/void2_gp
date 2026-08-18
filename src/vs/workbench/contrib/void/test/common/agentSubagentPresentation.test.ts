@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------*/
 
 import * as assert from 'assert';
-import { getAgentSubagentPresentation } from '../../common/agentSubagentPresentation.js';
+import { getAgentSubagentPresentation, selectThreadScopedValue } from '../../common/agentSubagentPresentation.js';
 
 const budget = (overrides: Record<string, unknown> = {}) => ({ accepted: 0, running: 0, queued: 0, maxAccepted: 4, maxConcurrent: 2, providerSends: 0, maxProviderSends: 64, resultChars: 0, maxResultChars: 32_000, deadlineMsRemaining: 240_000, usage: null, ...overrides }) as any;
 const run = (status: string, id = 'child-abcdefgh') => ({ id, status, queuedMs: 1, runningMs: 2, totalMs: 3, authority: { runtimeRevision: 'runtime', instructionsRevision: 'instructions', catalogRevision: 'catalog', selectedSkills: [] }, usage: null }) as any;
@@ -12,6 +12,13 @@ const diagnostics = (events: any[] = []) => ({ parentId: 'parent', generation: 1
 const event = (kind: string) => ({ sequence: 1, parentId: 'parent', generation: 1, kind, timestamp: 1, elapsedMs: 0, budget: { accepted: 0, running: 0, queued: 0, providerSends: 0, resultChars: 0 } });
 
 suite('Void AgentSubagentPresentation', () => {
+	test('returns the current task value for arrays, undefined, and objects without invoking stale callbacks', () => {
+		const stale = () => { throw new Error('stale callback must not run'); };
+		assert.deepStrictEqual(selectThreadScopedValue({ threadId: 'old', value: ['old'] }, 'new', () => ['new']), ['new']);
+		assert.strictEqual(selectThreadScopedValue({ threadId: 'old', value: undefined }, 'new', () => undefined), undefined);
+		assert.deepStrictEqual(selectThreadScopedValue({ threadId: 'old', value: { old: true } }, 'new', () => ({ current: true })), { current: true });
+		assert.deepStrictEqual(selectThreadScopedValue({ threadId: 'current', value: ['current'] }, 'current', stale), ['current']);
+	});
 	test('is absent only when no group data exists', () => {
 		assert.strictEqual(getAgentSubagentPresentation(undefined, [], undefined), undefined);
 		assert.ok(getAgentSubagentPresentation(budget(), [], undefined));
@@ -25,6 +32,26 @@ suite('Void AgentSubagentPresentation', () => {
 	test('keeps active counts and capacity compact without usage in the header', () => {
 		const value = getAgentSubagentPresentation(budget({ accepted: 2 }), [run('running'), run('queued', 'child-b')], diagnostics())!;
 		assert.strictEqual(value.summary, 'Child runs · 1 running · 1 queued · 2/4 accepted'); assert.strictEqual(value.summary.includes('usage'), false);
+	});
+	test('counts scheduler-active leases and labels waiting and ready child rows truthfully', () => {
+		const value = getAgentSubagentPresentation(budget({ accepted: 2, running: 1 }), [{ ...run('running', 'parent'), schedulerActivity: 'waiting_children' }, { ...run('running', 'nested'), schedulerActivity: 'active' }], diagnostics())!;
+		assert.strictEqual(value.running, 1); assert.ok(value.summary.includes('1 running')); assert.strictEqual(value.runs[0].statusLabel, 'Waiting for child runs'); assert.strictEqual(value.runs[1].statusLabel, 'Running');
+		const ready = getAgentSubagentPresentation(budget({ accepted: 1, running: 0 }), [{ ...run('running'), schedulerActivity: 'ready_to_resume' }], diagnostics())!;
+		assert.strictEqual(ready.running, 0); assert.strictEqual(ready.runs[0].statusLabel, 'Ready to resume');
+	});
+	test('uses scheduler activity labels only for running service views', () => {
+		const value = getAgentSubagentPresentation(budget({ accepted: 4 }), [
+			{ ...run('queued', 'queued-child'), schedulerActivity: 'ready_to_resume' },
+			{ ...run('completed', 'completed-child'), schedulerActivity: 'quiescing' },
+			{ ...run('failed', 'failed-child'), schedulerActivity: 'quiescing' },
+			{ ...run('cancelled', 'cancelled-child'), schedulerActivity: 'quiescing' },
+			{ ...run('running', 'waiting-child'), schedulerActivity: 'waiting_children' },
+			{ ...run('running', 'ready-child'), schedulerActivity: 'ready_to_resume' },
+			{ ...run('running', 'finishing-child'), schedulerActivity: 'quiescing' },
+		], diagnostics())!;
+		assert.deepStrictEqual(value.runs.map(child => child.statusLabel), [
+			'Queued', 'Completed', 'Failed', 'Cancelled', 'Waiting for child runs', 'Ready to resume', 'Finishing',
+		]);
 	});
 	test('reports completed runs without action required', () => {
 		const value = getAgentSubagentPresentation(budget({ accepted: 1 }), [run('completed')], diagnostics())!;
@@ -52,6 +79,14 @@ suite('Void AgentSubagentPresentation', () => {
 		const generic = getAgentSubagentPresentation(budget({ accepted: 1 }), [run('completed')], diagnostics())!.runs[0];
 		const named = getAgentSubagentPresentation(budget({ accepted: 1 }), [{ ...run('completed', 'child-12345678'), roleName: 'reviewer' }], diagnostics())!.runs[0];
 		assert.strictEqual(generic.roleName, undefined); assert.strictEqual(generic.shortId, 'child-ab'); assert.strictEqual(named.roleName, 'reviewer'); assert.strictEqual(named.shortId, 'child-12');
+	});
+	test('projects immutable inherited tools, approvals, Undo, and the no-OS-sandbox boundary', () => {
+		const value = getAgentSubagentPresentation(budget({ accepted: 1 }), [{ ...run('completed'), capabilityProfile: 'inherit_parent_write', toolPresentation: { toolNames: ['read_file', 'write_file', 'captured_mcp'], approvals: ['edits', 'MCP tools'], undoAvailable: true, applicationBoundary: 'no_os_sandbox' } }], diagnostics())!.runs[0];
+		assert.deepStrictEqual(value.toolPresentation?.toolNames, ['read_file', 'write_file', 'captured_mcp']); assert.deepStrictEqual(value.toolPresentation?.approvals, ['edits', 'MCP tools']); assert.strictEqual(value.toolPresentation?.undoAvailable, true); assert.strictEqual(value.toolPresentation?.applicationBoundary, 'no_os_sandbox');
+	});
+	test('keeps the read-only presentation distinct from inherited tool details', () => {
+		const value = getAgentSubagentPresentation(budget({ accepted: 1 }), [{ ...run('completed'), capabilityProfile: 'read_only' }], diagnostics())!.runs[0];
+		assert.strictEqual(value.capabilityProfile, 'read_only'); assert.strictEqual(value.toolPresentation, undefined);
 	});
 	test('preserves spawn order', () => {
 		const value = getAgentSubagentPresentation(budget({ accepted: 2 }), [run('queued', 'child-second'), run('running', 'child-first')], diagnostics())!;

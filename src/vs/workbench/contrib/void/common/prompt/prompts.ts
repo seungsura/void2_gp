@@ -11,7 +11,7 @@ import { os } from '../helpers/systemInfo.js';
 import { RawToolParamsObj } from '../sendLLMMessageTypes.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, BuiltinToolResultType, ToolName } from '../toolsServiceTypes.js';
 import { ChatMode } from '../voidSettingsTypes.js';
-import { ToolExecutionProfile, agentSubagentToolSchemas, isAgentSubagentControlName, isToolAllowedByProfile, readOnlyChildBuiltinSchemas } from '../agentSubagents.js';
+import { AgentSubagentToolSnapshot, AgentSubagentToolSnapshotEntry, ToolExecutionProfile, agentSubagentToolSchemas, isAgentSubagentControlName, isToolAllowedByProfile, readOnlyChildBuiltinSchemas } from '../agentSubagents.js';
 import { isReadSkillResourceToolName, readSkillResourceToolSchema } from '../agentSkills.js';
 
 // Triple backtick wrapper used throughout the prompts for code blocks
@@ -357,8 +357,8 @@ export const isABuiltinToolName = (toolName: string): toolName is BuiltinToolNam
 /** These are application control tools, not builtins: ChatThreadService intercepts them before MCP lookup. */
 const agentSubagentControlTool = (tool: InternalToolInfo): InternalToolInfo => tool;
 export const agentSubagentControlTools: readonly InternalToolInfo[] = Object.freeze([
-	agentSubagentControlTool({ name: 'spawn_agent', description: 'Start a bounded read-only child for a delegated task. At most four direct children succeed in this turn and at most two run concurrently; later children queue FIFO. Optional agent_type must be an admitted named custom agent. The child has no terminal and no OS sandbox.', params: { message: { description: 'The bounded delegated task.' }, agent_type: { description: 'Optional exact admitted custom-agent identity.' } }, schema: agentSubagentToolSchemas.spawn_agent }),
-	agentSubagentControlTool({ name: 'wait_agent', description: 'Wait for selected direct children, or all current-turn direct children when targets is omitted. It wakes when one selected child newly becomes terminal or timeout elapses; synthesize partial results and failures yourself. A terminal summary is delivered at most once.', params: { timeout_ms: { description: 'Optional wait time in milliseconds, 0 through 30000.' }, targets: { description: 'Optional array of one to four distinct direct-child ids; XML tag body is a JSON array such as ["id1","id2"].' } }, schema: agentSubagentToolSchemas.wait_agent }),
+	agentSubagentControlTool({ name: 'spawn_agent', description: 'Start a bounded child for a delegated task when the current turn grants delegation depth. Limits are supplied by the admitted turn; later children queue FIFO. Optional agent_type must be an admitted named custom agent and may carry its admitted capability profile. Generic children remain read-only. The child has no OS sandbox.', params: { message: { description: 'The bounded delegated task.' }, agent_type: { description: 'Optional exact admitted custom-agent identity.' } }, schema: agentSubagentToolSchemas.spawn_agent }),
+	agentSubagentControlTool({ name: 'wait_agent', description: 'Wait for selected direct children, or all current-turn direct children when targets is omitted. It wakes when one selected child newly becomes terminal or timeout elapses; synthesize partial results and failures yourself. A terminal summary is delivered at most once.', params: { timeout_ms: { description: 'Optional wait time in milliseconds, 0 through 30000.' }, targets: { description: 'Optional array of distinct direct-child ids within the protocol limit; XML tag body is a JSON array such as ["id1","id2"].' } }, schema: agentSubagentToolSchemas.wait_agent }),
 	agentSubagentControlTool({ name: 'interrupt_agent', description: 'Cancel one current-turn direct child by its id.', params: { target: { description: 'The direct child id.' } }, schema: agentSubagentToolSchemas.interrupt_agent }),
 ]);
 
@@ -379,7 +379,25 @@ export const agentSkillResourceTools: readonly InternalToolInfo[] = Object.freez
 
 
 
-export const availableTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined, toolExecutionProfile: ToolExecutionProfile = 'default-parent', agentDelegationAllowed = false) => {
+const deepFrozenClone = <T>(value: T): T => { if (!value || typeof value !== 'object') return value; if (Array.isArray(value)) return Object.freeze(value.map(deepFrozenClone)) as T; return Object.freeze(Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, deepFrozenClone(item)]))) as T; };
+const stableToolRevision = (tool: InternalToolInfo) => `tool-${JSON.stringify([tool.name, tool.description, tool.schema ?? null, tool.params, tool.mcpServerName ?? null])}`;
+const freezeToolSnapshotEntry = (tool: InternalToolInfo): AgentSubagentToolSnapshotEntry => Object.freeze({
+	name: tool.name, description: tool.description,
+	...(tool.schema ? { schema: deepFrozenClone(tool.schema) } : {}),
+	params: deepFrozenClone(tool.params),
+	kind: tool.mcpServerName ? 'mcp' : isReadSkillResourceToolName(tool.name) ? 'skill_resource' : 'builtin',
+	...(tool.mcpServerName ? { mcpServerName: tool.mcpServerName, approval: 'MCP tools' as const } : tool.name in approvalTypeOfBuiltinToolName ? { approval: approvalTypeOfBuiltinToolName[tool.name as BuiltinToolName] } : {}),
+	revision: stableToolRevision(tool),
+});
+
+/** Captures the same registry native and XML serializers consume, excluding ephemeral child controls. */
+export const captureParentModelToolSnapshot = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined, agentDelegationAllowed: boolean): AgentSubagentToolSnapshot => {
+	const tools = (availableTools(chatMode, mcpTools, 'default-parent', agentDelegationAllowed) ?? []).filter(tool => !isAgentSubagentControlName(tool.name));
+	const entries = Object.freeze(tools.map(freezeToolSnapshotEntry));
+	return Object.freeze({ revision: `parent-tools-${entries.map(entry => entry.revision).join('|')}`, tools: entries });
+};
+
+export const availableTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined, toolExecutionProfile: ToolExecutionProfile = 'default-parent', agentDelegationAllowed = false, frozenToolSnapshot?: AgentSubagentToolSnapshot) => {
 
 	const builtinToolNames: BuiltinToolName[] | undefined = chatMode === 'normal' ? undefined
 		: chatMode === 'gather' ? (Object.keys(builtinTools) as BuiltinToolName[]).filter(toolName => !(toolName in approvalTypeOfBuiltinToolName))
@@ -391,12 +409,15 @@ export const availableTools = (chatMode: ChatMode | null, mcpTools: InternalTool
 		: builtinTools[toolName]) ?? undefined
 	// A child is intentionally not allowed to serialize live MCP tools, even if present.
 	const effectiveMCPTools = chatMode === 'agent' && toolExecutionProfile === 'default-parent' ? mcpTools?.filter(tool => !isAgentSubagentControlName(tool.name) && !isReadSkillResourceToolName(tool.name)) : undefined
+	const inheritedTools: InternalToolInfo[] | undefined = toolExecutionProfile === 'inherited-parent-write-child'
+		? frozenToolSnapshot?.tools.map(tool => ({ name: tool.name, description: tool.description, ...(tool.schema ? { schema: tool.schema as Record<string, unknown> } : {}), params: tool.params as InternalToolInfo['params'], ...(tool.mcpServerName ? { mcpServerName: tool.mcpServerName } : {}) }))
+		: undefined;
 
-	const controlTools = chatMode === 'agent' && toolExecutionProfile === 'default-parent' && agentDelegationAllowed ? agentSubagentControlTools : []
+	const controlTools = chatMode === 'agent' && agentDelegationAllowed ? agentSubagentControlTools : []
 	const skillResourceTools = chatMode === 'agent' && toolExecutionProfile === 'default-parent' ? agentSkillResourceTools : []
 	const tools: InternalToolInfo[] | undefined = !(builtinToolNames || mcpTools || controlTools.length || skillResourceTools.length) ? undefined
 		: [
-			...effectiveBuiltinTools ?? [],
+			...inheritedTools ?? effectiveBuiltinTools ?? [],
 			...skillResourceTools,
 			...controlTools,
 			...effectiveMCPTools ?? [],
@@ -427,8 +448,8 @@ export const reParsedToolXMLString = (toolName: ToolName, toolParams: RawToolPar
 
 /* We expect tools to come at the end - not a hard limit, but that's just how we process them, and the flow makes more sense that way. */
 // - You are allowed to call multiple tools by specifying them consecutively. However, there should be NO text or writing between tool calls or after them.
-const systemToolsXMLPrompt = (chatMode: ChatMode, mcpTools: InternalToolInfo[] | undefined, toolExecutionProfile: ToolExecutionProfile, agentDelegationAllowed: boolean) => {
-	const tools = availableTools(chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed)
+const systemToolsXMLPrompt = (chatMode: ChatMode, mcpTools: InternalToolInfo[] | undefined, toolExecutionProfile: ToolExecutionProfile, agentDelegationAllowed: boolean, frozenToolSnapshot?: AgentSubagentToolSnapshot) => {
+	const tools = availableTools(chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed, frozenToolSnapshot)
 	if (!tools || tools.length === 0) return null
 
 	const toolXMLDefinitions = (`\
@@ -453,10 +474,11 @@ const systemToolsXMLPrompt = (chatMode: ChatMode, mcpTools: InternalToolInfo[] |
 // ======================================================== chat (normal, gather, agent) ========================================================
 
 
-export const chat_systemMessage = ({ workspaceFolders, openedURIs, activeURI, persistentTerminalIDs, directoryStr, chatMode: mode, mcpTools, includeXMLToolDefinitions, toolExecutionProfile = 'default-parent', agentDelegationAllowed = false }: { workspaceFolders: string[], directoryStr: string, openedURIs: string[], activeURI: string | undefined, persistentTerminalIDs: string[], chatMode: ChatMode, mcpTools: InternalToolInfo[] | undefined, includeXMLToolDefinitions: boolean, toolExecutionProfile?: ToolExecutionProfile, agentDelegationAllowed?: boolean }) => {
+export const chat_systemMessage = ({ workspaceFolders, openedURIs, activeURI, persistentTerminalIDs, directoryStr, chatMode: mode, mcpTools, includeXMLToolDefinitions, toolExecutionProfile = 'default-parent', agentDelegationAllowed = false, frozenToolSnapshot }: { workspaceFolders: string[], directoryStr: string, openedURIs: string[], activeURI: string | undefined, persistentTerminalIDs: string[], chatMode: ChatMode, mcpTools: InternalToolInfo[] | undefined, includeXMLToolDefinitions: boolean, toolExecutionProfile?: ToolExecutionProfile, agentDelegationAllowed?: boolean, frozenToolSnapshot?: AgentSubagentToolSnapshot }) => {
 	const header = (`You are an expert coding ${mode === 'agent' ? 'agent' : 'assistant'} whose job is \
 ${toolExecutionProfile === 'read-only-child' ? `to inspect only the captured workspace root. Void application-level read-only — terminal disabled, no OS sandbox.`
-		: mode === 'agent' ? `to help the user develop, run, and make changes to their codebase.`
+		: toolExecutionProfile === 'inherited-parent-write-child' ? `to work with the captured parent tool profile. Void application-level capability profile — no OS sandbox; approvals and Undo availability are presented by the application.`
+			: mode === 'agent' ? `to help the user develop, run, and make changes to their codebase.`
 			: mode === 'gather' ? `to search, understand, and reference files in the user's codebase.`
 				: mode === 'normal' ? `to assist the user with their coding tasks.`
 					: ''}
@@ -488,7 +510,7 @@ ${directoryStr}
 </files_overview>`)
 
 
-	const toolDefinitions = includeXMLToolDefinitions ? systemToolsXMLPrompt(mode, mcpTools, toolExecutionProfile, agentDelegationAllowed) : null
+	const toolDefinitions = includeXMLToolDefinitions ? systemToolsXMLPrompt(mode, mcpTools, toolExecutionProfile, agentDelegationAllowed, frozenToolSnapshot) : null
 
 	const details: string[] = []
 

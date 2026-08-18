@@ -19,7 +19,7 @@ import { ChatMode, displayInfoOfProviderName, ModelSelectionOptions, OverridesOf
 import { getSendableReasoningInfo, getModelCapabilities, getProviderCapabilities, defaultProviderSettings, getReservedOutputTokenSpace } from '../../common/modelCapabilities.js';
 import { extractReasoningWrapper, extractXMLToolsWrapper } from './extractGrammar.js';
 import { availableTools, InternalToolInfo } from '../../common/prompt/prompts.js';
-import { ToolExecutionProfile } from '../../common/agentSubagents.js';
+import { AgentSubagentToolSnapshot, ToolExecutionProfile } from '../../common/agentSubagents.js';
 import { classifyOpenAICompatibleToolSchemaDialect, formatPrematureStreamCloseMessage, isPrematureStreamClose, OpenAICompatibleStreamDiagnostics, redactOpenAICompatibleEndpoint } from './openAICompatibleDiagnostics.js';
 import { generateUuid } from '../../../../../base/common/uuid.js';
 
@@ -52,6 +52,7 @@ type SendChatParams_Internal = InternalCommonMessageParams & {
 	chatMode: ChatMode | null;
 	mcpTools: InternalToolInfo[] | undefined;
 	toolExecutionProfile?: ToolExecutionProfile;
+	frozenToolSnapshot?: AgentSubagentToolSnapshot;
 	agentDelegationAllowed?: boolean;
 	requestProfile?: LLMRequestProfile;
 }
@@ -234,8 +235,8 @@ const toOpenAICompatibleTool = (toolInfo: InternalToolInfo) => {
 	} satisfies OpenAI.Chat.Completions.ChatCompletionTool
 }
 
-export const openAITools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined, toolExecutionProfile: ToolExecutionProfile = 'default-parent', agentDelegationAllowed = false) => {
-	const allowedTools = availableTools(chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed)
+export const openAITools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined, toolExecutionProfile: ToolExecutionProfile = 'default-parent', agentDelegationAllowed = false, frozenToolSnapshot?: AgentSubagentToolSnapshot) => {
+	const allowedTools = availableTools(chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed, frozenToolSnapshot)
 	if (!allowedTools || Object.keys(allowedTools).length === 0) return null
 
 	const openAITools: OpenAI.Chat.Completions.ChatCompletionTool[] = []
@@ -275,7 +276,7 @@ const rawToolCallObjOfAnthropicParams = (toolBlock: Anthropic.Messages.ToolUseBl
 
 const GHOST_CHAT_MAX_COMPLETION_TOKENS = 256
 
-const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions, modelName: modelName_, _setAborter, providerName, chatMode, separateSystemMessage, overridesOfModel, mcpTools, toolExecutionProfile, agentDelegationAllowed, requestProfile }: SendChatParams_Internal) => {
+const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions, modelName: modelName_, _setAborter, providerName, chatMode, separateSystemMessage, overridesOfModel, mcpTools, toolExecutionProfile, frozenToolSnapshot, agentDelegationAllowed, requestProfile }: SendChatParams_Internal) => {
 	const isGhostChat = requestProfile === 'ghost-chat'
 	const {
 		modelName,
@@ -300,7 +301,7 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 	}
 
 	// tools
-	const potentialTools = isGhostChat ? null : openAITools(chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed)
+	const potentialTools = isGhostChat ? null : openAITools(chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed, frozenToolSnapshot)
 	const nativeToolsObj = potentialTools && specialToolFormat === 'openai-style' ?
 		{ tools: potentialTools } as const
 		: {}
@@ -332,7 +333,7 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 
 	// manually parse out tool results if XML
 	if (!isGhostChat && !specialToolFormat) {
-		const { newOnText, newOnFinalMessage } = extractXMLToolsWrapper(onText, onFinalMessage, chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed)
+		const { newOnText, newOnFinalMessage } = extractXMLToolsWrapper(onText, onFinalMessage, chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed, frozenToolSnapshot)
 		onText = newOnText
 		onFinalMessage = newOnFinalMessage
 	}
@@ -496,8 +497,8 @@ const toAnthropicTool = (toolInfo: InternalToolInfo) => {
 	} satisfies Anthropic.Messages.Tool
 }
 
-export const anthropicTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined, toolExecutionProfile: ToolExecutionProfile = 'default-parent', agentDelegationAllowed = false) => {
-	const allowedTools = availableTools(chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed)
+export const anthropicTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined, toolExecutionProfile: ToolExecutionProfile = 'default-parent', agentDelegationAllowed = false, frozenToolSnapshot?: AgentSubagentToolSnapshot) => {
+	const allowedTools = availableTools(chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed, frozenToolSnapshot)
 	if (!allowedTools || Object.keys(allowedTools).length === 0) return null
 
 	const anthropicTools: Anthropic.Messages.ToolUnion[] = []
@@ -510,7 +511,7 @@ export const anthropicTools = (chatMode: ChatMode | null, mcpTools: InternalTool
 
 
 // ------------ ANTHROPIC ------------
-const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions, overridesOfModel, modelName: modelName_, _setAborter, separateSystemMessage, chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed }: SendChatParams_Internal) => {
+const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions, overridesOfModel, modelName: modelName_, _setAborter, separateSystemMessage, chatMode, mcpTools, toolExecutionProfile, frozenToolSnapshot, agentDelegationAllowed }: SendChatParams_Internal) => {
 	const {
 		modelName,
 		specialToolFormat,
@@ -531,7 +532,7 @@ const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessag
 	const maxTokens = getReservedOutputTokenSpace(providerName, modelName_, { isReasoningEnabled: !!reasoningInfo?.isReasoningEnabled, overridesOfModel })
 
 	// tools
-	const potentialTools = anthropicTools(chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed)
+	const potentialTools = anthropicTools(chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed, frozenToolSnapshot)
 	const nativeToolsObj = potentialTools && specialToolFormat === 'anthropic-style' ?
 		{ tools: potentialTools, tool_choice: { type: 'auto' } } as const
 		: {}
@@ -555,7 +556,7 @@ const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessag
 
 	// manually parse out tool results if XML
 	if (!specialToolFormat) {
-		const { newOnText, newOnFinalMessage } = extractXMLToolsWrapper(onText, onFinalMessage, chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed)
+		const { newOnText, newOnFinalMessage } = extractXMLToolsWrapper(onText, onFinalMessage, chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed, frozenToolSnapshot)
 		onText = newOnText
 		onFinalMessage = newOnFinalMessage
 	}
@@ -775,8 +776,8 @@ const toGeminiFunctionDecl = (toolInfo: InternalToolInfo) => {
 	} satisfies FunctionDeclaration
 }
 
-export const geminiTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined, toolExecutionProfile: ToolExecutionProfile = 'default-parent', agentDelegationAllowed = false): GeminiTool[] | null => {
-	const allowedTools = availableTools(chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed)
+export const geminiTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined, toolExecutionProfile: ToolExecutionProfile = 'default-parent', agentDelegationAllowed = false, frozenToolSnapshot?: AgentSubagentToolSnapshot): GeminiTool[] | null => {
+	const allowedTools = availableTools(chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed, frozenToolSnapshot)
 	if (!allowedTools || Object.keys(allowedTools).length === 0) return null
 	const functionDecls: FunctionDeclaration[] = []
 	for (const t in allowedTools ?? {}) {
@@ -804,6 +805,7 @@ const sendGeminiChat = async ({
 	chatMode,
 	mcpTools,
 	toolExecutionProfile,
+	frozenToolSnapshot,
 	agentDelegationAllowed,
 }: SendChatParams_Internal) => {
 
@@ -834,7 +836,7 @@ const sendGeminiChat = async ({
 			: undefined
 
 	// tools
-	const potentialTools = geminiTools(chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed)
+	const potentialTools = geminiTools(chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed, frozenToolSnapshot)
 	const toolConfig = potentialTools && specialToolFormat === 'gemini-style' ?
 		potentialTools
 		: undefined
@@ -845,7 +847,7 @@ const sendGeminiChat = async ({
 
 	// manually parse out tool results if XML
 	if (!specialToolFormat) {
-		const { newOnText, newOnFinalMessage } = extractXMLToolsWrapper(onText, onFinalMessage, chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed)
+		const { newOnText, newOnFinalMessage } = extractXMLToolsWrapper(onText, onFinalMessage, chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed, frozenToolSnapshot)
 		onText = newOnText
 		onFinalMessage = newOnFinalMessage
 	}

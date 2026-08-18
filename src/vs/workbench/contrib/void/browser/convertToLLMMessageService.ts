@@ -17,7 +17,7 @@ import { ToolName } from '../common/toolsServiceTypes.js';
 import { IMCPService } from '../common/mcpService.js';
 import { AgentInstructionTurnSnapshot, assembleAgentInstructionText, routeAgentInstructionAuthority } from '../common/agentInstructions.js';
 import { AgentRuntimeTurnSnapshot, assembleProtectedAgentAuthority, isReadSkillResourceToolName } from '../common/agentSkills.js';
-import { ToolExecutionProfile } from '../common/agentSubagents.js';
+import { AgentSubagentToolSnapshot, ToolExecutionProfile } from '../common/agentSubagents.js';
 
 export const EMPTY_MESSAGE = '(empty message)'
 
@@ -554,7 +554,7 @@ const prepareMessages = (params: {
 export interface IConvertToLLMMessageService {
 	readonly _serviceBrand: undefined;
 	prepareLLMSimpleMessages: (opts: { simpleMessages: SimpleLLMMessage[], systemMessage: string, modelSelection: ModelSelection | null, featureName: FeatureName }) => { messages: LLMChatMessage[], separateSystemMessage: string | undefined }
-	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null, instructionSnapshot: AgentRuntimeTurnSnapshot | AgentInstructionTurnSnapshot, toolExecutionProfile?: ToolExecutionProfile, childRoot?: string, agentDelegationAllowed?: boolean }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined }>
+	prepareLLMChatMessages: (opts: { chatMessages: ChatMessage[], chatMode: ChatMode, modelSelection: ModelSelection | null, instructionSnapshot: AgentRuntimeTurnSnapshot | AgentInstructionTurnSnapshot, toolExecutionProfile?: ToolExecutionProfile, childRoot?: string, agentDelegationAllowed?: boolean, frozenToolSnapshot?: AgentSubagentToolSnapshot }) => Promise<{ messages: LLMChatMessage[], separateSystemMessage: string | undefined }>
 	prepareFIMMessage(opts: { messages: LLMFIMMessage, }): { prefix: string, suffix: string, stopTokens: string[] }
 }
 
@@ -577,8 +577,8 @@ export class ConvertToLLMMessageService extends Disposable implements IConvertTo
 	}
 
 	// system message
-	private _generateChatMessagesSystemMessage = async (chatMode: ChatMode, specialToolFormat: 'openai-style' | 'anthropic-style' | 'gemini-style' | undefined, toolExecutionProfile: ToolExecutionProfile = 'default-parent', childRoot?: string, agentDelegationAllowed = false) => {
-		if (toolExecutionProfile === 'read-only-child') return chat_systemMessage({ workspaceFolders: childRoot ? [childRoot] : [], openedURIs: [], activeURI: undefined, persistentTerminalIDs: [], directoryStr: childRoot ? `Root hint: ${childRoot} (use read tools; no recursive overview was injected).` : 'No root.', chatMode, mcpTools: undefined, includeXMLToolDefinitions: !specialToolFormat, toolExecutionProfile });
+	private _generateChatMessagesSystemMessage = async (chatMode: ChatMode, specialToolFormat: 'openai-style' | 'anthropic-style' | 'gemini-style' | undefined, toolExecutionProfile: ToolExecutionProfile = 'default-parent', childRoot?: string, agentDelegationAllowed = false, frozenToolSnapshot?: AgentSubagentToolSnapshot) => {
+		if (toolExecutionProfile === 'read-only-child' || toolExecutionProfile === 'inherited-parent-write-child') { const capabilityHint = toolExecutionProfile === 'read-only-child' ? 'use read tools' : 'use the captured parent tool profile'; return chat_systemMessage({ workspaceFolders: childRoot ? [childRoot] : [], openedURIs: [], activeURI: undefined, persistentTerminalIDs: [], directoryStr: childRoot ? `Root hint: ${childRoot} (${capabilityHint}; no recursive overview was injected).` : 'No root.', chatMode, mcpTools: undefined, includeXMLToolDefinitions: !specialToolFormat, toolExecutionProfile, agentDelegationAllowed, frozenToolSnapshot }); }
 		const workspaceFolders = this.workspaceContextService.getWorkspace().folders.map(f => f.uri.fsPath)
 
 		const openedURIs = this.modelService.getModels().filter(m => m.isAttachedToEditor()).map(m => m.uri.fsPath) || [];
@@ -666,7 +666,7 @@ export class ConvertToLLMMessageService extends Disposable implements IConvertTo
 		})
 		return { messages, separateSystemMessage };
 	}
-	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection, instructionSnapshot, toolExecutionProfile = 'default-parent', childRoot, agentDelegationAllowed = false }) => {
+	prepareLLMChatMessages: IConvertToLLMMessageService['prepareLLMChatMessages'] = async ({ chatMessages, chatMode, modelSelection, instructionSnapshot, toolExecutionProfile = 'default-parent', childRoot, agentDelegationAllowed = false, frozenToolSnapshot }) => {
 		if (modelSelection === null) return { messages: [], separateSystemMessage: undefined }
 		const runtimeCandidate = instructionSnapshot as unknown as Record<string, unknown>
 		const runtime = Object.prototype.hasOwnProperty.call(runtimeCandidate, 'schemaVersion') && runtimeCandidate.schemaVersion === 2 ? instructionSnapshot as AgentRuntimeTurnSnapshot : undefined
@@ -680,7 +680,7 @@ export class ConvertToLLMMessageService extends Disposable implements IConvertTo
 			supportsSystemMessage,
 		} = getModelCapabilities(providerName, modelName, overridesOfModel)
 
-		const fullSystemMessage = await this._generateChatMessagesSystemMessage(chatMode, specialToolFormat, toolExecutionProfile, childRoot, agentDelegationAllowed)
+		const fullSystemMessage = await this._generateChatMessagesSystemMessage(chatMode, specialToolFormat, toolExecutionProfile, childRoot, agentDelegationAllowed, frozenToolSnapshot)
 		const systemMessage = fullSystemMessage;
 
 		const modelSelectionOptions = runtime?.model.hasModel ? runtime.model.modelSelectionOptions : this.voidSettingsService.state.optionsOfModelSelection['Chat'][modelSelection.providerName]?.[modelSelection.modelName]

@@ -26,6 +26,7 @@ export const sendLLMMessage = async ({
 	separateSystemMessage,
 	mcpTools,
 	toolExecutionProfile,
+	frozenToolSnapshot,
 	agentDelegationAllowed,
 	requestProfile,
 }: SendLLMMessageParams,
@@ -139,7 +140,7 @@ export const sendLLMMessage = async ({
 		}
 		const { sendFIM, sendChat } = implementation
 		if (messagesType === 'chatMessages') {
-			await sendChat({ messages: messages_, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions, overridesOfModel, modelName, _setAborter, providerName, separateSystemMessage, chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed, requestProfile })
+			await sendChat({ messages: messages_, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions, overridesOfModel, modelName, _setAborter, providerName, separateSystemMessage, chatMode, mcpTools, toolExecutionProfile, frozenToolSnapshot, agentDelegationAllowed, requestProfile })
 			return
 		}
 		if (messagesType === 'FIMMessage') {

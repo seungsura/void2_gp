@@ -9,7 +9,7 @@ import { availableTools, InternalToolInfo } from '../../common/prompt/prompts.js
 import { OnFinalMessage, OnText, RawToolCallObj } from '../../common/sendLLMMessageTypes.js'
 import { ToolName, ToolParamName } from '../../common/toolsServiceTypes.js'
 import { ChatMode } from '../../common/voidSettingsTypes.js'
-import { ToolExecutionProfile } from '../../common/agentSubagents.js'
+import { AgentSubagentToolSnapshot, ToolExecutionProfile } from '../../common/agentSubagents.js'
 
 
 // =============== reasoning ===============
@@ -274,10 +274,11 @@ export const extractXMLToolsWrapper = (
 	mcpTools: InternalToolInfo[] | undefined,
 	toolExecutionProfile: ToolExecutionProfile = 'default-parent',
 	agentDelegationAllowed = false,
+	frozenToolSnapshot?: AgentSubagentToolSnapshot,
 ): { newOnText: OnText, newOnFinalMessage: OnFinalMessage } => {
 
 	if (!chatMode) return { newOnText: onText, newOnFinalMessage: onFinalMessage }
-	const tools = availableTools(chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed)
+	const tools = availableTools(chatMode, mcpTools, toolExecutionProfile, agentDelegationAllowed, frozenToolSnapshot)
 	if (!tools) return { newOnText: onText, newOnFinalMessage: onFinalMessage }
 
 	const toolOfToolName: ToolOfToolName = {}

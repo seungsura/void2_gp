@@ -5,7 +5,7 @@
 
 import { InternalToolInfo } from './prompt/prompts.js'
 import { ToolName, ToolParamName } from './toolsServiceTypes.js'
-import { ToolExecutionProfile } from './agentSubagents.js'
+import { AgentSubagentToolSnapshot, ToolExecutionProfile } from './agentSubagents.js'
 import { ChatMode, ModelSelection, ModelSelectionOptions, OverridesOfModel, ProviderName, RefreshableProviderName, SettingsOfProvider } from './voidSettingsTypes.js'
 
 
@@ -120,6 +120,8 @@ export type ServiceSendLLMMessageParams = {
 	overridesOfModel: OverridesOfModel | undefined;
 	onAbort: OnAbort;
 	toolExecutionProfile?: ToolExecutionProfile;
+	/** Immutable child-only parent registry captured at top-level admission. */
+	frozenToolSnapshot?: AgentSubagentToolSnapshot;
 	/** Ephemeral authority from the current typed @Agent selection; never persisted. */
 	agentDelegationAllowed?: boolean;
 	/** Narrow, non-persisted transport contract for an internal caller. */
@@ -140,6 +142,7 @@ export type SendLLMMessageParams = {
 	modelSelectionOptions: ModelSelectionOptions | undefined;
 	overridesOfModel: OverridesOfModel | undefined;
 	toolExecutionProfile?: ToolExecutionProfile;
+	frozenToolSnapshot?: AgentSubagentToolSnapshot;
 	agentDelegationAllowed?: boolean;
 	requestProfile?: LLMRequestProfile;
 

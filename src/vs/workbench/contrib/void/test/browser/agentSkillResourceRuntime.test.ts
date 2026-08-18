@@ -4,6 +4,7 @@ import { ChatThreadService } from '../../browser/chatThreadService.js';
 import { ConvertToLLMMessageService } from '../../browser/convertToLLMMessageService.js';
 import { AgentRuntimeTurnSnapshot, createAgentRuntimeTurnSnapshot, createSkillCatalog, skillAdvertisement } from '../../common/agentSkills.js';
 import { projectAgentConfig, resolveAgentInstructions, stableAgentInstructionRevision } from '../../common/agentInstructions.js';
+import { captureParentModelToolSnapshot } from '../../common/prompt/prompts.js';
 
 const encoder = new TextEncoder();
 const skillBody = (name: string) => `---\nname: ${name}\ndescription: ${name} description\n---\nbody-${name}`;
@@ -28,11 +29,13 @@ const fixture = (runtimeSnapshot = snapshot()) => {
 		_convertToLLMMessagesService: { prepareLLMChatMessages: async (options: unknown) => { conversionCalls.push(options); return { messages: [], separateSystemMessage: undefined }; } },
 		_toolsService: { validateParams: new Proxy({}, { get() { throw new Error('builtin lookup'); } }) }, _mcpService: { getMCPTools() { throw new Error('MCP lookup'); } },
 		_agentSubagentService: { cancelParent() { }, forgetParent() { } },
+		_cancelChildToolApprovalsForParent() { },
 		_addMessageToThread(_threadId: string, message: any) { messages.push(message); },
 		_updateLatestTool(_threadId: string, message: any) { if (messages[messages.length - 1]?.role === 'tool') messages[messages.length - 1] = message; else messages.push(message); },
 		_setStreamState(threadId: string, state: any) { value.streamState[threadId] = state; },
 		_purgeInstructionTurn(threadId: string) { purges++; value._instructionTurnOfThread.delete(threadId); },
 	};
+	value._revokeAgentDelegation = (threadId: string, forget = false) => (ChatThreadService.prototype as any)._revokeAgentDelegation.call(value, threadId, forget);
 	return { value, messages, serviceCalls, conversionCalls, runtimeSnapshot, setTrusted: (next: boolean) => trusted = next, setOwner: (next: string) => owner = next, purges: () => purges };
 };
 const run = (value: any, runtimeSnapshot: AgentRuntimeTurnSnapshot, raw: Record<string, unknown>, allowed = true) =>
@@ -140,6 +143,9 @@ suite('Void selected Skill resource Chat runtime', () => {
 		const childConverted = await converter.prepareLLMChatMessages({ chatMessages: [{ role: 'user', content: 'delegated read' } as any], chatMode: 'agent', modelSelection: { providerName: 'openAI', modelName: 'gpt-4.1' }, instructionSnapshot: childSnapshot, toolExecutionProfile: 'read-only-child', childRoot: 'file:///workspace' });
 		const childStrings = stringsOf(childConverted); for (const body of [skillBody('demo'), skillBody('other')]) assert.strictEqual(childStrings.some(value => value.includes(body)), true);
 		assert.strictEqual(JSON.stringify(childConverted).includes('read_skill_resource'), false);
+		const rootHintConverter = new ConvertToLLMMessageService({ getModels: () => [] } as never, { getWorkspace: () => ({ folders: [] }) } as never, { activeEditor: undefined } as never, { getAllDirectoriesStr: async () => '' } as never, { listPersistentTerminalIds: () => [] } as never, { state: { overridesOfModel: {}, globalSettings: {}, optionsOfModelSelection: {} } } as never, { getMCPTools: () => [] } as never);
+		const inheritedSystem = await (rootHintConverter as any)._generateChatMessagesSystemMessage('agent', undefined, 'inherited-parent-write-child', 'file:///workspace', false, captureParentModelToolSnapshot('agent', undefined, false));
+		assert.strictEqual(inheritedSystem.includes('captured parent tool profile'), true); assert.strictEqual(inheritedSystem.includes('to inspect only the captured workspace root'), false);
 	});
 
 	test('serializes optional spawn_agent.agent_type only for the delegated parent XML fallback', async () => {

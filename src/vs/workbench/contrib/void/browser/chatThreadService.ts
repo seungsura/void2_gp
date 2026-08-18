@@ -11,14 +11,14 @@ import { IStorageService, StorageScope, StorageTarget } from '../../../../platfo
 import { URI } from '../../../../base/common/uri.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { ILLMMessageService } from '../common/sendLLMMessageService.js';
-import { chat_userMessageContent, isABuiltinToolName } from '../common/prompt/prompts.js';
+import { captureParentModelToolSnapshot, chat_userMessageContent, isABuiltinToolName } from '../common/prompt/prompts.js';
 import { AnthropicReasoning, getErrorMessage, RawToolCallObj, RawToolParamsObj } from '../common/sendLLMMessageTypes.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { FeatureName, ModelSelection, ModelSelectionOptions, SettingsOfProvider } from '../common/voidSettingsTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { getIsReasoningEnabledState, getModelCapabilities, getReservedOutputTokenSpace } from '../common/modelCapabilities.js';
 import { estimateHistoryTokensForReadBudget, protectedSkillResourceHistoryLength } from './convertToLLMMessageService.js';
-import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolResultType, ToolCallParams, ToolName, ToolResult } from '../common/toolsServiceTypes.js';
+import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, BuiltinToolResultType, ToolCallParams, ToolName, ToolResult } from '../common/toolsServiceTypes.js';
 import { computeMaxReadOutputTokens, isBoundedReadHistory, isBoundedReadHistoryString } from '../common/readFileReliability.js';
 import { IToolsService } from './toolsServiceInterface.js';
 import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
@@ -43,9 +43,9 @@ import { IMCPService } from '../common/mcpService.js';
 import { RawMCPToolCall } from '../common/mcpServiceTypes.js';
 import { IAgentInstructionsService } from './agentInstructionsService.js';
 import { IAgentSkillsService } from './agentSkillsService.js';
-import { AgentInstructionTaskSession, AgentInstructionTurnSnapshot } from '../common/agentInstructions.js';
+import { AgentDelegationLimits, AgentInstructionTaskSession, AgentInstructionTurnSnapshot } from '../common/agentInstructions.js';
 import { AgentRuntimeTurnSnapshot, admitProtectedAgentAuthority, admitSkillResourceContext, assembleProtectedAgentAuthority, createAgentRuntimeTurnSnapshot, isReadSkillResourceToolName, reviveAgentRuntimeTurnSnapshot, runtimeModelFingerprint, selectExplicitSkills, skillAdvertisement, validateReadSkillResourceToolParams } from '../common/agentSkills.js';
-import { isAgentSubagentControlName, isNativeAgentToolFormat, validateAgentSubagentControlParams } from '../common/agentSubagents.js';
+import { AgentSubagentToolBroker, AgentSubagentToolBrokerRequest, AgentSubagentToolSnapshot, ChildToolApprovalKey, ChildToolApprovalView, childToolApprovalStructuralKey, createChildToolApprovalView, isAgentSubagentControlName, isNativeAgentToolFormat, readOnlyChildToolNames, validateAgentSubagentControlParams } from '../common/agentSubagents.js';
 import { IAgentSubagentService } from './agentSubagentService.js';
 import { IAgentCustomAgentService } from './agentCustomAgentService.js';
 import { CustomAgentCatalog, customAgentAdvertisement } from '../common/agentCustomAgents.js';
@@ -54,7 +54,7 @@ import { CustomAgentCatalog, customAgentAdvertisement } from '../common/agentCus
 // related to retrying when LLM message has error
 const CHAT_RETRIES = 3
 const RETRY_DELAY = 2500
-type AgentDelegationTurnAuthority = Readonly<{ allowed: boolean; generation: number; roles?: CustomAgentCatalog; settingsState?: IVoidSettingsService['state']; settingsOfProvider?: SettingsOfProvider }>
+type AgentDelegationTurnAuthority = Readonly<{ allowed: boolean; generation: number; limits: AgentDelegationLimits; runtimeSnapshot: AgentRuntimeTurnSnapshot; parentTools: AgentSubagentToolSnapshot; autoApprove: Readonly<{ edits: boolean; terminal: boolean; mcp: boolean }>; roles?: CustomAgentCatalog; settingsState?: IVoidSettingsService['state']; settingsOfProvider?: SettingsOfProvider }>
 
 
 const findStagingSelectionIndex = (currentSelections: StagingSelectionItem[] | undefined, newSelection: StagingSelectionItem): number | null => {
@@ -235,6 +235,10 @@ export interface IChatThreadService {
 
 	onDidChangeCurrentThread: Event<void>;
 	onDidChangeStreamState: Event<{ threadId: string }>
+	onDidChangeChildToolApprovals: Event<void>;
+	getChildToolApprovals(parentId: string): readonly ChildToolApprovalView[];
+	approveChildToolApproval(key: ChildToolApprovalKey): boolean;
+	rejectChildToolApproval(key: ChildToolApprovalKey): boolean;
 
 	getCurrentThread(): ThreadType;
 	openNewThread(): void;
@@ -306,6 +310,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 	private readonly _onDidChangeStreamState = new Emitter<{ threadId: string }>();
 	readonly onDidChangeStreamState: Event<{ threadId: string }> = this._onDidChangeStreamState.event;
+	private readonly _onDidChangeChildToolApprovals = this._register(new Emitter<void>());
+	readonly onDidChangeChildToolApprovals: Event<void> = this._onDidChangeChildToolApprovals.event;
 
 	readonly streamState: ThreadStreamState = {}
 	state: ThreadsState // allThreads is persisted, currentThread is not
@@ -353,6 +359,22 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	private readonly _instructionTurnOfThread = new Map<string, AgentRuntimeTurnSnapshot>();
 	private readonly _agentControlGeneration = new Map<string, number>();
 	private readonly _agentDelegationAuthorityOfThread = new Map<string, AgentDelegationTurnAuthority>();
+	private readonly _childToolApprovals = new Map<string, { view: ChildToolApprovalView; resolve: (decision: 'approved' | 'rejected' | 'cancelled') => void }>();
+	getChildToolApprovals(parentId: string): readonly ChildToolApprovalView[] { return Object.freeze([...this._childToolApprovals.values()].map(entry => entry.view).filter(view => view.key.parentId === parentId)); }
+	private _decideChildToolApproval(key: ChildToolApprovalKey, decision: 'approved' | 'rejected' | 'cancelled'): boolean {
+		const structuralKey = childToolApprovalStructuralKey(key); const record = this._childToolApprovals.get(structuralKey);
+		if (!record || record.view.key.parentId !== key.parentId || record.view.key.generation !== key.generation || record.view.key.childId !== key.childId || record.view.key.toolId !== key.toolId || record.view.key.snapshotRevision !== key.snapshotRevision) return false;
+		this._childToolApprovals.delete(structuralKey); record.resolve(decision); this._onDidChangeChildToolApprovals.fire(); return true;
+	}
+	approveChildToolApproval(key: ChildToolApprovalKey): boolean { return this._decideChildToolApproval(key, 'approved'); }
+	rejectChildToolApproval(key: ChildToolApprovalKey): boolean { return this._decideChildToolApproval(key, 'rejected'); }
+	private _cancelChildToolApproval(key: ChildToolApprovalKey): boolean { return this._decideChildToolApproval(key, 'cancelled'); }
+	private _awaitChildToolApproval(request: AgentSubagentToolBrokerRequest): Promise<'approved' | 'rejected' | 'cancelled'> {
+		const view = createChildToolApprovalView(request); const previous = this._childToolApprovals.get(view.structuralKey);
+		if (previous) return Promise.resolve('cancelled');
+		return new Promise(resolve => { this._childToolApprovals.set(view.structuralKey, { view, resolve }); this._onDidChangeChildToolApprovals.fire(); });
+	}
+	private _cancelChildToolApprovalsForParent(parentId: string): void { for (const view of this.getChildToolApprovals(parentId)) this._cancelChildToolApproval(view.key); }
 	private readonly _transientComposerDraftOfThread = new Map<string, string>();
 	getTransientComposerDraft(threadId: string): string { return this.state.allThreads[threadId] ? this._transientComposerDraftOfThread.get(threadId) ?? '' : '' }
 	setTransientComposerDraft(threadId: string, draft: string): void {
@@ -389,7 +411,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		}
 		// Losing trust starts a new top-level task session so project config is not retained.
 		if (record?.trustedAtStart && !trustedNow) {
-			this._purgeInstructionTurn(threadId)
+			// This is an intentional user-turn rebuild. The prior authority is revoked by
+			// the caller's new-turn boundary, so do not advance the generation twice.
+			this._purgeInstructionTurn(threadId, true, false)
 			record = undefined
 		}
 		if (!record) {
@@ -418,7 +442,16 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		}
 		return snapshot;
 	}
-	private _purgeInstructionTurn(threadId: string, removeSession = true) {
+	/** Revocation is a parent lifecycle boundary, never a view/switch boundary. */
+	private _revokeAgentDelegation(threadId: string, forget = false) {
+		this._cancelChildToolApprovalsForParent(threadId)
+		this._agentDelegationAuthorityOfThread.delete(threadId)
+		this._agentControlGeneration.set(threadId, (this._agentControlGeneration.get(threadId) ?? 0) + 1)
+		if (forget) this._agentSubagentService.forgetParent(threadId)
+		else this._agentSubagentService.cancelParent(threadId)
+	}
+	private _purgeInstructionTurn(threadId: string, removeSession = true, revoke = true) {
+		if (revoke) this._revokeAgentDelegation(threadId)
 		if (removeSession) this._agentInstructionSessionOfThread?.delete(threadId)
 		this._instructionTurnOfThread?.delete(threadId)
 		const thread = this.state.allThreads[threadId]
@@ -474,8 +507,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 
 	dangerousSetState(newState: ThreadsState) {
-		for (const threadId of Object.keys(this.state.allThreads)) this._agentSubagentService.forgetParent(threadId)
-		this._agentDelegationAuthorityOfThread.clear()
+		for (const threadId of Object.keys(this.state.allThreads)) this._revokeAgentDelegation(threadId, true)
 		this._agentControlGeneration.clear()
 		this._agentInstructionSessionOfThread.clear()
 		this._transientComposerDraftOfThread.clear()
@@ -484,11 +516,10 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		this._onDidChangeCurrentThread.fire()
 	}
 	resetState() {
-		for (const threadId of Object.keys(this.state.allThreads)) this._agentSubagentService.forgetParent(threadId)
+		for (const threadId of Object.keys(this.state.allThreads)) this._revokeAgentDelegation(threadId, true)
+		this._agentControlGeneration.clear()
 		this._agentInstructionSessionOfThread.clear()
 		this._instructionTurnOfThread.clear()
-		this._agentDelegationAuthorityOfThread.clear()
-		this._agentControlGeneration.clear()
 		this._transientComposerDraftOfThread.clear()
 		this.state = { allThreads: {}, currentThreadId: null as unknown as string } // see constructor
 		this.openNewThread()
@@ -668,8 +699,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			, threadId
 		)
 	}
-	rejectLatestToolRequest(threadId: string) {
-		this._agentDelegationAuthorityOfThread.delete(threadId)
+	rejectLatestToolRequest(threadId: string, revoke = true) {
+		if (revoke) this._revokeAgentDelegation(threadId)
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
 
@@ -693,10 +724,103 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		return this._mcpService.getMCPTools()?.find(t => t.name === toolName)?.mcpServerName
 	}
 
+	/** Child mutations are deliberately not routed through _runToolCall: that path owns
+	 * parent history, streaming state and interactive approval UI. */
+	private _createAgentSubagentToolBroker(threadId: string, authority: AgentDelegationTurnAuthority): AgentSubagentToolBroker {
+		type BrokerRequestState = { cancelled: boolean; executing: boolean; settled: boolean; interrupt?: () => void; interruptIssued: boolean; pendingKey?: ChildToolApprovalKey; resolve: () => void; quiescent: Promise<void> };
+		const requests = new Map<string, BrokerRequestState>();
+		// A turn is bounded to eight accepted children and sixteen turns per child.
+		// Retaining 128 completed keys blocks replay without retaining an unbounded log.
+		const completed = new Map<string, true>();
+		const approvalKeyOf = (request: AgentSubagentToolBrokerRequest): ChildToolApprovalKey => Object.freeze({ parentId: request.parentId, generation: request.generation, childId: request.childId, toolId: request.toolId, snapshotRevision: request.snapshotRevision });
+		const keyOf = (request: AgentSubagentToolBrokerRequest) => childToolApprovalStructuralKey(approvalKeyOf(request));
+		const rememberCompleted = (key: string) => {
+			completed.delete(key);
+			completed.set(key, true);
+			if (completed.size > 128) completed.delete(completed.keys().next().value!);
+		};
+		const current = (request: AgentSubagentToolBrokerRequest, state?: BrokerRequestState) =>
+			!state?.cancelled && !request.cancellationToken.isCancellationRequested && this._agentDelegationAuthorityOfThread.get(threadId) === authority &&
+			(this._agentControlGeneration.get(threadId) ?? 0) === authority.generation && request.parentId === threadId && request.generation === authority.generation &&
+			!!this.state.allThreads[threadId] && this._instructionTurnOfThread.get(threadId) === authority.runtimeSnapshot &&
+			this._workspaceContextService.getWorkspace().folders[0]?.uri.toString() === authority.runtimeSnapshot.ownerProjectRoot &&
+			authority.runtimeSnapshot.runCwd === authority.runtimeSnapshot.ownerProjectRoot && this._workspaceTrustManagementService.isWorkspaceTrusted() === authority.runtimeSnapshot.workspaceTrustedAtAdmission;
+		const fail = (error: string) => Object.freeze({ ok: false as const, error });
+		const stale = (request: AgentSubagentToolBrokerRequest, state?: BrokerRequestState) => fail(state?.cancelled || request.cancellationToken.isCancellationRequested ? 'cancelled' : 'tool_stale');
+		const settle = (state: BrokerRequestState) => { if (!state.settled) { state.settled = true; state.resolve(); } };
+		const admitted = (request: AgentSubagentToolBrokerRequest, state: BrokerRequestState) => {
+			if (!current(request, state) || request.snapshotRevision !== authority.parentTools.revision || request.tool.name !== request.name || isAgentSubagentControlName(request.name) || isReadSkillResourceToolName(request.name) || request.tool.kind === 'skill_resource') return false;
+			const frozen = authority.parentTools.tools.filter(tool => tool.name === request.name);
+			if (frozen.length !== 1 || frozen[0] !== request.tool || (readOnlyChildToolNames as readonly string[]).includes(request.name)) return false;
+			const live = captureParentModelToolSnapshot('agent', this._mcpService.getMCPTools(), authority.allowed);
+			if (live.revision !== authority.parentTools.revision) return false;
+			const liveExact = live.tools.filter(tool => tool.name === request.name);
+			if (liveExact.length !== 1 || liveExact[0].revision !== request.tool.revision) return false;
+			if (request.tool.kind === 'builtin') return !request.tool.mcpServerName && isABuiltinToolName(request.name) && request.tool.approval === approvalTypeOfBuiltinToolName[request.name];
+			return request.tool.kind === 'mcp' && !!request.tool.mcpServerName && request.tool.approval === 'MCP tools' && liveExact[0].kind === 'mcp' && liveExact[0].mcpServerName === request.tool.mcpServerName;
+		};
+		return Object.freeze({
+			execute: async (request) => {
+				const key = keyOf(request);
+				if (requests.has(key) || completed.has(key)) return fail('tool_replayed');
+				let resolve!: () => void;
+				const state: BrokerRequestState = { cancelled: false, executing: false, settled: false, interruptIssued: false, resolve: () => { }, quiescent: new Promise<void>(done => resolve = done) };
+				state.resolve = resolve;
+				requests.set(key, state); // synchronously installed before the first await
+				if (!admitted(request, state)) { settle(state); requests.delete(key); rememberCompleted(key); return stale(request, state); }
+				try {
+					if (request.tool.kind === 'builtin') {
+						if (!isABuiltinToolName(request.name)) return stale(request, state);
+						const builtinName: BuiltinToolName = request.name;
+						const validate = this._toolsService.validateParams[builtinName];
+						if (!validate) return stale(request, state);
+						const params: BuiltinToolCallParams[typeof builtinName] = validate(request.rawParams);
+						if (!admitted(request, state)) return stale(request, state);
+						const approval = request.tool.approval;
+						if ((approval === 'edits' && !authority.autoApprove.edits) || (approval === 'terminal' && !authority.autoApprove.terminal) || (approval === 'MCP tools' && !authority.autoApprove.mcp)) {
+							state.pendingKey = approvalKeyOf(request); const decision = await this._awaitChildToolApproval(request); state.pendingKey = undefined;
+							if (decision === 'rejected') return fail('rejected'); if (decision !== 'approved') return fail('cancelled'); if (!admitted(request, state)) return stale(request, state);
+						}
+						let result: unknown;
+						if (builtinName === 'write_file') {
+							const prepared = await this._toolsService.prepareWriteFile(params as BuiltinToolCallParams['write_file'], request.childId);
+							if (!prepared || !admitted(request, state)) return stale(request, state);
+							state.executing = true;
+							result = await prepared.execute();
+						} else {
+							const calls = this._toolsService.callTool as unknown as Record<string, (params: unknown, context: unknown) => Promise<{ result: unknown | Promise<unknown>; interruptTool?: () => void }>>;
+							const call = await calls[builtinName](params, { ownerThreadId: request.childId, childId: request.childId, maxReadOutputTokens: request.maxReadOutputTokens, cancellationToken: request.cancellationToken });
+							state.interrupt = typeof (call as { interruptTool?: unknown }).interruptTool === 'function' ? (call as { interruptTool: () => void }).interruptTool : undefined;
+							if (state.cancelled && state.interrupt && !state.interruptIssued) { state.interruptIssued = true; state.interrupt(); }
+							state.executing = true;
+							result = await call.result;
+						}
+						if (!admitted(request, state)) return stale(request, state);
+						const stringify = this._toolsService.stringOfResult as unknown as Record<string, (params: unknown, result: unknown) => string>;
+						return Object.freeze({ ok: true as const, content: stringify[builtinName](params, result), result });
+					}
+					if (request.tool.kind !== 'mcp' || !request.tool.mcpServerName || !admitted(request, state)) return stale(request, state);
+					if (!authority.autoApprove.mcp) { state.pendingKey = approvalKeyOf(request); const decision = await this._awaitChildToolApproval(request); state.pendingKey = undefined; if (decision === 'rejected') return fail('rejected'); if (decision !== 'approved') return fail('cancelled'); if (!admitted(request, state)) return stale(request, state); }
+					state.executing = true;
+					const result = (await this._mcpService.callMCPTool({ serverName: request.tool.mcpServerName, toolName: request.name, params: request.rawParams })).result;
+					if (!admitted(request, state)) return stale(request, state);
+					return Object.freeze({ ok: true as const, content: this._mcpService.stringifyResult(result), result });
+				} catch (error) { return fail(state.cancelled || request.cancellationToken.isCancellationRequested ? 'cancelled' : error instanceof Error && /invalid|param/i.test(error.message) ? 'invalid_params' : 'execution_failed'); }
+				finally { settle(state); requests.delete(key); rememberCompleted(key); }
+			},
+			cancel: async request => {
+				const state = requests.get(keyOf(request));
+				if (!state) return;
+				state.cancelled = true;
+				if (state.pendingKey) this._cancelChildToolApproval(state.pendingKey);
+				if (state.interrupt && !state.interruptIssued) { state.interruptIssued = true; try { state.interrupt(); } catch { /* cancellation remains fenced */ } }
+				await state.quiescent;
+			},
+		});
+	}
+
 	async abortRunning(threadId: string) {
-		this._agentControlGeneration.set(threadId, (this._agentControlGeneration.get(threadId) ?? 0) + 1)
-		this._agentDelegationAuthorityOfThread.delete(threadId)
-		this._agentSubagentService.cancelParent(threadId)
+		this._revokeAgentDelegation(threadId)
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
 
@@ -714,7 +838,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		}
 		// reject the tool for the user if relevant
 		else if (this.streamState[threadId]?.isRunning === 'awaiting_user') {
-			this.rejectLatestToolRequest(threadId)
+			this.rejectLatestToolRequest(threadId, false)
 		}
 		else if (this.streamState[threadId]?.isRunning === 'idle') {
 			// do nothing
@@ -876,7 +1000,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			try {
 				const control = validateAgentSubagentControlParams(toolName, opts.unvalidatedToolParams);
 				let result: object;
-				if (control.name === 'spawn_agent') result = await this._agentSubagentService.spawn(threadId, control.message, instructionSnapshot, control.agentType, agentDelegationAuthority.roles, agentDelegationAuthority.settingsState, agentDelegationAuthority.settingsOfProvider, controlGeneration);
+				if (control.name === 'spawn_agent') result = await this._agentSubagentService.spawn(threadId, control.message, instructionSnapshot, control.agentType, agentDelegationAuthority.roles, agentDelegationAuthority.settingsState, agentDelegationAuthority.settingsOfProvider, controlGeneration, agentDelegationAuthority.parentTools, this._createAgentSubagentToolBroker?.(threadId, agentDelegationAuthority));
 				else if (control.name === 'wait_agent') result = await this._agentSubagentService.wait(threadId, control.timeoutMs, control.targets, controlGeneration);
 				else result = this._agentSubagentService.interrupt(threadId, control.target, controlGeneration);
 				if (!isControlCurrent()) return { interrupted: true };
@@ -1302,9 +1426,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		if (agentSelection?.agentType && (!roleCatalog || roleCatalog.revision !== agentSelection.catalogRevision || roleCatalog.agents.find(role => role.identity === agentSelection.agentType)?.revision !== agentSelection.roleRevision)) {
 			this._setStreamState(threadId, { isRunning: undefined, error: { message: `The selected Agent role '${agentSelection.agentType}' changed or is no longer available. Select it again before sending.`, fullError: null } }); return false
 		}
-		this._agentDelegationAuthorityOfThread.delete(threadId)
-		this._agentControlGeneration.set(threadId, preflightGeneration + 1); this._agentSubagentService.forgetParent(threadId)
 		if (this.streamState[threadId]?.isRunning) await this.abortRunning(threadId)
+		else this._revokeAgentDelegation(threadId, true)
 		const turnGeneration = this._agentControlGeneration.get(threadId) ?? 0
 		const isCurrentTurn = () => (this._agentControlGeneration.get(threadId) ?? 0) === turnGeneration
 		const capturedSettingsState = agentDelegationAllowed ? deepClone(this._settingsService.state) : undefined;
@@ -1314,7 +1437,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const instructionSnapshot = await this._beginInstructionTurn(threadId)
 		if (!isCurrentTurn()) return false
 		// A failed new admission must not leave a previous turn's runtime authority resumable.
-		this._purgeInstructionTurn(threadId, false)
+		this._purgeInstructionTurn(threadId, false, false)
 
 		// add user's message to chat history
 		const instructions = userMessage
@@ -1354,13 +1477,20 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const userMessageContentBase = await chat_userMessageContent(instructions, currSelns, { directoryStrService: this._directoryStringService, fileService: this._fileService }) // user message + names of files (NOT content)
 		if (!isCurrentTurn()) return false
 		const roleAd = roleCatalog ? customAgentAdvertisement(roleCatalog, runtimeModel.hasModel ? Math.min(2_000, Math.max(0, Math.floor(runtimeModel.contextWindow * .01 * 4))) : 2_000) : undefined
+		const delegationLimits = instructionSnapshot.config.agentDelegationLimits
+		if (agentDelegationAllowed && instructionSnapshot.config.agentDelegationLimitDiagnostics.length) this._notificationService.notify({ severity: Severity.Warning, message: `Some Agent child-limit settings were invalid. Using safe limits: up to ${delegationLimits.maxAcceptedChildren} children, ${delegationLimits.maxConcurrentThreadsPerSession} concurrent, depth ${delegationLimits.maxDepth}.` })
 		const userMessageContent = agentDelegationIntent
-			? `${userMessageContentBase}\n\n[User delegation marker: up to four generic read-only children are available for this turn, with two running concurrently. Named custom agents admitted for this turn (optional exact agent_type): ${roleAd?.text || 'none'}${roleAd?.omitted ? `; ${roleAd.omitted} omitted` : ''}.${agentSelection?.agentType ? ` For this selected role, call spawn_agent with agent_type=${agentSelection.agentType} exactly.` : ''} Call spawn_agent for delegated tasks, then wait_agent for their results; partial child failures do not prevent your synthesis.]`
+			? `${userMessageContentBase}\n\n[User delegation marker: up to ${delegationLimits.maxAcceptedChildren} generic read-only children are available for this turn, with ${delegationLimits.maxConcurrentThreadsPerSession} running concurrently and maximum depth ${delegationLimits.maxDepth}. Named custom agents admitted for this turn (optional exact agent_type): ${roleAd?.text || 'none'}${roleAd?.omitted ? `; ${roleAd.omitted} omitted` : ''}.${agentSelection?.agentType ? ` For this selected role, call spawn_agent with agent_type=${agentSelection.agentType} exactly.` : ''} Call spawn_agent for delegated tasks, then wait_agent for their results; partial child failures do not prevent your synthesis.]`
 			: userMessageContentBase
 		const currentOwner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
 		if (currentOwner !== runtimeSnapshot.ownerProjectRoot || currentOwner !== runtimeSnapshot.runCwd || this._workspaceTrustManagementService.isWorkspaceTrusted() !== runtimeSnapshot.workspaceTrustedAtAdmission) { this._purgeInstructionTurn(threadId, false); throw new Error('skill_owner_or_trust_changed') }
 		if (!isCurrentTurn()) return false
-		const agentDelegationAuthority = Object.freeze({ allowed: agentDelegationAllowed, generation: turnGeneration, ...(roleCatalog ? { roles: roleCatalog, settingsState: capturedSettingsState, settingsOfProvider: capturedSettingsOfProvider } : {}) })
+		const parentTools = captureParentModelToolSnapshot('agent', this._mcpService.getMCPTools(), agentDelegationAllowed)
+		// Delegation may be admitted for the generic profile even when role-catalog
+		// capture did not materialize a settings state. Preserve the historical
+		// default-deny policy instead of dereferencing an optional capture.
+		const autoApprove = capturedSettingsState?.globalSettings?.autoApprove ?? {}
+		const agentDelegationAuthority = Object.freeze({ allowed: agentDelegationAllowed, generation: turnGeneration, limits: delegationLimits, runtimeSnapshot, parentTools, autoApprove: Object.freeze({ edits: !!autoApprove.edits, terminal: !!autoApprove.terminal, mcp: !!autoApprove['MCP tools'] }), ...(roleCatalog ? { roles: roleCatalog, settingsState: capturedSettingsState, settingsOfProvider: capturedSettingsOfProvider } : {}) })
 		this._agentDelegationAuthorityOfThread.set(threadId, agentDelegationAuthority)
 		this._rememberInstructionTurn(threadId, runtimeSnapshot)
 		const userHistoryElt: ChatMessage = { role: 'user', content: userMessageContent, displayContent: instructions, selections: currSelns, state: defaultMessageState }
@@ -1737,8 +1867,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 
 	deleteThread(threadId: string): void {
-		this._agentSubagentService.forgetParent(threadId)
-		this._agentDelegationAuthorityOfThread.delete(threadId); this._agentControlGeneration.delete(threadId)
+		this._revokeAgentDelegation(threadId, true)
+		this._agentControlGeneration.delete(threadId)
 		this.clearTransientComposerDraft(threadId)
 		const { allThreads: currentThreads } = this.state
 
@@ -1752,7 +1882,10 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		this._storeAllThreads(newThreads);
 		this._setState({ ...this.state, allThreads: newThreads })
 	}
-	override dispose(): void { this._agentDelegationAuthorityOfThread.clear(); this._agentControlGeneration.clear(); this._transientComposerDraftOfThread.clear(); super.dispose(); }
+	override dispose(): void {
+		for (const threadId of Object.keys(this.state.allThreads)) this._revokeAgentDelegation(threadId, true)
+		this._agentDelegationAuthorityOfThread.clear(); this._agentControlGeneration.clear(); this._transientComposerDraftOfThread.clear(); super.dispose();
+	}
 
 	duplicateThread(threadId: string) {
 		const { allThreads: currentThreads } = this.state

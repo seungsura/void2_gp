@@ -126,7 +126,7 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 		// A read-only child has no MCP authority. Do not even enumerate the live MCP
 		// registry for it: later provider filtering is a defense in depth, not the
 		// browser-side serialization boundary.
-		const mcpTools = params.messagesType === 'chatMessages' && (params.toolExecutionProfile === 'read-only-child' || params.requestProfile === 'ghost-chat')
+		const mcpTools = params.messagesType === 'chatMessages' && (params.toolExecutionProfile === 'read-only-child' || params.toolExecutionProfile === 'inherited-parent-write-child' || params.requestProfile === 'ghost-chat')
 			? []
 			: this.mcpService.getMCPTools()
 

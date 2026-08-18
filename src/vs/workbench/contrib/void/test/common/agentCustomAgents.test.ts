@@ -15,6 +15,20 @@ suite('Void custom agents', () => {
 			assert.strictEqual(catalog.agents.length, 0); assert.strictEqual(catalog.diagnostics.length, 1);
 		}
 	});
+	test('uses explicit capability profiles while retaining legacy read-only compatibility', () => {
+		const legacy = createCustomAgentCatalog([candidate('user', 'file:///u/legacy.toml', { ...valid(), sandbox_mode: 'read-only' }, 'legacy')]);
+		assert.strictEqual(legacy.agents[0].capabilityProfile, 'read_only');
+		const explicitReadOnly = createCustomAgentCatalog([candidate('user', 'file:///u/explicit-read-only.toml', { ...valid(), capability_profile: 'read_only' }, 'explicit-read-only')]);
+		assert.strictEqual(explicitReadOnly.agents[0].capabilityProfile, 'read_only');
+		const compatible = createCustomAgentCatalog([candidate('user', 'file:///u/compatible.toml', { ...valid(), sandbox_mode: 'read-only', capability_profile: 'read_only' }, 'compatible')]);
+		assert.strictEqual(compatible.agents[0].capabilityProfile, 'read_only');
+		const inherited = createCustomAgentCatalog([candidate('user', 'file:///u/write.toml', { ...valid(), capability_profile: 'inherit_parent_write' }, 'write')]);
+		assert.strictEqual(inherited.agents[0].capabilityProfile, 'inherit_parent_write');
+		for (const parsed of [{ ...valid(), capability_profile: 'write' }, { ...valid(), capability_profile: 1 }, { ...valid(), sandbox_mode: 'read-only', capability_profile: 'inherit_parent_write' }]) {
+			const catalog = createCustomAgentCatalog([candidate('user', 'file:///u/invalid.toml', parsed)]);
+			assert.strictEqual(catalog.agents.length, 0); assert.strictEqual(catalog.diagnostics.length, 1);
+		}
+	});
 	test('project overrides user while duplicate identities in a scope fail closed', () => {
 		const overridden = createCustomAgentCatalog([candidate('user', 'file:///u/a.toml', valid(), 'u'), candidate('project', 'file:///p/a.toml', { ...valid(), description: 'Project.' }, 'p')]);
 		assert.strictEqual(overridden.agents.length, 1); assert.strictEqual(overridden.agents[0].provenance.scope, 'project');

@@ -4,7 +4,9 @@
 import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
 export type CustomAgentDiagnostic = Readonly<{ code: string; detail: string; identity?: string }>;
 export type CustomAgentSkillRule = Readonly<{ selector: string; enabled: boolean }>;
-export type CustomAgent = Readonly<{ identity: string; name: string; description: string; developerInstructions: string; model?: string; modelReasoningEffort?: string; skillRules?: readonly CustomAgentSkillRule[]; revision: string; provenance: Readonly<{ scope: 'user' | 'project'; uri: string }> }>;
+/** `sandbox_mode = "read-only"` remains a compatibility spelling, not an OS sandbox. */
+export type CustomAgentCapabilityProfile = 'read_only' | 'inherit_parent_write';
+export type CustomAgent = Readonly<{ identity: string; name: string; description: string; developerInstructions: string; capabilityProfile: CustomAgentCapabilityProfile; model?: string; modelReasoningEffort?: string; skillRules?: readonly CustomAgentSkillRule[]; revision: string; provenance: Readonly<{ scope: 'user' | 'project'; uri: string }> }>;
 export type CustomAgentCatalog = Readonly<{ revision: string; agents: readonly CustomAgent[]; diagnostics: readonly CustomAgentDiagnostic[] }>;
 export type CustomAgentCandidate = Readonly<{ scope: 'user' | 'project'; uri: string; filename: string; text: string; parsed: unknown }>;
 export type CustomAgentPickerDescriptor = Readonly<{ kind: 'generic' | 'role' | 'diagnostic'; identity: string; catalogRevision?: string; roleRevision?: string; disabled?: boolean }>;
@@ -29,7 +31,7 @@ const freeze = <T>(value: T): T => Object.freeze(value);
 export const strictCustomAgent = (candidate: CustomAgentCandidate): { agent?: CustomAgent; diagnostics: readonly CustomAgentDiagnostic[] } => {
 	const invalid = (code: string, name?: string) => freeze({ diagnostics: freeze([{ code, detail: candidate.uri, ...(name ? { identity: name } : {}) }]) });
 	const raw = object(candidate.parsed); if (!raw) return invalid('custom_agent_invalid_toml');
-	const allowed = ['name', 'description', 'developer_instructions', 'model', 'model_reasoning_effort', 'sandbox_mode', 'mcp_servers', 'skills'];
+	const allowed = ['name', 'description', 'developer_instructions', 'model', 'model_reasoning_effort', 'sandbox_mode', 'capability_profile', 'mcp_servers', 'skills'];
 	if (Object.keys(raw).some(key => !allowed.includes(key))) return invalid('custom_agent_unknown_key');
 	const name = raw.name, description = raw.description, instructions = raw.developer_instructions;
 	// Filename is discovery-only. It must never repair or redefine the declared identity.
@@ -39,11 +41,19 @@ export const strictCustomAgent = (candidate: CustomAgentCandidate): { agent?: Cu
 	if (raw.model !== undefined && (typeof raw.model !== 'string' || !raw.model.trim())) return invalid('custom_agent_invalid_model', name);
 	if (raw.model_reasoning_effort !== undefined && (typeof raw.model_reasoning_effort !== 'string' || !effort.has(raw.model_reasoning_effort))) return invalid('custom_agent_invalid_reasoning_effort', name);
 	if (raw.sandbox_mode !== undefined && raw.sandbox_mode !== 'read-only') return invalid('custom_agent_sandbox_not_read_only', name);
+	let capabilityProfile: CustomAgentCapabilityProfile = 'read_only';
+	if (raw.capability_profile !== undefined) {
+		if (raw.capability_profile === 'read_only' || raw.capability_profile === 'inherit_parent_write') capabilityProfile = raw.capability_profile;
+		else return invalid('custom_agent_invalid_capability_profile', name);
+	}
+	// The legacy spelling only ever means application-level read-only. Do not silently
+	// downgrade a conflicting role into a selectable one.
+	if (raw.sandbox_mode === 'read-only' && capabilityProfile !== 'read_only') return invalid('custom_agent_conflicting_capability_profile', name);
 	if (raw.mcp_servers !== undefined) return invalid('custom_agent_mcp_unsupported', name);
 	let skillRules: CustomAgentSkillRule[] | undefined;
 	if (raw.skills !== undefined) { const skills = object(raw.skills); const config = skills && skills.config; if (!skills || Object.keys(skills).some(key => key !== 'config') || !Array.isArray(config)) return invalid('custom_agent_invalid_skills', name); skillRules = []; for (const value of config) { const rule = object(value); if (!rule || Object.keys(rule).some(key => key !== 'name' && key !== 'enabled') || typeof rule.name !== 'string' || !rule.name || typeof rule.enabled !== 'boolean') return invalid('custom_agent_invalid_skills', name); skillRules.push(freeze({ selector: rule.name, enabled: rule.enabled })); } }
 	const revision = hash([candidate.scope, candidate.uri, candidate.text]);
-	return freeze({ agent: freeze({ identity: name, name, description, developerInstructions: instructions, ...(raw.model ? { model: raw.model as string } : {}), ...(raw.model_reasoning_effort ? { modelReasoningEffort: raw.model_reasoning_effort as string } : {}), ...(skillRules ? { skillRules: freeze(skillRules) } : {}), revision, provenance: freeze({ scope: candidate.scope, uri: candidate.uri }) }), diagnostics: freeze([]) });
+	return freeze({ agent: freeze({ identity: name, name, description, developerInstructions: instructions, capabilityProfile, ...(raw.model ? { model: raw.model as string } : {}), ...(raw.model_reasoning_effort ? { modelReasoningEffort: raw.model_reasoning_effort as string } : {}), ...(skillRules ? { skillRules: freeze(skillRules) } : {}), revision, provenance: freeze({ scope: candidate.scope, uri: candidate.uri }) }), diagnostics: freeze([]) });
 };
 
 export const createCustomAgentCatalog = (candidates: readonly CustomAgentCandidate[], diagnostics: readonly CustomAgentDiagnostic[] = []): CustomAgentCatalog => {

@@ -66,6 +66,24 @@ suite('AGENTS instruction lifecycle', () => {
 		assert.strictEqual(nextTask.ownerProjectRoot, 'file:///two');
 	});
 
+	test('freezes trusted project child limits for a task while an untrusted new task resolves user-only safe limits', async () => {
+		let trusted = true;
+		let projectAccepted = 8;
+		const user: any = { agentMaxAcceptedChildren: 1 };
+		const userSource: any = { uri: 'file:///home/.codex/config.toml', scope: 'user', status: 'loaded', projectedKeys: ['agents', 'agents.max_accepted_children'] };
+		const load = () => projectAgentConfig(user, trusted ? { agentMaxAcceptedChildren: projectAccepted, agentMaxConcurrentThreadsPerSession: 4 } : undefined, [userSource, ...(trusted ? [{ uri: 'file:///root/.codex/config.toml', scope: 'project' as const, status: 'loaded' as const, projectedKeys: ['agents', 'agents.max_accepted_children', 'agents.max_concurrent_threads_per_session'] as const }] : [])], 'file:///root', 'file:///root');
+		const currentTask = new AgentInstructionTaskSession(async () => load(), async config => makeTurn('agents', config));
+		const first = await currentTask.beginTopLevelTurn();
+		projectAccepted = 2; trusted = false;
+		const sameTask = await currentTask.beginTopLevelTurn();
+		const nextTask = await new AgentInstructionTaskSession(async () => load(), async config => makeTurn('agents', config)).beginTopLevelTurn();
+		assert.deepStrictEqual(first.config.agentDelegationLimits, { maxAcceptedChildren: 8, maxConcurrentThreadsPerSession: 4, maxDepth: 1 });
+		assert.strictEqual(sameTask.config, first.config);
+		assert.deepStrictEqual(sameTask.config.agentDelegationLimits, { maxAcceptedChildren: 8, maxConcurrentThreadsPerSession: 4, maxDepth: 1 });
+		assert.deepStrictEqual(nextTask.config.agentDelegationLimits, { maxAcceptedChildren: 1, maxConcurrentThreadsPerSession: 1, maxDepth: 1 });
+		assert.deepStrictEqual(nextTask.config.agentDelegationLimitsSource, { maxAcceptedChildren: 'user', maxConcurrentThreadsPerSession: 'default', maxDepth: 'default' });
+	});
+
 	test('shares concurrent initial config work and keeps a rejected config sticky', async () => {
 		let configLoads = 0;
 		let turnLoads = 0;

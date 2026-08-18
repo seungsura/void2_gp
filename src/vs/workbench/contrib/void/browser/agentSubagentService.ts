@@ -14,10 +14,10 @@ import { deepClone } from '../../../../base/common/objects.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
 import { IWorkspaceTrustManagementService } from '../../../../platform/workspace/common/workspaceTrust.js';
-import { AgentRuntimeTurnSnapshot, admitProtectedAgentAuthority, createAgentRuntimeTurnSnapshot, selectExplicitSkills, skillAdvertisement } from '../common/agentSkills.js';
-import { AGENT_SUBAGENT_MAX_ACCEPTED, AGENT_SUBAGENT_MAX_AGGREGATE_RESULT_CHARS, AGENT_SUBAGENT_MAX_CONCURRENT, AGENT_SUBAGENT_MAX_GROUP_PROVIDER_SENDS, AGENT_SUBAGENT_MAX_GROUP_RUN_MS, AGENT_SUBAGENT_MAX_RESULTS, AGENT_SUBAGENT_MAX_TRACE_EVENTS, AgentSubagentBudgetView, AgentSubagentDiagnosticsView, AgentSubagentLifecycle, AgentSubagentReceipt, AgentSubagentRunView, AgentSubagentStatus, AgentSubagentTraceDiagnostic, AgentSubagentTraceEvent, AgentSubagentTraceKind } from '../common/agentSubagents.js';
+import { AgentRuntimeTurnSnapshot, admitProtectedAgentAuthority, admitSkillResourceContext, assembleProtectedAgentAuthority, createAgentRuntimeTurnSnapshot, isReadSkillResourceToolName, selectExplicitSkills, skillAdvertisement, validateReadSkillResourceToolParams } from '../common/agentSkills.js';
+import { AGENT_SUBAGENT_MAX_AGGREGATE_RESULT_CHARS, AGENT_SUBAGENT_MAX_GROUP_PROVIDER_SENDS, AGENT_SUBAGENT_MAX_GROUP_RUN_MS, AGENT_SUBAGENT_MAX_RESULTS, AGENT_SUBAGENT_MAX_TRACE_EVENTS, AGENT_SUBAGENT_MAX_WAIT_TARGETS, AgentSubagentBudgetView, AgentSubagentDiagnosticsView, AgentSubagentLifecycle, AgentSubagentReceipt, AgentSubagentRunView, AgentSubagentStatus, AgentSubagentToolBroker, AgentSubagentToolBrokerRequest, AgentSubagentToolSnapshot, AgentSubagentTraceDiagnostic, AgentSubagentTraceEvent, AgentSubagentTraceKind, ToolExecutionProfile, isAgentSubagentControlName, isMutationCapableSnapshot, validateAgentSubagentControlParams } from '../common/agentSubagents.js';
 import { ILLMMessageService } from '../common/sendLLMMessageService.js';
-import { assertCanonicalAgentChildRawUri, assertCanonicalAgentChildUriPath, assertCanonicalReadOnlyChildRawPaths, assertExactReadOnlyChildRawKeys, canonicalAgentChildUri, isToolAllowedByProfile } from '../common/agentSubagents.js';
+import { assertCanonicalAgentChildRawUri, assertCanonicalAgentChildUriPath, assertCanonicalReadOnlyChildRawPaths, assertExactReadOnlyChildRawKeys, canonicalAgentChildUri, isToolAllowedByProfile, readOnlyChildToolNames } from '../common/agentSubagents.js';
 import { IToolsService } from './toolsServiceInterface.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { IAgentSkillsService } from './agentSkillsService.js';
@@ -29,14 +29,18 @@ import { isEqualOrParent } from '../../../../base/common/resources.js';
 import { ModelSelection, providerNames, SettingsOfProvider } from '../common/voidSettingsTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { getModelCapabilities, getReservedOutputTokenSpace } from '../common/modelCapabilities.js';
-import { appendAgentInstructionDeveloperInstructions } from '../common/agentInstructions.js';
+import { AgentDelegationLimits, appendAgentInstructionDeveloperInstructions } from '../common/agentInstructions.js';
+import { computeMaxReadOutputTokens } from '../common/readFileReliability.js';
+import { estimateHistoryTokensForReadBudget, protectedSkillResourceHistoryLength } from './convertToLLMMessageService.js';
+import { isABuiltinToolName } from '../common/prompt/prompts.js';
 
 const MAX_CHILD_TURNS = 16;
 const MAX_CHILD_SUMMARY = 8_000;
 const MAX_CHILD_RUN_MS = 120_000;
 
-type ChildRun = { readonly id: string; readonly parentId: string; readonly generation: number; readonly message: string; readonly snapshot: AgentRuntimeTurnSnapshot; readonly lifecycle: AgentSubagentLifecycle; readonly cancellation: CancellationTokenSource; readonly settingsOfProvider: SettingsOfProvider; readonly acceptedAt: number; startedAt?: number; settledAt?: number; readonly role?: { name: string; description: string; revision: string }; requestId?: string; timeoutHandle?: ReturnType<typeof setTimeout>; summary: string };
-type ChildGroup = { readonly parentId: string; readonly generation: number; readonly createdAt: number; readonly runs: ChildRun[]; readonly admissions: Set<CancellationTokenSource>; readonly deadlineAt: number; cancellation: boolean; accepted: number; providerSends: number; resultChars: number; traceSequence: number; readonly traceEvents: AgentSubagentTraceEvent[]; droppedTraceEvents: number; admissionChain: Promise<void>; deadline?: ReturnType<typeof setTimeout> };
+type ChildSchedulerActivity = 'active' | 'waiting_children' | 'ready_to_resume' | 'quiescing';
+type ChildRun = { readonly id: string; readonly parentId: string; readonly parentRunId: string | undefined; readonly depth: number; readonly remainingDepth: number; readonly message: string; readonly snapshot: AgentRuntimeTurnSnapshot; readonly lifecycle: AgentSubagentLifecycle; readonly cancellation: CancellationTokenSource; readonly settingsOfProvider: SettingsOfProvider; readonly admittedRoles: CustomAgentCatalog | undefined; readonly admittedSettingsState: IVoidSettingsService['state']; readonly toolExecutionProfile: ToolExecutionProfile; readonly parentTools?: AgentSubagentToolSnapshot; readonly broker?: AgentSubagentToolBroker; readonly mutationCapable: boolean; brokerRequest?: AgentSubagentToolBrokerRequest; brokerExecute?: Promise<unknown>; brokerCancelPromise?: Promise<void>; brokerCancelled: boolean; released: boolean; readonly acceptedAt: number; startedAt?: number; settledAt?: number; readonly role?: { name: string; description: string; revision: string; capabilityProfile: 'read_only' | 'inherit_parent_write' }; requestId?: string; timeoutHandle?: ReturnType<typeof setTimeout>; summary: string; schedulerActive: boolean; schedulerActivity: ChildSchedulerActivity; yielded: boolean; resume?: () => void; runPromise?: Promise<void> };
+type ChildGroup = { readonly parentId: string; readonly generation: number; readonly createdAt: number; readonly limits: AgentDelegationLimits; readonly runs: ChildRun[]; readonly admissions: Map<CancellationTokenSource, string | undefined>; readonly deadlineAt: number; cancellation: boolean; accepted: number; providerSends: number; resultChars: number; traceSequence: number; readonly traceEvents: AgentSubagentTraceEvent[]; droppedTraceEvents: number; admissionChain: Promise<void>; deadline?: ReturnType<typeof setTimeout> };
 export const IAgentSubagentService = createDecorator<IAgentSubagentService>('voidAgentSubagentService');
 export type AgentSubagentRunChangeEvent = Readonly<
 	{ parentId: string; id: string; status: AgentSubagentStatus; removed?: false }
@@ -47,7 +51,7 @@ export type AgentSubagentWaitChild = Readonly<{ id: string; status: AgentSubagen
 export type AgentSubagentWaitResult = Readonly<{ id?: string; status?: AgentSubagentStatus; children: readonly AgentSubagentWaitChild[]; receipt?: AgentSubagentReceipt; receipts?: readonly AgentSubagentReceipt[]; budget: AgentSubagentBudgetView; deliverSummary: boolean; timedOut: boolean }>;
 export interface IAgentSubagentService {
 	readonly _serviceBrand: undefined;
-	spawn(parentId: string, message: string, snapshot: AgentRuntimeTurnSnapshot, agentType?: string, admittedRoles?: CustomAgentCatalog, admittedSettingsState?: IVoidSettingsService['state'], admittedSettingsOfProvider?: SettingsOfProvider, generation?: number): Promise<{ id: string; status: AgentSubagentStatus }>;
+	spawn(parentId: string, message: string, snapshot: AgentRuntimeTurnSnapshot, agentType?: string, admittedRoles?: CustomAgentCatalog, admittedSettingsState?: IVoidSettingsService['state'], admittedSettingsOfProvider?: SettingsOfProvider, generation?: number, parentTools?: AgentSubagentToolSnapshot, broker?: AgentSubagentToolBroker): Promise<{ id: string; status: AgentSubagentStatus }>;
 	wait(parentId: string, timeoutMs: number, targets?: readonly string[], generation?: number): Promise<AgentSubagentWaitResult>;
 	interrupt(parentId: string, target: string, generation?: number): { id?: string; status: AgentSubagentStatus; receipt?: AgentSubagentReceipt };
 	cancelParent(parentId: string): void;
@@ -64,6 +68,8 @@ export interface IAgentSubagentService {
 export class AgentSubagentService extends Disposable implements IAgentSubagentService {
 	readonly _serviceBrand: undefined;
 	private readonly groups = new Map<string, ChildGroup>();
+	/** Kept outside a generation so a forgotten, still-running writer cannot overlap a new generation. */
+	private readonly mutationOwners = new Map<string, string>();
 	private readonly _onDidChangeRun = this._register(new Emitter<AgentSubagentRunChangeEvent>());
 	readonly onDidChangeRun = this._onDidChangeRun.event;
 	private readonly _onDidChangeDiagnostics = this._register(new Emitter<AgentSubagentDiagnosticsChangeEvent>());
@@ -71,12 +77,16 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 
 	constructor(@ILLMMessageService private readonly llm: ILLMMessageService, @IToolsService private readonly tools: IToolsService, @IFileService private readonly fileService: IFileService, @IWorkspaceContextService private readonly workspace: IWorkspaceContextService, @IWorkspaceTrustManagementService private readonly trust: IWorkspaceTrustManagementService, @IConvertToLLMMessageService private readonly converter: IConvertToLLMMessageService, @IAgentSkillsService private readonly skills: IAgentSkillsService, @IAgentCustomAgentService private readonly customAgents: IAgentCustomAgentService, @IVoidSettingsService private readonly settings: IVoidSettingsService) { super(); }
 
-	async spawn(parentId: string, message: string, parent: AgentRuntimeTurnSnapshot, agentType?: string, admittedRoles?: CustomAgentCatalog, admittedSettingsState?: IVoidSettingsService['state'], admittedSettingsOfProvider?: SettingsOfProvider, generation = 0) {
+	async spawn(parentId: string, message: string, parent: AgentRuntimeTurnSnapshot, agentType?: string, admittedRoles?: CustomAgentCatalog, admittedSettingsState?: IVoidSettingsService['state'], admittedSettingsOfProvider?: SettingsOfProvider, generation = 0, parentTools?: AgentSubagentToolSnapshot, broker?: AgentSubagentToolBroker) {
+		return this.spawnWithin(parentId, message, parent, agentType, admittedRoles, admittedSettingsState, admittedSettingsOfProvider, generation, undefined, parentTools, broker);
+	}
+	private async spawnWithin(parentId: string, message: string, parent: AgentRuntimeTurnSnapshot, agentType: string | undefined, admittedRoles: CustomAgentCatalog | undefined, admittedSettingsState: IVoidSettingsService['state'] | undefined, admittedSettingsOfProvider: SettingsOfProvider | undefined, generation: number, parentRun?: ChildRun, parentTools?: AgentSubagentToolSnapshot, broker?: AgentSubagentToolBroker) {
 		let group = this.groups.get(parentId);
 		if (group && group.generation !== generation) { this.forgetParent(parentId); group = undefined; }
-		if (!group) { const createdAt = Date.now(); group = { parentId, generation, createdAt, runs: [], admissions: new Set(), deadlineAt: createdAt + AGENT_SUBAGENT_MAX_GROUP_RUN_MS, cancellation: false, accepted: 0, providerSends: 0, resultChars: 0, traceSequence: 0, traceEvents: [], droppedTraceEvents: 0, admissionChain: Promise.resolve() }; this.groups.set(parentId, group); this.trace(group, 'group_created'); group.deadline = setTimeout(() => this.cancelGroup(group!, 'Child group exceeded its bounded run duration.'), AGENT_SUBAGENT_MAX_GROUP_RUN_MS); }
+		if (!group) { if (parentRun) throw new Error('agent_child_group_missing'); const createdAt = Date.now(); const limits = Object.freeze({ ...parent.instructions.config.agentDelegationLimits }); group = { parentId, generation, createdAt, limits, runs: [], admissions: new Map(), deadlineAt: createdAt + AGENT_SUBAGENT_MAX_GROUP_RUN_MS, cancellation: false, accepted: 0, providerSends: 0, resultChars: 0, traceSequence: 0, traceEvents: [], droppedTraceEvents: 0, admissionChain: Promise.resolve() }; this.groups.set(parentId, group); this.trace(group, 'group_created'); group.deadline = setTimeout(() => this.cancelGroup(group!, 'Child group exceeded its bounded run duration.'), AGENT_SUBAGENT_MAX_GROUP_RUN_MS); }
 		if (group.cancellation) throw new Error('agent_child_cancelled');
-		if (group.accepted + group.admissions.size >= AGENT_SUBAGENT_MAX_ACCEPTED) throw new Error('agent_child_limit_reached');
+		if (parentRun && (parentRun.parentId !== parentId || parentRun.generation !== generation || parentRun.lifecycle.status !== 'running' || parentRun.remainingDepth <= 0 || !group.runs.includes(parentRun))) throw new Error('agent_child_depth_exhausted');
+		if (group.accepted + group.admissions.size >= group.limits.maxAcceptedChildren) throw new Error('agent_child_limit_reached');
 		if (!parent.model.hasModel) throw new Error('agent_child_model_missing');
 		const parentModel = parent.model;
 		if (!providerNames.includes(parent.model.providerName as never)) throw new Error('agent_child_provider_invalid');
@@ -85,7 +95,7 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 		const settingsOfProvider = admittedSettingsOfProvider ?? this.llm.captureSettingsOfProvider();
 		const capturedState = admittedSettingsState ?? deepClone(this.settings.state); // compatibility fallback for direct callers; top-level admission supplies the frozen state
 		// Reserve before asynchronous role/Skill work. Chaining makes admission order deterministic.
-		const admission = new CancellationTokenSource(); group.admissions.add(admission);
+		const admission = new CancellationTokenSource(); group.admissions.set(admission, parentRun?.id);
 		this.trace(group, 'admission_started');
 		const admittedGroup = group;
 		const admissionWork = async () => { try {
@@ -95,17 +105,24 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 			const role = agentType ? catalogAtAdmission?.agents.find(candidate => candidate.identity === agentType) : undefined;
 			if (agentType && !role) throw new Error('custom_agent_not_found');
 			const roleModel = role && (role.model || role.modelReasoningEffort) ? this.roleRuntimeModel(parentModel, role.model, role.modelReasoningEffort, capturedState) : parentModel;
+			const toolExecutionProfile: ToolExecutionProfile = role?.capabilityProfile === 'inherit_parent_write' ? 'inherited-parent-write-child' : 'read-only-child';
+			const effectiveParentTools = parentRun?.parentTools ?? parentTools;
+			const effectiveBroker = parentRun?.broker ?? broker;
+			if (toolExecutionProfile === 'inherited-parent-write-child' && (!effectiveParentTools || !effectiveBroker || (parentRun && parentRun.toolExecutionProfile !== 'inherited-parent-write-child'))) throw new Error('custom_agent_capability_profile_not_authorized');
 			const effectiveCatalog = role ? Object.freeze({ ...parent.catalog, skills: applyCustomAgentSkillRules(parent.catalog.skills, role.skillRules) }) : parent.catalog;
 			const explicit = selectExplicitSkills(effectiveCatalog, message);
 			if (explicit.diagnostic) throw new Error(explicit.diagnostic.code);
 			const bodies = await Promise.all((explicit.skills ?? []).map(async skill => { const read = await this.awaitAdmission(admission, this.skills.readSkillBody(skill.provenance.skillRoot, skill.bodyRevision)); if (admission.token.isCancellationRequested) throw new Error('agent_child_cancelled'); if (!this.matchesParent(parent)) throw new Error('agent_child_owner_or_trust_changed'); if (!read.body || read.diagnostic) throw new Error(read.diagnostic?.code ?? 'skill_body_unreadable'); return { identity: skill.identity, skillRoot: skill.provenance.skillRoot, bodyRevision: skill.bodyRevision, body: read.body }; }));
-			if (admission.token.isCancellationRequested || admittedGroup.cancellation) throw new Error('agent_child_cancelled');
+			if (admission.token.isCancellationRequested || admittedGroup.cancellation || (parentRun && !this.isCurrent(parentRun))) throw new Error('agent_child_cancelled');
 			if (!this.matchesParent(parent)) throw new Error('agent_child_owner_or_trust_changed');
 			if (role) { const currentCatalog = await this.awaitAdmission(admission, this.customAgents.getCatalog(URI.parse(parentOwnerProjectRoot))); const current = currentCatalog.agents.find(candidate => candidate.identity === role.identity); if (!current || currentCatalog.revision !== catalogAtAdmission!.revision || current.revision !== role.revision) throw new Error('custom_agent_stale'); if (!this.matchesParent(parent)) throw new Error('agent_child_owner_or_trust_changed'); }
 			if (admission.token.isCancellationRequested || admittedGroup.cancellation) throw new Error('agent_child_cancelled');
 			const snapshot = role ? createAgentRuntimeTurnSnapshot(appendAgentInstructionDeveloperInstructions(parent.instructions, role.developerInstructions), effectiveCatalog, skillAdvertisement(effectiveCatalog, roleModel.contextWindow), bodies, roleModel, parent.workspaceTrustedAtAdmission) : createAgentRuntimeTurnSnapshot(parent.instructions, parent.catalog, skillAdvertisement(parent.catalog, parentModel.contextWindow), bodies, parentModel, parent.workspaceTrustedAtAdmission);
-			admitProtectedAgentAuthority(snapshot, false);
-			const run: ChildRun = { id: generateUuid(), parentId, generation, message, snapshot, lifecycle: new AgentSubagentLifecycle(), cancellation: new CancellationTokenSource(), settingsOfProvider, acceptedAt: Date.now(), ...(role ? { role: { name: role.name, description: role.description, revision: role.revision } } : {}), summary: '' };
+			// Only the inherited profile has the application resource reader. Keep the
+			// manifest and the protected-context admission calculation in lockstep with
+			// the model-facing profile: a read-only child must neither see nor reserve it.
+			admitProtectedAgentAuthority(snapshot, toolExecutionProfile === 'inherited-parent-write-child');
+			const run: ChildRun = { id: generateUuid(), parentId, generation, parentRunId: parentRun?.id, depth: parentRun ? parentRun.depth + 1 : 1, remainingDepth: parentRun ? parentRun.remainingDepth - 1 : admittedGroup.limits.maxDepth - 1, message, snapshot, lifecycle: new AgentSubagentLifecycle(), cancellation: new CancellationTokenSource(), settingsOfProvider, admittedRoles, admittedSettingsState: capturedState, toolExecutionProfile, ...(effectiveParentTools ? { parentTools: effectiveParentTools } : {}), ...(effectiveBroker ? { broker: effectiveBroker } : {}), mutationCapable: toolExecutionProfile === 'inherited-parent-write-child' && isMutationCapableSnapshot(effectiveParentTools), brokerCancelled: false, released: false, acceptedAt: Date.now(), ...(role ? { role: { name: role.name, description: role.description, revision: role.revision, capabilityProfile: role.capabilityProfile } } : {}), summary: '', schedulerActive: false, schedulerActivity: 'ready_to_resume', yielded: false };
 			admittedGroup.runs.push(run); admittedGroup.accepted++; admittedGroup.admissions.delete(admission); admission.dispose();
 			this.trace(admittedGroup, 'child_queued', run);
 			this._onDidChangeRun.fire({ parentId, id: run.id, status: run.lifecycle.status });
@@ -142,7 +159,7 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 		try {
 			if (!run.lifecycle.start()) return;
 			run.startedAt = Date.now(); const groupAtStart = this.groups.get(run.parentId); if (groupAtStart?.generation === run.generation) this.trace(groupAtStart, 'child_running', run);
-			run.timeoutHandle = setTimeout(() => { const requestId = run.requestId; run.cancellation.cancel(); if (this.settle(run, 'failed', 'Child exceeded its bounded run duration.') && requestId) this.llm.abort(requestId); }, MAX_CHILD_RUN_MS);
+			run.timeoutHandle = setTimeout(() => this.cancelRun(run, 'Child exceeded its bounded run duration.', 'failed'), MAX_CHILD_RUN_MS);
 			this._onDidChangeRun.fire({ parentId: run.parentId, id: run.id, status: run.lifecycle.status });
 			const model = run.snapshot.model;
 			if (!model.hasModel) { this.settle(run, 'failed', 'Child model is unavailable.'); return; }
@@ -152,29 +169,105 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 			const owner = URI.parse(run.snapshot.ownerProjectRoot);
 			const history: ChatMessage[] = [{ role: 'user', content: message, displayContent: message, selections: [], state: { stagingSelections: [], isBeingEdited: false } }];
 			for (let turn = 0; turn < MAX_CHILD_TURNS && !run.cancellation.token.isCancellationRequested; turn++) {
-			const prepared = await this.converter.prepareLLMChatMessages({ chatMessages: history, chatMode: 'agent', modelSelection, instructionSnapshot: run.snapshot, toolExecutionProfile: 'read-only-child', childRoot: owner.toString(), agentDelegationAllowed: false });
-			if (!this.isCurrent(run)) { this.settle(run, 'cancelled', 'Child owner or trust changed.'); return; }
+			const prepared = await this.converter.prepareLLMChatMessages({ chatMessages: history, chatMode: 'agent', modelSelection, instructionSnapshot: run.snapshot, toolExecutionProfile: run.toolExecutionProfile, childRoot: owner.toString(), agentDelegationAllowed: run.remainingDepth > 0, frozenToolSnapshot: run.parentTools });
+			if (!this.isCurrent(run) || !run.schedulerActive || (run.mutationCapable && this.mutationOwners.get(run.parentId) !== run.id)) { this.settle(run, 'cancelled', 'Child owner or scheduler changed.'); return; }
 			const group = this.groups.get(run.parentId); if (!group || group.generation !== run.generation || group.providerSends >= AGENT_SUBAGENT_MAX_GROUP_PROVIDER_SENDS) { this.settle(run, 'failed', 'Child group provider-send budget exceeded.'); return; } group.providerSends++; this.trace(group, 'provider_send', run);
 			const response = await new Promise<{ text?: string; tool?: { id: string; name: string; rawParams: Record<string, unknown> }; error?: string }>(resolve => {
 				let resolved = false;
 				const finish = (value: { text?: string; tool?: { id: string; name: string; rawParams: Record<string, unknown> }; error?: string }) => { if (!resolved) { resolved = true; resolve(value); } };
-				const requestId = this.llm.sendLLMMessage({ messagesType: 'chatMessages', messages: prepared.messages, separateSystemMessage: prepared.separateSystemMessage, chatMode: 'agent', toolExecutionProfile: 'read-only-child', agentDelegationAllowed: false, settingsOfProviderOverride: run.settingsOfProvider, modelSelection, modelSelectionOptions: model.modelSelectionOptions as never, overridesOfModel: { [modelSelection.providerName]: { [model.modelName]: model.selectedModelOverrides } } as never, logging: { loggingName: 'Agent child', loggingExtras: { childId: run.id, turn } }, onText: () => {}, onFinalMessage: ({ fullText, toolCall }) => finish(toolCall ? { text: fullText, tool: { id: toolCall.id, name: toolCall.name, rawParams: toolCall.rawParams } } : { text: fullText }), onError: ({ message: error }) => finish({ error }), onAbort: () => finish({ error: 'Child cancelled.' }) });
+				const requestId = this.llm.sendLLMMessage({ messagesType: 'chatMessages', messages: prepared.messages, separateSystemMessage: prepared.separateSystemMessage, chatMode: 'agent', toolExecutionProfile: run.toolExecutionProfile, frozenToolSnapshot: run.parentTools, agentDelegationAllowed: run.remainingDepth > 0, settingsOfProviderOverride: run.settingsOfProvider, modelSelection, modelSelectionOptions: model.modelSelectionOptions as never, overridesOfModel: { [modelSelection.providerName]: { [model.modelName]: model.selectedModelOverrides } } as never, logging: { loggingName: 'Agent child', loggingExtras: { childId: run.id, turn, depth: run.depth } }, onText: () => {}, onFinalMessage: ({ fullText, toolCall }) => finish(toolCall ? { text: fullText, tool: { id: toolCall.id, name: toolCall.name, rawParams: toolCall.rawParams } } : { text: fullText }), onError: ({ message: error }) => finish({ error }), onAbort: () => finish({ error: 'Child cancelled.' }) });
 				run.requestId = requestId ?? undefined;
 				if (!requestId) finish({ error: 'Child provider request was not started.' });
 			});
+			run.requestId = undefined; // cancellation must never keep a completed provider request as an active lease.
 			if (!this.isCurrent(run)) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; }
 			if (response.error) { this.settle(run, run.cancellation.token.isCancellationRequested ? 'cancelled' : 'failed', response.error); return; }
 			history.push({ role: 'assistant', displayContent: response.text ?? '', reasoning: '', anthropicReasoning: null });
 			if (!response.tool) { this.settle(run, 'completed', (response.text ?? '').slice(0, MAX_CHILD_SUMMARY)); return; }
-			if (!isToolAllowedByProfile('read-only-child', response.tool.name) || !Object.prototype.hasOwnProperty.call(this.tools.validateParams, response.tool.name)) { history.push({ role: 'tool', type: 'tool_error', content: 'The requested tool is not authorized for this read-only child.', id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: undefined, name: response.tool.name, params: response.tool.rawParams, result: 'The requested tool is not authorized for this read-only child.' }); continue; }
+			if (isAgentSubagentControlName(response.tool.name)) {
+				try {
+					const control = validateAgentSubagentControlParams(response.tool.name, response.tool.rawParams);
+					let result: object;
+					if (control.name === 'spawn_agent') result = await this.spawnWithin(run.parentId, control.message, run.snapshot, control.agentType, run.admittedRoles, run.admittedSettingsState, run.settingsOfProvider, run.generation, run, run.parentTools, run.broker);
+					else if (control.name === 'wait_agent') {
+						// Validate direct targets before yielding. The timer and receipt settle while
+						// this run is not consuming a scheduler slot; only the next provider turn
+						// waits for reacquisition.
+						this.assertWaitTargets(run.parentId, run.id, control.targets, run.generation);
+						await this.yieldForChildren(run);
+						result = await this.waitFor(run.parentId, run.id, control.timeoutMs, control.targets, run.generation);
+						// Timeout/receipt completion is observable before this parent competes
+						// for a scheduler (and possible mutation) lease again.
+						this.setSchedulerActivity(run, false, 'ready_to_resume');
+						history.push({ role: 'tool', type: 'success', content: JSON.stringify(result), id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: undefined, name: response.tool.name, params: response.tool.rawParams, result: result as never });
+						await this.reacquire(run);
+						if (!this.isCurrent(run)) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; }
+						continue;
+					}
+					else result = this.interruptFor(run.parentId, run.id, control.target, run.generation);
+					if (!this.isCurrent(run)) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; }
+					history.push({ role: 'tool', type: 'success', content: JSON.stringify(result), id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: undefined, name: response.tool.name, params: response.tool.rawParams, result: result as never });
+				} catch (error) {
+					const content = `The child-control call failed: ${error instanceof Error ? error.message : String(error)}`;
+					history.push({ role: 'tool', type: 'tool_error', content, id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: undefined, name: response.tool.name, params: response.tool.rawParams, result: content });
+				}
+				continue;
+			}
+			if (run.toolExecutionProfile === 'inherited-parent-write-child' && !(readOnlyChildToolNames as readonly string[]).includes(response.tool.name)) {
+				const capturedEntries = run.parentTools?.tools.filter(tool => tool.name === response.tool!.name) ?? [];
+				const captured = capturedEntries.length === 1 ? capturedEntries[0] : undefined;
+				if (!captured || !run.broker) { const content = !captured ? 'The requested tool is absent from this child\'s frozen parent capability snapshot.' : 'The inherited parent tool broker is unavailable.'; history.push({ role: 'tool', type: 'tool_error', content, id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: captured?.mcpServerName, name: response.tool.name, params: response.tool.rawParams, result: content }); continue; }
+				if (isReadSkillResourceToolName(response.tool.name)) {
+					try {
+						const params = validateReadSkillResourceToolParams(response.tool.rawParams); const selection = run.snapshot.selected.find(item => item.identity === params.skill);
+						if (!selection) throw new Error('skill_not_selected');
+						const maxReadOutputTokens = run.snapshot.model.hasModel ? computeMaxReadOutputTokens(run.snapshot.model.contextWindow, run.snapshot.model.reservedOutputTokens, estimateHistoryTokensForReadBudget(history)) : 0;
+						const exactInputBudgetChars = run.snapshot.model.hasModel ? Math.max(0, run.snapshot.model.contextWindow - run.snapshot.model.reservedOutputTokens) * 4 : 0;
+						const protectedCharsRemaining = Math.max(0, exactInputBudgetChars - assembleProtectedAgentAuthority(run.snapshot, true).length - protectedSkillResourceHistoryLength(history));
+						const maxResourceChars = Math.min(maxReadOutputTokens * 4, protectedCharsRemaining);
+						const maxResourceBytes = maxResourceChars > 0 ? Math.min(Number.MAX_SAFE_INTEGER, maxResourceChars * 3 + 3) : 0;
+						const read = await this.skills.readSkillResource(selection, params.resourcePath, { maxResourceBytes, token: run.cancellation.token });
+						if (!this.isCurrent(run)) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; }
+						if (read.body === undefined) throw new Error(read.diagnostic?.code ?? 'skill_resource_unreadable');
+						const content = admitSkillResourceContext(read.body, maxReadOutputTokens);
+						const success: ChatMessage & { role: 'tool' } = { role: 'tool', type: 'success', content, id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: undefined, name: response.tool.name, params: response.tool.rawParams, result: content as never };
+						try {
+							await this.converter.prepareLLMChatMessages({ chatMessages: [...history, success], chatMode: 'agent', modelSelection, instructionSnapshot: run.snapshot, toolExecutionProfile: run.toolExecutionProfile, childRoot: owner.toString(), agentDelegationAllowed: run.remainingDepth > 0, frozenToolSnapshot: run.parentTools });
+						} catch { throw new Error('skill_resource_context_admission_failed'); }
+						if (!this.isCurrent(run)) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; }
+						history.push(success);
+					} catch (error) { if (!this.isCurrent(run)) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; } const content = error instanceof Error ? error.message : 'skill_resource_unreadable'; history.push({ role: 'tool', type: 'tool_error', content, id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: undefined, name: response.tool.name, params: response.tool.rawParams, result: content }); }
+					continue;
+				}
+				const maxReadOutputTokens = run.snapshot.model.hasModel ? computeMaxReadOutputTokens(run.snapshot.model.contextWindow, run.snapshot.model.reservedOutputTokens, estimateHistoryTokensForReadBudget(history)) : 0;
+				const request: AgentSubagentToolBrokerRequest = Object.freeze({ parentId: run.parentId, generation: run.generation, childId: run.id, toolId: response.tool.id, name: response.tool.name, tool: captured, rawParams: Object.freeze({ ...response.tool.rawParams }), snapshotRevision: run.parentTools!.revision, maxReadOutputTokens, cancellationToken: run.cancellation.token });
+				run.brokerRequest = request;
+				try {
+					const execute = run.broker.execute(request); run.brokerExecute = execute;
+					const brokered = await execute;
+					run.brokerExecute = undefined;
+					if (!this.isCurrent(run) || run.brokerRequest !== request) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; }
+					run.brokerRequest = undefined;
+					if (brokered.ok) history.push({ role: 'tool', type: 'success', content: brokered.content, id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: captured.mcpServerName, name: response.tool.name, params: response.tool.rawParams, result: brokered.result as never });
+					else history.push({ role: 'tool', type: 'tool_error', content: brokered.error, id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: captured.mcpServerName, name: response.tool.name, params: response.tool.rawParams, result: brokered.error });
+				} catch { run.brokerExecute = undefined; if (!this.isCurrent(run) || run.brokerRequest !== request) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; } run.brokerRequest = undefined; const content = 'execution_failed'; history.push({ role: 'tool', type: 'tool_error', content, id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: captured.mcpServerName, name: response.tool.name, params: response.tool.rawParams, result: content }); }
+				continue;
+			}
+			if (!(readOnlyChildToolNames as readonly string[]).includes(response.tool.name) || !Object.prototype.hasOwnProperty.call(this.tools.validateParams, response.tool.name)) { history.push({ role: 'tool', type: 'tool_error', content: 'The requested tool is not authorized for this read-only child.', id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: undefined, name: response.tool.name, params: response.tool.rawParams, result: 'The requested tool is not authorized for this read-only child.' }); continue; }
 			try {
 				if (!this.isCurrent(run)) throw new Error('agent_child_owner_or_trust_changed');
+				if (run.toolExecutionProfile === 'inherited-parent-write-child') {
+					// A same-name MCP or duplicate frozen entry must not fall through to the
+					// local read registry: inherited authority is the complete snapshot.
+					const exact = run.parentTools?.tools.filter(tool => tool.name === response.tool!.name) ?? [];
+					if (exact.length !== 1 || exact[0].kind !== 'builtin' || exact[0].mcpServerName || !(readOnlyChildToolNames as readonly string[]).includes(response.tool.name) || !isABuiltinToolName(response.tool.name)) throw new Error('tool_stale');
+				}
 				assertExactReadOnlyChildRawKeys(response.tool.name, response.tool.rawParams);
 				assertCanonicalReadOnlyChildRawPaths(response.tool.name, response.tool.rawParams);
 				const params = (this.tools.validateParams as Record<string, (raw: Record<string, unknown>) => unknown>)[response.tool.name](response.tool.rawParams);
 				await this.assertContainedRead(params as Record<string, unknown>, owner);
 				if (!this.isCurrent(run)) throw new Error('agent_child_owner_or_trust_changed');
-				const maxReadOutputTokens = Math.max(256, Math.min(8192, model.contextWindow - model.reservedOutputTokens));
+				const maxReadOutputTokens = run.snapshot.model.hasModel ? computeMaxReadOutputTokens(run.snapshot.model.contextWindow, run.snapshot.model.reservedOutputTokens, estimateHistoryTokensForReadBudget(history)) : 0;
 				const toolContext = { ownerThreadId: run.id, maxReadOutputTokens, childId: run.id, ownerRoot: owner, cancellationToken: run.cancellation.token, maxResults: AGENT_SUBAGENT_MAX_RESULTS, maxFileSize: 1024 * 1024 };
 				const call = await (this.tools.callTool as Record<string, (params: unknown, context?: unknown) => Promise<{ result: Promise<unknown> }>>)[response.tool.name](params, toolContext);
 				const result = await call.result;
@@ -189,19 +282,86 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 			this.settle(run, run.cancellation.token.isCancellationRequested ? 'cancelled' : 'failed', run.cancellation.token.isCancellationRequested ? 'Child cancelled.' : 'Child exceeded its bounded tool turn limit.');
 		} catch (error) {
 			this.settleRunFailure(run, error);
+		} finally {
+			this.releaseExecution(run);
 		}
 	}
 	private settleRunFailure(run: ChildRun, error: unknown): void { const cancelled = run.lifecycle.status === 'cancelled' || run.cancellation.token.isCancellationRequested; const detail = error instanceof Error ? error.message : String(error); this.settle(run, cancelled ? 'cancelled' : 'failed', cancelled ? 'Child cancelled.' : `Child failed: ${detail}`); }
 	private matchesParent(snapshot: AgentRuntimeTurnSnapshot): boolean { return this.workspace.getWorkspace().folders[0]?.uri.toString() === snapshot.ownerProjectRoot && this.trust.isWorkspaceTrusted() === snapshot.workspaceTrustedAtAdmission; }
 	private isCurrent(run: ChildRun): boolean { const group = this.groups.get(run.parentId); return run.lifecycle.status === 'running' && !run.cancellation.token.isCancellationRequested && !!group && group.generation === run.generation && group.runs.includes(run) && !group.cancellation && this.matchesParent(run.snapshot); }
-	private promote(group: ChildGroup): void { if (group.cancellation) return; while (group.runs.filter(run => run.lifecycle.status === 'running').length < AGENT_SUBAGENT_MAX_CONCURRENT) { const next = group.runs.find(run => run.lifecycle.status === 'queued'); if (!next) return; void this.run(next, next.message).catch(error => this.settleRunFailure(next, error)); } }
-	private settle(run: ChildRun, status: Exclude<AgentSubagentStatus, 'queued' | 'running'>, summary: string): boolean { const group = this.groups.get(run.parentId); const bounded = group ? summary.slice(0, Math.max(0, Math.min(MAX_CHILD_SUMMARY, AGENT_SUBAGENT_MAX_AGGREGATE_RESULT_CHARS - group.resultChars))) : summary.slice(0, MAX_CHILD_SUMMARY); const settled = run.lifecycle.settle(status, run.id, bounded); if (settled) { run.settledAt = Date.now(); if (group && group.generation === run.generation) { group.resultChars += bounded.length; this.trace(group, status === 'completed' ? 'child_completed' : status === 'failed' ? 'child_failed' : 'child_cancelled', run, status, this.terminalDiagnostic(status, summary)); } if (run.timeoutHandle !== undefined) { clearTimeout(run.timeoutHandle); run.timeoutHandle = undefined; } run.summary = bounded; this.tools.invalidateReadReceipts(run.id); run.requestId = undefined; run.cancellation.dispose(); this._onDidChangeRun.fire({ parentId: run.parentId, id: run.id, status }); if (group && group.generation === run.generation) this.promote(group); } return settled; }
+	/** A terminal child can still hold an external broker tombstone, but never a scheduler slot. */
+	private activeCount(group: ChildGroup): number { return group.runs.filter(run => run.schedulerActive && (run.lifecycle.status === 'queued' || run.lifecycle.status === 'running')).length; }
+	private mayAcquireMutation(run: ChildRun): boolean { return !run.mutationCapable || !this.mutationOwners.has(run.parentId) || this.mutationOwners.get(run.parentId) === run.id; }
+	/** Scheduler activity is observable independently from lifecycle status. */
+	private setSchedulerActivity(run: ChildRun, schedulerActive: boolean, schedulerActivity: ChildSchedulerActivity, emit = true): void {
+		const changed = run.schedulerActive !== schedulerActive || run.schedulerActivity !== schedulerActivity;
+		run.schedulerActive = schedulerActive;
+		run.schedulerActivity = schedulerActivity;
+		if (!changed || !emit) return;
+		this._onDidChangeRun.fire({ parentId: run.parentId, id: run.id, status: run.lifecycle.status });
+		const group = this.groups.get(run.parentId);
+		if (group?.generation === run.generation) this._onDidChangeDiagnostics.fire({ parentId: run.parentId, generation: group.generation });
+	}
+	private activate(run: ChildRun): boolean { if (!this.mayAcquireMutation(run)) return false; if (run.mutationCapable) this.mutationOwners.set(run.parentId, run.id); this.setSchedulerActivity(run, true, 'active'); run.yielded = false; return true; }
+	private promote(group: ChildGroup): void {
+		if (group.cancellation) return;
+		while (this.activeCount(group) < group.limits.maxConcurrentThreadsPerSession) {
+			const next = group.runs.find(run => (run.lifecycle.status === 'queued' || run.lifecycle.status === 'running' && run.yielded && !!run.resume) && !run.schedulerActive && this.mayAcquireMutation(run));
+			if (!next || !this.activate(next)) return;
+			if (next.lifecycle.status === 'queued') next.runPromise = Promise.resolve().then(() => this.run(next, next.message)).catch(error => this.settleRunFailure(next, error));
+			else { const resume = next.resume; next.resume = undefined; resume?.(); }
+		}
+	}
+	private async yieldForChildren(run: ChildRun): Promise<void> {
+		if (!run.schedulerActive || run.requestId || run.brokerRequest) throw new Error('agent_child_wait_not_quiescent');
+		this.setSchedulerActivity(run, false, 'waiting_children'); run.yielded = true;
+		if (this.mutationOwners.get(run.parentId) === run.id) this.mutationOwners.delete(run.parentId);
+		const group = this.groups.get(run.parentId); if (group) this.promote(group);
+	}
+	private async reacquire(run: ChildRun): Promise<void> {
+		if (!this.isCurrent(run)) throw new Error('agent_child_cancelled');
+		if (run.schedulerActive) return;
+		await new Promise<void>((resolve, reject) => {
+			let listener: { dispose(): void } | undefined;
+			run.resume = () => { listener?.dispose(); resolve(); };
+			listener = run.cancellation.token.onCancellationRequested(() => { listener?.dispose(); reject(new Error('agent_child_cancelled')); });
+			const group = this.groups.get(run.parentId); if (!group) { listener.dispose(); reject(new Error('agent_child_cancelled')); return; }
+			this.promote(group);
+		});
+		if (!this.isCurrent(run) || !run.schedulerActive) throw new Error('agent_child_cancelled');
+	}
+	private releaseExecution(run: ChildRun): void {
+		if (run.released) return;
+		// A terminal writer is intentionally not shown as Running, but its mutation
+		// tombstone remains until the parent broker has acknowledged cancellation.
+		if (run.brokerCancelPromise) { void run.brokerCancelPromise.then(() => this.releaseExecution(run), () => { /* fail closed: retain the tombstone */ }); return; }
+		run.released = true; this.setSchedulerActivity(run, false, 'quiescing'); run.yielded = false; run.resume = undefined;
+		if (this.mutationOwners.get(run.parentId) === run.id) this.mutationOwners.delete(run.parentId);
+		run.cancellation.dispose();
+		const group = this.groups.get(run.parentId); if (group) this.promote(group);
+	}
+	private cancelBroker(run: ChildRun): void {
+		if (!run.brokerRequest || run.brokerCancelled) return;
+		run.brokerCancelled = true;
+		try {
+			const acknowledgement = run.broker!.cancel(run.brokerRequest);
+			run.brokerCancelPromise = acknowledgement.then(() => {
+				run.brokerCancelPromise = undefined;
+				// The broker acknowledgement is the authoritative external quiescence
+				// boundary: execute may never settle after cancellation.
+				this.releaseExecution(run);
+				this._onDidChangeRun.fire({ parentId: run.parentId, id: run.id, status: run.lifecycle.status });
+				const group = this.groups.get(run.parentId); if (group) this._onDidChangeDiagnostics.fire({ parentId: run.parentId, generation: group.generation });
+			}, () => { /* fail closed: retain the mutation tombstone */ return new Promise<void>(() => { }); });
+		} catch { run.brokerCancelPromise = new Promise<void>(() => { }); }
+	}
+	private settle(run: ChildRun, status: Exclude<AgentSubagentStatus, 'queued' | 'running'>, summary: string): boolean { const group = this.groups.get(run.parentId); const bounded = group ? summary.slice(0, Math.max(0, Math.min(MAX_CHILD_SUMMARY, AGENT_SUBAGENT_MAX_AGGREGATE_RESULT_CHARS - group.resultChars))) : summary.slice(0, MAX_CHILD_SUMMARY); const settled = run.lifecycle.settle(status, run.id, bounded); if (settled) { this.setSchedulerActivity(run, false, 'quiescing', false); this.cancelBroker(run); run.settledAt = Date.now(); if (group && group.generation === run.generation) { group.resultChars += bounded.length; this.trace(group, status === 'completed' ? 'child_completed' : status === 'failed' ? 'child_failed' : 'child_cancelled', run, status, this.terminalDiagnostic(status, summary)); } if (run.timeoutHandle !== undefined) { clearTimeout(run.timeoutHandle); run.timeoutHandle = undefined; } run.summary = bounded; this.tools.invalidateReadReceipts(run.id); this._onDidChangeRun.fire({ parentId: run.parentId, id: run.id, status }); if (!run.runPromise) this.releaseExecution(run); if (group && group.generation === run.generation) this.promote(group); } return settled; }
 	private trace(group: ChildGroup, kind: AgentSubagentTraceKind, run?: ChildRun, status?: Exclude<AgentSubagentStatus, 'queued' | 'running'>, diagnostic?: AgentSubagentTraceDiagnostic): void {
 		const timestamp = Date.now(); const budget = this.traceBudget(group); const event: AgentSubagentTraceEvent = Object.freeze({ sequence: ++group.traceSequence, parentId: group.parentId, generation: group.generation, ...(run ? { childId: run.id } : {}), kind, timestamp, elapsedMs: Math.max(0, timestamp - group.createdAt), ...(status ? { status } : {}), ...(diagnostic ? { diagnostic } : {}), budget: Object.freeze(budget) });
 		if (group.traceEvents.length >= AGENT_SUBAGENT_MAX_TRACE_EVENTS) group.droppedTraceEvents++; else group.traceEvents.push(event);
 		this._onDidChangeDiagnostics.fire({ parentId: group.parentId, generation: group.generation });
 	}
-	private traceBudget(group: ChildGroup) { return { accepted: group.accepted, running: group.runs.filter(run => run.lifecycle.status === 'running').length, queued: group.runs.filter(run => run.lifecycle.status === 'queued').length, providerSends: group.providerSends, resultChars: group.resultChars }; }
+	private traceBudget(group: ChildGroup) { return { accepted: group.accepted, running: this.activeCount(group), queued: group.runs.filter(run => run.lifecycle.status === 'queued').length, providerSends: group.providerSends, resultChars: group.resultChars }; }
 	private diagnostic(error: unknown): AgentSubagentTraceDiagnostic { const code = error instanceof Error ? error.message : ''; if (code.includes('cancel')) return 'cancelled'; if (code.includes('model_missing')) return 'model_missing'; if (code.includes('provider_invalid')) return 'provider_invalid'; if (code.includes('owner') || code.includes('trust')) return 'owner_changed'; if (code.includes('role') || code.includes('custom_agent')) return code.includes('stale') ? 'role_stale' : 'role_not_found'; if (code.includes('skill')) return 'skill_unavailable'; if (code.includes('budget') || code.includes('limit')) return 'budget_exhausted'; if (code.includes('provider')) return 'provider_error'; return 'unknown'; }
 	private terminalDiagnostic(status: Exclude<AgentSubagentStatus, 'queued' | 'running'>, summary: string): AgentSubagentTraceDiagnostic | undefined { if (status === 'completed') return undefined; if (status === 'cancelled') return 'cancelled'; if (summary.includes('provider-send budget')) return 'budget_exhausted'; if (summary.includes('exceeded') || summary.includes('limit')) return summary.includes('turn') ? 'turn_limit' : 'timeout'; if (summary.includes('provider')) return 'provider_error'; return 'unknown'; }
 	private async assertContainedRead(params: Record<string, unknown>, owner: URI): Promise<void> {
@@ -240,10 +400,20 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 	}
 
 	async wait(parentId: string, timeoutMs: number, targets?: readonly string[], generation = 0): Promise<AgentSubagentWaitResult> {
+		return this.waitFor(parentId, undefined, timeoutMs, targets, generation);
+	}
+	private assertWaitTargets(parentId: string, directParentRunId: string | undefined, targets: readonly string[] | undefined, generation: number): void {
 		const group = this.groups.get(parentId); if (!group || group.generation !== generation) throw new Error('agent_child_not_found');
-		if (targets && (targets.length < 1 || targets.length > AGENT_SUBAGENT_MAX_ACCEPTED || new Set(targets).size !== targets.length || targets.some(target => typeof target !== 'string' || !target.trim() || target.length > 256))) throw new Error('wait_agent_invalid_params');
-		if (targets) for (const id of targets) if (!group.runs.some(candidate => candidate.id === id)) throw new Error('agent_child_not_direct');
-		const selected = targets ? group.runs.filter(run => targets.includes(run.id)) : [...group.runs];
+		const direct = group.runs.filter(candidate => candidate.parentRunId === directParentRunId);
+		if (!targets) { if (!direct.length) throw new Error('agent_child_not_found'); return; }
+		if (targets.some(id => !direct.some(candidate => candidate.id === id))) throw new Error('agent_child_not_direct');
+	}
+	private async waitFor(parentId: string, directParentRunId: string | undefined, timeoutMs: number, targets: readonly string[] | undefined, generation: number): Promise<AgentSubagentWaitResult> {
+		const group = this.groups.get(parentId); if (!group || group.generation !== generation) throw new Error('agent_child_not_found');
+		if (targets && (targets.length < 1 || targets.length > AGENT_SUBAGENT_MAX_WAIT_TARGETS || new Set(targets).size !== targets.length || targets.some(target => typeof target !== 'string' || !target.trim() || target.length > 256))) throw new Error('wait_agent_invalid_params');
+		const direct = group.runs.filter(candidate => candidate.parentRunId === directParentRunId);
+		if (targets) for (const id of targets) if (!direct.some(candidate => candidate.id === id)) throw new Error('agent_child_not_direct');
+		const selected = targets ? direct.filter(run => targets.includes(run.id)) : direct;
 		if (!selected.length) throw new Error('agent_child_not_found');
 		let values = selected.map(run => run.lifecycle.receipt(true)); let timedOut = false;
 		if (!values.some(value => value.deliverSummary) && selected.some(run => run.lifecycle.status === 'queued' || run.lifecycle.status === 'running')) { timedOut = await new Promise<boolean>(resolve => { let done = false; let handle: ReturnType<typeof setTimeout>; const finish = (timeout: boolean) => { if (done) return; done = true; clearTimeout(handle); listener.dispose(); resolve(timeout); }; const listener = this.onDidChangeRun(event => { if (event.parentId === parentId && selected.some(run => run.id === event.id && (event.removed || event.status !== 'queued' && event.status !== 'running'))) finish(false); }); handle = setTimeout(() => finish(true), timeoutMs); }); values = selected.map(run => run.lifecycle.receipt(true)); }
@@ -252,14 +422,25 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 		const legacy = selected.length === 1 ? { id: selected[0].id, status: selected[0].lifecycle.status } : newlyDelivered.length === 1 ? { id: newlyDelivered[0].id, status: newlyDelivered[0].status } : {};
 		return { ...legacy, children: Object.freeze(selected.map(run => Object.freeze({ id: run.id, status: run.lifecycle.status, ...(run.role ? { roleName: run.role.name, roleDescription: run.role.description } : {}), usage: null }))), ...(newlyDelivered.length === 1 ? { receipt: newlyDelivered[0] } : { receipts: Object.freeze(newlyDelivered) }), budget: this.budget(group), deliverSummary: newlyDelivered.length > 0, timedOut };
 	}
-	private view(run: ChildRun): AgentSubagentRunView { const now = Date.now(); const startedAt = run.startedAt ?? now; const endedAt = run.settledAt ?? now; return Object.freeze({ id: run.id, status: run.lifecycle.status, ...(run.summary ? { summary: run.summary } : {}), ...(run.role ? { roleName: run.role.name, roleDescription: run.role.description } : {}), queuedMs: Math.max(0, startedAt - run.acceptedAt), runningMs: Math.max(0, endedAt - startedAt), totalMs: Math.max(0, endedAt - run.acceptedAt), authority: Object.freeze({ runtimeRevision: run.snapshot.revision, instructionsRevision: run.snapshot.instructions.revision, catalogRevision: run.snapshot.catalog.revision, ...(run.snapshot.model.hasModel ? { modelFingerprint: run.snapshot.model.fingerprint } : {}), ...(run.role ? { roleRevision: run.role.revision } : {}), selectedSkills: Object.freeze(run.snapshot.selected.map(skill => Object.freeze({ identity: skill.identity, bodyRevision: skill.bodyRevision }))) }), usage: null }); }
+	private view(run: ChildRun): AgentSubagentRunView { const now = Date.now(); const startedAt = run.startedAt ?? now; const endedAt = run.settledAt ?? now; const inherited = run.toolExecutionProfile === 'inherited-parent-write-child'; const approvals = inherited ? [...new Set(run.parentTools?.tools.flatMap(tool => tool.approval ? [tool.approval] : []) ?? [])] : []; const undoAvailable = !!run.parentTools?.tools.some(tool => tool.kind === 'builtin' && tool.name === 'write_file' && tool.approval === 'edits'); return Object.freeze({ id: run.id, ...(run.parentRunId ? { parentRunId: run.parentRunId } : {}), depth: run.depth, remainingDepth: run.remainingDepth, status: run.lifecycle.status, schedulerActivity: run.schedulerActivity, ...(run.summary ? { summary: run.summary } : {}), ...(run.role ? { roleName: run.role.name, roleDescription: run.role.description } : {}), capabilityProfile: inherited ? 'inherit_parent_write' : 'read_only', ...(inherited ? { toolPresentation: Object.freeze({ toolNames: Object.freeze(run.parentTools?.tools.map(tool => tool.name) ?? []), approvals: Object.freeze(approvals), undoAvailable, applicationBoundary: 'no_os_sandbox' as const }) } : {}), queuedMs: Math.max(0, startedAt - run.acceptedAt), runningMs: Math.max(0, endedAt - startedAt), totalMs: Math.max(0, endedAt - run.acceptedAt), authority: Object.freeze({ runtimeRevision: run.snapshot.revision, instructionsRevision: run.snapshot.instructions.revision, catalogRevision: run.snapshot.catalog.revision, ...(run.snapshot.model.hasModel ? { modelFingerprint: run.snapshot.model.fingerprint } : {}), ...(run.role ? { roleRevision: run.role.revision } : {}), selectedSkills: Object.freeze(run.snapshot.selected.map(skill => Object.freeze({ identity: skill.identity, bodyRevision: skill.bodyRevision }))) }), usage: null }); }
 	getRunViews(parentId: string): readonly AgentSubagentRunView[] { return Object.freeze((this.groups.get(parentId)?.runs ?? []).map(run => this.view(run))); }
 	getRunView(parentId: string): AgentSubagentRunView | undefined { return this.getRunViews(parentId)[0]; }
-	private budget(group: ChildGroup): AgentSubagentBudgetView { return Object.freeze({ accepted: group.accepted, running: group.runs.filter(run => run.lifecycle.status === 'running').length, queued: group.runs.filter(run => run.lifecycle.status === 'queued').length, maxAccepted: AGENT_SUBAGENT_MAX_ACCEPTED, maxConcurrent: AGENT_SUBAGENT_MAX_CONCURRENT, providerSends: group.providerSends, maxProviderSends: AGENT_SUBAGENT_MAX_GROUP_PROVIDER_SENDS, resultChars: group.resultChars, maxResultChars: AGENT_SUBAGENT_MAX_AGGREGATE_RESULT_CHARS, deadlineMsRemaining: Math.max(0, group.deadlineAt - Date.now()), usage: null }); }
+	private budget(group: ChildGroup): AgentSubagentBudgetView { return Object.freeze({ accepted: group.accepted, running: this.activeCount(group), queued: group.runs.filter(run => run.lifecycle.status === 'queued').length, maxAccepted: group.limits.maxAcceptedChildren, maxConcurrent: group.limits.maxConcurrentThreadsPerSession, providerSends: group.providerSends, maxProviderSends: AGENT_SUBAGENT_MAX_GROUP_PROVIDER_SENDS, resultChars: group.resultChars, maxResultChars: AGENT_SUBAGENT_MAX_AGGREGATE_RESULT_CHARS, deadlineMsRemaining: Math.max(0, group.deadlineAt - Date.now()), usage: null }); }
 	getBudgetView(parentId: string): AgentSubagentBudgetView | undefined { const group = this.groups.get(parentId); return group && this.budget(group); }
 	getDiagnosticsView(parentId: string): AgentSubagentDiagnosticsView | undefined { const group = this.groups.get(parentId); if (!group) return undefined; const counts = { completed: 0, failed: 0, cancelled: 0 }; for (const run of group.runs) if (run.lifecycle.status === 'completed') counts.completed++; else if (run.lifecycle.status === 'failed') counts.failed++; else if (run.lifecycle.status === 'cancelled') counts.cancelled++; return Object.freeze({ parentId: group.parentId, generation: group.generation, elapsedMs: Math.max(0, Date.now() - group.createdAt), events: Object.freeze([...group.traceEvents]), droppedEvents: group.droppedTraceEvents, ...counts, usage: null }); }
-	interrupt(parentId: string, target: string, generation = 0) { const group = this.groups.get(parentId); const run = group?.generation === generation ? group.runs.find(candidate => candidate.id === target) : undefined; if (!run) throw new Error('agent_child_not_direct'); const requestId = run.requestId; run.cancellation.cancel(); if (this.settle(run, 'cancelled', 'Child cancelled by parent.') && requestId) this.llm.abort(requestId); const value = run.lifecycle.receipt(false); return { id: run.id, status: run.lifecycle.status, receipt: value.receipt }; }
-	private cancelGroup(group: ChildGroup, summary: string): void { if (group.cancellation) return; group.cancellation = true; this.trace(group, 'group_cancelled', undefined, undefined, summary.includes('exceeded') ? 'timeout' : 'cancelled'); if (group.deadline) clearTimeout(group.deadline); for (const admission of group.admissions) { admission.cancel(); admission.dispose(); } group.admissions.clear(); for (const run of group.runs) if (run.lifecycle.status === 'queued' || run.lifecycle.status === 'running') { const requestId = run.requestId; run.cancellation.cancel(); if (this.settle(run, 'cancelled', summary) && requestId) this.llm.abort(requestId); } }
+	interrupt(parentId: string, target: string, generation = 0) { return this.interruptFor(parentId, undefined, target, generation); }
+	private interruptFor(parentId: string, directParentRunId: string | undefined, target: string, generation: number) { const group = this.groups.get(parentId); const run = group?.generation === generation ? group.runs.find(candidate => candidate.id === target && candidate.parentRunId === directParentRunId) : undefined; if (!run) throw new Error('agent_child_not_direct'); this.cancelRunTree(group!, run, 'Child cancelled by parent.'); const value = run.lifecycle.receipt(false); return { id: run.id, status: run.lifecycle.status, receipt: value.receipt }; }
+	private cancelRunTree(group: ChildGroup, run: ChildRun, summary: string): void { for (const child of group.runs.filter(candidate => candidate.parentRunId === run.id)) this.cancelRunTree(group, child, summary); for (const [admission, ownerRunId] of group.admissions) if (ownerRunId === run.id) { admission.cancel(); admission.dispose(); group.admissions.delete(admission); } this.cancelRun(run, summary); }
+	private cancelRun(run: ChildRun, summary: string, status: 'cancelled' | 'failed' = 'cancelled'): void {
+		if (run.lifecycle.status !== 'queued' && run.lifecycle.status !== 'running') return;
+		// Fence first; abort/provider cancellation and broker cancellation happen before any lease is released.
+		run.cancellation.cancel();
+		const requestId = run.requestId; if (requestId) this.llm.abort(requestId);
+		this.cancelBroker(run);
+		this.settle(run, status, summary);
+		if (!run.runPromise) this.releaseExecution(run); // queued/yielded children have no in-flight provider or broker promise.
+	}
+	private cancelGroup(group: ChildGroup, summary: string): void { if (group.cancellation) return; group.cancellation = true; this.trace(group, 'group_cancelled', undefined, undefined, summary.includes('exceeded') ? 'timeout' : 'cancelled'); if (group.deadline) clearTimeout(group.deadline); for (const admission of group.admissions.keys()) { admission.cancel(); admission.dispose(); } group.admissions.clear(); for (const run of group.runs) this.cancelRun(run, summary); }
 	cancelParent(parentId: string) { const group = this.groups.get(parentId); if (group) this.cancelGroup(group, 'Child cancelled by parent.'); }
 	forgetParent(parentId: string) { const group = this.groups.get(parentId); if (!group) return; this.cancelGroup(group, 'Child cancelled by parent.'); this.groups.delete(parentId); this._onDidChangeDiagnostics.fire({ parentId, generation: group.generation }); for (const run of group.runs) this._onDidChangeRun.fire({ parentId, id: run.id, removed: true }); }
 	override dispose(): void { for (const parentId of [...this.groups.keys()]) this.forgetParent(parentId); this.groups.clear(); super.dispose(); }

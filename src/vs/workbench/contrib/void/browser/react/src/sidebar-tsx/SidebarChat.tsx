@@ -6,7 +6,7 @@
 import React, { ButtonHTMLAttributes, FormEvent, FormHTMLAttributes, Fragment, KeyboardEvent, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 
 
-import { useAccessor, useAgentSubagentBudget, useAgentSubagentDiagnostics, useAgentSubagentRuns, useChatThreadsState, useChatThreadsStreamState, useSettingsState, useActiveURI, useCommandBarState } from '../util/services.js';
+import { useAccessor, useAgentSubagentBudget, useAgentSubagentDiagnostics, useAgentSubagentRuns, useChatThreadsState, useChatThreadsStreamState, useSettingsState, useActiveURI, useChildToolApprovals, useCommandBarState } from '../util/services.js';
 import { ScrollType } from '../../../../../../../editor/common/editorCommon.js';
 
 import { ChatMarkdownRender, ChatMessageLocation, getApplyBoxId } from '../markdown/ChatMarkdownRender.js';
@@ -24,7 +24,7 @@ import { WarningBox } from '../void-settings-tsx/WarningBox.js';
 import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../common/modelCapabilities.js';
 import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, CircleEllipsis, Folder, ALargeSmall, TypeOutline, Text } from 'lucide-react';
 import { ChatMessage, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
-import { isActiveChildRun } from '../../../../common/agentSubagents.js';
+import { ChildToolApprovalView, isActiveChildRun } from '../../../../common/agentSubagents.js';
 import { AgentSubagentPresentation, getAgentSubagentPresentation } from '../../../../common/agentSubagentPresentation.js';
 import { canSubmitChatCurrent, ChatCurrentStatusPresentation, getChatCurrentStatusPresentation } from '../../../../common/chatCurrentStatusPresentation.js';
 import { submitChatComposer } from '../../../../common/chatComposerSubmission.js';
@@ -2745,15 +2745,30 @@ const CommandBarInChat = () => {
 
 
 
-const ChildRunPanel = ({ presentation }: { presentation: AgentSubagentPresentation | undefined }) => {
-	if (!presentation) return null;
+const ChildRunPanel = ({ presentation, approvals }: { presentation: AgentSubagentPresentation | undefined; approvals: readonly ChildToolApprovalView[] }) => {
+	const chatThreadsService = useAccessor().get('IChatThreadService')
+	if (!presentation && approvals.length === 0) return null;
 	return <section className='text-xs mb-1' aria-label='Child runs'>
-		<div className='text-void-fg-3' role='status' aria-live='polite' aria-atomic='true'>{presentation.summary}</div>
+		{approvals.map(approval => {
+			const key = approval.key
+			const title = approval.title
+			return <div key={approval.structuralKey} className='border border-void-warning rounded-sm px-2 py-1 mt-1' aria-label={`${title}, child ${approval.childShortId}, awaiting approval`}>
+				<div className='text-void-fg-1'>{title}</div>
+				<div className='text-void-warning' role='status'>Awaiting approval · action required</div>
+				<div className='text-void-fg-3'>Child {approval.childShortId} · approval category: {approval.category}</div>
+				<pre className='text-void-fg-3 whitespace-pre-wrap break-all overflow-hidden'>{approval.parameters}</pre>
+				<div className='flex gap-2 mt-1'>
+					<button type='button' className='focus-ring px-2 py-0.5 rounded-sm bg-void-bg-3' aria-label={`Approve ${approval.toolName} for child ${approval.childShortId}`} onClick={() => chatThreadsService.approveChildToolApproval(key)}>Approve</button>
+					<button type='button' className='focus-ring px-2 py-0.5 rounded-sm bg-void-bg-3' aria-label={`Reject ${approval.toolName} for child ${approval.childShortId}`} onClick={() => chatThreadsService.rejectChildToolApproval(key)}>Reject</button>
+				</div>
+			</div>
+		})}
+		{presentation ? <><div className='text-void-fg-3' role='status' aria-live='polite' aria-atomic='true'>{presentation.summary}</div>
 		{presentation.actionRequired ? <div className='text-void-warning'>{presentation.actionRequiredLabel}. Open details for the recorded status.</div> : null}
 		{presentation.runs.map(view => <details key={view.id} className='border border-void-border-1 rounded-sm px-2 py-1 mt-1'>
 			<summary className='focus-ring cursor-pointer select-none' aria-label={`Child Run${view.roleName ? ` ${view.roleName}` : ''} ${view.shortId} ${view.statusLabel}`}>Child Run{view.roleName ? ` · ${view.roleName}` : ''} · {view.shortId} · {view.statusLabel} · {view.totalMs}ms</summary>
 			<div className='pt-1 text-void-fg-3'>
-				<div>Void application-level read-only — terminal disabled, no OS sandbox</div>
+				{view.toolPresentation ? <div>Void application-level inherited parent profile: {view.toolPresentation.toolNames.join(', ') || 'no captured tools'}; approvals: {view.toolPresentation.approvals.join(', ') || 'none'}; Undo for successful write_file modify {view.toolPresentation.undoAvailable ? 'available' : 'not available'}; no OS sandbox</div> : <div>Void application-level read-only — terminal disabled, no OS sandbox</div>}
 				{view.roleDescription ? <div>{view.roleDescription}</div> : null}
 				<div>Timing: {view.queuedMs}ms queued, {view.runningMs}ms running, {view.totalMs}ms total</div>
 				{view.summary ? <div className='pt-1 whitespace-pre-wrap break-words'>{view.summary}</div> : null}
@@ -2763,7 +2778,7 @@ const ChildRunPanel = ({ presentation }: { presentation: AgentSubagentPresentati
 		{presentation.budget || presentation.diagnostics ? <details className='border border-void-border-1 rounded-sm px-2 py-1 mt-1'><summary className='focus-ring cursor-pointer select-none' aria-label='Child diagnostics'>Diagnostics and technical details</summary><div className='pt-1 text-void-fg-3'>
 			{presentation.budget ? <div>Budget: {presentation.budget.providerSends}/{presentation.budget.maxProviderSends} provider sends, {presentation.budget.resultChars}/{presentation.budget.maxResultChars} result chars, {presentation.budget.deadlineMsRemaining}ms deadline remaining; {presentation.usageLabel}</div> : <div>{presentation.usageLabel}</div>}
 			{presentation.diagnostics ? <><div>Timeline: {presentation.diagnostics.events.length} events, {presentation.diagnostics.elapsedMs}ms</div>{presentation.diagnostics.droppedEvents ? <div>{presentation.diagnostics.droppedEvents} later events omitted</div> : null}{presentation.diagnostics.events.map(event => <div key={event.sequence}>#{event.sequence} +{event.elapsedMs}ms · {event.kind}{event.childId ? ` · ${event.childId.slice(0, 8)}` : ''}{event.diagnostic ? ` · ${event.diagnostic}` : ''} · {event.budget.running} running/{event.budget.queued} queued</div>)}</> : null}
-		</div></details> : null}
+		</div></details> : null}</> : null}
 	</section>;
 };
 
@@ -2794,6 +2809,7 @@ export const SidebarChat = () => {
 	const childRuns = useAgentSubagentRuns(currentThread.id)
 	const childBudget = useAgentSubagentBudget(currentThread.id)
 	const childDiagnostics = useAgentSubagentDiagnostics(currentThread.id)
+	const childToolApprovals = useChildToolApprovals(currentThread.id)
 	const childPresentation = getAgentSubagentPresentation(childBudget, childRuns, childDiagnostics)
 	const childIsActive = childRuns.some(isActiveChildRun)
 	const isAnyRunning = !!isRunning || childIsActive
@@ -3025,7 +3041,7 @@ export const SidebarChat = () => {
 
 	const threadPageInput = <div key={'input' + chatThreadsState.currentThreadId}>
 		<div className='px-4'>
-			<ChildRunPanel presentation={childPresentation} />
+			<ChildRunPanel presentation={childPresentation} approvals={childToolApprovals} />
 			<CommandBarInChat />
 		</div>
 		<div className='px-2 pb-2'>
@@ -3035,7 +3051,7 @@ export const SidebarChat = () => {
 
 	const landingPageInput = <div>
 		<div className='pt-8'>
-			<div className='px-4'><ChildRunPanel presentation={childPresentation} /></div>
+			<div className='px-4'><ChildRunPanel presentation={childPresentation} approvals={childToolApprovals} /></div>
 			{inputChatArea}
 		</div>
 	</div>

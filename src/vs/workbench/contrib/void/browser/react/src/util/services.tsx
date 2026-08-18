@@ -55,8 +55,9 @@ import { IMCPService } from '../../../../common/mcpService.js';
 import { IStorageService, StorageScope } from '../../../../../../../platform/storage/common/storage.js'
 import { OPT_OUT_KEY } from '../../../../common/storageKeys.js'
 import { IAgentSubagentService } from '../../../agentSubagentService.js'
-import { AgentSubagentBudgetView, AgentSubagentDiagnosticsView, AgentSubagentRunView } from '../../../../common/agentSubagents.js'
+import { AgentSubagentBudgetView, AgentSubagentDiagnosticsView, AgentSubagentRunView, ChildToolApprovalView } from '../../../../common/agentSubagents.js'
 import { hasActionRequiredChild } from '../../../../common/chatHistoryPresentation.js'
+import { selectThreadScopedValue } from '../../../../common/agentSubagentPresentation.js'
 
 
 // normally to do this you'd use a useEffect that calls .onDidChangeState(), but useEffect mounts too late and misses initial state changes
@@ -310,27 +311,41 @@ export const useChatThreadsStreamState = (threadId: string) => {
 
 export const useAgentSubagentRun = (threadId: string): AgentSubagentRunView | undefined => {
 	const service = useAccessor().get('IAgentSubagentService')
-	const [view, setView] = useState(() => service.getRunView(threadId))
-	useEffect(() => { setView(service.getRunView(threadId)); const disposable = service.onDidChangeRun(event => { if (event.parentId === threadId) setView(service.getRunView(threadId)) }); return () => disposable.dispose() }, [service, threadId])
-	return view
+	const [state, setState] = useState(() => ({ threadId, value: service.getRunView(threadId) }))
+	useEffect(() => { const refresh = () => setState({ threadId, value: service.getRunView(threadId) }); refresh(); const disposable = service.onDidChangeRun(event => { if (event.parentId === threadId) refresh() }); return () => disposable.dispose() }, [service, threadId])
+	return selectThreadScopedValue(state, threadId, () => service.getRunView(threadId))
 }
 export const useAgentSubagentRuns = (threadId: string): readonly AgentSubagentRunView[] => {
 	const service = useAccessor().get('IAgentSubagentService')
-	const [views, setViews] = useState(() => service.getRunViews(threadId))
-	useEffect(() => { setViews(service.getRunViews(threadId)); const disposable = service.onDidChangeRun(event => { if (event.parentId === threadId) setViews(service.getRunViews(threadId)) }); return () => disposable.dispose() }, [service, threadId])
-	return views
+	const [state, setState] = useState(() => ({ threadId, value: service.getRunViews(threadId) }))
+	useEffect(() => { const refresh = () => setState({ threadId, value: service.getRunViews(threadId) }); refresh(); const disposable = service.onDidChangeRun(event => { if (event.parentId === threadId) refresh() }); return () => disposable.dispose() }, [service, threadId])
+	return selectThreadScopedValue(state, threadId, () => service.getRunViews(threadId))
 }
 export const useAgentSubagentBudget = (threadId: string): AgentSubagentBudgetView | undefined => {
 	const service = useAccessor().get('IAgentSubagentService')
-	const [budget, setBudget] = useState(() => service.getBudgetView(threadId))
-	useEffect(() => { setBudget(service.getBudgetView(threadId)); const disposable = service.onDidChangeRun(event => { if (event.parentId === threadId) setBudget(service.getBudgetView(threadId)) }); return () => disposable.dispose() }, [service, threadId])
-	return budget
+	const [state, setState] = useState(() => ({ threadId, value: service.getBudgetView(threadId) }))
+	useEffect(() => { const refresh = () => setState({ threadId, value: service.getBudgetView(threadId) }); refresh(); const disposable = service.onDidChangeRun(event => { if (event.parentId === threadId) refresh() }); return () => disposable.dispose() }, [service, threadId])
+	return selectThreadScopedValue(state, threadId, () => service.getBudgetView(threadId))
 }
 export const useAgentSubagentDiagnostics = (threadId: string): AgentSubagentDiagnosticsView | undefined => {
 	const service = useAccessor().get('IAgentSubagentService')
-	const [diagnostics, setDiagnostics] = useState(() => service.getDiagnosticsView(threadId))
-	useEffect(() => { setDiagnostics(service.getDiagnosticsView(threadId)); const disposable = service.onDidChangeDiagnostics(event => { if (event.parentId === threadId) setDiagnostics(service.getDiagnosticsView(threadId)) }); return () => disposable.dispose() }, [service, threadId])
-	return diagnostics
+	const [state, setState] = useState(() => ({ threadId, value: service.getDiagnosticsView(threadId) }))
+	useEffect(() => { const refresh = () => setState({ threadId, value: service.getDiagnosticsView(threadId) }); refresh(); const disposable = service.onDidChangeDiagnostics(event => { if (event.parentId === threadId) refresh() }); return () => disposable.dispose() }, [service, threadId])
+	return selectThreadScopedValue(state, threadId, () => service.getDiagnosticsView(threadId))
+}
+
+export const useChildToolApprovals = (threadId: string): readonly ChildToolApprovalView[] => {
+	const service = useAccessor().get('IChatThreadService')
+	const [state, setState] = useState(() => ({ threadId, value: service.getChildToolApprovals(threadId) }))
+	useEffect(() => {
+		const refresh = () => setState({ threadId, value: service.getChildToolApprovals(threadId) })
+		refresh()
+		const disposable = service.onDidChangeChildToolApprovals(refresh)
+		return () => disposable.dispose()
+	}, [service, threadId])
+	// Never expose the previous task's pending card during the render before its
+	// effect refreshes. Switching tasks is a view boundary, not cancellation.
+	return selectThreadScopedValue(state, threadId, () => service.getChildToolApprovals(threadId))
 }
 
 export const useFullChatThreadsStreamState = () => {

@@ -1,17 +1,27 @@
 import assert from 'assert';
 import { URI } from '../../../../../base/common/uri.js';
+import { Event } from '../../../../../base/common/event.js';
+import { getSingletonServiceDescriptors } from '../../../../../platform/instantiation/common/extensions.js';
+import { TestDialogService } from '../../../../../platform/dialogs/test/common/testDialogService.js';
+import { TestNotificationService } from '../../../../../platform/notification/test/common/testNotificationService.js';
+import { UndoRedoService } from '../../../../../platform/undoRedo/common/undoRedoService.js';
+import { createTextModel } from '../../../../../editor/test/common/testTextModel.js';
 import { AgentSubagentService } from '../../browser/agentSubagentService.js';
 import { ChatThreadService } from '../../browser/chatThreadService.js';
 import { ToolsService } from '../../browser/toolsService.js';
+import '../../browser/editCodeService.js';
+import { IEditCodeService } from '../../browser/editCodeServiceInterface.js';
 import { assembleProtectedAgentAuthority, createAgentRuntimeTurnSnapshot, createSkillCatalog, skillAdvertisement } from '../../common/agentSkills.js';
 import { projectAgentConfig, resolveAgentInstructions, stableAgentInstructionRevision } from '../../common/agentInstructions.js';
 import { assertCanonicalAgentChildRawUri, readOnlyChildToolNames } from '../../common/agentSubagents.js';
-import { availableTools } from '../../common/prompt/prompts.js';
+import { availableTools, captureParentModelToolSnapshot } from '../../common/prompt/prompts.js';
+import { IMCPService } from '../../common/mcpService.js';
 
 const bytes = (value: string) => new TextEncoder().encode(value);
 const skillText = (name: string) => `---\nname: ${name}\ndescription: ${name}\n---\nbody-${name}`;
-const instructions = (owner = 'file:///workspace') => {
-	const config = projectAgentConfig({ developerInstructions: 'developer' }, undefined, [{ uri: 'file:///home/.codex/config.toml', scope: 'user', status: 'loaded', projectedKeys: ['developer_instructions'] }], owner, owner);
+const instructions = (owner = 'file:///workspace', limits?: { maxAcceptedChildren?: number; maxConcurrentThreadsPerSession?: number; maxDepth?: number }) => {
+	const projectedKeys: any[] = ['developer_instructions']; if (limits) projectedKeys.push('agents'); if (limits?.maxAcceptedChildren !== undefined) projectedKeys.push('agents.max_accepted_children'); if (limits?.maxConcurrentThreadsPerSession !== undefined) projectedKeys.push('agents.max_concurrent_threads_per_session'); if (limits?.maxDepth !== undefined) projectedKeys.push('agents.max_depth');
+	const config = projectAgentConfig({ developerInstructions: 'developer', ...(limits?.maxAcceptedChildren === undefined ? {} : { agentMaxAcceptedChildren: limits.maxAcceptedChildren }), ...(limits?.maxConcurrentThreadsPerSession === undefined ? {} : { agentMaxConcurrentThreadsPerSession: limits.maxConcurrentThreadsPerSession }), ...(limits?.maxDepth === undefined ? {} : { agentMaxDepth: limits.maxDepth }) }, undefined, [{ uri: 'file:///home/.codex/config.toml', scope: 'user', status: 'loaded', projectedKeys }], owner, owner);
 	const candidates = [{ uri: URI.joinPath(URI.parse(owner), 'AGENTS.md').toString(), outcome: Object.freeze({ status: 'bytes' as const, bytes: bytes('agents') }) }];
 	return resolveAgentInstructions(config, candidates, stableAgentInstructionRevision(config, candidates));
 };
@@ -19,9 +29,9 @@ const catalog = (owner = 'file:///workspace') => {
 	const root = URI.joinPath(URI.parse(owner), '.agents/skills');
 	return createSkillCatalog(['demo', 'other'].map((name, rank) => ({ source: 'repository' as const, rank, root: root.toString(), skillRoot: URI.joinPath(root, name).toString(), directoryName: name, bytes: bytes(skillText(name)) })));
 };
-const snapshot = (selected: string[] = [], owner = 'file:///workspace', modelName = 'gpt-4.1') => {
+const snapshot = (selected: string[] = [], owner = 'file:///workspace', modelName = 'gpt-4.1', limits?: { maxAcceptedChildren?: number; maxConcurrentThreadsPerSession?: number; maxDepth?: number }) => {
 	const value = catalog(owner);
-	return createAgentRuntimeTurnSnapshot(instructions(owner), value, skillAdvertisement(value, 10_000), selected.map(identity => { const skill = value.skills.find(item => item.identity === identity)!; return { identity, skillRoot: skill.provenance.skillRoot, bodyRevision: skill.bodyRevision, body: skillText(identity) }; }), { hasModel: true, providerName: 'openAI', modelName, contextWindow: 10_000, reservedOutputTokens: 1_000, modelSelectionOptions: { reasoningEnabled: true }, selectedModelOverrides: { temperature: .2 } }, true);
+	return createAgentRuntimeTurnSnapshot(instructions(owner, limits), value, skillAdvertisement(value, 10_000), selected.map(identity => { const skill = value.skills.find(item => item.identity === identity)!; return { identity, skillRoot: skill.provenance.skillRoot, bodyRevision: skill.bodyRevision, body: skillText(identity) }; }), { hasModel: true, providerName: 'openAI', modelName, contextWindow: 10_000, reservedOutputTokens: 1_000, modelSelectionOptions: { reasoningEnabled: true }, selectedModelOverrides: { temperature: .2 } }, true);
 };
 
 type FixtureOverrides = {
@@ -29,6 +39,7 @@ type FixtureOverrides = {
 	trusted?: boolean;
 	liveSettings?: any;
 	readSkillBody?: (root: string, revision: string) => Promise<any>;
+	readSkillResource?: (selection: any, path: string, options: any) => Promise<any>;
 	resolve?: (uri: URI) => Promise<any>;
 	prepare?: (options: any) => Promise<any>;
 	send?: (options: any, turn: number) => string | null;
@@ -36,6 +47,7 @@ type FixtureOverrides = {
 	stringOfResult?: (name: string, params: any, result: any, context: any) => string;
 	customCatalog?: any;
 	settingsState?: any;
+	broker?: any;
 };
 const fixture = (overrides: FixtureOverrides = {}) => {
 	const providerCalls: any[] = [];
@@ -47,10 +59,11 @@ const fixture = (overrides: FixtureOverrides = {}) => {
 	let owner = overrides.owner ?? 'file:///workspace';
 	let trusted = overrides.trusted ?? true;
 	const liveSettings = overrides.liveSettings ?? { openAI: { apiKey: 'captured-key', endpoint: 'https://captured.invalid', models: [] } };
+	const requests = new Map<string, any[]>();
 	const llm: any = {
 		captureSettingsOfProvider: () => JSON.parse(JSON.stringify(liveSettings)),
-		sendLLMMessage(options: any) { providerCalls.push(options); return overrides.send?.(options, providerCalls.length) ?? `request-${providerCalls.length}`; },
-		abort() { aborts++; },
+		sendLLMMessage(options: any) { providerCalls.push(options); const request = overrides.send?.(options, providerCalls.length) ?? `request-${providerCalls.length}`; if (request) { const values = requests.get(request) ?? []; values.push(options); requests.set(request, values); } return request; },
+		abort(request?: string) { aborts++; requests.get(request ?? '')?.shift()?.onAbort(); },
 	};
 	const parseParams = (name: string, raw: any) => ({ ...raw, ...(typeof raw.uri === 'string' ? { uri: URI.parse(raw.uri) } : {}), ...(typeof raw.search_in_folder === 'string' ? { searchInFolder: raw.search_in_folder === '' ? null : URI.parse(raw.search_in_folder) } : {}), ...(name === 'search_pathnames_only' ? { includePattern: raw.include_pattern ?? null, pageNumber: raw.page_number ?? 1 } : {}), ...(name === 'search_for_files' ? { isRegex: raw.is_regex ?? false, pageNumber: raw.page_number ?? 1 } : {}), ...(name === 'search_in_file' ? { isRegex: raw.is_regex ?? false } : {}) });
 	const names = ['read_file', 'ls_dir', 'search_pathnames_only', 'search_for_files', 'search_in_file'];
@@ -67,30 +80,155 @@ const fixture = (overrides: FixtureOverrides = {}) => {
 	const workspace: any = { getWorkspace: () => ({ folders: [{ uri: URI.parse(owner) }] }) };
 	const trust: any = { isWorkspaceTrusted: () => trusted };
 	const converter: any = { prepareLLMChatMessages: async (options: any) => { converterCalls.push({ ...options, chatMessages: options.chatMessages.map((message: any) => ({ ...message })) }); return overrides.prepare?.(options) ?? { messages: [{ role: 'user', content: 'prepared' }], separateSystemMessage: 'protected' }; } };
-	const skills: any = { readSkillBody: overrides.readSkillBody ?? (async (root: string) => ({ body: skillText(root.endsWith('/other') ? 'other' : 'demo') })) };
+	const skills: any = { readSkillBody: overrides.readSkillBody ?? (async (root: string) => ({ body: skillText(root.endsWith('/other') ? 'other' : 'demo') })), readSkillResource: overrides.readSkillResource ?? (async () => ({ body: '' })) };
 	const customAgents: any = { getCatalog: async () => overrides.customCatalog ?? ({ revision: 'empty', agents: [], diagnostics: [] }) };
 	const settings: any = { state: overrides.settingsState ?? { settingsOfProvider: liveSettings, optionsOfModelSelection: { Chat: { openAI: {} } }, overridesOfModel: {} } };
+	const broker = overrides.broker ?? { execute: async () => ({ ok: true as const, content: 'brokered' }), async cancel() { } };
 	const service = new AgentSubagentService(llm, tools, file, workspace, trust, converter, skills, customAgents, settings);
 	service.onDidChangeRun(event => events.push(event));
-	return { service, customAgents, settings, providerCalls, converterCalls, toolCalls, invalidations, events, liveSettings, setOwner: (value: string) => owner = value, setTrusted: (value: boolean) => trusted = value, aborts: () => aborts };
+	return { service, customAgents, settings, broker, providerCalls, converterCalls, toolCalls, invalidations, events, liveSettings, setOwner: (value: string) => owner = value, setTrusted: (value: boolean) => trusted = value, aborts: () => aborts };
 };
 const final = (options: any, text = 'done') => queueMicrotask(() => options.onFinalMessage({ fullText: text, fullReasoning: '', anthropicReasoning: null }));
 const toolThenFinal = (tool: { id: string; name: string; rawParams: Record<string, unknown> }) => (options: any, turn: number) => { queueMicrotask(() => turn === 1 ? options.onFinalMessage({ fullText: 'tool', fullReasoning: '', anthropicReasoning: null, toolCall: tool }) : options.onFinalMessage({ fullText: 'done', fullReasoning: '', anthropicReasoning: null })); return `request-${turn}`; };
+const bindManualApproval = (receiver: any) => {
+	receiver._childToolApprovals = new Map(); receiver._onDidChangeChildToolApprovals = { fire() { } };
+	for (const name of ['_awaitChildToolApproval', '_cancelChildToolApproval', '_cancelChildToolApprovalsForParent', '_decideChildToolApproval', 'approveChildToolApproval', 'rejectChildToolApproval', 'getChildToolApprovals'] as const) receiver[name] = (...args: any[]) => (ChatThreadService.prototype as any)[name].call(receiver, ...args);
+};
 
 suite('Void AgentSubagentService', () => {
-	test('bridges named Agent admission through the real control dispatcher into one Child Run lifecycle', async () => {
-		const role: any = { identity: 'reader', name: 'reader', description: 'Read.', developerInstructions: 'role developer', model: 'o4-mini', modelReasoningEffort: 'medium', revision: 'role-1', skillRules: [{ selector: 'demo', enabled: true }] };
-		const roles: any = { revision: 'roles-1', agents: [role], diagnostics: [] }; const f = fixture({ liveSettings: { openAI: { apiKey: 'captured-key', endpoint: 'https://captured.invalid', _didFillInProviderSettings: true, models: [{ modelName: 'gpt-4.1', isHidden: false, type: 'default' }, { modelName: 'o4-mini', isHidden: false, type: 'default' }] } }, customCatalog: roles, send: () => 'request' });
+	test('broker cancellation before write preparation settles without a mutation', async () => {
+		const runtime = snapshot(); const parentTools = captureParentModelToolSnapshot('agent', [], true); const authority: any = Object.freeze({ allowed: true, generation: 4, runtimeSnapshot: runtime, parentTools, autoApprove: Object.freeze({ edits: true, terminal: true, mcp: true }) });
+		let prepared = 0, executed = 0, releasePrepare!: (value: any) => void; const prepare = new Promise<any>(resolve => releasePrepare = resolve);
+		const receiver: any = { state: { allThreads: { parent: { messages: [], state: {}, filesWithUserChanges: new Set() } } }, _instructionTurnOfThread: new Map([['parent', runtime]]), _agentDelegationAuthorityOfThread: new Map([['parent', authority]]), _agentControlGeneration: new Map([['parent', 4]]), _workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: URI.parse('file:///workspace') }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => true }, _mcpService: { getMCPTools: () => [], callMCPTool() { throw new Error('must_not_run'); }, stringifyResult: () => '' }, _toolsService: { validateParams: { write_file: (raw: any) => raw }, prepareWriteFile: async () => { prepared++; return prepare; }, stringOfResult: { write_file: () => 'written' } } };
+		const broker = (ChatThreadService.prototype as any)._createAgentSubagentToolBroker.call(receiver, 'parent', authority);
+		const write = parentTools.tools.find(tool => tool.name === 'write_file')!; const request: any = Object.freeze({ parentId: 'parent', generation: 4, childId: 'child', toolId: 'write', name: 'write_file', tool: write, rawParams: Object.freeze({ uri: 'file:///workspace/a', content: 'gamma' }), snapshotRevision: parentTools.revision, maxReadOutputTokens: 10, cancellationToken: { isCancellationRequested: false } });
+		const pending = broker.execute(request); await Promise.resolve(); const acknowledgement = broker.cancel(request); let acknowledged = false; void acknowledgement.then(() => acknowledged = true); await Promise.resolve(); assert.strictEqual(prepared, 1); assert.strictEqual(acknowledged, false); releasePrepare({ execute: async () => { executed++; return {}; } }); assert.strictEqual((await pending).ok, false); await acknowledgement; assert.strictEqual(executed, 0, 'cancellation before execute must create no mutation or Undo element');
+	});
+
+	test('broker rejects invalid frozen builtin params before publishing approval', async () => {
+		const runtime = snapshot(); const parentTools = captureParentModelToolSnapshot('agent', [], true); const authority: any = Object.freeze({ allowed: true, generation: 4, runtimeSnapshot: runtime, parentTools, autoApprove: Object.freeze({ edits: false, terminal: false, mcp: false }) });
+		let validations = 0, prepared = 0;
+		const receiver: any = { state: { allThreads: { parent: { messages: [], state: {}, filesWithUserChanges: new Set() } } }, _instructionTurnOfThread: new Map([['parent', runtime]]), _agentDelegationAuthorityOfThread: new Map([['parent', authority]]), _agentControlGeneration: new Map([['parent', 4]]), _workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: URI.parse('file:///workspace') }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => true }, _mcpService: { getMCPTools: () => [], stringifyResult: () => '' }, _toolsService: { validateParams: { write_file: () => { validations++; throw new Error('invalid write'); } }, prepareWriteFile: async () => { prepared++; return undefined; }, stringOfResult: { write_file: () => '' } } };
+		const broker = (ChatThreadService.prototype as any)._createAgentSubagentToolBroker.call(receiver, 'parent', authority);
+		const write = parentTools.tools.find(tool => tool.name === 'write_file')!; const request: any = Object.freeze({ parentId: 'parent', generation: 4, childId: 'child', toolId: 'write-invalid', name: 'write_file', tool: write, rawParams: Object.freeze({}), snapshotRevision: parentTools.revision, maxReadOutputTokens: 10, cancellationToken: { isCancellationRequested: false } });
+		assert.deepStrictEqual(await broker.execute(request), { ok: false, error: 'invalid_params' }); assert.strictEqual(validations, 1); assert.strictEqual(prepared, 0);
+	});
+
+	test('broker manually approves or rejects validated edit, terminal, and MCP calls exactly once', async () => {
+		const runtime = snapshot(); const mcp = { name: 'captured_mcp', description: 'Captured.', mcpServerName: 'server-a', params: {}, schema: { type: 'object' } }; const parentTools = captureParentModelToolSnapshot('agent', [mcp], true); const authority: any = Object.freeze({ allowed: true, generation: 4, runtimeSnapshot: runtime, parentTools, autoApprove: Object.freeze({ edits: false, terminal: false, mcp: false }) });
+		const validations: string[] = []; let writes = 0, terminals = 0, mcpCalls = 0;
+		const receiver: any = { state: { allThreads: { parent: { messages: [], state: {}, filesWithUserChanges: new Set() } } }, _instructionTurnOfThread: new Map([['parent', runtime]]), _agentDelegationAuthorityOfThread: new Map([['parent', authority]]), _agentControlGeneration: new Map([['parent', 4]]), _workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: URI.parse('file:///workspace') }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => true }, _mcpService: { getMCPTools: () => [mcp], async callMCPTool() { mcpCalls++; return { result: { ok: true } }; }, stringifyResult: () => 'mcp-result' }, _toolsService: { validateParams: { write_file: (raw: any) => { validations.push('write'); return raw; }, run_command: (raw: any) => { validations.push('terminal'); return raw; } }, prepareWriteFile: async () => ({ execute: async () => { writes++; return {}; } }), callTool: { run_command: async () => { terminals++; return { result: {} }; } }, stringOfResult: { write_file: () => '', run_command: () => 'terminal-result' } } };
+		bindManualApproval(receiver); const broker = (ChatThreadService.prototype as any)._createAgentSubagentToolBroker.call(receiver, 'parent', authority); const request = (name: string, toolId: string, rawParams: any) => Object.freeze({ parentId: 'parent', generation: 4, childId: 'child', toolId, name, tool: parentTools.tools.find(tool => tool.name === name)!, rawParams: Object.freeze(rawParams), snapshotRevision: parentTools.revision, maxReadOutputTokens: 10, cancellationToken: { isCancellationRequested: false } });
+		for (const item of [request('write_file', 'write', { uri: 'file:///workspace/a', content: 'x' }), request('run_command', 'terminal', { command: 'dir' }), request('captured_mcp', 'mcp', {})]) { const pending = broker.execute(item); await Promise.resolve(); const approval = [...receiver._childToolApprovals.values()][0].view; assert.strictEqual(receiver.rejectChildToolApproval(approval.key), true); assert.strictEqual(receiver.rejectChildToolApproval(approval.key), false); assert.deepStrictEqual(await pending, { ok: false, error: 'rejected' }); }
+		const approved = request('write_file', 'write-approved', { uri: 'file:///workspace/a', content: 'x' }); const approvedPending = broker.execute(approved); await Promise.resolve(); const approval = [...receiver._childToolApprovals.values()][0].view; assert.strictEqual(receiver.approveChildToolApproval(approval.key), true); assert.deepStrictEqual((await approvedPending).ok, true); assert.strictEqual(receiver.approveChildToolApproval(approval.key), false);
+		for (const item of [request('run_command', 'terminal-approved', { command: 'dir' }), request('captured_mcp', 'mcp-approved', {})]) { const pending = broker.execute(item); await Promise.resolve(); const view = [...receiver._childToolApprovals.values()][0].view; assert.strictEqual(receiver.approveChildToolApproval(view.key), true); assert.strictEqual((await pending).ok, true); }
+		assert.deepStrictEqual(validations, ['write', 'terminal', 'write', 'terminal']); assert.strictEqual(writes, 1); assert.strictEqual(terminals, 1); assert.strictEqual(mcpCalls, 1);
+	});
+
+	test('manual approval is frozen per turn, survives task switching, and cancellation or revocation removes it', async () => {
+		const runtime = snapshot(); const parentTools = captureParentModelToolSnapshot('agent', [], true); const liveAutoApprove = { edits: false, terminal: false, mcp: false }; const authority: any = Object.freeze({ allowed: true, generation: 4, runtimeSnapshot: runtime, parentTools, autoApprove: Object.freeze({ ...liveAutoApprove }) }); let terminals = 0;
+		const receiver: any = { state: { allThreads: { parent: { messages: [], state: {}, filesWithUserChanges: new Set() }, other: { messages: [], state: {}, filesWithUserChanges: new Set() } }, currentThreadId: 'parent' }, _setState(value: any) { this.state = { ...this.state, ...value }; }, _instructionTurnOfThread: new Map([['parent', runtime]]), _agentDelegationAuthorityOfThread: new Map([['parent', authority]]), _agentControlGeneration: new Map([['parent', 4]]), _workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: URI.parse('file:///workspace') }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => true }, _mcpService: { getMCPTools: () => [], stringifyResult: () => '' }, _toolsService: { validateParams: { run_command: (raw: any) => raw }, callTool: { run_command: async () => { terminals++; return { result: {} }; } }, stringOfResult: { run_command: () => 'done' } }, _agentSubagentService: { cancelParent() { }, forgetParent() { } } };
+		bindManualApproval(receiver); const broker = (ChatThreadService.prototype as any)._createAgentSubagentToolBroker.call(receiver, 'parent', authority); const tool = parentTools.tools.find(tool => tool.name === 'run_command')!; const request = (toolId: string): any => Object.freeze({ parentId: 'parent', generation: 4, childId: 'child', toolId, name: 'run_command', tool, rawParams: Object.freeze({ command: 'dir' }), snapshotRevision: parentTools.revision, maxReadOutputTokens: 10, cancellationToken: { isCancellationRequested: false } });
+		const pending = broker.execute(request('frozen-manual')); await Promise.resolve(); liveAutoApprove.terminal = true; assert.strictEqual(receiver.getChildToolApprovals('parent').length, 1); assert.strictEqual(receiver.getChildToolApprovals('other').length, 0); (ChatThreadService.prototype as any).switchToThread.call(receiver, 'other'); assert.strictEqual(receiver.state.currentThreadId, 'other'); assert.strictEqual(receiver.getChildToolApprovals('parent').length, 1); const cancellation = broker.cancel(request('frozen-manual')); assert.deepStrictEqual(await pending, { ok: false, error: 'cancelled' }); await cancellation; assert.strictEqual(receiver.getChildToolApprovals('parent').length, 0); assert.strictEqual(terminals, 0);
+		const pendingRevoked = broker.execute(request('revoked')); await Promise.resolve(); assert.strictEqual(receiver.getChildToolApprovals('parent').length, 1); (ChatThreadService.prototype as any)._revokeAgentDelegation.call(receiver, 'parent'); assert.deepStrictEqual(await pendingRevoked, { ok: false, error: 'cancelled' }); assert.strictEqual(receiver.getChildToolApprovals('parent').length, 0);
+		const autoAuthority: any = Object.freeze({ ...authority, generation: 6, autoApprove: Object.freeze({ edits: false, terminal: true, mcp: false }) }); receiver._instructionTurnOfThread.set('parent', runtime); receiver._agentDelegationAuthorityOfThread.set('parent', autoAuthority); receiver._agentControlGeneration.set('parent', 6); liveAutoApprove.terminal = false; const autoBroker = (ChatThreadService.prototype as any)._createAgentSubagentToolBroker.call(receiver, 'parent', autoAuthority); const autoRequest: any = Object.freeze({ ...request('auto'), generation: 6 }); assert.strictEqual((await autoBroker.execute(autoRequest)).ok, true); assert.strictEqual(receiver.getChildToolApprovals('parent').length, 0); assert.strictEqual(terminals, 1);
+	});
+
+	test('broker rejects concurrent and settled exact replay with one terminal side effect and interrupt', async () => {
+		const runtime = snapshot(); const parentTools = captureParentModelToolSnapshot('agent', [], true); const authority: any = Object.freeze({ allowed: true, generation: 4, runtimeSnapshot: runtime, parentTools, autoApprove: Object.freeze({ edits: true, terminal: true, mcp: true }) });
+		let calls = 0, interrupts = 0, release!: (value: unknown) => void; const result = new Promise<unknown>(resolve => release = resolve);
+		const receiver: any = { state: { allThreads: { parent: { messages: [], state: {}, filesWithUserChanges: new Set() } } }, _instructionTurnOfThread: new Map([['parent', runtime]]), _agentDelegationAuthorityOfThread: new Map([['parent', authority]]), _agentControlGeneration: new Map([['parent', 4]]), _workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: URI.parse('file:///workspace') }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => true }, _mcpService: { getMCPTools: () => [], stringifyResult: () => '' }, _toolsService: { validateParams: { run_command: (raw: any) => raw }, callTool: { run_command: async () => { calls++; return { result, interruptTool: () => { interrupts++; } }; } }, stringOfResult: { run_command: () => 'done' } } };
+		const broker = (ChatThreadService.prototype as any)._createAgentSubagentToolBroker.call(receiver, 'parent', authority); const tool = parentTools.tools.find(tool => tool.name === 'run_command')!; const request = (raw: any = {}) => Object.freeze({ parentId: 'parent', generation: 4, childId: 'child', toolId: 'same-tool', name: 'run_command', tool, rawParams: Object.freeze(raw), snapshotRevision: parentTools.revision, maxReadOutputTokens: 10, cancellationToken: { isCancellationRequested: false } });
+		const first = broker.execute(request()); await Promise.resolve(); assert.deepStrictEqual(await broker.execute(request()), { ok: false, error: 'tool_replayed' }); assert.strictEqual(calls, 1);
+		const cancelled = broker.cancel(request()); await Promise.resolve(); assert.strictEqual(interrupts, 1); release({}); assert.deepStrictEqual(await first, { ok: false, error: 'cancelled' }); await cancelled;
+		assert.deepStrictEqual(await broker.execute(request()), { ok: false, error: 'tool_replayed' }); assert.strictEqual(calls, 1); assert.strictEqual(interrupts, 1);
+	});
+
+	test('broker terminal cancellation interrupts exactly once and acknowledges only after its result settles', async () => {
+		const runtime = snapshot(); const parentTools = captureParentModelToolSnapshot('agent', [], true); const authority: any = Object.freeze({ allowed: true, generation: 4, runtimeSnapshot: runtime, parentTools, autoApprove: Object.freeze({ edits: true, terminal: true, mcp: true }) });
+		let interrupts = 0, release!: (value: unknown) => void; const result = new Promise<unknown>(resolve => release = resolve);
+		const receiver: any = { state: { allThreads: { parent: { messages: [], state: {}, filesWithUserChanges: new Set() } } }, _instructionTurnOfThread: new Map([['parent', runtime]]), _agentDelegationAuthorityOfThread: new Map([['parent', authority]]), _agentControlGeneration: new Map([['parent', 4]]), _workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: URI.parse('file:///workspace') }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => true }, _mcpService: { getMCPTools: () => [], stringifyResult: () => '' }, _toolsService: { validateParams: { run_command: (raw: any) => raw }, callTool: { run_command: async () => ({ result, interruptTool: () => { interrupts++; } }) }, stringOfResult: { run_command: () => 'done' } } };
+		const broker = (ChatThreadService.prototype as any)._createAgentSubagentToolBroker.call(receiver, 'parent', authority); const tool = parentTools.tools.find(tool => tool.name === 'run_command')!; const request: any = Object.freeze({ parentId: 'parent', generation: 4, childId: 'child', toolId: 'terminal', name: 'run_command', tool, rawParams: Object.freeze({ command: 'dir' }), snapshotRevision: parentTools.revision, maxReadOutputTokens: 10, cancellationToken: { isCancellationRequested: false } });
+		const pending = broker.execute(request); await Promise.resolve(); const acknowledgement = broker.cancel(request); let acknowledged = false; void acknowledgement.then(() => acknowledged = true); await Promise.resolve(); assert.strictEqual(interrupts, 1); assert.strictEqual(acknowledged, false); release({}); assert.deepStrictEqual(await pending, { ok: false, error: 'cancelled' }); await acknowledgement; assert.strictEqual(interrupts, 1);
+	});
+
+	test('broker MCP cancellation acknowledges only after the MCP settlement and fences its late result', async () => {
+		const runtime = snapshot(); const mcp = { name: 'captured_mcp', description: 'Captured.', mcpServerName: 'server-a', params: {}, schema: { type: 'object' } }; const parentTools = captureParentModelToolSnapshot('agent', [mcp], true); const authority: any = Object.freeze({ allowed: true, generation: 4, runtimeSnapshot: runtime, parentTools, autoApprove: Object.freeze({ edits: true, terminal: true, mcp: true }) });
+		let release!: (value: any) => void; const settlement = new Promise<any>(resolve => release = resolve);
+		const receiver: any = { state: { allThreads: { parent: { messages: [], state: {}, filesWithUserChanges: new Set() } } }, _instructionTurnOfThread: new Map([['parent', runtime]]), _agentDelegationAuthorityOfThread: new Map([['parent', authority]]), _agentControlGeneration: new Map([['parent', 4]]), _workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: URI.parse('file:///workspace') }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => true }, _mcpService: { getMCPTools: () => [mcp], callMCPTool: () => settlement, stringifyResult: () => 'late' }, _toolsService: { validateParams: {}, callTool: {}, stringOfResult: {} } };
+		const broker = (ChatThreadService.prototype as any)._createAgentSubagentToolBroker.call(receiver, 'parent', authority); const tool = parentTools.tools.find(tool => tool.name === 'captured_mcp')!; const request: any = Object.freeze({ parentId: 'parent', generation: 4, childId: 'child', toolId: 'mcp', name: 'captured_mcp', tool, rawParams: Object.freeze({}), snapshotRevision: parentTools.revision, maxReadOutputTokens: 10, cancellationToken: { isCancellationRequested: false } });
+		const pending = broker.execute(request); await Promise.resolve(); const acknowledgement = broker.cancel(request); let acknowledged = false; void acknowledgement.then(() => acknowledged = true); await Promise.resolve(); assert.strictEqual(acknowledged, false); release({ result: { ok: true } }); assert.deepStrictEqual(await pending, { ok: false, error: 'cancelled' }); await acknowledgement;
+	});
+
+	test('MCPService.getMCPTools preserves the exact production inputSchema for a captured child tool', () => {
+		const descriptor = getSingletonServiceDescriptors().find(([id]) => id === IMCPService)?.[1];
+		assert.ok(descriptor, 'MCP service must be registered before its production schema can be captured');
+		const mcp = Object.create(descriptor.ctor.prototype) as { state: any; getMCPTools(): any[] | undefined };
+		const schema = Object.freeze({ type: 'object', properties: { exact: { type: 'string', description: 'Do not widen.' } }, required: ['exact'], additionalProperties: false });
+		mcp.state = { mcpServerOfName: { 'server-a': { tools: [{ name: 'schema_mcp', description: 'Schema.', inputSchema: schema }] } }, error: undefined };
+		const tools = mcp.getMCPTools();
+		assert.ok(tools);
+		const parentTools = captureParentModelToolSnapshot('agent', tools, true);
+		const entry = parentTools.tools.find(tool => tool.name === 'schema_mcp')!;
+		assert.strictEqual(tools![0].schema, schema); assert.deepStrictEqual(entry.schema, schema); assert.strictEqual(entry.kind, 'mcp'); assert.strictEqual(entry.mcpServerName, 'server-a');
+	});
+
+	test('real child write_file broker uses a child receipt, editor transaction, save, and one Undo element', async () => {
+		const uri = URI.parse('file:///workspace/note.txt');
+		const model = createTextModel('alpha\nbeta', null, undefined, uri);
+		const undoRedo = new UndoRedoService(new TestDialogService(), new TestNotificationService());
+		const saved: Uint8Array[] = [];
+		const voidModels: any = {
+			initializeModel: async () => { }, getModelSafe: async () => ({ model }), getModel: () => ({ model }),
+			saveModel: async () => { saved.push(new TextEncoder().encode(model.getValue())); },
+		};
+		const editDescriptor = getSingletonServiceDescriptors().find(([id]) => id === IEditCodeService)?.[1];
+		assert.ok(editDescriptor, 'editCodeService side-effect registration must be loaded');
+		const editCode = new editDescriptor.ctor(
+			{ listCodeEditors: () => [], onCodeEditorAdd: Event.None }, { getModels: () => [model], onModelAdded: Event.None }, undoRedo,
+			{}, { addConsistentItemToURI: () => 'none', removeConsistentItemFromURI: () => { } }, { createInstance: () => ({}), invokeFunction: () => undefined },
+			{ addToEditor: () => 'none', removeFromEditor: () => { } }, { capture: () => { } }, new TestNotificationService(),
+			{ state: { globalSettings: { autoAcceptLLMChanges: false } } }, voidModels, {},
+		);
+		const safeFile: any = { resolve: async (value: URI) => ({ resource: value, isSymbolicLink: false, isDirectory: true }), stat: async (value: URI) => ({ resource: value, isSymbolicLink: false, size: model.getValueLength() }) };
+		const tools = new ToolsService(safeFile, { getWorkspace: () => ({ folders: [{ uri: URI.parse('file:///workspace') }] }) } as never, {} as never, { createInstance: () => ({}) } as never, voidModels, { state: { globalSettings: {} } } as never, editCode, {} as never, { getStreamState: () => undefined } as never, {} as never, { read: () => [] } as never);
+		const childContext: any = { ownerThreadId: 'child', childId: 'child', ownerRoot: URI.parse('file:///workspace'), maxReadOutputTokens: 1024, maxFileSize: 1_048_576, maxResults: 100 };
+		const read = await tools.callTool.read_file({ uri, startLine: 1, endLine: null, lineByteOffset: 0 }, childContext);
+		const receipt = (await read.result).receipt.id;
+		const params: any = { uri, operation: 'modify', readReceiptId: receipt, edits: [{ oldText: 'beta', newText: 'gamma' }] };
+		await assert.rejects(() => tools.prepareWriteFile(params, 'wrong-parent'), /stale_read/);
+		const runtime = snapshot(); const parentTools = captureParentModelToolSnapshot('agent', [], true);
+		const authority: any = Object.freeze({ allowed: true, generation: 4, runtimeSnapshot: runtime, parentTools, autoApprove: Object.freeze({ edits: false, terminal: false, mcp: false }) });
+		const approvalEvents: number[] = []; const receiver: any = { state: { allThreads: { parent: { messages: [], state: {}, filesWithUserChanges: new Set() } } }, streamState: {}, _instructionTurnOfThread: new Map([['parent', runtime]]), _agentDelegationAuthorityOfThread: new Map([['parent', authority]]), _agentControlGeneration: new Map([['parent', 4]]), _workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: URI.parse('file:///workspace') }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => true }, _mcpService: { getMCPTools: () => [], stringifyResult: () => '' }, _toolsService: tools };
+		bindManualApproval(receiver); receiver._onDidChangeChildToolApprovals = { fire: () => approvalEvents.push(receiver._childToolApprovals.size) };
+		const broker = (ChatThreadService.prototype as any)._createAgentSubagentToolBroker.call(receiver, 'parent', authority);
+		const write = parentTools.tools.find(tool => tool.name === 'write_file')!;
+		const request = (toolId: string): any => Object.freeze({ parentId: 'parent', generation: 4, childId: 'child', toolId, name: 'write_file', tool: write, rawParams: Object.freeze({ uri: uri.toString(), operation: 'modify', read_receipt_id: receipt, edits: [{ old_text: 'beta', new_text: 'gamma' }] }), snapshotRevision: parentTools.revision, maxReadOutputTokens: 1024, cancellationToken: { isCancellationRequested: false } });
+		const rejectedPending = broker.execute(request('write-reject')); await Promise.resolve(); const rejectedView = [...receiver._childToolApprovals.values()][0].view; assert.strictEqual(receiver.rejectChildToolApproval(rejectedView.key), true); assert.strictEqual(receiver.approveChildToolApproval(rejectedView.key), false); assert.deepStrictEqual(await rejectedPending, { ok: false, error: 'rejected' }); assert.strictEqual(model.getValue(), 'alpha\nbeta'); assert.strictEqual(saved.length, 0); assert.strictEqual(undoRedo.getElements(uri).past.length, 0);
+		const pending = broker.execute(request('write-approve')); await Promise.resolve(); const approvalView = [...receiver._childToolApprovals.values()][0].view; for (const field of ['parentId', 'generation', 'childId', 'toolId', 'snapshotRevision'] as const) { const wrong = { ...approvalView.key, [field]: field === 'generation' ? 5 : `${approvalView.key[field]}-wrong` }; assert.strictEqual(receiver.approveChildToolApproval(wrong), false); assert.strictEqual(receiver._childToolApprovals.size, 1); } assert.strictEqual(receiver.approveChildToolApproval(approvalView.key), true); assert.strictEqual(receiver.rejectChildToolApproval(approvalView.key), false); const result = await pending;
+		assert.deepStrictEqual(result, { ok: true, content: JSON.stringify({ operation: 'modify', didChange: true, editCount: 1 }), result: { operation: 'modify', didChange: true, editCount: 1 } });
+		assert.deepStrictEqual(approvalEvents, [1, 0, 1, 0]); assert.strictEqual(receiver.state.allThreads.parent.messages.length, 0); assert.deepStrictEqual(receiver.streamState, {});
+		assert.strictEqual(model.getValue(), 'alpha\ngamma'); assert.deepStrictEqual([...saved.at(-1)!], [...new TextEncoder().encode('alpha\ngamma')]); assert.strictEqual(undoRedo.getElements(uri).past.length, 1);
+		await undoRedo.undo(uri);
+		assert.strictEqual(model.getValue(), 'alpha\nbeta'); assert.deepStrictEqual([...saved.at(-1)!], [...new TextEncoder().encode('alpha\nbeta')]);
+		model.dispose(); editCode.dispose();
+	});
+
+	test('real ChatThread inherited-write spawn routes an auto-approved captured MCP tool without parent contamination', async () => {
+		const role: any = { identity: 'writer', name: 'writer', description: 'Write.', developerInstructions: 'role developer', model: 'o4-mini', modelReasoningEffort: 'medium', capabilityProfile: 'inherit_parent_write', revision: 'role-1', skillRules: [{ selector: 'demo', enabled: true }] };
+		const roles: any = { revision: 'roles-1', agents: [role], diagnostics: [] }; const capturedMcp: any = { name: 'captured_mcp', description: 'Captured mutation.', mcpServerName: 'server-a', params: {}, schema: { type: 'object' } }; let mcpCalls = 0; let releaseMcp!: (value: any) => void; let markMcpCalled!: () => void; const mcpSettlement = new Promise<any>(resolve => releaseMcp = resolve); const mcpCalled = new Promise<void>(resolve => markMcpCalled = resolve);
+		const f = fixture({ liveSettings: { openAI: { apiKey: 'captured-key', endpoint: 'https://captured.invalid', _didFillInProviderSettings: true, models: [{ modelName: 'gpt-4.1', isHidden: false, type: 'default' }, { modelName: 'o4-mini', isHidden: false, type: 'default' }] } }, customCatalog: roles, send: toolThenFinal({ id: 'captured-call', name: 'captured_mcp', rawParams: { change: 'one' } }) });
 		const messages: any[] = []; let admitted: any; let spawned = 0; const thread: any = { messages, state: { stagingSelections: [] }, filesWithUserChanges: new Set<string>() };
-		const receiver: any = { state: { allThreads: { parent: thread }, currentThreadId: 'parent' }, streamState: {}, _agentControlGeneration: new Map(), _agentDelegationAuthorityOfThread: new Map(), _agentInstructionSessionOfThread: new Map(), _instructionTurnOfThread: new Map(), _agentSubagentService: f.service, _agentCustomAgentService: { getCatalog: async () => roles }, _currentModelSelectionProps: () => ({ modelSelection: { providerName: 'openAI', modelName: 'gpt-4.1' }, modelSelectionOptions: {} }), _settingsService: { state: { globalSettings: { chatMode: 'agent' }, settingsOfProvider: f.liveSettings, optionsOfModelSelection: { Chat: { openAI: { 'o4-mini': { reasoningEnabled: true, reasoningEffort: 'medium' } } } }, overridesOfModel: { openAI: { 'gpt-4.1': {}, 'o4-mini': { temperature: .7 } } } } }, _llmMessageService: { captureSettingsOfProvider: () => f.liveSettings }, _beginInstructionTurn: async () => instructions(), _purgeInstructionTurn() { }, _workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: URI.parse('file:///workspace') }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => true }, _agentSkillsService: { getCatalog: async () => catalog(), readSkillBody: async (root: string) => ({ body: skillText(root.endsWith('/other') ? 'other' : 'demo') }) }, _directoryStringService: {}, _fileService: {}, _rememberInstructionTurn() { }, _addMessageToThread: (_: string, message: any) => messages.push(message), _runChatAgent: async ({ agentDelegationAuthority }: any) => { admitted = agentDelegationAuthority; }, _wrapRunAgentToNotify: (promise: Promise<void>) => promise, _toolsService: { invalidateReadReceipts() { }, validateParams: {} }, _mcpService: { getMCPTools: () => [] } };
-		const selection = { type: 'Agent', label: 'Void application-level read-only', agentType: 'reader', catalogRevision: 'roles-1', roleRevision: 'role-1', state: undefined } as const;
+		const receiver: any = { state: { allThreads: { parent: thread }, currentThreadId: 'parent' }, streamState: {}, _agentControlGeneration: new Map(), _agentDelegationAuthorityOfThread: new Map(), _agentInstructionSessionOfThread: new Map(), _instructionTurnOfThread: new Map(), _agentSubagentService: f.service, _revokeAgentDelegation(threadId: string, forget = false) { return (ChatThreadService.prototype as any)._revokeAgentDelegation.call(this, threadId, forget); }, _createAgentSubagentToolBroker(threadId: string, authority: any) { return (ChatThreadService.prototype as any)._createAgentSubagentToolBroker.call(this, threadId, authority); }, _agentCustomAgentService: { getCatalog: async () => roles }, _currentModelSelectionProps: () => ({ modelSelection: { providerName: 'openAI', modelName: 'gpt-4.1' }, modelSelectionOptions: {} }), _settingsService: { state: { globalSettings: { chatMode: 'agent', autoApprove: { 'MCP tools': true } }, settingsOfProvider: f.liveSettings, optionsOfModelSelection: { Chat: { openAI: { 'o4-mini': { reasoningEnabled: true, reasoningEffort: 'medium' } } } }, overridesOfModel: { openAI: { 'gpt-4.1': { specialToolFormat: 'openai-style' }, 'o4-mini': { temperature: .7 } } } } }, _llmMessageService: { captureSettingsOfProvider: () => f.liveSettings }, _beginInstructionTurn: async () => instructions(), _purgeInstructionTurn() { }, _workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: URI.parse('file:///workspace') }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => true }, _agentSkillsService: { getCatalog: async () => catalog(), readSkillBody: async (root: string) => ({ body: skillText(root.endsWith('/other') ? 'other' : 'demo') }) }, _directoryStringService: {}, _fileService: {}, _rememberInstructionTurn(threadId: string, runtimeSnapshot: any) { this._instructionTurnOfThread.set(threadId, runtimeSnapshot); }, _addMessageToThread: (_: string, message: any) => messages.push(message), _runChatAgent: async ({ agentDelegationAuthority }: any) => { admitted = agentDelegationAuthority; }, _wrapRunAgentToNotify: (promise: Promise<void>) => promise, _toolsService: { invalidateReadReceipts() { }, validateParams: {} }, _mcpService: { getMCPTools: () => [capturedMcp], callMCPTool() { mcpCalls++; markMcpCalled(); return mcpSettlement; }, stringifyResult: () => 'captured' } };
+		bindManualApproval(receiver);
+		const selection = { type: 'Agent', label: 'Void application-level read-only', agentType: 'writer', catalogRevision: 'roles-1', roleRevision: 'role-1', state: undefined } as const;
 		await (ChatThreadService.prototype as any)._addUserMessageAndStreamResponse.call(receiver, { userMessage: '$demo inspect', _chatSelections: [selection], threadId: 'parent' });
-		assert.strictEqual(f.service.getRunView('parent'), undefined); assert.ok(messages[0].content.includes('agent_type=reader exactly'));
+		assert.strictEqual(f.service.getRunView('parent'), undefined); assert.strictEqual(admitted?.allowed, true); assert.strictEqual(receiver.streamState.parent?.toolInfo, undefined);
 		const generation = receiver._agentControlGeneration.get('parent'); receiver._agentDelegationAuthorityOfThread.set('parent', admitted);
-		await (ChatThreadService.prototype as any)._runToolCall.call(receiver, 'parent', 'spawn_agent', 'spawn-id', undefined, { preapproved: false, unvalidatedToolParams: { message: '$demo inspect', agent_type: 'reader' } }, snapshot(), admitted);
-		assert.strictEqual(messages.some(message => message.role === 'tool' && (message.type === 'invalid_params' || /agent_delegation_not_authorized/.test(message.content))), false, JSON.stringify(messages)); const child = f.service.getRunView('parent')!; assert.strictEqual(child.roleName, 'reader'); assert.ok(f.events.some(event => event.id === child.id)); assert.strictEqual(f.providerCalls[0].modelSelection.modelName, 'o4-mini'); assert.strictEqual(f.providerCalls[0].modelSelectionOptions.reasoningEffort, 'medium');
+		await (ChatThreadService.prototype as any)._runToolCall.call(receiver, 'parent', 'spawn_agent', 'spawn-id', undefined, { preapproved: false, unvalidatedToolParams: { message: '$demo inspect', agent_type: 'writer' } }, snapshot(), admitted);
+		await Promise.race([mcpCalled, new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('captured_mcp_timeout')), 1_000))]); assert.strictEqual(messages.some(message => message.role === 'tool' && (message.type === 'invalid_params' || /agent_delegation_not_authorized/.test(message.content))), false, JSON.stringify(messages)); const child = f.service.getRunView('parent')!; assert.strictEqual(child.roleName, 'writer'); assert.strictEqual(child.capabilityProfile, 'inherit_parent_write'); assert.ok(f.events.some(event => event.id === child.id)); assert.strictEqual(f.providerCalls[0].modelSelection.modelName, 'o4-mini'); assert.strictEqual(f.providerCalls[0].modelSelectionOptions.reasoningEffort, 'medium'); assert.strictEqual(mcpCalls, 1);
 		await (ChatThreadService.prototype as any)._runToolCall.call(receiver, 'parent', 'wait_agent', 'wait-id', undefined, { preapproved: false, unvalidatedToolParams: { timeout_ms: 0, targets: [child.id] } }, snapshot(), admitted);
-		assert.strictEqual(receiver._agentControlGeneration.get('parent'), generation); await (ChatThreadService.prototype as any)._runToolCall.call(receiver, 'parent', 'interrupt_agent', 'interrupt-id', undefined, { preapproved: false, unvalidatedToolParams: { target: child.id } }, snapshot(), admitted); assert.strictEqual(messages.some(message => message.role === 'tool' && message.type === 'invalid_params'), false, JSON.stringify(messages)); assert.strictEqual(f.service.getRunView('parent')?.status, 'cancelled');
+		assert.strictEqual(receiver._agentControlGeneration.get('parent'), generation); await (ChatThreadService.prototype as any)._runToolCall.call(receiver, 'parent', 'interrupt_agent', 'interrupt-id', undefined, { preapproved: false, unvalidatedToolParams: { target: child.id } }, snapshot(), admitted); releaseMcp({ result: { ok: true } }); await Promise.resolve(); assert.strictEqual(messages.some(message => message.role === 'tool' && message.type === 'invalid_params'), false, JSON.stringify(messages)); assert.strictEqual(f.service.getRunView('parent')?.status, 'cancelled'); assert.strictEqual(receiver.streamState.parent?.toolInfo, undefined); assert.strictEqual(messages.some(message => message.role === 'tool' && message.type === 'tool_request'), false);
 	});
 	test('keeps a bounded local diagnostic timeline separate from model-facing wait results', async () => {
 		const f = fixture({ send: options => { final(options); return 'request'; } }); const changes: any[] = []; f.service.onDidChangeDiagnostics(event => changes.push(event));
@@ -110,16 +248,210 @@ suite('Void AgentSubagentService', () => {
 	test('reserves four admissions, starts two, queues FIFO, and never refunds terminal quota', async () => {
 		const f = fixture({ send: () => 'request' });
 		const children = await Promise.all(['one', 'two', 'three', 'four'].map(message => f.service.spawn('parent', message, snapshot())));
-		assert.strictEqual(f.providerCalls.length, 2); assert.deepStrictEqual(f.service.getRunViews('parent').map(view => view.status), ['running', 'running', 'queued', 'queued']);
+		assert.strictEqual(f.providerCalls.length, 2); assert.deepStrictEqual(f.service.getRunViews('parent').map(view => view.status), ['running', 'running', 'queued', 'queued']); assert.deepStrictEqual(f.service.getBudgetView('parent') && { maxAccepted: f.service.getBudgetView('parent')!.maxAccepted, maxConcurrent: f.service.getBudgetView('parent')!.maxConcurrent }, { maxAccepted: 4, maxConcurrent: 2 });
 		await assert.rejects(() => f.service.spawn('parent', 'five', snapshot()), /agent_child_limit_reached/);
 		f.service.interrupt('parent', children[0].id);
-		await Promise.resolve();
+		await new Promise(resolve => setTimeout(resolve, 0)); // cancellation waits for the aborted provider promise to quiesce before freeing its scheduler slot.
 		assert.strictEqual(f.providerCalls.length, 3); assert.deepStrictEqual(f.service.getRunViews('parent').map(view => view.status), ['cancelled', 'running', 'running', 'queued']);
 		f.service.interrupt('parent', children[1].id);
-		await Promise.resolve();
+		await new Promise(resolve => setTimeout(resolve, 0));
 		assert.strictEqual(f.providerCalls.length, 4); assert.deepStrictEqual(f.service.getRunViews('parent').map(view => view.status), ['cancelled', 'cancelled', 'running', 'running']);
 		assert.deepStrictEqual(f.converterCalls.slice(0, 4).map(call => call.chatMessages[0].content), ['one', 'two', 'three', 'four']);
 		await assert.rejects(() => f.service.spawn('parent', 'still-five', snapshot()), /agent_child_limit_reached/);
+	});
+
+	test('freezes configured child limits per group generation and exposes them in the budget', async () => {
+		const f = fixture({ send: () => 'request' });
+		const one = snapshot([], 'file:///workspace', 'gpt-4.1', { maxAcceptedChildren: 1, maxConcurrentThreadsPerSession: 1, maxDepth: 1 });
+		const eight = snapshot([], 'file:///workspace', 'gpt-4.1', { maxAcceptedChildren: 8, maxConcurrentThreadsPerSession: 4, maxDepth: 2 });
+		await f.service.spawn('configured', 'one', one, undefined, undefined, undefined, undefined, 3);
+		assert.deepStrictEqual(f.service.getBudgetView('configured') && { maxAccepted: f.service.getBudgetView('configured')!.maxAccepted, maxConcurrent: f.service.getBudgetView('configured')!.maxConcurrent }, { maxAccepted: 1, maxConcurrent: 1 });
+		await assert.rejects(() => f.service.spawn('configured', 'live-change-must-not-expand', eight, undefined, undefined, undefined, undefined, 3), /agent_child_limit_reached/);
+		await f.service.spawn('configured', 'new-generation-one', eight, undefined, undefined, undefined, undefined, 4);
+		await Promise.all(['two', 'three', 'four'].map(message => f.service.spawn('configured', message, eight, undefined, undefined, undefined, undefined, 4)));
+		assert.deepStrictEqual(f.service.getBudgetView('configured') && { accepted: f.service.getBudgetView('configured')!.accepted, maxAccepted: f.service.getBudgetView('configured')!.maxAccepted, maxConcurrent: f.service.getBudgetView('configured')!.maxConcurrent }, { accepted: 4, maxAccepted: 8, maxConcurrent: 4 });
+		assert.strictEqual(f.providerCalls.length, 5);
+	});
+
+	test('gates nested child controls by remaining depth while sharing one root group budget', async () => {
+		let calls = 0;
+		const f = fixture({ send: options => { calls++; if (calls === 1) queueMicrotask(() => options.onFinalMessage({ fullText: 'delegate', fullReasoning: '', anthropicReasoning: null, toolCall: { id: 'nested-spawn', name: 'spawn_agent', rawParams: { message: 'grandchild' } } })); else queueMicrotask(() => options.onFinalMessage({ fullText: 'done', fullReasoning: '', anthropicReasoning: null })); return `request-${calls}`; } });
+		await f.service.spawn('depth-two', 'top', snapshot([], 'file:///workspace', 'gpt-4.1', { maxAcceptedChildren: 2, maxConcurrentThreadsPerSession: 2, maxDepth: 2 }));
+		await new Promise(resolve => setTimeout(resolve, 0));
+		const runs = f.service.getRunViews('depth-two'); const top = runs.find(run => run.depth === 1)!; const nested = runs.find(run => run.depth === 2)!;
+		assert.deepStrictEqual({ parentRunId: top.parentRunId, depth: top.depth, remainingDepth: top.remainingDepth }, { parentRunId: undefined, depth: 1, remainingDepth: 1 });
+		assert.deepStrictEqual({ parentRunId: nested.parentRunId, depth: nested.depth, remainingDepth: nested.remainingDepth }, { parentRunId: top.id, depth: 2, remainingDepth: 0 });
+		assert.strictEqual(f.providerCalls.some(call => call.agentDelegationAllowed === true), true); assert.strictEqual(f.providerCalls.some(call => call.agentDelegationAllowed === false), true);
+		assert.strictEqual(f.converterCalls.some(call => call.agentDelegationAllowed === true), true); assert.strictEqual(f.converterCalls.some(call => call.agentDelegationAllowed === false), true);
+		assert.deepStrictEqual(f.service.getBudgetView('depth-two') && { accepted: f.service.getBudgetView('depth-two')!.accepted, maxAccepted: f.service.getBudgetView('depth-two')!.maxAccepted, maxConcurrent: f.service.getBudgetView('depth-two')!.maxConcurrent }, { accepted: 2, maxAccepted: 2, maxConcurrent: 2 });
+		await assert.rejects(() => f.service.wait('depth-two', 0, [nested.id]), /agent_child_not_direct/); assert.throws(() => f.service.interrupt('depth-two', nested.id), /agent_child_not_direct/);
+
+		let depthOneCalls = 0; const shallow = fixture({ send: options => { depthOneCalls++; if (depthOneCalls === 1) queueMicrotask(() => options.onFinalMessage({ fullText: 'deny', fullReasoning: '', anthropicReasoning: null, toolCall: { id: 'denied-spawn', name: 'spawn_agent', rawParams: { message: 'not admitted' } } })); else queueMicrotask(() => options.onFinalMessage({ fullText: 'done', fullReasoning: '', anthropicReasoning: null })); return `request-${depthOneCalls}`; } });
+		await shallow.service.spawn('depth-one', 'top', snapshot([], 'file:///workspace', 'gpt-4.1', { maxAcceptedChildren: 1, maxConcurrentThreadsPerSession: 1, maxDepth: 1 })); await new Promise(resolve => setTimeout(resolve, 0));
+		assert.strictEqual(shallow.service.getRunViews('depth-one').length, 1); assert.strictEqual(shallow.providerCalls.every(call => call.agentDelegationAllowed === false), true); assert.strictEqual(shallow.converterCalls.every(call => call.agentDelegationAllowed === false), true);
+	});
+
+	test('keeps a generic child read-only when the parent captured write-capable tools', async () => {
+		const live = [{ name: 'parent_mcp', description: 'Captured parent MCP.', schema: { type: 'object', properties: { query: { type: 'string', description: 'original' } } }, params: { query: { description: 'query' } }, mcpServerName: 'parent-server' }];
+		const parentTools = captureParentModelToolSnapshot('agent', live, true);
+		const f = fixture({ send: options => { final(options); return 'request'; } });
+		await f.service.spawn('generic-profile', 'inspect', snapshot(), undefined, undefined, undefined, undefined, 0, parentTools);
+		await f.service.wait('generic-profile', 1_000);
+		const view = f.service.getRunView('generic-profile')!;
+		assert.strictEqual(view.capabilityProfile, 'read_only'); assert.strictEqual(view.toolPresentation, undefined);
+		assert.strictEqual(f.converterCalls[0].toolExecutionProfile, 'read-only-child'); assert.strictEqual(f.providerCalls[0].toolExecutionProfile, 'read-only-child');
+		assert.deepStrictEqual(availableTools('agent', undefined, f.providerCalls[0].toolExecutionProfile, false, parentTools)!.map(tool => tool.name), [...readOnlyChildToolNames]);
+	});
+
+	test('uses the exact frozen parent snapshot only for an admitted inherit-parent-write role', async () => {
+		const live = [{ name: 'parent_mcp', description: 'Captured parent MCP.', schema: { type: 'object', properties: { query: { type: 'string', description: 'original' } } }, params: { query: { description: 'query' } }, mcpServerName: 'parent-server' }];
+		const parentTools = captureParentModelToolSnapshot('agent', live, false);
+		const role: any = { identity: 'writer', name: 'writer', description: 'Write with parent authority.', developerInstructions: 'write only through the parent profile', capabilityProfile: 'inherit_parent_write', revision: 'writer-1', skillRules: [] };
+		const roles: any = { revision: 'roles-1', agents: [role], diagnostics: [] };
+		const f = fixture({ customCatalog: roles, send: options => { final(options); return 'request'; } });
+		await f.service.spawn('writer-profile', 'update', snapshot(), 'writer', roles, undefined, undefined, 0, parentTools, f.broker);
+		await f.service.wait('writer-profile', 1_000);
+		const view = f.service.getRunView('writer-profile')!;
+		assert.strictEqual(view.capabilityProfile, 'inherit_parent_write'); assert.deepStrictEqual(view.toolPresentation?.toolNames, parentTools.tools.map(tool => tool.name)); assert.strictEqual(view.toolPresentation?.applicationBoundary, 'no_os_sandbox');
+		assert.strictEqual(f.converterCalls[0].toolExecutionProfile, 'inherited-parent-write-child'); assert.strictEqual(f.converterCalls[0].frozenToolSnapshot, parentTools); assert.strictEqual(f.providerCalls[0].frozenToolSnapshot, parentTools);
+	});
+
+	test('requires the parent broker and routes only a captured inherited tool through its frozen revision', async () => {
+		const live = [{ name: 'captured_mcp', description: 'Captured MCP.', schema: { type: 'object' }, params: {}, mcpServerName: 'captured-server' }]; const parentTools = captureParentModelToolSnapshot('agent', live, false);
+		const role: any = { identity: 'writer', name: 'writer', description: 'Write.', developerInstructions: 'writer', capabilityProfile: 'inherit_parent_write', revision: 'writer-1', skillRules: [] }; const roles: any = { revision: 'roles-1', agents: [role], diagnostics: [] };
+		const denied = fixture({ customCatalog: roles }); await assert.rejects(() => denied.service.spawn('broker-required', 'update', snapshot(), 'writer', roles, undefined, undefined, 0, parentTools), /custom_agent_capability_profile_not_authorized/); assert.strictEqual(denied.providerCalls.length, 0);
+		const seen: any[] = []; const f = fixture({ customCatalog: roles, broker: { execute: async (request: any) => { seen.push(request); return { ok: true, content: 'applied', result: { receipt: 'one' } }; }, async cancel() { } }, send: toolThenFinal({ id: 'captured-call', name: 'captured_mcp', rawParams: { change: 'one' } }) });
+		await f.service.spawn('brokered', 'update', snapshot(), 'writer', roles, undefined, undefined, 0, parentTools, f.broker); await f.service.wait('brokered', 1_000);
+		const captured = parentTools.tools.find(tool => tool.name === 'captured_mcp')!;
+		assert.deepStrictEqual(seen.map(request => ({ name: request.name, snapshotRevision: request.snapshotRevision, childId: typeof request.childId, toolName: request.tool.name, server: request.tool.mcpServerName, revision: request.tool.revision })), [{ name: 'captured_mcp', snapshotRevision: parentTools.revision, childId: 'string', toolName: 'captured_mcp', server: 'captured-server', revision: captured.revision }]); assert.strictEqual(f.converterCalls[1].chatMessages.some((message: any) => message.role === 'tool' && message.content === 'applied'), true);
+	});
+
+	test('serializes mutation-capable children while read-only work continues, including a cancelled deferred broker', async () => {
+		const parentTools = captureParentModelToolSnapshot('agent', [{ name: 'captured_mcp', description: 'Captured MCP.', schema: { type: 'object' }, params: {}, mcpServerName: 'captured-server' }], false);
+		const role: any = { identity: 'writer', name: 'writer', description: 'Write.', developerInstructions: 'writer', capabilityProfile: 'inherit_parent_write', revision: 'writer-1', skillRules: [] }; const roles: any = { revision: 'roles-1', agents: [role], diagnostics: [] };
+		let release!: (value: any) => void; let acknowledge!: () => void; let cancels = 0; const deferred = new Promise<any>(resolve => release = resolve); const cancelAck = new Promise<void>(resolve => acknowledge = resolve);
+		let sends = 0; const f = fixture({ customCatalog: roles, broker: { execute: () => deferred, cancel: async () => { cancels++; await cancelAck; } }, send: options => { sends++; if (sends === 1) queueMicrotask(() => options.onFinalMessage({ fullText: 'write', fullReasoning: '', anthropicReasoning: null, toolCall: { id: 'm1-tool', name: 'captured_mcp', rawParams: {} } })); else if (sends === 2) queueMicrotask(() => options.onFinalMessage({ fullText: 'read done', fullReasoning: '', anthropicReasoning: null })); else queueMicrotask(() => options.onFinalMessage({ fullText: 'write done', fullReasoning: '', anthropicReasoning: null })); return `request-${sends}`; } });
+		const limits = { maxAcceptedChildren: 3, maxConcurrentThreadsPerSession: 2, maxDepth: 1 };
+		const m1 = await f.service.spawn('mutation', 'm1', snapshot([], 'file:///workspace', 'gpt-4.1', limits), 'writer', roles, undefined, undefined, 0, parentTools, f.broker);
+		await f.service.spawn('mutation', 'read', snapshot([], 'file:///workspace', 'gpt-4.1', limits));
+		const m2 = await f.service.spawn('mutation', 'm2', snapshot([], 'file:///workspace', 'gpt-4.1', limits), 'writer', roles, undefined, undefined, 0, parentTools, f.broker);
+		await new Promise(resolve => setTimeout(resolve, 0)); assert.strictEqual(f.providerCalls.length, 2); assert.strictEqual(f.service.getRunViews('mutation').find(run => run.id === m2.id)?.status, 'queued');
+		f.service.interrupt('mutation', m1.id); assert.strictEqual(cancels, 1); assert.strictEqual(f.providerCalls.length, 2); // M2 cannot pass the old generation's broker tombstone.
+		release({ ok: true, content: 'late', result: {} }); await new Promise(resolve => setTimeout(resolve, 0)); assert.strictEqual(f.providerCalls.length, 2); assert.strictEqual(f.service.getRunViews('mutation').find(run => run.id === m1.id)?.status, 'cancelled');
+		acknowledge(); await new Promise(resolve => setTimeout(resolve, 0));
+		assert.strictEqual(f.providerCalls.length, 3); assert.strictEqual(f.converterCalls.filter(call => call.chatMessages.some((message: any) => message.content === 'late')).length, 0); assert.ok(f.service.getBudgetView('mutation')!.running <= 2);
+	});
+
+	test('broker cancellation acknowledgement releases a terminal writer even when execute never settles', async () => {
+		const parentTools = captureParentModelToolSnapshot('agent', [{ name: 'captured_mcp', description: 'Captured MCP.', schema: { type: 'object' }, params: {}, mcpServerName: 'captured-server' }], false);
+		const role: any = { identity: 'writer', name: 'writer', description: 'Write.', developerInstructions: 'writer', capabilityProfile: 'inherit_parent_write', revision: 'writer-1', skillRules: [] }; const roles: any = { revision: 'roles-1', agents: [role], diagnostics: [] };
+		let acknowledge!: () => void; const ack = new Promise<void>(resolve => acknowledge = resolve); const never = new Promise<any>(() => { }); let sends = 0;
+		const f = fixture({ customCatalog: roles, broker: { execute: () => never, cancel: () => ack }, send: options => { sends++; queueMicrotask(() => sends === 1 ? options.onFinalMessage({ fullText: 'write', fullReasoning: '', anthropicReasoning: null, toolCall: { id: 'write', name: 'captured_mcp', rawParams: {} } }) : final(options)); return `request-${sends}`; } });
+		const first = await f.service.spawn('ack-generation', 'first', snapshot([], 'file:///workspace', 'gpt-4.1', { maxAcceptedChildren: 2, maxConcurrentThreadsPerSession: 1, maxDepth: 1 }), 'writer', roles, undefined, undefined, 0, parentTools, f.broker);
+		await new Promise(resolve => setTimeout(resolve, 0)); f.service.interrupt('ack-generation', first.id); assert.strictEqual(f.service.getBudgetView('ack-generation')!.running, 0);
+		await f.service.spawn('ack-generation', 'next', snapshot([], 'file:///workspace', 'gpt-4.1', { maxAcceptedChildren: 2, maxConcurrentThreadsPerSession: 1, maxDepth: 1 }), 'writer', roles, undefined, undefined, 1, parentTools, f.broker);
+		await new Promise(resolve => setTimeout(resolve, 0)); assert.strictEqual(sends, 1, 'new generation must remain behind the old mutation tombstone');
+		acknowledge(); await new Promise(resolve => setTimeout(resolve, 0)); assert.strictEqual(sends, 2, 'acknowledgement, not execute settlement, releases the writer lease');
+	});
+
+	test('does not yield a parent scheduler slot for a targetless wait with no direct child', async () => {
+		let sends = 0; const f = fixture({ send: options => { sends++; queueMicrotask(() => sends === 1 ? options.onFinalMessage({ fullText: 'wait', fullReasoning: '', anthropicReasoning: null, toolCall: { id: 'wait', name: 'wait_agent', rawParams: { timeout_ms: 0 } } }) : final(options)); return `request-${sends}`; } });
+		await f.service.spawn('no-direct-wait', 'top', snapshot()); await f.service.wait('no-direct-wait', 1_000);
+		assert.strictEqual(sends, 2); assert.strictEqual(f.service.getRunView('no-direct-wait')?.status, 'completed'); assert.strictEqual(f.service.getRunView('no-direct-wait')?.schedulerActivity, 'quiescing');
+	});
+
+	test('admits empty Skill resources and preserves the prospective read budget before history append', async () => {
+		const parentTools = captureParentModelToolSnapshot('agent', undefined, false);
+		assert.ok(parentTools.tools.some(tool => tool.name === 'read_skill_resource'));
+		const role: any = { identity: 'writer', name: 'writer', description: 'Write.', developerInstructions: 'writer', capabilityProfile: 'inherit_parent_write', revision: 'writer-1', skillRules: [] }; const roles: any = { revision: 'roles-1', agents: [role], diagnostics: [] };
+		const reads: any[] = []; const f = fixture({ customCatalog: roles, readSkillResource: async (_selection, path, options) => { reads.push({ path, options }); return { body: '' }; }, send: toolThenFinal({ id: 'skill-read', name: 'read_skill_resource', rawParams: { skill: 'demo', resource_path: 'README.md' } }) });
+		await f.service.spawn('empty-resource', '$demo read', snapshot(['demo']), 'writer', roles, undefined, undefined, 0, parentTools, f.broker); await f.service.wait('empty-resource', 1_000);
+		assert.strictEqual(reads.length, 1); assert.ok(reads[0].options.maxResourceBytes >= 0); assert.ok(f.converterCalls.some(call => call.chatMessages.some((message: any) => message.role === 'tool' && message.name === 'read_skill_resource' && message.content === '')));
+	});
+
+	test('keeps child Skill-resource failures inside the frozen selected manifest and does not dispatch a broker call', async () => {
+		const parentTools = captureParentModelToolSnapshot('agent', undefined, false);
+		const role: any = { identity: 'writer', name: 'writer', description: 'Write.', developerInstructions: 'writer', capabilityProfile: 'inherit_parent_write', revision: 'writer-1', skillRules: [] }; const roles: any = { revision: 'roles-1', agents: [role], diagnostics: [] };
+		for (const [raw, read, expected] of [
+			[{ skill: 'demo', resource_path: 'a', extra: true }, undefined, 'read_skill_resource_invalid_params'],
+			[{ skill: 'demo', resource_path: '../a' }, undefined, 'skill_resource_outside_root'],
+			[{ skill: 'other', resource_path: 'a' }, undefined, 'skill_not_selected'],
+			[{ skill: 'demo', resource_path: 'a' }, async () => ({ diagnostic: { code: 'skill_stale' } }), 'skill_stale'],
+		] as const) {
+			let brokerCalls = 0; const f = fixture({ customCatalog: roles, ...(read ? { readSkillResource: read as any } : {}), broker: { execute: async () => { brokerCalls++; return { ok: true, content: 'must-not-run' }; }, async cancel() { } }, send: toolThenFinal({ id: 'resource', name: 'read_skill_resource', rawParams: raw as any }) });
+			await f.service.spawn(`resource-${expected}`, '$demo inspect', snapshot(['demo']), 'writer', roles, undefined, undefined, 0, parentTools, f.broker); await f.service.wait(`resource-${expected}`, 1_000);
+			assert.strictEqual(brokerCalls, 0); assert.ok(f.converterCalls.some(call => call.chatMessages.some((message: any) => message.role === 'tool' && message.type === 'tool_error' && message.content === expected)));
+		}
+	});
+
+	test('yields a nested parent wait slot so maxConcurrent one completes without a deadlock', async () => {
+		let sends = 0; const f = fixture({ send: options => { sends++; if (sends === 1) queueMicrotask(() => options.onFinalMessage({ fullText: 'spawn', fullReasoning: '', anthropicReasoning: null, toolCall: { id: 'spawn', name: 'spawn_agent', rawParams: { message: 'child' } } })); else if (sends === 2) queueMicrotask(() => options.onFinalMessage({ fullText: 'wait', fullReasoning: '', anthropicReasoning: null, toolCall: { id: 'wait', name: 'wait_agent', rawParams: { timeout_ms: 1000 } } })); else queueMicrotask(() => options.onFinalMessage({ fullText: 'done', fullReasoning: '', anthropicReasoning: null })); return `request-${sends}`; } });
+		await f.service.spawn('yield', 'top', snapshot([], 'file:///workspace', 'gpt-4.1', { maxAcceptedChildren: 2, maxConcurrentThreadsPerSession: 1, maxDepth: 2 }));
+		const done = await Promise.race([f.service.wait('yield', 1_000), new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('nested_wait_deadlock')), 1_100))]);
+		assert.strictEqual(done.status, 'completed'); assert.strictEqual(f.providerCalls.length, 4); assert.ok(f.service.getBudgetView('yield')!.running <= 1);
+	});
+
+	test('reports waiting and ready scheduler activity while a timed nested wait holds the only active lease', async () => {
+		let sends = 0; let releaseNested!: () => void; const nestedStarted = new Promise<void>(resolve => releaseNested = resolve); let nestedOptions: any;
+		const f = fixture({ send: options => { sends++; if (sends === 1) queueMicrotask(() => options.onFinalMessage({ fullText: 'spawn', fullReasoning: '', anthropicReasoning: null, toolCall: { id: 'spawn', name: 'spawn_agent', rawParams: { message: 'nested' } } })); else if (sends === 2) queueMicrotask(() => options.onFinalMessage({ fullText: 'wait', fullReasoning: '', anthropicReasoning: null, toolCall: { id: 'wait', name: 'wait_agent', rawParams: { timeout_ms: 5 } } })); else if (sends === 3) { nestedOptions = options; releaseNested(); } else queueMicrotask(() => options.onFinalMessage({ fullText: 'parent done', fullReasoning: '', anthropicReasoning: null })); return `request-${sends}`; } });
+		const activities: Array<{ id: string; activity: string | undefined; running: number }> = [];
+		f.service.onDidChangeRun(event => { const view = f.service.getRunViews('scheduler-timeout').find(run => run.id === event.id); activities.push({ id: event.id, activity: view?.schedulerActivity, running: f.service.getBudgetView('scheduler-timeout')?.running ?? -1 }); });
+		await f.service.spawn('scheduler-timeout', 'top', snapshot([], 'file:///workspace', 'gpt-4.1', { maxAcceptedChildren: 2, maxConcurrentThreadsPerSession: 1, maxDepth: 2 }));
+		await nestedStarted;
+		await new Promise(resolve => setTimeout(resolve, 15));
+		const views = f.service.getRunViews('scheduler-timeout'); const parent = views.find(run => run.depth === 1)!; const nested = views.find(run => run.depth === 2)!;
+		assert.ok(activities.some(value => value.id === parent.id && value.activity === 'waiting_children'));
+		assert.ok(activities.some(value => value.id === parent.id && value.activity === 'ready_to_resume' && value.running === 1));
+		assert.strictEqual(f.service.getRunViews('scheduler-timeout').find(run => run.id === nested.id)?.schedulerActivity, 'active'); assert.strictEqual(f.service.getBudgetView('scheduler-timeout')?.running, 1); assert.ok(activities.every(value => value.running <= 1));
+		nestedOptions.onFinalMessage({ fullText: 'nested done', fullReasoning: '', anthropicReasoning: null });
+		await f.service.wait('scheduler-timeout', 1_000, [parent.id]);
+		assert.ok(activities.some(value => value.id === parent.id && value.activity === 'active' && value.running === 1)); assert.strictEqual(f.service.getBudgetView('scheduler-timeout')?.running, 0); assert.strictEqual(sends, 4);
+	});
+
+	test('rejects a nested inherited-write role from a read-only parent before a row, provider call, or quota reservation', async () => {
+		const parentTools = captureParentModelToolSnapshot('agent', undefined, true);
+		const role: any = { identity: 'writer', name: 'writer', description: 'Write with parent authority.', developerInstructions: 'writer', capabilityProfile: 'inherit_parent_write', revision: 'writer-1', skillRules: [] };
+		const roles: any = { revision: 'roles-1', agents: [role], diagnostics: [] };
+		let sends = 0;
+		const f = fixture({ send: options => { sends++; queueMicrotask(() => sends === 1 ? options.onFinalMessage({ fullText: 'try elevation', fullReasoning: '', anthropicReasoning: null, toolCall: { id: 'nested-writer', name: 'spawn_agent', rawParams: { message: 'write', agent_type: 'writer' } } }) : options.onFinalMessage({ fullText: 'done', fullReasoning: '', anthropicReasoning: null })); return `request-${sends}`; } });
+		await f.service.spawn('no-elevation', 'top', snapshot([], 'file:///workspace', 'gpt-4.1', { maxAcceptedChildren: 2, maxConcurrentThreadsPerSession: 2, maxDepth: 2 }), undefined, roles, undefined, undefined, 0, parentTools);
+		await new Promise(resolve => setTimeout(resolve, 0));
+		assert.strictEqual(sends, 2); assert.strictEqual(f.service.getRunViews('no-elevation').length, 1); assert.strictEqual(f.service.getBudgetView('no-elevation')?.accepted, 1); assert.strictEqual(f.service.getBudgetView('no-elevation')?.running, 0); assert.strictEqual(f.service.getRunView('no-elevation')?.capabilityProfile, 'read_only');
+	});
+
+	test('retains one captured profile for inherited parent and nested child after live registry drift', async () => {
+		const live = [{ name: 'captured_mcp', description: 'Captured MCP.', schema: { type: 'object', properties: { query: { type: 'string', description: 'original' } } }, params: { query: { description: 'query' } }, mcpServerName: 'captured-server' }];
+		const parentTools = captureParentModelToolSnapshot('agent', live, true);
+		const role: any = { identity: 'writer', name: 'writer', description: 'Write with parent authority.', developerInstructions: 'writer', capabilityProfile: 'inherit_parent_write', revision: 'writer-1', skillRules: [] };
+		const roles: any = { revision: 'roles-1', agents: [role], diagnostics: [] };
+		let sends = 0;
+		const f = fixture({ customCatalog: roles, send: options => { sends++; queueMicrotask(() => sends === 1 ? options.onFinalMessage({ fullText: 'delegate', fullReasoning: '', anthropicReasoning: null, toolCall: { id: 'nested-writer', name: 'spawn_agent', rawParams: { message: 'nested', agent_type: 'writer' } } }) : options.onFinalMessage({ fullText: 'done', fullReasoning: '', anthropicReasoning: null })); return `request-${sends}`; } });
+		await f.service.spawn('frozen-inherited-tree', 'top', snapshot([], 'file:///workspace', 'gpt-4.1', { maxAcceptedChildren: 2, maxConcurrentThreadsPerSession: 2, maxDepth: 2 }), 'writer', roles, undefined, undefined, 0, parentTools, f.broker);
+		live[0].name = 'live_replaced'; live[0].schema!.properties.query.description = 'mutated'; live.push({ name: 'late_mcp', description: 'Late.', params: {}, mcpServerName: 'late-server' });
+		await new Promise(resolve => setTimeout(resolve, 0));
+		const views = f.service.getRunViews('frozen-inherited-tree'); assert.strictEqual(views.length, 2); assert.ok(views.every(view => view.capabilityProfile === 'inherit_parent_write'));
+		assert.strictEqual(parentTools.tools.find(tool => tool.name === 'captured_mcp')?.schema?.properties && (parentTools.tools.find(tool => tool.name === 'captured_mcp')!.schema!.properties as any).query.description, 'original');
+		assert.ok(f.converterCalls.every(call => call.frozenToolSnapshot === parentTools && call.toolExecutionProfile === 'inherited-parent-write-child')); assert.ok(f.providerCalls.every(call => call.frozenToolSnapshot === parentTools && call.toolExecutionProfile === 'inherited-parent-write-child'));
+		assert.ok(f.providerCalls.every(call => availableTools('agent', [{ name: 'live_replaced', description: 'live', params: {} }], call.toolExecutionProfile, call.agentDelegationAllowed, call.frozenToolSnapshot)!.some(tool => tool.name === 'late_mcp') === false));
+	});
+
+	test('cancels a nested subtree from its direct root parent and fences late child completion', async () => {
+		let sends = 0; const pending: any[] = []; const f = fixture({ send: options => { sends++; if (sends === 1) queueMicrotask(() => options.onFinalMessage({ fullText: 'delegate', fullReasoning: '', anthropicReasoning: null, toolCall: { id: 'spawn', name: 'spawn_agent', rawParams: { message: 'nested' } } })); else pending.push(options); return `request-${sends}`; } });
+		await f.service.spawn('tree', 'top', snapshot([], 'file:///workspace', 'gpt-4.1', { maxAcceptedChildren: 2, maxConcurrentThreadsPerSession: 2, maxDepth: 2 })); await new Promise(resolve => setTimeout(resolve, 0));
+		const top = f.service.getRunViews('tree').find(run => run.depth === 1)!; const nested = f.service.getRunViews('tree').find(run => run.depth === 2)!;
+		f.service.interrupt('tree', top.id);
+		assert.deepStrictEqual(f.service.getRunViews('tree').map(run => run.status), ['cancelled', 'cancelled']);
+		for (const options of pending) options.onFinalMessage({ fullText: 'late', fullReasoning: '', anthropicReasoning: null });
+		assert.deepStrictEqual(f.service.getRunViews('tree').map(run => run.status), ['cancelled', 'cancelled']); assert.ok(f.aborts() >= 2); assert.throws(() => f.service.interrupt('tree', nested.id), /agent_child_not_direct/);
+	});
+
+	test('cancels a deferred nested admission with its parent before it can append or dispatch', async () => {
+		let release!: () => void, entered!: () => void; const deferred = new Promise<void>(resolve => release = resolve); const started = new Promise<void>(resolve => entered = resolve); let sends = 0;
+		const f = fixture({ readSkillBody: async () => { entered(); await deferred; return { body: skillText('demo') }; }, send: options => { sends++; if (sends === 1) queueMicrotask(() => options.onFinalMessage({ fullText: 'delegate', fullReasoning: '', anthropicReasoning: null, toolCall: { id: 'spawn', name: 'spawn_agent', rawParams: { message: '$demo nested' } } })); return `request-${sends}`; } });
+		await f.service.spawn('deferred-tree', 'top', snapshot([], 'file:///workspace', 'gpt-4.1', { maxAcceptedChildren: 2, maxConcurrentThreadsPerSession: 2, maxDepth: 2 })); await started;
+		const top = f.service.getRunViews('deferred-tree')[0]; assert.strictEqual(sends, 1);
+		f.service.interrupt('deferred-tree', top.id); release(); await new Promise(resolve => setTimeout(resolve, 0));
+		assert.deepStrictEqual(f.service.getRunViews('deferred-tree').map(run => run.status), ['cancelled']); assert.strictEqual(sends, 1); assert.strictEqual(f.service.getBudgetView('deferred-tree')?.accepted, 1);
 	});
 
 	test('failed admission releases its reservation without a row or event', async () => {
