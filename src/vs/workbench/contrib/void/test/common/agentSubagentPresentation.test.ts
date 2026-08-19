@@ -16,7 +16,7 @@ suite('Void AgentSubagentPresentation', () => {
 		const stale = () => { throw new Error('stale callback must not run'); };
 		assert.deepStrictEqual(selectThreadScopedValue({ threadId: 'old', value: ['old'] }, 'new', () => ['new']), ['new']);
 		assert.strictEqual(selectThreadScopedValue({ threadId: 'old', value: undefined }, 'new', () => undefined), undefined);
-		assert.deepStrictEqual(selectThreadScopedValue({ threadId: 'old', value: { old: true } }, 'new', () => ({ current: true })), { current: true });
+		assert.deepStrictEqual(selectThreadScopedValue<Record<string, boolean>>({ threadId: 'old', value: { old: true } }, 'new', () => ({ current: true })), { current: true });
 		assert.deepStrictEqual(selectThreadScopedValue({ threadId: 'current', value: ['current'] }, 'current', stale), ['current']);
 	});
 	test('is absent only when no group data exists', () => {

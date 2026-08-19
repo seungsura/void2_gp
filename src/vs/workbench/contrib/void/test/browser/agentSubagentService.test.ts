@@ -1,4 +1,5 @@
 import assert from 'assert';
+import { CancellationTokenSource } from '../../../../../base/common/cancellation.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { Event } from '../../../../../base/common/event.js';
 import { getSingletonServiceDescriptors } from '../../../../../platform/instantiation/common/extensions.js';
@@ -15,7 +16,7 @@ import { IEditCodeService } from '../../browser/editCodeServiceInterface.js';
 import { assembleProtectedAgentAuthority, createAgentRuntimeTurnSnapshot, createSkillCatalog, skillAdvertisement } from '../../common/agentSkills.js';
 import { projectAgentConfig, resolveAgentInstructions, stableAgentInstructionRevision } from '../../common/agentInstructions.js';
 import { assertCanonicalAgentChildRawUri, readOnlyChildToolNames } from '../../common/agentSubagents.js';
-import { availableTools, captureParentModelToolSnapshot } from '../../common/prompt/prompts.js';
+import { availableTools, captureParentModelToolSnapshot, InternalToolInfo } from '../../common/prompt/prompts.js';
 import { IMCPService } from '../../common/mcpService.js';
 import { INTERNAL_EMPTY_MESSAGE_SENTINEL } from '../../common/assistantMessagePresentation.js';
 
@@ -274,7 +275,7 @@ suite('Void AgentSubagentService', () => {
 		const role: any = { identity: 'writer', name: 'writer', description: 'Write.', developerInstructions: 'role developer', model: 'o4-mini', modelReasoningEffort: 'medium', capabilityProfile: 'inherit_parent_write', revision: 'role-1', skillRules: [{ selector: 'demo', enabled: true }] };
 		const roles: any = { revision: 'roles-1', agents: [role], diagnostics: [] }; const capturedMcp: any = { name: 'captured_mcp', description: 'Captured mutation.', mcpServerName: 'server-a', params: {}, schema: { type: 'object' } }; let mcpCalls = 0; let releaseMcp!: (value: any) => void; let markMcpCalled!: () => void; const mcpSettlement = new Promise<any>(resolve => releaseMcp = resolve); const mcpCalled = new Promise<void>(resolve => markMcpCalled = resolve);
 		const f = fixture({ liveSettings: { openAI: { apiKey: 'captured-key', endpoint: 'https://captured.invalid', _didFillInProviderSettings: true, models: [{ modelName: 'gpt-4.1', isHidden: false, type: 'default' }, { modelName: 'o4-mini', isHidden: false, type: 'default' }] } }, customCatalog: roles, send: toolThenFinal({ id: 'captured-call', name: 'captured_mcp', rawParams: { change: 'one' } }) });
-		const messages: any[] = []; let admitted: any; let spawned = 0; const thread: any = { messages, state: { stagingSelections: [] }, filesWithUserChanges: new Set<string>() };
+		const messages: any[] = []; let admitted: any; const thread: any = { messages, state: { stagingSelections: [] }, filesWithUserChanges: new Set<string>() };
 		const receiver: any = { state: { allThreads: { parent: thread }, currentThreadId: 'parent' }, streamState: {}, _agentControlGeneration: new Map(), _agentDelegationAuthorityOfThread: new Map(), _agentInstructionSessionOfThread: new Map(), _instructionTurnOfThread: new Map(), _agentSubagentService: f.service, _revokeAgentDelegation(threadId: string, forget = false) { return (ChatThreadService.prototype as any)._revokeAgentDelegation.call(this, threadId, forget); }, _createAgentSubagentToolBroker(threadId: string, authority: any) { return (ChatThreadService.prototype as any)._createAgentSubagentToolBroker.call(this, threadId, authority); }, _agentCustomAgentService: { getCatalog: async () => roles }, _currentModelSelectionProps: () => ({ modelSelection: { providerName: 'openAI', modelName: 'gpt-4.1' }, modelSelectionOptions: {} }), _settingsService: { state: { globalSettings: { chatMode: 'agent', autoApprove: { 'MCP tools': true } }, settingsOfProvider: f.liveSettings, optionsOfModelSelection: { Chat: { openAI: { 'o4-mini': { reasoningEnabled: true, reasoningEffort: 'medium' } } } }, overridesOfModel: { openAI: { 'gpt-4.1': { specialToolFormat: 'openai-style' }, 'o4-mini': { temperature: .7 } } } } }, _llmMessageService: { captureSettingsOfProvider: () => f.liveSettings }, _beginInstructionTurn: async () => instructions(), _purgeInstructionTurn() { }, _workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: URI.parse('file:///workspace') }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => true }, _agentSkillsService: { getCatalog: async () => catalog(), readSkillBody: async (root: string) => ({ body: skillText(root.endsWith('/other') ? 'other' : 'demo') }) }, _directoryStringService: {}, _fileService: {}, _rememberInstructionTurn(threadId: string, runtimeSnapshot: any) { this._instructionTurnOfThread.set(threadId, runtimeSnapshot); }, _addMessageToThread: (_: string, message: any) => messages.push(message), _runChatAgent: async ({ agentDelegationAuthority }: any) => { admitted = agentDelegationAuthority; }, _wrapRunAgentToNotify: (promise: Promise<void>) => promise, _toolsService: { invalidateReadReceipts() { }, validateParams: {} }, _mcpService: { getMCPTools: () => [capturedMcp], callMCPTool() { mcpCalls++; markMcpCalled(); return mcpSettlement; }, stringifyResult: () => 'captured' } };
 		bindManualApproval(receiver);
 		const selection = { type: 'Agent', label: 'Void application-level read-only', agentType: 'writer', catalogRevision: 'roles-1', roleRevision: 'role-1', state: undefined } as const;
@@ -476,14 +477,15 @@ suite('Void AgentSubagentService', () => {
 	});
 
 	test('retains one captured profile for inherited parent and nested child after live registry drift', async () => {
-		const live = [{ name: 'captured_mcp', description: 'Captured MCP.', schema: { type: 'object', properties: { query: { type: 'string', description: 'original' } } }, params: { query: { description: 'query' } }, mcpServerName: 'captured-server' }];
+		const capturedSchema = { type: 'object', properties: { query: { type: 'string', description: 'original' } } };
+		const live: InternalToolInfo[] = [{ name: 'captured_mcp', description: 'Captured MCP.', schema: capturedSchema, params: { query: { description: 'query' } }, mcpServerName: 'captured-server' }];
 		const parentTools = captureParentModelToolSnapshot('agent', live, true);
 		const role: any = { identity: 'writer', name: 'writer', description: 'Write with parent authority.', developerInstructions: 'writer', capabilityProfile: 'inherit_parent_write', revision: 'writer-1', skillRules: [] };
 		const roles: any = { revision: 'roles-1', agents: [role], diagnostics: [] };
 		let sends = 0;
 		const f = fixture({ customCatalog: roles, send: options => { sends++; queueMicrotask(() => sends === 1 ? options.onFinalMessage({ fullText: 'delegate', fullReasoning: '', anthropicReasoning: null, toolCall: { id: 'nested-writer', name: 'spawn_agent', rawParams: { message: 'nested', agent_type: 'writer' } } }) : options.onFinalMessage({ fullText: 'done', fullReasoning: '', anthropicReasoning: null })); return `request-${sends}`; } });
 		await f.service.spawn('frozen-inherited-tree', 'top', snapshot([], 'file:///workspace', 'gpt-4.1', { maxAcceptedChildren: 2, maxConcurrentThreadsPerSession: 2, maxDepth: 2 }), 'writer', roles, undefined, undefined, 0, parentTools, f.broker);
-		live[0].name = 'live_replaced'; live[0].schema!.properties.query.description = 'mutated'; live.push({ name: 'late_mcp', description: 'Late.', params: {}, mcpServerName: 'late-server' });
+		live[0].name = 'live_replaced'; capturedSchema.properties.query.description = 'mutated'; live.push({ name: 'late_mcp', description: 'Late.', params: { query: { description: 'query' } }, mcpServerName: 'late-server' });
 		await new Promise(resolve => setTimeout(resolve, 0));
 		const views = f.service.getRunViews('frozen-inherited-tree'); assert.strictEqual(views.length, 2); assert.ok(views.every(view => view.capabilityProfile === 'inherit_parent_write'));
 		assert.strictEqual(parentTools.tools.find(tool => tool.name === 'captured_mcp')?.schema?.properties && (parentTools.tools.find(tool => tool.name === 'captured_mcp')!.schema!.properties as any).query.description, 'original');
@@ -750,32 +752,44 @@ suite('Void AgentSubagentService', () => {
 		await assert.rejects(() => cancellingTools.callTool.search_in_file({ uri: target, query: 'absent', isRegex: false }, { ...childContext, cancellationToken: iterationCancellation }), /agent_child_cancelled/);
 
 		let fileQueryOptions: any; const queryBuilder = { file: (_roots: URI[], options: any) => { fileQueryOptions = options; return options; }, text: () => ({}) };
-		const overLimitResults = Array.from({ length: 101 }, (_, index) => ({ resource: URI.parse(`file:///workspace/${index}`), results: [] }));
+		const overLimitResults = Array.from({ length: 102 }, (_, index) => ({ resource: URI.parse(`file:///workspace/${index}`), results: [] }));
 		const cappedTools = makeRealTools(safeFile, { initializeModel: async () => { }, getModelSafe: async () => ({ model: null }) }, { fileSearch: async () => ({ results: overLimitResults }) }, queryBuilder);
-		await assert.rejects(() => cappedTools.callTool.search_pathnames_only({ query: 'a', includePattern: null, pageNumber: 1 }, childContext), /agent_child_search_result_limit/); assert.strictEqual(fileQueryOptions.ignoreSymlinks, true); assert.strictEqual(fileQueryOptions.maxResults, 100); assert.strictEqual(fileQueryOptions.maxFileSize, 1_048_576);
+		const cappedCall = await cappedTools.callTool.search_pathnames_only({ query: 'a', includePattern: null, pageNumber: 1 }, childContext);
+		await assert.rejects(Promise.resolve(cappedCall.result), /agent_child_search_result_limit/); assert.strictEqual(fileQueryOptions.ignoreSymlinks, true); assert.strictEqual(fileQueryOptions.maxResults, 101); assert.strictEqual(fileQueryOptions.maxFileSize, 1_048_576);
 		const outsideSearch = makeRealTools(safeFile, { initializeModel: async () => { }, getModelSafe: async () => ({ model: null }) }, { fileSearch: async () => ({ results: [{ resource: URI.parse('file:///outside/a'), results: [] }] }) }, queryBuilder);
-		await assert.rejects(() => outsideSearch.callTool.search_pathnames_only({ query: 'a', includePattern: null, pageNumber: 1 }, childContext), /agent_child_search_outside_owner/);
-		const searchCancellation: any = { isCancellationRequested: false };
-		const cancelledSearch = makeRealTools(safeFile, { initializeModel: async () => { }, getModelSafe: async () => ({ model: null }) }, { fileSearch: async () => { searchCancellation.isCancellationRequested = true; return { results: [] }; } }, queryBuilder);
-		await assert.rejects(() => cancelledSearch.callTool.search_pathnames_only({ query: 'a', includePattern: null, pageNumber: 1 }, { ...childContext, cancellationToken: searchCancellation }), /agent_child_cancelled/);
+		const outsideSearchCall = await outsideSearch.callTool.search_pathnames_only({ query: 'a', includePattern: null, pageNumber: 1 }, childContext);
+		await assert.rejects(Promise.resolve(outsideSearchCall.result), /agent_child_search_outside_owner/);
+		const searchCancellation = new CancellationTokenSource();
+		try {
+			const cancelledSearch = makeRealTools(safeFile, { initializeModel: async () => { }, getModelSafe: async () => ({ model: null }) }, { fileSearch: async () => { searchCancellation.cancel(); return { results: [] }; } }, queryBuilder);
+			const cancelledSearchCall = await cancelledSearch.callTool.search_pathnames_only({ query: 'a', includePattern: null, pageNumber: 1 }, { ...childContext, cancellationToken: searchCancellation.token });
+			await assert.rejects(Promise.resolve(cancelledSearchCall.result), /agent_child_cancelled/);
+		} finally { searchCancellation.dispose(); }
 		let blockedFileBackend = 0; let blockedTextBackend = 0;
 		const blockedRootTools = makeRealTools({ ...safeFile, resolve: async (uri: URI) => ({ resource: uri, isSymbolicLink: uri.toString() === owner.toString() }) }, { initializeModel: async () => { }, getModelSafe: async () => ({ model: null }) }, { fileSearch: async () => { blockedFileBackend++; return { results: [] }; }, textSearch: async () => { blockedTextBackend++; return { results: [] }; } }, { file: () => ({}), text: () => ({}) });
-		await assert.rejects(() => blockedRootTools.callTool.search_pathnames_only({ query: 'a', includePattern: null, pageNumber: 1 }, childContext), /agent_child_reparse_point/);
-		await assert.rejects(() => blockedRootTools.callTool.search_for_files({ query: 'a', isRegex: false, searchInFolder: null, pageNumber: 1 }, childContext), /agent_child_reparse_point/); assert.strictEqual(blockedFileBackend, 0); assert.strictEqual(blockedTextBackend, 0);
+		const blockedPathnameCall = await blockedRootTools.callTool.search_pathnames_only({ query: 'a', includePattern: null, pageNumber: 1 }, childContext);
+		await assert.rejects(Promise.resolve(blockedPathnameCall.result), /agent_child_reparse_point/);
+		const blockedContentCall = await blockedRootTools.callTool.search_for_files({ query: 'a', isRegex: false, searchInFolder: null, pageNumber: 1 }, childContext);
+		await assert.rejects(Promise.resolve(blockedContentCall.result), /agent_child_reparse_point/); assert.strictEqual(blockedFileBackend, 0); assert.strictEqual(blockedTextBackend, 0);
 		let blockedSubfolderBackend = 0;
 		const blockedSubfolderTools = makeRealTools({ ...safeFile, resolve: async (uri: URI) => ({ resource: uri, isSymbolicLink: uri.path === '/workspace/sub' }) }, { initializeModel: async () => { }, getModelSafe: async () => ({ model: null }) }, { textSearch: async () => { blockedSubfolderBackend++; return { results: [] }; } }, { file: () => ({}), text: () => ({}) });
-		await assert.rejects(() => blockedSubfolderTools.callTool.search_for_files({ query: 'a', isRegex: false, searchInFolder: URI.parse('file:///workspace/sub'), pageNumber: 1 }, childContext), /agent_child_reparse_point/); assert.strictEqual(blockedSubfolderBackend, 0);
+		const blockedSubfolderCall = await blockedSubfolderTools.callTool.search_for_files({ query: 'a', isRegex: false, searchInFolder: URI.parse('file:///workspace/sub'), pageNumber: 1 }, childContext);
+		await assert.rejects(Promise.resolve(blockedSubfolderCall.result), /agent_child_reparse_point/); assert.strictEqual(blockedSubfolderBackend, 0);
 		let fileRootSwapped = false; let textRootSwapped = false;
 		const swappedFileTools = makeRealTools({ ...safeFile, resolve: async (uri: URI) => ({ resource: uri, isSymbolicLink: fileRootSwapped && uri.toString() === owner.toString() }) }, { initializeModel: async () => { }, getModelSafe: async () => ({ model: null }) }, { fileSearch: async () => { fileRootSwapped = true; return { results: [] }; } }, { file: () => ({}), text: () => ({}) });
-		await assert.rejects(() => swappedFileTools.callTool.search_pathnames_only({ query: 'a', includePattern: null, pageNumber: 1 }, childContext), /agent_child_reparse_point/);
+		const swappedFileCall = await swappedFileTools.callTool.search_pathnames_only({ query: 'a', includePattern: null, pageNumber: 1 }, childContext);
+		await assert.rejects(Promise.resolve(swappedFileCall.result), /agent_child_reparse_point/);
 		const swappedTextTools = makeRealTools({ ...safeFile, resolve: async (uri: URI) => ({ resource: uri, isSymbolicLink: textRootSwapped && uri.path === '/workspace/sub' }) }, { initializeModel: async () => { }, getModelSafe: async () => ({ model: null }) }, { textSearch: async () => { textRootSwapped = true; return { results: [] }; } }, { file: () => ({}), text: () => ({}) });
-		await assert.rejects(() => swappedTextTools.callTool.search_for_files({ query: 'a', isRegex: false, searchInFolder: URI.parse('file:///workspace/sub'), pageNumber: 1 }, childContext), /agent_child_reparse_point/);
+		const swappedTextCall = await swappedTextTools.callTool.search_for_files({ query: 'a', isRegex: false, searchInFolder: URI.parse('file:///workspace/sub'), pageNumber: 1 }, childContext);
+		await assert.rejects(Promise.resolve(swappedTextCall.result), /agent_child_reparse_point/);
 		const textRoots: string[][] = []; const textOptions: any[] = [];
 		const textQueryBuilder = { file: () => ({}), text: (_pattern: unknown, roots: URI[], options: unknown) => { textRoots.push(roots.map(uri => uri.toString())); textOptions.push(options); return {}; } };
 		const narrowedSearch = makeRealTools(safeFile, { initializeModel: async () => { }, getModelSafe: async () => ({ model: null }) }, { textSearch: async () => ({ results: [] }) }, textQueryBuilder);
-		await narrowedSearch.callTool.search_for_files({ query: 'a', isRegex: false, searchInFolder: URI.parse('file:///workspace/sub'), pageNumber: 1 }, childContext);
-		await narrowedSearch.callTool.search_for_files({ query: 'a', isRegex: false, searchInFolder: null, pageNumber: 1 }, childContext);
-		assert.deepStrictEqual(textRoots, [['file:///workspace/sub'], ['file:///workspace']]); assert.strictEqual(textOptions.every(options => options.ignoreSymlinks === true && options.maxResults === 100 && options.maxFileSize === 1_048_576), true);
+		const narrowedSubfolderCall = await narrowedSearch.callTool.search_for_files({ query: 'a', isRegex: false, searchInFolder: URI.parse('file:///workspace/sub'), pageNumber: 1 }, childContext);
+		await Promise.resolve(narrowedSubfolderCall.result);
+		const narrowedRootCall = await narrowedSearch.callTool.search_for_files({ query: 'a', isRegex: false, searchInFolder: null, pageNumber: 1 }, childContext);
+		await Promise.resolve(narrowedRootCall.result);
+		assert.deepStrictEqual(textRoots, [['file:///workspace/sub'], ['file:///workspace']]); assert.strictEqual(textOptions.every(options => options.ignoreSymlinks === true && options.maxResults === 101 && options.maxFileSize === 1_048_576), true);
 	});
 
 	test('passes a unique receipt owner/cancellation fence and invalidates it exactly once', async () => {

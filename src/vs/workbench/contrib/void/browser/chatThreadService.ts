@@ -763,7 +763,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			return request.tool.kind === 'mcp' && !!request.tool.mcpServerName && request.tool.approval === 'MCP tools' && liveExact[0].kind === 'mcp' && liveExact[0].mcpServerName === request.tool.mcpServerName;
 		};
 		return Object.freeze({
-			execute: async (request) => {
+			execute: async (request: AgentSubagentToolBrokerRequest) => {
 				const key = keyOf(request);
 				if (requests.has(key) || completed.has(key)) return fail('tool_replayed');
 				let resolve!: () => void;
@@ -811,7 +811,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				} catch (error) { return fail(state.cancelled || request.cancellationToken.isCancellationRequested ? 'cancelled' : error instanceof Error && /invalid|param/i.test(error.message) ? 'invalid_params' : 'execution_failed'); }
 				finally { settle(state); requests.delete(key); rememberCompleted(key); }
 			},
-			cancel: async request => {
+			cancel: async (request: AgentSubagentToolBrokerRequest) => {
 				const state = requests.get(keyOf(request));
 				if (!state) return;
 				state.cancelled = true;
