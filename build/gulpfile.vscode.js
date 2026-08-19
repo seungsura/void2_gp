@@ -47,6 +47,7 @@ const vscodeEntryPoints = [
 	buildfile.workerOutputLinks,
 	buildfile.workerBackgroundTokenization,
 	buildfile.workbenchDesktop,
+	buildfile.entrypoint('vs/workbench/contrib/void/electron-main/controlledSearchFallbackProbe'),
 	buildfile.code
 ].flat();
 
