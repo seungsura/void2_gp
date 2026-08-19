@@ -50,7 +50,7 @@ const runBundled = (options: ProbeOptions): readonly string[] | 'missing' | unde
 	const result = childProcess.spawnSync(options.bundledRipgrep, args, { windowsHide: true, shell: false, encoding: 'utf8', maxBuffer: CONTROLLED_SEARCH_MAX_STDOUT_BYTES, timeout: 10_000 });
 	if (result.error) return isBundledRipgrepMissingError(result.error) ? 'missing' : undefined;
 	if (result.status !== 0 && result.status !== 1) return undefined;
-	return parsePaths(typeof result.stdout === 'string' ? result.stdout : result.stdout.toString('utf8'), options.root);
+	return parsePaths(result.stdout, options.root);
 };
 
 const main = async () => {

@@ -94,26 +94,27 @@ suite('Void controlled Search browser facade and ToolsService', () => {
 	test('does not fallback for generic, regex, cancellation, or zero-result outcomes', async () => {
 		for (const error of [new Error('generic'), new SearchError('bad regex', SearchErrorCode.regexParseError)]) {
 			const fixture = toolsFixture({ textSearch: async () => { throw error; } });
-			await assert.rejects(async () => (await fixture.service.callTool.search_for_files({ query: '[', isRegex: true, searchInFolder: null, pageNumber: 1 })).result);
+			const call = await fixture.service.callTool.search_for_files({ query: '[', isRegex: true, searchInFolder: null, pageNumber: 1 });
+			await assert.rejects(Promise.resolve(call.result), (error: unknown) => error instanceof Error);
 			assert.strictEqual(fixture.fallbackRequests.length, 0);
 		}
 		const empty = toolsFixture({ fileSearch: async () => ({ results: [], messages: [] }) }); assert.deepStrictEqual((await pathname(empty.service)).result.uris, []); assert.strictEqual(empty.fallbackRequests.length, 0);
 		let cancelled = false; const cancellation = toolsFixture({ fileSearch: async (_query, token) => new Promise((_resolve, reject) => token.onCancellationRequested(() => { cancelled = true; reject(new SearchError('cancelled', SearchErrorCode.canceled)); })) });
-		const call = await cancellation.service.callTool.search_pathnames_only({ query: 'alpha', includePattern: null, pageNumber: 1 }); call.interruptTool?.(); await assert.rejects(() => call.result); assert.strictEqual(cancelled, true); assert.strictEqual(cancellation.fallbackRequests.length, 0);
+		const call = await cancellation.service.callTool.search_pathnames_only({ query: 'alpha', includePattern: null, pageNumber: 1 }); call.interruptTool?.(); await assert.rejects(Promise.resolve(call.result)); assert.strictEqual(cancelled, true); assert.strictEqual(cancellation.fallbackRequests.length, 0);
 	});
 
 	test('reports both backends unavailable without exposing a command or arbitrary error', async () => {
 		const fixture = toolsFixture({ fileSearch: async () => { throw missing(); }, fallback: async () => ({ ok: false, code: 'search_backend_unavailable', trace: 'terminal-fallback-unavailable' }) });
 		const call = await fixture.service.callTool.search_pathnames_only({ query: 'private-query', includePattern: null, pageNumber: 1 });
-		await assert.rejects(() => call.result, error => error instanceof ControlledSearchError && error.code === 'search_backend_unavailable' && error.message === 'search_backend_unavailable' && error.trace === 'terminal-fallback-unavailable');
+		await assert.rejects(Promise.resolve(call.result), (error: unknown) => error instanceof ControlledSearchError && error.code === 'search_backend_unavailable' && error.message === 'search_backend_unavailable' && error.trace === 'terminal-fallback-unavailable');
 		assert.strictEqual(fixture.fallbackRequests.length, 1);
 	});
 
 	test('validates local roots before fallback and validates returned paths after it', async () => {
 		const remote = toolsFixture({ root: URI.parse('vscode-remote://fixture/workspace'), fileSearch: async () => { throw missing(); } });
-		const remoteCall = await remote.service.callTool.search_pathnames_only({ query: 'alpha', includePattern: null, pageNumber: 1 }); await assert.rejects(() => remoteCall.result, /search_backend_unavailable/); assert.strictEqual(remote.fallbackRequests.length, 0);
+		const remoteCall = await remote.service.callTool.search_pathnames_only({ query: 'alpha', includePattern: null, pageNumber: 1 }); await assert.rejects(Promise.resolve(remoteCall.result), /search_backend_unavailable/); assert.strictEqual(remote.fallbackRequests.length, 0);
 		const escaped = toolsFixture({ fileSearch: async () => { throw missing(); }, fallback: async () => ({ ok: true, paths: [URI.file('/outside.txt').fsPath], hasMore: false, trace: 'terminal-fallback' }) });
-		const escapedCall = await escaped.service.callTool.search_pathnames_only({ query: 'alpha', includePattern: null, pageNumber: 1 }); await assert.rejects(() => escapedCall.result, /search_failed/);
+		const escapedCall = await escaped.service.callTool.search_pathnames_only({ query: 'alpha', includePattern: null, pageNumber: 1 }); await assert.rejects(Promise.resolve(escapedCall.result), /search_failed/);
 	});
 
 	test('linked cancellation fences a fallback result during asynchronous child path validation', async () => {
@@ -129,13 +130,13 @@ suite('Void controlled Search browser facade and ToolsService', () => {
 		const context = { ownerThreadId: 'parent', childId: 'child', ownerRoot: root, maxReadOutputTokens: 100, maxResults: 2, maxFileSize: 1024 };
 		const call = await fixture.service.callTool.search_pathnames_only({ query: 'alpha', includePattern: null, pageNumber: 1 }, context);
 		await started; call.interruptTool?.(); releaseValidation();
-		await assert.rejects(() => call.result, error => error instanceof ControlledSearchError && error.code === 'search_cancelled');
+		await assert.rejects(Promise.resolve(call.result), (error: unknown) => error instanceof ControlledSearchError && error.code === 'search_cancelled');
 	});
 
 	test('fails closed instead of silently truncating parent output and keeps fallback trace out of model text', async () => {
 		const longPaths = ['a', 'b', 'c'].map(character => URI.file(`/workspace/${character.repeat(32_000)}.txt`).fsPath);
 		const fixture = toolsFixture({ fileSearch: async () => { throw missing(); }, fallback: async () => ({ ok: true, paths: longPaths, hasMore: false, trace: 'terminal-fallback' }) });
-		const call = await fixture.service.callTool.search_pathnames_only({ query: 'alpha', includePattern: null, pageNumber: 1 }); await assert.rejects(() => call.result, error => error instanceof ControlledSearchError && error.code === 'search_output_limit' && error.trace === 'terminal-fallback');
+		const call = await fixture.service.callTool.search_pathnames_only({ query: 'alpha', includePattern: null, pageNumber: 1 }); await assert.rejects(Promise.resolve(call.result), (error: unknown) => error instanceof ControlledSearchError && error.code === 'search_output_limit' && error.trace === 'terminal-fallback');
 		const visible = fixture.service.stringOfResult.search_pathnames_only({ query: 'alpha', includePattern: null, pageNumber: 1 }, { uris: [first], hasNextPage: false, backendTrace: 'terminal-fallback' }); assert.strictEqual(visible.includes('terminal-fallback'), false);
 	});
 
@@ -156,13 +157,13 @@ suite('Void controlled Search browser facade and ToolsService', () => {
 		const firstPageCall = await fixture.service.callTool.search_for_files({ query: 'alpha', isRegex: false, searchInFolder: null, pageNumber: 1 }, context);
 		assert.deepStrictEqual(await firstPageCall.result, { uris: [first], hasNextPage: true, backendTrace: 'bundled-rg' });
 		const laterPageCall = await fixture.service.callTool.search_for_files({ query: 'alpha', isRegex: false, searchInFolder: null, pageNumber: 2 }, context);
-		await assert.rejects(() => laterPageCall.result, error => error instanceof ControlledSearchError && error.code === 'search_output_limit' && error.trace === 'bundled-rg');
+		await assert.rejects(Promise.resolve(laterPageCall.result), (error: unknown) => error instanceof ControlledSearchError && error.code === 'search_output_limit' && error.trace === 'bundled-rg');
 	});
 
 	test('parent interrupt owns the primary token while search_in_file remains in-process', async () => {
 		let cancelled = false;
 		const fixture = toolsFixture({ fileSearch: async (_query, token) => new Promise((_resolve, reject) => token.onCancellationRequested(() => { cancelled = true; reject(new SearchError('cancelled', SearchErrorCode.canceled)); })) });
-		const pending = await fixture.service.callTool.search_pathnames_only({ query: 'alpha', includePattern: null, pageNumber: 1 }); assert.strictEqual(typeof pending.interruptTool, 'function'); pending.interruptTool?.(); await assert.rejects(() => pending.result); assert.strictEqual(cancelled, true); assert.strictEqual(fixture.fallbackRequests.length, 0);
+		const pending = await fixture.service.callTool.search_pathnames_only({ query: 'alpha', includePattern: null, pageNumber: 1 }); assert.strictEqual(typeof pending.interruptTool, 'function'); pending.interruptTool?.(); await assert.rejects(Promise.resolve(pending.result)); assert.strictEqual(cancelled, true); assert.strictEqual(fixture.fallbackRequests.length, 0);
 		const local = await fixture.service.callTool.search_in_file({ uri: first, query: 'needle', isRegex: false }); assert.deepStrictEqual(await local.result, { lines: [1] }); assert.strictEqual(fixture.fallbackRequests.length, 0);
 	});
 });
