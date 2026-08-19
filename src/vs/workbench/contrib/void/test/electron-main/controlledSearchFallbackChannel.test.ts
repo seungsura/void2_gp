@@ -191,8 +191,11 @@ suite('Void controlled Search electron-main channel', () => {
 	});
 
 	test('timeout wins a synchronous kill-close race and settles only once', async () => {
-		const fixture = runWithChild(root, () => { }, { timeoutMs: 1, kill: child => child.emit('close', 0) });
-		assert.deepStrictEqual(await fixture.channel.call<any>(undefined, 'search', pathnameRequest(root)), { ok: false, code: 'search_timeout', trace: 'terminal-fallback' });
+		const rootStats = await fs.promises.stat(root);
+		const fixture = runWithChild(root, () => { }, { timeoutMs: 1, kill: child => child.emit('close', 0), stat: async () => rootStats });
+		const pending = fixture.channel.call<any>(undefined, 'search', pathnameRequest(root));
+		await fixture.spawned;
+		assert.deepStrictEqual(await pending, { ok: false, code: 'search_timeout', trace: 'terminal-fallback' });
 		assert.strictEqual(fixture.kills(), 1);
 	});
 
