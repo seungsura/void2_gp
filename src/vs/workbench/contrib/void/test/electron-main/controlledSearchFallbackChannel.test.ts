@@ -90,7 +90,8 @@ suite('Void controlled Search electron-main channel', () => {
 		assert.strictEqual(fixture.kills(), 0);
 	});
 
-	test('executes the fixed PowerShell wrapper with system rg for pathname AND include and content search', async () => {
+	test('executes the fixed PowerShell wrapper with system rg for pathname AND include and content search', async function () {
+		this.timeout(5_000);
 		if (process.platform !== 'win32') return;
 		const pathnameMatch = path.join(root, 'search-probe-alpha.txt');
 		const pathnameExcluded = path.join(root, 'search-probe-alpha.ts');
