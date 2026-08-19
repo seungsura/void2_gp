@@ -239,6 +239,25 @@ suite('Void Settings switch style delivery', function () {
 					forcedColors: matchMedia('(forced-colors: active)').matches,
 				};
 			});
+			const waitForSwitchState = async (expectedChecked: boolean): Promise<Awaited<ReturnType<typeof inspect>>> => {
+				const expectedTrackClass = expectedChecked ? 'void-bg-zinc-900' : 'void-bg-white';
+				const expectedKnobClass = expectedChecked ? 'void-translate-x-6' : 'void-translate-x-1';
+				try {
+					await page.waitForFunction(({ expectedChecked, expectedTrackClass, expectedKnobClass }) => {
+						const input = document.querySelector<HTMLInputElement>('input[role=switch][aria-label="Enable fixture"]');
+						const track = input?.nextElementSibling as HTMLElement | null;
+						const knob = track?.firstElementChild as HTMLElement | null;
+						return input?.checked === expectedChecked
+							&& track?.classList.contains(expectedTrackClass) === true
+							&& knob?.classList.contains(expectedKnobClass) === true
+							&& [...track.getAnimations(), ...knob.getAnimations()].every(animation => animation.playState !== 'running');
+					}, { expectedChecked, expectedTrackClass, expectedKnobClass }, { polling: 20, timeout: 1_000 });
+				} catch (error: unknown) {
+					const observation = await inspect();
+					assert.fail(`Switch did not settle to checked=${expectedChecked}: ${JSON.stringify(observation)}; ${error instanceof Error ? error.message : String(error)}`);
+				}
+				return inspect();
+			};
 
 			assert.strictEqual(await page.getByRole('switch', { name: 'Enable fixture' }).count(), 1);
 			assert.deepStrictEqual(await page.locator('#settings-root').evaluate((rootNode) => [
@@ -252,19 +271,20 @@ suite('Void Settings switch style delivery', function () {
 			assert.deepStrictEqual(normalUnchecked.input, { opacity: '0', appearance: 'auto', checked: false, disabled: false });
 			assert.strictEqual(normalUnchecked.track.pointerEvents, 'none');
 			await page.getByRole('switch', { name: 'Enable fixture' }).click();
-			const normalChecked = await inspect();
+			const normalChecked = await waitForSwitchState(true);
 			assert.strictEqual(normalChecked.input.checked, true);
 			assert.notStrictEqual(normalChecked.track.backgroundColor, normalUnchecked.track.backgroundColor);
 			assert.notStrictEqual(normalChecked.knob.transform, normalUnchecked.knob.transform);
 			assert.deepStrictEqual(await page.evaluate(() => (window as any).__voidSwitchFixture.changes), [true]);
 			await page.getByRole('switch', { name: 'Enable fixture' }).press('Space');
+			await waitForSwitchState(false);
 			assert.deepStrictEqual(await page.evaluate(() => (window as any).__voidSwitchFixture.changes), [true, false]);
 
 			await page.locator('#settings-root').evaluate((rootNode) => rootNode.classList.add('void-dark'));
-			const darkUnchecked = await inspect();
+			const darkUnchecked = await waitForSwitchState(false);
 			assert.deepStrictEqual(darkUnchecked.input, { opacity: '0', appearance: 'auto', checked: false, disabled: false });
 			await page.getByRole('switch', { name: 'Enable fixture' }).click();
-			const darkChecked = await inspect();
+			const darkChecked = await waitForSwitchState(true);
 			assert.notStrictEqual(darkChecked.track.backgroundColor, darkUnchecked.track.backgroundColor);
 			assert.notStrictEqual(darkChecked.knob.transform, darkUnchecked.knob.transform);
 
