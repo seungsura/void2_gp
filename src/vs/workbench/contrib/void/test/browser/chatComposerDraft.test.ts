@@ -13,6 +13,8 @@ const draftReceiver = () => {
 	const value: any = Object.create(ChatThreadService.prototype);
 	value.state = { allThreads: { A: { ...thread(['selection-a']), id: 'A' }, B: { ...thread(['selection-b']), id: 'B' } }, currentThreadId: 'A' };
 	value._transientComposerDraftOfThread = new Map<string, string>();
+	value._parentRunTokenOfThread = new Map<string, symbol>();
+	value._toolsService = { invalidateReadReceipts() { } };
 	value._childToolApprovals = new Map<string, unknown>(); value._onDidChangeChildToolApprovals = { fire() { } };
 	value._setState = (partial: any) => { value.state = { ...value.state, ...partial }; };
 	return value;
