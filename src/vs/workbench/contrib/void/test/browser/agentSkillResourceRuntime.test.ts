@@ -23,11 +23,11 @@ const fixture = (runtimeSnapshot = snapshot()) => {
 	const thread = { messages, state: {} };
 	const value: any = {
 		state: { allThreads: { parent: thread }, currentThreadId: 'parent' }, streamState: {},
-		_instructionTurnOfThread: new Map([['parent', runtimeSnapshot]]), _agentInstructionSessionOfThread: new Map(), _agentControlGeneration: new Map([['parent', 0]]), _agentDelegationAuthorityOfThread: new Map(),
+		_instructionTurnOfThread: new Map([['parent', runtimeSnapshot]]), _agentInstructionSessionOfThread: new Map(), _agentControlGeneration: new Map([['parent', 0]]), _parentRunTokenOfThread: new Map(), _agentDelegationAuthorityOfThread: new Map(),
 		_workspaceContextService: { getWorkspace: () => ({ folders: owner ? [{ uri: URI.parse(owner) }] : [] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => trusted },
 		_agentSkillsService: { readSkillResource: async (selection: unknown, resourcePath: string, options: unknown) => { serviceCalls.push({ selection, resourcePath, options }); return { body: 'RESOURCE\n' }; } },
 		_convertToLLMMessagesService: { prepareLLMChatMessages: async (options: unknown) => { conversionCalls.push(options); return { messages: [], separateSystemMessage: undefined }; } },
-		_toolsService: { validateParams: new Proxy({}, { get() { throw new Error('builtin lookup'); } }) }, _mcpService: { getMCPTools() { throw new Error('MCP lookup'); } },
+		_toolsService: { invalidateReadReceipts(_threadId: string) { }, validateParams: new Proxy({}, { get() { throw new Error('builtin lookup'); } }) }, _mcpService: { getMCPTools() { throw new Error('MCP lookup'); } },
 		_agentSubagentService: { cancelParent() { }, forgetParent() { } },
 		_cancelChildToolApprovalsForParent() { },
 		_addMessageToThread(_threadId: string, message: any) { messages.push(message); },
@@ -39,7 +39,7 @@ const fixture = (runtimeSnapshot = snapshot()) => {
 	return { value, messages, serviceCalls, conversionCalls, runtimeSnapshot, setTrusted: (next: boolean) => trusted = next, setOwner: (next: string) => owner = next, purges: () => purges };
 };
 const run = (value: any, runtimeSnapshot: AgentRuntimeTurnSnapshot, raw: Record<string, unknown>, allowed = true) =>
-	(ChatThreadService.prototype as any)._runToolCall.call(value, 'parent', 'read_skill_resource', 'provider-tool-id', 'spoofed-mcp', { preapproved: false, unvalidatedToolParams: raw }, runtimeSnapshot, undefined, allowed, value._agentControlGeneration.get('parent') ?? 0);
+	(ChatThreadService.prototype as any)._runToolCall.call(value, 'parent', 'read_skill_resource', 'provider-tool-id', 'spoofed-mcp', { preapproved: false, unvalidatedToolParams: raw }, runtimeSnapshot, undefined, allowed, value._agentControlGeneration.get('parent') ?? 0, () => true);
 
 suite('Void selected Skill resource Chat runtime', () => {
 	test('routes before builtin/MCP/approval and returns exact text from the captured selected descriptor', async () => {

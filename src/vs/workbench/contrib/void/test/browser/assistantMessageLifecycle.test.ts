@@ -8,6 +8,7 @@ import { ConvertToLLMMessageService } from '../../browser/convertToLLMMessageSer
 import { projectAgentConfig, resolveAgentInstructions, stableAgentInstructionRevision } from '../../common/agentInstructions.js';
 import { assistantMessagePresentation, INTERNAL_EMPTY_MESSAGE_SENTINEL, sanitizeAssistantDisplayContent } from '../../common/assistantMessagePresentation.js';
 import { THREAD_STORAGE_KEY } from '../../common/storageKeys.js';
+import { Severity } from '../../../../../platform/notification/common/notification.js';
 
 const bytes = (value: string) => new TextEncoder().encode(value);
 
@@ -34,7 +35,283 @@ const instructionSnapshot = () => {
 	});
 };
 
+type TestParentRun = Readonly<{ token: symbol; generation: number; isLatest: () => boolean; isActive: () => boolean; deactivate: () => void; releaseLatest: () => void }>;
+type ParentRunFixture = { _agentControlGeneration: Map<string, number>; _parentRunTokenOfThread: Map<string, symbol> };
+type TestMessage = { role: string; content?: string; displayContent?: string; reasoning?: string; type?: string };
+type TestToolMutation = { type?: string };
+type TestLLMInfo = { displayContentSoFar: string; reasoningSoFar: string; toolCallSoFar: unknown };
+type TestStream = { isRunning?: string; llmInfo?: TestLLMInfo; toolInfo?: { toolName: string; toolParams: unknown; id: string; content: string; rawParams: unknown; mcpServerName?: string }; interrupt?: Promise<() => void> | 'not_needed'; error?: unknown };
+type TestStreamRecord = Record<string, TestStream | undefined>;
+type TestProviderCallbacks = {
+	onText(value: { fullText: string; fullReasoning: string; toolCall?: unknown }): void;
+	onFinalMessage(value: { fullText: string; fullReasoning: string; toolCall?: { name: string; id: string; rawParams: Record<string, unknown> }; anthropicReasoning: null }): Promise<void>;
+	onError(error: { message: string; fullError: Error | null }): Promise<void>;
+	onAbort(): void;
+};
+type TestNotification = { severity: Severity; message: string };
+type TestBuiltinSetup = { execute: () => Promise<unknown> } | { result: Promise<unknown>; interruptTool: () => void };
+type TestRunChatOptions = {
+	threadId: string;
+	modelSelection: { providerName: 'openAI' | 'openAICompatible'; modelName: string } | null;
+	modelSelectionOptions: unknown;
+	instructionSnapshot: ReturnType<typeof instructionSnapshot>;
+	callThisToolFirst?: { role: 'tool'; type: 'tool_request'; name: 'read_file'; id: string; params: Record<string, unknown>; rawParams: Record<string, unknown>; content: string; result: null; mcpServerName: undefined };
+};
+type TestToolCallResult = { awaitingUserApproval?: boolean; interrupted?: boolean };
+interface ChatLifecycleTestAdapter {
+	_runChatAgent(this: unknown, options: TestRunChatOptions & { parentRun: TestParentRun }): Promise<void>;
+	_runToolCall(this: unknown, threadId: string, toolName: string, toolId: string, mcpServerName: string | undefined, options: { preapproved: true; unvalidatedToolParams: Record<string, unknown>; validatedParams: Record<string, unknown> }, snapshot: ReturnType<typeof instructionSnapshot>, authority: undefined, skillReadAllowed: boolean, generation: number, isActive: () => boolean): Promise<TestToolCallResult>;
+	_wrapRunAgentToNotify(this: unknown, promise: Promise<void>, threadId: string, parentRun: TestParentRun): Promise<void>;
+	_revokeAgentDelegation(this: unknown, threadId: string, forget?: boolean): void;
+	abortRunning(this: unknown, threadId: string): Promise<void>;
+}
+const chatLifecycle = ChatThreadService.prototype as unknown as ChatLifecycleTestAdapter;
+
+const llmInfoOf = (stream: TestStream | undefined): TestLLMInfo => {
+	if (!stream?.llmInfo) throw new Error('Expected an LLM stream fixture.');
+	return stream.llmInfo;
+};
+
+const beginTestParentRun = (receiver: ParentRunFixture, threadId: string): TestParentRun => {
+	const token = Symbol('test-parent-run');
+	const generation = receiver._agentControlGeneration.get(threadId) ?? 0;
+	let active = true;
+	receiver._parentRunTokenOfThread.set(threadId, token);
+	const isLatest = () => receiver._parentRunTokenOfThread.get(threadId) === token && (receiver._agentControlGeneration.get(threadId) ?? 0) === generation;
+	return { token, generation, isLatest, isActive: () => active && isLatest(), deactivate: () => { active = false; }, releaseLatest: () => { if (isLatest()) receiver._parentRunTokenOfThread.delete(threadId); } };
+};
+
+const standaloneParentRun = (isLatest: () => boolean): TestParentRun => ({ token: Symbol('standalone-parent-run'), generation: 0, isLatest, isActive: isLatest, deactivate() { }, releaseLatest() { } });
+
+const runChatAgent = (receiver: ParentRunFixture, options: TestRunChatOptions) => {
+	const parentRun = beginTestParentRun(receiver, options.threadId);
+	return chatLifecycle._runChatAgent.call(receiver, { ...options, parentRun });
+};
+
+const deferred = <T>() => {
+	let resolve: (value: T) => void = () => { throw new Error('deferred resolve was not initialized'); };
+	let reject: (error: Error) => void = () => { throw new Error('deferred reject was not initialized'); };
+	const promise = new Promise<T>((resolvePromise, rejectPromise) => { resolve = resolvePromise; reject = rejectPromise; });
+	return { promise, resolve, reject };
+};
+
 suite('Assistant message lifecycle', () => {
+	test('a delayed provider final from an aborted run cannot append into a newer LLM run', async () => {
+		const snapshot = instructionSnapshot();
+		const callbacks: TestProviderCallbacks[] = [];
+		const messages: TestMessage[] = [];
+		const streamState: TestStreamRecord = {};
+		const receiver = {
+			state: { allThreads: { task: { messages, state: {}, filesWithUserChanges: new Set<string>() } }, currentThreadId: 'task' },
+			streamState,
+			_agentControlGeneration: new Map([['task', 0]]),
+			_parentRunTokenOfThread: new Map<string, symbol>(),
+			_agentDelegationAuthorityOfThread: new Map(),
+			_settingsService: { state: { globalSettings: { chatMode: 'agent' } } },
+			_convertToLLMMessagesService: { prepareLLMChatMessages: async () => ({ messages: [], separateSystemMessage: false }) },
+			_llmMessageService: { sendLLMMessage: (options: TestProviderCallbacks) => { callbacks.push(options); return `request-${callbacks.length}`; }, abort() { } },
+			_mcpService: { getMCPTools: () => [] },
+			_metricsService: { capture() { } },
+			_setStreamState(threadId: string, value: TestStream | undefined) { streamState[threadId] = value; },
+			_addMessageToThread(_threadId: string, message: TestMessage) { messages.push(message); },
+		};
+		const run = () => runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot });
+		const runA = run();
+		await Promise.resolve();
+		assert.strictEqual(callbacks.length, 1);
+		receiver._agentControlGeneration.set('task', 1);
+		const runB = run();
+		await Promise.resolve();
+		assert.strictEqual(callbacks.length, 2);
+		callbacks[1].onText({ fullText: 'B partial', fullReasoning: 'B reasoning', toolCall: undefined });
+		assert.strictEqual(llmInfoOf(streamState.task).displayContentSoFar, 'B partial');
+		callbacks[0].onText({ fullText: 'A stale partial', fullReasoning: 'A reasoning', toolCall: undefined });
+		await callbacks[0].onFinalMessage({ fullText: 'A stale result', fullReasoning: '', anthropicReasoning: null });
+		await runA;
+		assert.deepStrictEqual(llmInfoOf(streamState.task), { displayContentSoFar: 'B partial', reasoningSoFar: 'B reasoning', toolCallSoFar: null });
+		assert.strictEqual(messages.length, 0);
+		await callbacks[1].onFinalMessage({ fullText: 'B result', fullReasoning: '', anthropicReasoning: null });
+		await runB;
+		assert.deepStrictEqual(messages.map(message => message.displayContent), ['B result']);
+	});
+
+	test('a same-generation approval continuation owns a new parent-run token', async () => {
+		const snapshot = instructionSnapshot(); const callbacks: TestProviderCallbacks[] = []; const messages: TestMessage[] = []; const streamState: TestStreamRecord = {};
+		const receiver = {
+			state: { allThreads: { task: { messages, state: {}, filesWithUserChanges: new Set<string>() } }, currentThreadId: 'task' }, streamState,
+			_agentControlGeneration: new Map([['task', 4]]), _parentRunTokenOfThread: new Map<string, symbol>(), _agentDelegationAuthorityOfThread: new Map(),
+			_settingsService: { state: { globalSettings: { chatMode: 'agent' } } }, _convertToLLMMessagesService: { prepareLLMChatMessages: async () => ({ messages: [], separateSystemMessage: false }) },
+			_llmMessageService: { sendLLMMessage: (options: TestProviderCallbacks) => { callbacks.push(options); return `request-${callbacks.length}`; }, abort() { } }, _mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } },
+			_setStreamState(threadId: string, value: TestStream | undefined) { streamState[threadId] = value; }, _addMessageToThread(_threadId: string, message: TestMessage) { messages.push(message); },
+		};
+		const run = () => runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot });
+		const runA = run(); await Promise.resolve(); const runB = run(); await Promise.resolve(); assert.strictEqual(callbacks.length, 2);
+		callbacks[1].onText({ fullText: 'continuation partial', fullReasoning: '', toolCall: undefined }); callbacks[0].onText({ fullText: 'stale A', fullReasoning: '', toolCall: undefined });
+		await callbacks[0].onFinalMessage({ fullText: 'stale A', fullReasoning: '', anthropicReasoning: null }); await runA;
+		assert.strictEqual(llmInfoOf(streamState.task).displayContentSoFar, 'continuation partial'); assert.strictEqual(messages.length, 0);
+		await callbacks[1].onFinalMessage({ fullText: 'continuation complete', fullReasoning: '', anthropicReasoning: null }); await runB;
+		assert.deepStrictEqual(messages.map(message => message.displayContent), ['continuation complete']);
+	});
+
+	test('a stale preapproved-tool continuation cannot clear its replacement run', async () => {
+		const snapshot = instructionSnapshot(); const callbacks: TestProviderCallbacks[] = []; const streamState: TestStreamRecord = {}; let releaseTool: () => void = () => { throw new Error('tool was not entered'); };
+		const receiver = {
+			state: { allThreads: { task: { messages: [], state: {}, filesWithUserChanges: new Set<string>() } }, currentThreadId: 'task' }, streamState,
+			_agentControlGeneration: new Map([['task', 4]]), _parentRunTokenOfThread: new Map<string, symbol>(), _agentDelegationAuthorityOfThread: new Map(),
+			_settingsService: { state: { globalSettings: { chatMode: 'agent' } } }, _convertToLLMMessagesService: { prepareLLMChatMessages: async () => ({ messages: [], separateSystemMessage: false }) },
+			_llmMessageService: { sendLLMMessage: (options: TestProviderCallbacks) => { callbacks.push(options); return `request-${callbacks.length}`; }, abort() { } }, _mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } },
+			_runToolCall: async () => { await new Promise<void>(resolve => releaseTool = resolve); return { interrupted: false }; }, _setStreamState(threadId: string, value: TestStream | undefined) { streamState[threadId] = value; }, _addMessageToThread() { },
+		};
+		const runA = runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot, callThisToolFirst: { role: 'tool', type: 'tool_request', name: 'read_file', id: 'tool-a', params: {}, rawParams: {}, content: '', result: null, mcpServerName: undefined } });
+		await Promise.resolve(); const runB = runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot });
+		await Promise.resolve(); callbacks[0].onText({ fullText: 'B partial', fullReasoning: '', toolCall: undefined }); releaseTool(); await runA;
+		assert.strictEqual(llmInfoOf(streamState.task).displayContentSoFar, 'B partial'); await callbacks[0].onFinalMessage({ fullText: 'B final', fullReasoning: '', anthropicReasoning: null }); await runB;
+	});
+
+	test('a restored pending approval resumes with the default generation when no map entry exists', async () => {
+		const snapshot = instructionSnapshot(); const messages: TestMessage[] = []; const streamState: TestStreamRecord = {}; let toolRuns = 0;
+		const receiver = { state: { allThreads: { task: { messages, state: {}, filesWithUserChanges: new Set<string>() } }, currentThreadId: 'task' }, streamState, _agentControlGeneration: new Map<string, number>(), _parentRunTokenOfThread: new Map<string, symbol>(), _agentDelegationAuthorityOfThread: new Map(), _settingsService: { state: { globalSettings: { chatMode: 'agent' } } }, _convertToLLMMessagesService: { prepareLLMChatMessages: async () => ({ messages: [], separateSystemMessage: false }) }, _runToolCall: async () => { toolRuns++; return { interrupted: false }; }, _llmMessageService: { sendLLMMessage: (options: TestProviderCallbacks) => { queueMicrotask(() => void options.onFinalMessage({ fullText: 'resumed', fullReasoning: '', anthropicReasoning: null })); return 'resumed-request'; }, abort() { } }, _mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } }, _setStreamState(threadId: string, value: TestStream | undefined) { streamState[threadId] = value; }, _addMessageToThread(_threadId: string, message: TestMessage) { messages.push(message); } };
+		await runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot, callThisToolFirst: { role: 'tool', type: 'tool_request', name: 'read_file', id: 'restored-tool', params: {}, rawParams: {}, content: '', result: null, mcpServerName: undefined } });
+		assert.strictEqual(toolRuns, 1); assert.deepStrictEqual(messages.map(message => message.displayContent), ['resumed']);
+	});
+
+	test('a stale generic MCP settlement cannot mutate replacement history or stream', async () => {
+		for (const settlement of ['resolve', 'reject'] as const) {
+			const pendingMCP = deferred<{ result: { ok: boolean } }>();
+			const mutations: TestToolMutation[] = [];
+			const replacement = { isRunning: 'LLM', llmInfo: { displayContentSoFar: `B-${settlement}`, reasoningSoFar: 'B', toolCallSoFar: null }, interrupt: Promise.resolve(() => { }) };
+			const streamState: TestStreamRecord = {};
+			let current = true;
+			let stringifyCalls = 0;
+			const receiver = {
+				state: { allThreads: { task: { messages: [], state: {}, filesWithUserChanges: new Set<string>() } } },
+				streamState,
+				_mcpService: { getMCPTools: () => [{ name: 'deferred_mcp', mcpServerName: 'fixture' }], callMCPTool: () => pendingMCP.promise, stringifyResult: () => { stringifyCalls++; return 'late-success'; } },
+				_updateLatestTool(_threadId: string, message: TestToolMutation) { mutations.push(message); },
+				_setStreamState(threadId: string, value: TestStream | undefined) { streamState[threadId] = value; },
+			};
+			const run = chatLifecycle._runToolCall.call(receiver, 'task', 'deferred_mcp', `tool-${settlement}`, 'fixture', { preapproved: true, unvalidatedToolParams: {}, validatedParams: {} }, instructionSnapshot(), undefined, false, 0, () => current);
+			await Promise.resolve();
+			assert.strictEqual(mutations.length, 1);
+			current = false;
+			streamState.task = replacement;
+			if (settlement === 'resolve') pendingMCP.resolve({ result: { ok: true } });
+			else pendingMCP.reject(new Error('late MCP rejection'));
+			assert.deepStrictEqual(await run, { interrupted: true });
+			assert.strictEqual(mutations.length, 1);
+			assert.strictEqual(mutations.some(message => message.type === 'success' || message.type === 'tool_error'), false);
+			assert.strictEqual(stringifyCalls, 0);
+			assert.strictEqual(streamState.task, replacement);
+		}
+	});
+
+	test('built-in setup cancellation settles before deferred prepare or call handles and preserves a newer run', async () => {
+		for (const setupKind of ['prepare-write', 'call-handle'] as const) {
+			const setup = deferred<TestBuiltinSetup>();
+			const mutations: TestToolMutation[] = [];
+			const streamState: TestStreamRecord = {};
+			let executeCalls = 0;
+			let interruptCalls = 0;
+			const receiver = {
+				state: { allThreads: { task: { messages: [], state: {}, filesWithUserChanges: new Set<string>() } } },
+				streamState,
+				_parentRunTokenOfThread: new Map<string, symbol>(),
+				_agentControlGeneration: new Map([['task', 0]]),
+				_agentDelegationAuthorityOfThread: new Map(),
+				_childToolApprovals: new Map(),
+				_onDidChangeChildToolApprovals: { fire() { } },
+				_agentSubagentService: { cancelParent() { }, forgetParent() { } },
+				_toolsService: {
+					invalidateReadReceipts(_threadId: string) { },
+					prepareWriteFile: () => setup.promise,
+					callTool: { run_command: () => setup.promise },
+					stringOfResult: { run_command: () => { throw new Error('stale result was stringified'); } },
+				},
+				_mcpService: { getMCPTools: () => [] },
+				toolErrMsgs: { interrupted: 'Tool call was interrupted by the user.' },
+				_updateLatestTool(_threadId: string, message: TestToolMutation) { mutations.push(message); },
+				_setStreamState(threadId: string, value: TestStream | undefined) { streamState[threadId] = value; },
+			};
+			Object.setPrototypeOf(receiver, ChatThreadService.prototype);
+			const parentRun = beginTestParentRun(receiver, 'task');
+			const toolName = setupKind === 'prepare-write' ? 'write_file' : 'run_command';
+			const run = chatLifecycle._runToolCall.call(receiver, 'task', toolName, `tool-${setupKind}`, undefined, { preapproved: true, unvalidatedToolParams: {}, validatedParams: {} }, instructionSnapshot(), undefined, false, parentRun.generation, parentRun.isActive);
+			await Promise.resolve();
+			assert.strictEqual(streamState.task?.isRunning, 'tool');
+			const abort = chatLifecycle.abortRunning.call(receiver, 'task');
+			const abortSettled = await Promise.race([abort.then(() => true), new Promise<boolean>(resolve => setTimeout(() => resolve(false), 1_000))]);
+			assert.strictEqual(abortSettled, true);
+			const replacementRun = beginTestParentRun(receiver, 'task');
+			const replacement = { isRunning: 'LLM', llmInfo: { displayContentSoFar: `B-${setupKind}`, reasoningSoFar: 'B', toolCallSoFar: null }, interrupt: Promise.resolve(() => { }) };
+			streamState.task = replacement;
+			const mutationsAfterAbort = mutations.length;
+			if (setupKind === 'prepare-write') setup.resolve({ execute: () => { executeCalls++; return Promise.resolve({}); } });
+			else setup.resolve({ result: Promise.resolve({}), interruptTool: () => { interruptCalls++; } });
+			assert.deepStrictEqual(await run, { interrupted: true });
+			assert.strictEqual(executeCalls, 0);
+			assert.strictEqual(interruptCalls, setupKind === 'call-handle' ? 1 : 0);
+			assert.strictEqual(mutations.length, mutationsAfterAbort);
+			assert.strictEqual(streamState.task, replacement);
+			assert.strictEqual(replacementRun.isActive(), true);
+			replacementRun.deactivate(); replacementRun.releaseLatest();
+		}
+	});
+
+	test('run completion notifications preserve current effects and suppress stale effects', async () => {
+		const invalidations: string[] = [];
+		const notifications: TestNotification[] = [];
+		const receiver = {
+			state: { allThreads: { task: { messages: [{ role: 'user', displayContent: 'fixture request' }] } }, currentThreadId: 'other' },
+			streamState: {},
+			_agentControlGeneration: new Map([['task', 0]]),
+			_parentRunTokenOfThread: new Map<string, symbol>(),
+			_agentDelegationAuthorityOfThread: new Map(),
+			_childToolApprovals: new Map(),
+			_onDidChangeChildToolApprovals: { fire() { } },
+			_agentSubagentService: { cancelParent() { }, forgetParent() { } },
+			_toolsService: { invalidateReadReceipts: (threadId: string) => invalidations.push(threadId) },
+			_notificationService: { notify: (notification: TestNotification) => notifications.push(notification) },
+		};
+		Object.setPrototypeOf(receiver, ChatThreadService.prototype);
+		const wrap = (promise: Promise<void>, isLatest: () => boolean) => chatLifecycle._wrapRunAgentToNotify.call(receiver, promise, 'task', standaloneParentRun(isLatest));
+		const sameGenerationA = beginTestParentRun(receiver, 'task'); const sameGenerationPending = deferred<void>(); const staleSameGeneration = chatLifecycle._wrapRunAgentToNotify.call(receiver, sameGenerationPending.promise, 'task', sameGenerationA); const sameGenerationB = beginTestParentRun(receiver, 'task'); sameGenerationPending.resolve(undefined); await staleSameGeneration; assert.strictEqual(invalidations.length, 0); assert.strictEqual(notifications.length, 0); sameGenerationB.deactivate(); sameGenerationB.releaseLatest();
+		for (const settlement of ['resolve', 'reject'] as const) {
+			const pending = deferred<void>(); const oldRun = beginTestParentRun(receiver, 'task'); const wrapped = chatLifecycle._wrapRunAgentToNotify.call(receiver, pending.promise, 'task', oldRun);
+			chatLifecycle._revokeAgentDelegation.call(receiver, 'task'); assert.strictEqual(invalidations.length, 1); const replacement = beginTestParentRun(receiver, 'task');
+			if (settlement === 'resolve') pending.resolve(undefined); else pending.reject(new Error('stale revoked failure'));
+			await wrapped; assert.strictEqual(invalidations.length, 1); assert.strictEqual(notifications.length, 0); replacement.deactivate(); replacement.releaseLatest(); invalidations.length = 0;
+		}
+		for (const settlement of ['resolve', 'reject'] as const) {
+			const pending = deferred<void>(); let current = true; const wrapped = wrap(pending.promise, () => current); current = false;
+			if (settlement === 'resolve') pending.resolve(undefined); else pending.reject(new Error('stale failure'));
+			await wrapped;
+		}
+		assert.strictEqual(invalidations.length, 0); assert.strictEqual(notifications.length, 0);
+		await wrap(Promise.resolve(), () => true);
+		assert.deepStrictEqual(invalidations, ['task']); assert.strictEqual(notifications.length, 1); assert.strictEqual(notifications[0].severity, Severity.Info); assert.strictEqual(notifications[0].message, 'A new Chat result is ready.');
+		await assert.rejects(wrap(Promise.reject(new Error('current failure')), () => true), /current failure/);
+		assert.deepStrictEqual(invalidations, ['task', 'task']); assert.strictEqual(notifications.length, 2); assert.strictEqual(notifications[1].severity, Severity.Warning); assert.ok(notifications[1].message.includes('current failure'));
+	});
+
+	test('a completed provider attempt ignores every late or duplicate callback without changing current effects', async () => {
+		const snapshot = instructionSnapshot(); const callbacks: TestProviderCallbacks[] = []; const messages: TestMessage[] = [{ role: 'user', content: 'fixture request', displayContent: 'fixture request' }]; const streamState: TestStreamRecord = {}; const metrics: string[] = []; const invalidations: string[] = []; const notifications: TestNotification[] = [];
+		const receiver = {
+			state: { allThreads: { task: { messages, state: {}, filesWithUserChanges: new Set<string>() } }, currentThreadId: 'other' }, streamState,
+			_agentControlGeneration: new Map([['task', 0]]), _parentRunTokenOfThread: new Map<string, symbol>(), _agentDelegationAuthorityOfThread: new Map(),
+			_settingsService: { state: { globalSettings: { chatMode: 'agent' } } }, _convertToLLMMessagesService: { prepareLLMChatMessages: async () => ({ messages: [], separateSystemMessage: false }) },
+			_llmMessageService: { sendLLMMessage: (options: TestProviderCallbacks) => { callbacks.push(options); return 'current-request'; }, abort() { } }, _mcpService: { getMCPTools: () => [] },
+			_metricsService: { capture: (name: string) => metrics.push(name) }, _toolsService: { invalidateReadReceipts: (threadId: string) => invalidations.push(threadId) }, _notificationService: { notify: (notification: TestNotification) => notifications.push(notification) },
+			_setStreamState(threadId: string, value: TestStream | undefined) { streamState[threadId] = value; }, _addMessageToThread(_threadId: string, message: TestMessage) { messages.push(message); },
+		};
+		const parentRun = beginTestParentRun(receiver, 'task');
+		const running = chatLifecycle._runChatAgent.call(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot, parentRun });
+		const wrapped = chatLifecycle._wrapRunAgentToNotify.call(receiver, running, 'task', parentRun);
+		await Promise.resolve(); assert.strictEqual(callbacks.length, 1); callbacks[0].onText({ fullText: 'current partial', fullReasoning: 'current reasoning', toolCall: undefined }); await callbacks[0].onFinalMessage({ fullText: 'current final', fullReasoning: 'current reasoning', anthropicReasoning: null }); await wrapped;
+		const finalStream = streamState.task; const finalHistory = JSON.stringify(messages); const finalMetrics = [...metrics];
+		callbacks[0].onText({ fullText: 'late text', fullReasoning: 'late reasoning', toolCall: undefined }); await callbacks[0].onFinalMessage({ fullText: 'duplicate final', fullReasoning: '', anthropicReasoning: null }); await callbacks[0].onError({ message: 'duplicate error', fullError: null }); callbacks[0].onAbort(); await Promise.resolve();
+		assert.strictEqual(streamState.task, finalStream); assert.strictEqual(JSON.stringify(messages), finalHistory); assert.deepStrictEqual(metrics, finalMetrics); assert.deepStrictEqual(metrics, ['Agent Loop Done']); assert.deepStrictEqual(invalidations, ['task']); assert.strictEqual(notifications.length, 1); assert.strictEqual(notifications[0].severity, Severity.Info); assert.strictEqual(receiver._parentRunTokenOfThread.has('task'), false);
+	});
+
 	test('request conversion through deterministic local echo never stores or renders the internal empty sentinel', async () => {
 		const snapshot = instructionSnapshot();
 		const thread: any = {
@@ -69,6 +346,7 @@ suite('Assistant message lifecycle', () => {
 			state: { allThreads: { task: thread }, currentThreadId: 'task' },
 			streamState,
 			_agentControlGeneration: new Map([['task', 0]]),
+			_parentRunTokenOfThread: new Map<string, symbol>(),
 			_agentDelegationAuthorityOfThread: new Map(),
 			_settingsService: { state: { globalSettings: { chatMode: 'agent' } } },
 			_convertToLLMMessagesService: converter,
@@ -96,7 +374,7 @@ suite('Assistant message lifecycle', () => {
 			},
 		};
 
-		await (ChatThreadService.prototype as any)._runChatAgent.call(receiver, {
+		await runChatAgent(receiver, {
 			threadId: 'task',
 			modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' },
 			modelSelectionOptions: snapshot.model.modelSelectionOptions,

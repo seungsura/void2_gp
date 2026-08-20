@@ -35,8 +35,10 @@ const delegationLifecycleFixture = () => ({
 	_revokeAgentDelegation: revokeAgentDelegation,
 	_cancelChildToolApprovalsForParent() { },
 	_agentControlGeneration: new Map<string, number>(),
+	_parentRunTokenOfThread: new Map<string, symbol>(),
 	_agentDelegationAuthorityOfThread: new Map<string, unknown>(),
 	_agentSubagentService: { cancelParent() { }, forgetParent() { } },
+	_toolsService: { invalidateReadReceipts(_threadId: string) { } },
 });
 const nonAgentSettingsFixture = () => ({ state: { overridesOfModel: {}, globalSettings: { chatMode: 'chat' } } });
 
@@ -285,6 +287,7 @@ suite('AGENTS instruction runtime paths', () => {
 		const receiver = {
 			state: { allThreads: { task: thread }, overridesOfModel: {} },
 			_agentControlGeneration: new Map<string, number>(),
+			_parentRunTokenOfThread: new Map<string, symbol>(),
 			streamState,
 			_settingsService: { state: { globalSettings: { chatMode: 'agent' }, overridesOfModel: {} } },
 			_setStreamState(threadId: string, value: unknown) { streamState[threadId] = value; },
@@ -318,8 +321,9 @@ suite('AGENTS instruction runtime paths', () => {
 			_metricsService: { capture: (...args: unknown[]) => metrics.push(args) },
 		};
 
+		const token = Symbol('instruction-runtime-parent-run'); let active = true; receiver._parentRunTokenOfThread.set('task', token); const isLatest = () => receiver._parentRunTokenOfThread.get('task') === token && (receiver._agentControlGeneration.get('task') ?? 0) === 0; const parentRun = { token, generation: 0, isLatest, isActive: () => active && isLatest(), deactivate: () => { active = false; }, releaseLatest: () => { if (isLatest()) receiver._parentRunTokenOfThread.delete('task'); } };
 		const run = (ChatThreadService.prototype as unknown as { _runChatAgent: (options: unknown) => Promise<void> })._runChatAgent;
-		await run.call(receiver, { threadId: 'task', modelSelection: null, modelSelectionOptions: undefined, instructionSnapshot });
+		await run.call(receiver, { threadId: 'task', modelSelection: null, modelSelectionOptions: undefined, instructionSnapshot, parentRun });
 
 		assert.strictEqual(sends, 3);
 		assert.strictEqual(preparedMessages.length, 2);
