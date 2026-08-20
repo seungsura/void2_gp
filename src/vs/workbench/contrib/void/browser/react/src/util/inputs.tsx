@@ -384,6 +384,17 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 
 	const textAreaRef = useRef<HTMLTextAreaElement | null>(null)
 	const selectedOptionRef = useRef<HTMLDivElement>(null);
+	const adjustHeight = useCallback(() => {
+		const r = textAreaRef.current
+		if (!r) return
+
+		r.style.height = 'auto' // set to auto to reset height, then set to new height
+
+		if (r.scrollHeight === 0) return requestAnimationFrame(adjustHeight)
+		const h = r.scrollHeight
+		const newHeight = Math.min(h + 1, 500) // plus one to avoid scrollbar appearing when it shouldn't
+		r.style.height = `${newHeight}px`
+	}, []);
 	const [isMenuOpen, _setIsMenuOpen] = useState(false); // the @ to mention menu
 	const setIsMenuOpen: typeof _setIsMenuOpen = (value) => {
 		if (!enableAtToMention) { return; } // never open menu if not enabled
@@ -771,20 +782,6 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 
 
 	const [isEnabled, setEnabled] = useState(true)
-
-	const adjustHeight = useCallback(() => {
-		const r = textAreaRef.current
-		if (!r) return
-
-		r.style.height = 'auto' // set to auto to reset height, then set to new height
-
-		if (r.scrollHeight === 0) return requestAnimationFrame(adjustHeight)
-		const h = r.scrollHeight
-		const newHeight = Math.min(h + 1, 500) // plus one to avoid scrollbar appearing when it shouldn't
-		r.style.height = `${newHeight}px`
-	}, []);
-
-
 
 	const fns: TextAreaFns = useMemo(() => ({
 		setValue: (val) => {
