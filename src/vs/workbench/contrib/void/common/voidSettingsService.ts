@@ -33,7 +33,7 @@ type SetModelSelectionOfFeatureFn = <K extends FeatureName>(
 	newVal: ModelSelectionOfFeature[K],
 ) => Promise<void>;
 
-type SetGlobalSettingFn = <T extends GlobalSettingName>(settingName: T, newVal: GlobalSettings[T]) => void;
+type SetGlobalSettingFn = <T extends GlobalSettingName>(settingName: T, newVal: GlobalSettings[T]) => Promise<void>;
 
 type SetOptionsOfModelSelection = (featureName: FeatureName, providerName: ProviderName, modelName: string, newVal: Partial<ModelSelectionOptions>) => void
 
@@ -227,13 +227,14 @@ const defaultState = () => {
 
 
 export const IVoidSettingsService = createDecorator<IVoidSettingsService>('VoidSettingsService');
-class VoidSettingsService extends Disposable implements IVoidSettingsService {
+export class VoidSettingsService extends Disposable implements IVoidSettingsService {
 	_serviceBrand: undefined;
 
 	private readonly _onDidChangeState = new Emitter<void>();
 	readonly onDidChangeState: Event<void> = this._onDidChangeState.event; // this is primarily for use in react, so react can listen + update on state changes
 
 	state: VoidSettingsState;
+	private _storeStateTail: Promise<void> = Promise.resolve();
 
 	private readonly _resolver: () => void
 	waitForInitState: Promise<void> // await this if you need a valid state initially
@@ -263,8 +264,8 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 		this.state = _validatedModelState(newState)
 		await this._storeState()
 		this._onDidChangeState.fire()
-		this._onUpdate_syncApplyToChat()
-		this._onUpdate_syncSCMToChat()
+		await this._onUpdate_syncApplyToChat()
+		await this._onUpdate_syncSCMToChat()
 	}
 	async resetState() {
 		await this.dangerousSetState(defaultState())
@@ -361,10 +362,14 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 	}
 
 
-	private async _storeState() {
-		const state = this.state
-		const encryptedState = await this._encryptionService.encrypt(JSON.stringify(state))
-		this._storageService.store(VOID_SETTINGS_STORAGE_KEY, encryptedState, StorageScope.APPLICATION, StorageTarget.USER);
+	private _storeState(): Promise<void> {
+		const write = async () => {
+			const encryptedState = await this._encryptionService.encrypt(JSON.stringify(this.state))
+			this._storageService.store(VOID_SETTINGS_STORAGE_KEY, encryptedState, StorageScope.APPLICATION, StorageTarget.USER);
+		};
+		const pending = this._storeStateTail.then(write, write);
+		this._storeStateTail = pending.catch(() => undefined);
+		return pending;
 	}
 
 	setSettingOfProvider: SetSettingOfProviderFn = async (providerName, settingName, newVal) => {
@@ -402,13 +407,13 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 	}
 
 
-	private _onUpdate_syncApplyToChat() {
+	private async _onUpdate_syncApplyToChat() {
 		// if sync is turned on, sync (call this whenever Chat model or !!sync changes)
-		this.setModelSelectionOfFeature('Apply', deepClone(this.state.modelSelectionOfFeature['Chat']))
+		await this.setModelSelectionOfFeature('Apply', deepClone(this.state.modelSelectionOfFeature['Chat']))
 	}
 
-	private _onUpdate_syncSCMToChat() {
-		this.setModelSelectionOfFeature('SCM', deepClone(this.state.modelSelectionOfFeature['Chat']))
+	private async _onUpdate_syncSCMToChat() {
+		await this.setModelSelectionOfFeature('SCM', deepClone(this.state.modelSelectionOfFeature['Chat']))
 	}
 
 	setGlobalSetting: SetGlobalSettingFn = async (settingName, newVal) => {
@@ -425,8 +430,8 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 		this._onDidChangeState.fire()
 
 		// hooks
-		if (this.state.globalSettings.syncApplyToChat) this._onUpdate_syncApplyToChat()
-		if (this.state.globalSettings.syncSCMToChat) this._onUpdate_syncSCMToChat()
+		if (this.state.globalSettings.syncApplyToChat) await this._onUpdate_syncApplyToChat()
+		if (this.state.globalSettings.syncSCMToChat) await this._onUpdate_syncSCMToChat()
 
 	}
 
@@ -448,8 +453,8 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 		// hooks
 		if (featureName === 'Chat') {
 			// When Chat model changes, update synced features
-			this._onUpdate_syncApplyToChat()
-			this._onUpdate_syncSCMToChat()
+			await this._onUpdate_syncApplyToChat()
+			await this._onUpdate_syncSCMToChat()
 		}
 	}
 
