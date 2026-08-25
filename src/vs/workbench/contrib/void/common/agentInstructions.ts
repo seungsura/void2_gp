@@ -7,9 +7,6 @@ import { isEqualOrParent } from '../../../../base/common/resources.js';
 
 export const DEFAULT_PROJECT_DOC_MAX_BYTES = 32 * 1024;
 export const DEFAULT_AGENT_DELEGATION_LIMITS = Object.freeze({ maxAcceptedChildren: 4, maxConcurrentThreadsPerSession: 2, maxDepth: 1 });
-export const MAX_AGENT_DELEGATION_THREADS = 8;
-export const MAX_AGENT_DELEGATION_CONCURRENT_THREADS_PER_SESSION = 4;
-export const MAX_AGENT_DELEGATION_DEPTH = 2;
 const MAX_AGENT_DELEGATION_LIMIT_DIAGNOSTICS = 8;
 
 export type AgentDelegationLimits = Readonly<{
@@ -117,11 +114,14 @@ export const projectAgentConfig = (
 ): AgentInstructionsConfig => {
 	const maxAcceptedChildren = project?.agentMaxAcceptedChildren ?? user?.agentMaxAcceptedChildren ?? DEFAULT_AGENT_DELEGATION_LIMITS.maxAcceptedChildren;
 	const configuredConcurrent = project?.agentMaxConcurrentThreadsPerSession ?? user?.agentMaxConcurrentThreadsPerSession ?? DEFAULT_AGENT_DELEGATION_LIMITS.maxConcurrentThreadsPerSession;
-	const maxConcurrentThreadsPerSession = Math.min(configuredConcurrent, maxAcceptedChildren);
 	const maxAcceptedChildrenSource = project?.agentMaxAcceptedChildren !== undefined ? 'project' : user?.agentMaxAcceptedChildren !== undefined ? 'user' : 'default';
 	const maxConcurrentThreadsPerSessionSource = project?.agentMaxConcurrentThreadsPerSession !== undefined ? 'project' : user?.agentMaxConcurrentThreadsPerSession !== undefined ? 'user' : 'default';
+	// A default concurrency follows a smaller explicitly configured open capacity.
+	// An explicit conflicting value remains visible and is rejected at admission; it
+	// must never be silently rewritten into a different user setting.
+	const maxConcurrentThreadsPerSession = maxConcurrentThreadsPerSessionSource === 'default' ? Math.min(configuredConcurrent, maxAcceptedChildren) : configuredConcurrent;
 	const limitDiagnostics = [...(user?.agentDelegationLimitDiagnostics ?? []), ...(project?.agentDelegationLimitDiagnostics ?? [])];
-	if (configuredConcurrent > maxAcceptedChildren && maxConcurrentThreadsPerSessionSource !== 'default' && maxConcurrentThreadsPerSessionSource !== maxAcceptedChildrenSource) limitDiagnostics.push(Object.freeze({ source: maxConcurrentThreadsPerSessionSource, reason: 'max_concurrent_threads_per_session_clamped', code: 'agent_delegation_limits_invalid' }));
+	if (configuredConcurrent > maxAcceptedChildren && maxConcurrentThreadsPerSessionSource !== 'default' && !limitDiagnostics.some(diagnostic => diagnostic.source === maxConcurrentThreadsPerSessionSource && diagnostic.reason === 'max_concurrent_threads_per_session_exceeds_accepted')) limitDiagnostics.push(Object.freeze({ source: maxConcurrentThreadsPerSessionSource, reason: 'max_concurrent_threads_per_session_exceeds_accepted', code: 'agent_delegation_limits_invalid' }));
 	return Object.freeze({
 		developerInstructions: project?.developerInstructions ?? user?.developerInstructions ?? '',
 		projectDocMaxBytes: project?.projectDocMaxBytes ?? user?.projectDocMaxBytes ?? DEFAULT_PROJECT_DOC_MAX_BYTES,
@@ -148,17 +148,17 @@ export const projectAgentConfigProjection = (value: unknown): ParsedAgentConfig 
 		if (agentDiagnostics.length < MAX_AGENT_DELEGATION_LIMIT_DIAGNOSTICS) agentDiagnostics.push(Object.freeze({ source: 'user', reason, code: 'agent_delegation_limits_invalid' }));
 	};
 	if (agentsTablePresent && !agentsTable) agentDiagnostic('agents_not_object');
-	const strictLimit = (key: 'max_accepted_children' | 'max_concurrent_threads_per_session' | 'max_depth', max: number, reason: AgentDelegationLimitDiagnostic['reason']): number | undefined => {
+	const strictLimit = (key: 'max_accepted_children' | 'max_concurrent_threads_per_session' | 'max_depth', min: number, reason: AgentDelegationLimitDiagnostic['reason']): number | undefined => {
 		if (!agentsTable || agentsTable[key] === undefined) return undefined;
 		const raw = agentsTable[key];
-		if (typeof raw !== 'number' || !Number.isSafeInteger(raw) || raw < 1 || raw > max) { agentDiagnostic(reason); return undefined; }
+		if (typeof raw !== 'number' || !Number.isSafeInteger(raw) || raw < min) { agentDiagnostic(reason); return undefined; }
 		return raw;
 	};
 	if (agentsTable) for (const key of Object.keys(agentsTable)) if (!['max_accepted_children', 'max_concurrent_threads_per_session', 'max_depth'].includes(key)) agentDiagnostic('unknown_key');
-	const agentMaxAcceptedChildren = strictLimit('max_accepted_children', MAX_AGENT_DELEGATION_THREADS, 'max_accepted_children_invalid');
-	let agentMaxConcurrentThreadsPerSession = strictLimit('max_concurrent_threads_per_session', MAX_AGENT_DELEGATION_CONCURRENT_THREADS_PER_SESSION, 'max_concurrent_threads_per_session_invalid');
-	if (agentMaxAcceptedChildren !== undefined && agentMaxConcurrentThreadsPerSession !== undefined && agentMaxConcurrentThreadsPerSession > agentMaxAcceptedChildren) { agentDiagnostic('max_concurrent_threads_per_session_exceeds_accepted'); agentMaxConcurrentThreadsPerSession = undefined; }
-	const agentMaxDepth = strictLimit('max_depth', MAX_AGENT_DELEGATION_DEPTH, 'max_depth_invalid');
+	const agentMaxAcceptedChildren = strictLimit('max_accepted_children', 1, 'max_accepted_children_invalid');
+	const agentMaxConcurrentThreadsPerSession = strictLimit('max_concurrent_threads_per_session', 1, 'max_concurrent_threads_per_session_invalid');
+	if (agentMaxAcceptedChildren !== undefined && agentMaxConcurrentThreadsPerSession !== undefined && agentMaxConcurrentThreadsPerSession > agentMaxAcceptedChildren) agentDiagnostic('max_concurrent_threads_per_session_exceeds_accepted');
+	const agentMaxDepth = strictLimit('max_depth', 0, 'max_depth_invalid');
 	const rules: SkillConfigRule[] = []; const diagnostics: SkillConfigDiagnostic[] = [];
 	const skillTablePresent = record.skills !== undefined;
 	const skillTable = record.skills && typeof record.skills === 'object' && !Array.isArray(record.skills) ? record.skills as Record<string, unknown> : undefined;
@@ -434,9 +434,9 @@ export const reviveAgentInstructionTurnSnapshot = (value: unknown): AgentInstruc
 	const rawLimits = object(config.agentDelegationLimits)!;
 	const rawLimitSources = object(config.agentDelegationLimitsSource)!;
 	const limitNames = ['maxAcceptedChildren', 'maxConcurrentThreadsPerSession', 'maxDepth'] as const;
-	const limitsValid = Number.isSafeInteger(rawLimits.maxAcceptedChildren) && (rawLimits.maxAcceptedChildren as number) >= 1 && (rawLimits.maxAcceptedChildren as number) <= MAX_AGENT_DELEGATION_THREADS
-		&& Number.isSafeInteger(rawLimits.maxConcurrentThreadsPerSession) && (rawLimits.maxConcurrentThreadsPerSession as number) >= 1 && (rawLimits.maxConcurrentThreadsPerSession as number) <= Math.min(MAX_AGENT_DELEGATION_CONCURRENT_THREADS_PER_SESSION, rawLimits.maxAcceptedChildren as number)
-		&& Number.isSafeInteger(rawLimits.maxDepth) && (rawLimits.maxDepth as number) >= 1 && (rawLimits.maxDepth as number) <= MAX_AGENT_DELEGATION_DEPTH
+	const limitsValid = Number.isSafeInteger(rawLimits.maxAcceptedChildren) && (rawLimits.maxAcceptedChildren as number) >= 1
+		&& Number.isSafeInteger(rawLimits.maxConcurrentThreadsPerSession) && (rawLimits.maxConcurrentThreadsPerSession as number) >= 1
+		&& Number.isSafeInteger(rawLimits.maxDepth) && (rawLimits.maxDepth as number) >= 0
 		&& Object.keys(rawLimits).length === 3 && Object.keys(rawLimitSources).length === 3
 		&& limitNames.every(name => ['user', 'project', 'default'].includes(rawLimitSources[name] as string));
 	if (!limitsValid) return undefined;

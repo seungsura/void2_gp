@@ -304,7 +304,7 @@ suite('Void AgentSubagentService', () => {
 		const diagnostics = f.service.getDiagnosticsView('admission-trace')!; const failed = diagnostics.events.find(event => event.kind === 'admission_failed'); assert.strictEqual(failed?.diagnostic, 'skill_unavailable'); assert.strictEqual(JSON.stringify(failed).includes('skill_stale'), false);
 		f.service.forgetParent('admission-trace'); assert.strictEqual(f.service.getDiagnosticsView('admission-trace'), undefined);
 	});
-	test('reserves four admissions, starts two, queues FIFO, and never refunds terminal quota', async () => {
+	test('reserves four admissions, starts two, queues FIFO, and refunds terminal open capacity', async () => {
 		const f = fixture({ send: () => 'request' });
 		const children = await Promise.all(['one', 'two', 'three', 'four'].map(message => f.service.spawn('parent', message, snapshot())));
 		assert.strictEqual(f.providerCalls.length, 2); assert.deepStrictEqual(f.service.getRunViews('parent').map(view => view.status), ['running', 'running', 'queued', 'queued']); assert.deepStrictEqual(f.service.getBudgetView('parent') && { maxAccepted: f.service.getBudgetView('parent')!.maxAccepted, maxConcurrent: f.service.getBudgetView('parent')!.maxConcurrent }, { maxAccepted: 4, maxConcurrent: 2 });
@@ -316,7 +316,7 @@ suite('Void AgentSubagentService', () => {
 		await new Promise(resolve => setTimeout(resolve, 0));
 		assert.strictEqual(f.providerCalls.length, 4); assert.deepStrictEqual(f.service.getRunViews('parent').map(view => view.status), ['cancelled', 'cancelled', 'running', 'running']);
 		assert.deepStrictEqual(f.converterCalls.slice(0, 4).map(call => call.chatMessages[0].content), ['one', 'two', 'three', 'four']);
-		await assert.rejects(() => f.service.spawn('parent', 'still-five', snapshot()), /agent_child_limit_reached/);
+		await f.service.spawn('parent', 'five-after-terminal', snapshot());
 	});
 
 	test('freezes configured child limits per group generation and exposes them in the budget', async () => {
@@ -342,7 +342,7 @@ suite('Void AgentSubagentService', () => {
 		assert.deepStrictEqual({ parentRunId: nested.parentRunId, depth: nested.depth, remainingDepth: nested.remainingDepth }, { parentRunId: top.id, depth: 2, remainingDepth: 0 });
 		assert.strictEqual(f.providerCalls.some(call => call.agentDelegationAllowed === true), true); assert.strictEqual(f.providerCalls.some(call => call.agentDelegationAllowed === false), true);
 		assert.strictEqual(f.converterCalls.some(call => call.agentDelegationAllowed === true), true); assert.strictEqual(f.converterCalls.some(call => call.agentDelegationAllowed === false), true);
-		assert.deepStrictEqual(f.service.getBudgetView('depth-two') && { accepted: f.service.getBudgetView('depth-two')!.accepted, maxAccepted: f.service.getBudgetView('depth-two')!.maxAccepted, maxConcurrent: f.service.getBudgetView('depth-two')!.maxConcurrent }, { accepted: 2, maxAccepted: 2, maxConcurrent: 2 });
+		assert.deepStrictEqual(f.service.getBudgetView('depth-two') && { accepted: f.service.getBudgetView('depth-two')!.accepted, maxAccepted: f.service.getBudgetView('depth-two')!.maxAccepted, maxConcurrent: f.service.getBudgetView('depth-two')!.maxConcurrent }, { accepted: 0, maxAccepted: 2, maxConcurrent: 2 });
 		await assert.rejects(() => f.service.wait('depth-two', 0, [nested.id]), /agent_child_not_direct/); assert.throws(() => f.service.interrupt('depth-two', nested.id), /agent_child_not_direct/);
 
 		let depthOneCalls = 0; const shallow = fixture({ send: options => { depthOneCalls++; if (depthOneCalls === 1) queueMicrotask(() => options.onFinalMessage({ fullText: 'deny', fullReasoning: '', anthropicReasoning: null, toolCall: { id: 'denied-spawn', name: 'spawn_agent', rawParams: { message: 'not admitted' } } })); else queueMicrotask(() => options.onFinalMessage({ fullText: 'done', fullReasoning: '', anthropicReasoning: null })); return `request-${depthOneCalls}`; } });
@@ -475,7 +475,7 @@ suite('Void AgentSubagentService', () => {
 		const f = fixture({ send: options => { sends++; queueMicrotask(() => sends === 1 ? options.onFinalMessage({ fullText: 'try elevation', fullReasoning: '', anthropicReasoning: null, toolCall: { id: 'nested-writer', name: 'spawn_agent', rawParams: { message: 'write', agent_type: 'writer' } } }) : options.onFinalMessage({ fullText: 'done', fullReasoning: '', anthropicReasoning: null })); return `request-${sends}`; } });
 		await f.service.spawn('no-elevation', 'top', snapshot([], 'file:///workspace', 'gpt-4.1', { maxAcceptedChildren: 2, maxConcurrentThreadsPerSession: 2, maxDepth: 2 }), undefined, roles, undefined, undefined, 0, parentTools);
 		await new Promise(resolve => setTimeout(resolve, 0));
-		assert.strictEqual(sends, 2); assert.strictEqual(f.service.getRunViews('no-elevation').length, 1); assert.strictEqual(f.service.getBudgetView('no-elevation')?.accepted, 1); assert.strictEqual(f.service.getBudgetView('no-elevation')?.running, 0); assert.strictEqual(f.service.getRunView('no-elevation')?.capabilityProfile, 'read_only');
+		assert.strictEqual(sends, 2); assert.strictEqual(f.service.getRunViews('no-elevation').length, 1); assert.strictEqual(f.service.getBudgetView('no-elevation')?.accepted, 0); assert.strictEqual(f.service.getBudgetView('no-elevation')?.running, 0); assert.strictEqual(f.service.getRunView('no-elevation')?.capabilityProfile, 'read_only');
 	});
 
 	test('retains one captured profile for inherited parent and nested child after live registry drift', async () => {
@@ -511,7 +511,7 @@ suite('Void AgentSubagentService', () => {
 		await f.service.spawn('deferred-tree', 'top', snapshot([], 'file:///workspace', 'gpt-4.1', { maxAcceptedChildren: 2, maxConcurrentThreadsPerSession: 2, maxDepth: 2 })); await started;
 		const top = f.service.getRunViews('deferred-tree')[0]; assert.strictEqual(sends, 1);
 		f.service.interrupt('deferred-tree', top.id); release(); await new Promise(resolve => setTimeout(resolve, 0));
-		assert.deepStrictEqual(f.service.getRunViews('deferred-tree').map(run => run.status), ['cancelled']); assert.strictEqual(sends, 1); assert.strictEqual(f.service.getBudgetView('deferred-tree')?.accepted, 1);
+		assert.deepStrictEqual(f.service.getRunViews('deferred-tree').map(run => run.status), ['cancelled']); assert.strictEqual(sends, 1); assert.strictEqual(f.service.getBudgetView('deferred-tree')?.accepted, 0);
 	});
 
 	test('failed admission releases its reservation without a row or event', async () => {
@@ -521,6 +521,14 @@ suite('Void AgentSubagentService', () => {
 		(f.service as any).skills.readSkillBody = async () => ({ body: skillText('demo') });
 		await Promise.all(['1', '2', '3', '4'].map(message => f.service.spawn('admission-release', message, snapshot())));
 		assert.strictEqual(f.service.getBudgetView('admission-release')?.accepted, 4); await assert.rejects(() => f.service.spawn('admission-release', '5', snapshot()), /agent_child_limit_reached/);
+	});
+
+	test('returns terminal open capacity while retaining terminal rows and rejects depth zero before a row or provider call', async () => {
+		const f = fixture({ send: options => { queueMicrotask(() => options.onFinalMessage({ fullText: 'done', fullReasoning: '', anthropicReasoning: null })); return 'request'; } });
+		await assert.rejects(() => f.service.spawn('depth-zero', 'nope', snapshot([], 'file:///workspace', 'gpt-4.1', { maxAcceptedChildren: 32, maxConcurrentThreadsPerSession: 16, maxDepth: 0 })), /agent_child_depth_exhausted/);
+		assert.strictEqual(f.service.getRunViews('depth-zero').length, 0); assert.strictEqual(f.providerCalls.length, 0);
+		for (let index = 0; index < 100; index++) { await f.service.spawn('sequential', String(index), snapshot([], 'file:///workspace', 'gpt-4.1', { maxAcceptedChildren: 32, maxConcurrentThreadsPerSession: 16, maxDepth: 4 })); await f.service.wait('sequential', 1_000); }
+		assert.strictEqual(f.service.getRunViews('sequential').length, 100); assert.strictEqual(f.service.getBudgetView('sequential')?.accepted, 0); assert.strictEqual(f.service.getBudgetView('sequential')?.maxConcurrent, 16);
 	});
 
 	test('cancels a hung admission promptly without creating a row or provider request', async () => {
@@ -555,7 +563,7 @@ suite('Void AgentSubagentService', () => {
 
 	test('enforces provider/result budgets and the shared cancellation path structurally', async () => {
 		const f = fixture({ send: () => 'request' }); const child = await f.service.spawn('ledger', 'inspect', snapshot()); const group = (f.service as any).groups.get('ledger');
-		group.providerSends = 64; f.service.interrupt('ledger', child.id); const blocked = await f.service.spawn('ledger', 'blocked', snapshot()); await new Promise(resolve => setTimeout(resolve, 0)); assert.strictEqual(f.providerCalls.length, 1); assert.strictEqual(f.service.getRunViews('ledger').find(view => view.id === blocked.id)?.status, 'failed'); assert.strictEqual(f.service.getDiagnosticsView('ledger')?.events.find(event => event.kind === 'child_failed' && event.childId === blocked.id)?.diagnostic, 'budget_exhausted');
+		f.service.interrupt('ledger', child.id); group.activeProviderSends = group.budgetLimits.maxProviderSends; const blocked = await f.service.spawn('ledger', 'blocked', snapshot()); await new Promise(resolve => setTimeout(resolve, 0)); assert.strictEqual(f.providerCalls.length, 1); assert.strictEqual(f.service.getRunViews('ledger').find(view => view.id === blocked.id)?.status, 'failed'); assert.strictEqual(f.service.getDiagnosticsView('ledger')?.events.find(event => event.kind === 'child_failed' && event.childId === blocked.id)?.diagnostic, 'budget_exhausted');
 		const capped = await Promise.all(['1', '2', '3', '4'].map(message => f.service.spawn('result-cap', message, snapshot()))); const budgetGroup = (f.service as any).groups.get('result-cap'); for (const id of capped.map(child => child.id)) { const run = budgetGroup.runs.find((candidate: any) => candidate.id === id); (f.service as any).settle(run, 'completed', 'x'.repeat(10_000)); } assert.strictEqual(budgetGroup.resultChars, 32_000); assert.deepStrictEqual(budgetGroup.runs.map((run: any) => run.summary.length), [8_000, 8_000, 8_000, 8_000]);
 		let entered!: () => void; const enteredRead = new Promise<void>(resolve => entered = resolve); const deadline = fixture({ readSkillBody: async () => { entered(); return new Promise<any>(() => { }); } }); const pending = deadline.service.spawn('deadline', '$demo inspect', snapshot()); await enteredRead; (deadline.service as any).cancelGroup((deadline.service as any).groups.get('deadline'), 'deadline'); await assert.rejects(pending, /agent_child_cancelled/); assert.deepStrictEqual(deadline.service.getRunViews('deadline'), []); assert.strictEqual(deadline.providerCalls.length, 0);
 	});

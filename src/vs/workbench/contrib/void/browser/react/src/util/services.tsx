@@ -55,6 +55,7 @@ import { IMCPService } from '../../../../common/mcpService.js';
 import { IStorageService, StorageScope } from '../../../../../../../platform/storage/common/storage.js'
 import { OPT_OUT_KEY } from '../../../../common/storageKeys.js'
 import { IAgentSubagentService } from '../../../agentSubagentService.js'
+import { IAgentInstructionsService } from '../../../agentInstructionsService.js'
 import { AgentSubagentBudgetView, AgentSubagentDiagnosticsView, AgentSubagentRunView, ChildToolApprovalView } from '../../../../common/agentSubagents.js'
 import { hasActionRequiredChild } from '../../../../common/chatHistoryPresentation.js'
 import { selectThreadScopedValue } from '../../../../common/agentSubagentPresentation.js'
@@ -234,6 +235,7 @@ const getReactAccessor = (accessor: ServicesAccessor) => {
 
 		IStorageService: accessor.get(IStorageService),
 		IAgentSubagentService: accessor.get(IAgentSubagentService),
+		IAgentInstructionsService: accessor.get(IAgentInstructionsService),
 
 	} as const
 	return reactAccessor

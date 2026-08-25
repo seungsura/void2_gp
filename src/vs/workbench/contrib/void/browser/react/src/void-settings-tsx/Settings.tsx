@@ -45,6 +45,36 @@ const ButtonLeftTextRightOption = ({ text, leftButton }: { text: string, leftBut
 	</div>
 }
 
+const AgentDelegationSettings = () => {
+	const accessor = useAccessor()
+	const instructions = accessor.get('IAgentInstructionsService')
+	const commandService = accessor.get('ICommandService')
+	const [config, setConfig] = useState<Awaited<ReturnType<typeof instructions.beginTaskSession>>>()
+	useEffect(() => { let active = true; void instructions.beginTaskSession().then(value => { if (active) setConfig(value) }); return () => { active = false } }, [instructions])
+	if (!config) return <div className='text-void-fg-3 text-sm'>Loading Agent delegation configuration…</div>
+	const limits = config.agentDelegationLimits
+	const source = (key: keyof typeof limits) => config.agentDelegationLimitsSource[key]
+	const relationInvalid = limits.maxConcurrentThreadsPerSession > limits.maxAcceptedChildren
+	const open = (scope: 'user' | 'project') => {
+		const target = config.configSources.find(item => item.scope === scope)?.uri
+		if (target) void commandService.executeCommand('vscode.open', URI.parse(target))
+	}
+	return <div className='max-w-[600px]'>
+		<h2 className='text-3xl mb-2'>Agent delegation</h2>
+		<div className='text-void-fg-3 text-sm mb-3'>Open capacity is live queued and running children; terminal child rows remain as receipts but return one slot. Safety budgets are derived from configured capacity and shown in Child Run details.</div>
+		<div className='text-sm grid grid-cols-3 gap-x-3 gap-y-1'>
+			<span>Open children</span><span>{limits.maxAcceptedChildren}</span><span className='text-void-fg-3'>{source('maxAcceptedChildren')}</span>
+			<span>Concurrent children</span><span>{limits.maxConcurrentThreadsPerSession}</span><span className='text-void-fg-3'>{source('maxConcurrentThreadsPerSession')}</span>
+			<span>Maximum depth</span><span>{limits.maxDepth}</span><span className='text-void-fg-3'>{source('maxDepth')}</span>
+		</div>
+		{relationInvalid && <div className='text-red-500 text-sm mt-2'>Concurrent children exceeds open capacity. Delegation is disabled until the configuration is corrected.</div>}
+		<div className='flex gap-2 mt-3'>
+			<button className='px-3 py-1 bg-void-bg-2 rounded-sm' onClick={() => open('user')}>Edit user config.toml</button>
+			{config.configSources.some(item => item.scope === 'project') && <button className='px-3 py-1 bg-void-bg-2 rounded-sm' onClick={() => open('project')}>Edit project config.toml</button>}
+		</div>
+	</div>
+}
+
 // models
 const RefreshModelButton = ({ providerName }: { providerName: RefreshableProviderName }) => {
 
@@ -1378,6 +1408,7 @@ export const Settings = () => {
 
 							{/* General section */}
 							<div className={`${shouldShowTab('general') ? `` : 'hidden'} flex flex-col gap-12`}>
+								<AgentDelegationSettings />
 								<div className='max-w-[600px]'>
 									<h2 className='text-3xl mb-2'>Read file limits</h2>
 									<h4 className='text-void-fg-3 mb-3'>Per-call ceilings: 1–4,000 lines, 1–128 KiB UTF-8, and 1–24,000 estimated tokens.</h4>

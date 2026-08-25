@@ -120,9 +120,9 @@ suite('AGENTS instruction resolver', () => {
 		assert.deepStrictEqual(defaults.agentDelegationLimits, DEFAULT_AGENT_DELEGATION_LIMITS);
 		assert.deepStrictEqual(defaults.agentDelegationLimitsSource, { maxAcceptedChildren: 'default', maxConcurrentThreadsPerSession: 'default', maxDepth: 'default' });
 		assert.deepStrictEqual(userOnly.agentDelegationLimits, { maxAcceptedChildren: 6, maxConcurrentThreadsPerSession: 4, maxDepth: 2 });
-		assert.deepStrictEqual(merged.agentDelegationLimits, { maxAcceptedChildren: 3, maxConcurrentThreadsPerSession: 3, maxDepth: 1 });
+		assert.deepStrictEqual(merged.agentDelegationLimits, { maxAcceptedChildren: 3, maxConcurrentThreadsPerSession: 4, maxDepth: 1 });
 		assert.deepStrictEqual(merged.agentDelegationLimitsSource, { maxAcceptedChildren: 'project', maxConcurrentThreadsPerSession: 'user', maxDepth: 'project' });
-		assert.deepStrictEqual(merged.agentDelegationLimitDiagnostics, [{ source: 'user', reason: 'max_concurrent_threads_per_session_clamped', code: 'agent_delegation_limits_invalid' }]);
+		assert.deepStrictEqual(merged.agentDelegationLimitDiagnostics, [{ source: 'user', reason: 'max_concurrent_threads_per_session_exceeds_accepted', code: 'agent_delegation_limits_invalid' }]);
 		assert.deepStrictEqual(merged.configSources.map(item => item.projectedKeys), [['agents', 'agents.max_accepted_children', 'agents.max_concurrent_threads_per_session', 'agents.max_depth'], ['agents', 'agents.max_accepted_children', 'agents.max_depth']]);
 		assert.strictEqual(Object.isFrozen(merged.agentDelegationLimits), true);
 	});
@@ -130,10 +130,10 @@ suite('AGENTS instruction resolver', () => {
 	test('rejects an over-concurrent value in the same Agent table instead of silently clamping it', () => {
 		const sameTable = parseAgentConfigSource('user', 'user', source('user', '[agents]\nmax_accepted_children = 2\nmax_concurrent_threads_per_session = 4').outcome, parse);
 		const resolved = projectAgentConfig(sameTable.projected, undefined, [sameTable.provenance]);
-		assert.strictEqual(sameTable.projected?.agentMaxConcurrentThreadsPerSession, undefined);
+		assert.strictEqual(sameTable.projected?.agentMaxConcurrentThreadsPerSession, 4);
 		assert.deepStrictEqual(sameTable.projected?.agentDelegationLimitDiagnostics, [{ source: 'user', reason: 'max_concurrent_threads_per_session_exceeds_accepted', code: 'agent_delegation_limits_invalid' }]);
-		assert.deepStrictEqual(sameTable.provenance.projectedKeys, ['agents', 'agents.max_accepted_children']);
-		assert.deepStrictEqual(resolved.agentDelegationLimits, { maxAcceptedChildren: 2, maxConcurrentThreadsPerSession: 2, maxDepth: 1 });
+		assert.deepStrictEqual(sameTable.provenance.projectedKeys, ['agents', 'agents.max_accepted_children', 'agents.max_concurrent_threads_per_session']);
+		assert.deepStrictEqual(resolved.agentDelegationLimits, { maxAcceptedChildren: 2, maxConcurrentThreadsPerSession: 4, maxDepth: 1 });
 	});
 
 	test('benignly clamps default concurrency for a project-only accepted-child override and revives it', () => {
@@ -151,12 +151,12 @@ suite('AGENTS instruction resolver', () => {
 		const invalid = parseAgentConfigSource('user', 'user', source('user', '[agents]\nmax_accepted_children = 0\nmax_concurrent_threads_per_session = 5\nmax_depth = 3\nmax_threads = 1\nunknown_a = 1\nunknown_b = 2\nunknown_c = 3\nunknown_d = 4\nunknown_e = 5\nunknown_f = 6\nunknown_g = 7').outcome, parse);
 		const nonObject = parseAgentConfigSource('project', 'project', source('project', 'agents = 2').outcome, parse);
 		const resolved = projectAgentConfig(invalid.projected, nonObject.projected, [invalid.provenance, nonObject.provenance]);
-		assert.deepStrictEqual(resolved.agentDelegationLimits, DEFAULT_AGENT_DELEGATION_LIMITS);
+		assert.deepStrictEqual(resolved.agentDelegationLimits, { maxAcceptedChildren: 4, maxConcurrentThreadsPerSession: 5, maxDepth: 3 });
 		assert.strictEqual(invalid.projected?.agentDelegationLimitDiagnostics?.length, 8);
 		assert.deepStrictEqual(invalid.projected?.agentDelegationLimitDiagnostics?.slice(0, 4).map(item => item.reason), ['unknown_key', 'unknown_key', 'unknown_key', 'unknown_key']);
 		assert.deepStrictEqual(nonObject.projected?.agentDelegationLimitDiagnostics, [{ source: 'project', reason: 'agents_not_object', code: 'agent_delegation_limits_invalid' }]);
 		assert.strictEqual(resolved.agentDelegationLimitDiagnostics.length, 8);
-		assert.deepStrictEqual(resolved.configSources.map(item => item.projectedKeys), [['agents'], ['agents']]);
+		assert.deepStrictEqual(resolved.configSources.map(item => item.projectedKeys), [['agents', 'agents.max_concurrent_threads_per_session', 'agents.max_depth'], ['agents']]);
 	});
 
 	test('uses stable revisions for all snapshot inputs and deeply freezes exposed records', () => {

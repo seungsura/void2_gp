@@ -110,7 +110,7 @@ export const getAgentSubagentPresentation = (
 		counts.completed ? `${counts.completed} completed` : undefined,
 		counts.cancelled ? `${counts.cancelled} cancelled` : undefined,
 		admissionPending ? `${admissionPending} preparing` : undefined,
-		`${accepted}/${budget?.maxAccepted ?? accepted} accepted`,
+		`${accepted}/${budget?.maxAccepted ?? accepted} open capacity`,
 	].filter((label): label is string => !!label);
 	const actionParts = [counts.failed ? `${counts.failed} child failure${counts.failed === 1 ? '' : 's'}` : undefined, admissionFailures ? `${admissionFailures} setup failure${admissionFailures === 1 ? '' : 's'}` : undefined].filter((label): label is string => !!label);
 	const presentedBudget = budget && freeze({ ...budget });

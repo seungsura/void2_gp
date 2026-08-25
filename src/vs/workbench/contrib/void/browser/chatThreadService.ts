@@ -1497,7 +1497,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const capturedOverride = capturedModel.modelSelection ? this._settingsService.state.overridesOfModel[capturedModel.modelSelection.providerName]?.[capturedModel.modelSelection.modelName] ?? {} : {};
 		const nativeToolFormat = capturedModel.modelSelection ? getModelCapabilities(capturedModel.modelSelection.providerName, capturedModel.modelSelection.modelName, { [capturedModel.modelSelection.providerName]: { [capturedModel.modelSelection.modelName]: capturedOverride } } as never).specialToolFormat : undefined;
 		const isAgentChat = this._settingsService.state.globalSettings.chatMode === 'agent';
-		const agentDelegationAllowed = isAgentChat && isNativeAgentToolFormat(nativeToolFormat);
+		let agentDelegationAllowed = isAgentChat && isNativeAgentToolFormat(nativeToolFormat);
 		if (isAgentChat && !capturedModel.modelSelection) {
 			this._setStreamState(threadId, { isRunning: undefined, error: { message: 'Agent chat requires a selected Chat model with native Agent tools. Select a supported model before sending.', fullError: null } });
 			return false;
@@ -1524,6 +1524,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const capturedOverrides = capturedModel.modelSelection ? { [capturedModel.modelSelection.providerName]: { [capturedModel.modelSelection.modelName]: deepClone(capturedOverride) } } as never : undefined;
 		// This must happen before history changes: a task cannot cross a workspace owner boundary.
 		const instructionSnapshot = await this._beginInstructionTurn(threadId)
+		// A zero depth configuration disables the native child-control surface before
+		// the model tool snapshot and parent authority are constructed.
+		if (instructionSnapshot.config.agentDelegationLimits.maxDepth === 0 || instructionSnapshot.config.agentDelegationLimits.maxConcurrentThreadsPerSession > instructionSnapshot.config.agentDelegationLimits.maxAcceptedChildren) agentDelegationAllowed = false
 		if (!isCurrentTurn()) return false
 		// A failed new admission must not leave a previous turn's runtime authority resumable.
 		this._purgeInstructionTurn(threadId, false, false)
@@ -1576,8 +1579,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		if (!isCurrentTurn()) return false
 		const roleAd = roleCatalog ? customAgentAdvertisement(roleCatalog, runtimeModel.hasModel ? Math.min(2_000, Math.max(0, Math.floor(runtimeModel.contextWindow * .01 * 4))) : 2_000) : undefined
 		const delegationLimits = instructionSnapshot.config.agentDelegationLimits
-		if (agentDelegationAllowed && instructionSnapshot.config.agentDelegationLimitDiagnostics.length) this._notificationService.notify({ severity: Severity.Warning, message: `Some Agent child-limit settings were invalid. Using safe limits: up to ${delegationLimits.maxAcceptedChildren} children, ${delegationLimits.maxConcurrentThreadsPerSession} concurrent, depth ${delegationLimits.maxDepth}.` })
-		const userMessageContent = agentDelegationIntent
+		if (instructionSnapshot.config.agentDelegationLimitDiagnostics.length) this._notificationService.notify({ severity: Severity.Warning, message: delegationLimits.maxConcurrentThreadsPerSession > delegationLimits.maxAcceptedChildren ? `Agent child concurrency (${delegationLimits.maxConcurrentThreadsPerSession}) exceeds open capacity (${delegationLimits.maxAcceptedChildren}). Edit the config before delegating.` : `Some Agent child-limit settings were invalid. Check the Agent delegation configuration.` })
+		const userMessageContent = agentDelegationIntent && agentDelegationAllowed
 			? `${userMessageContentBase}\n\n[User delegation marker: up to ${delegationLimits.maxAcceptedChildren} generic read-only children are available for this turn, with ${delegationLimits.maxConcurrentThreadsPerSession} running concurrently and maximum depth ${delegationLimits.maxDepth}. Named custom agents admitted for this turn (optional exact agent_type): ${roleAd?.text || 'none'}${roleAd?.omitted ? `; ${roleAd.omitted} omitted` : ''}.${agentSelection?.agentType ? ` For this selected role, call spawn_agent with agent_type=${agentSelection.agentType} exactly.` : ''} Call spawn_agent for delegated tasks, then wait_agent for their results; partial child failures do not prevent your synthesis.]`
 			: userMessageContentBase
 		const currentOwner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
