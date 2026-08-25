@@ -5,6 +5,19 @@
 
 import { FeatureName, ModelSelectionOptions, OverridesOfModel, ProviderName } from './voidSettingsTypes.js';
 
+// The product exposes this friendly name, while the corporate OpenAI-compatible
+// endpoint expects its established wire model identifier.
+export const corporateOpenAICompatibleEndpoint = 'https://aicode.pearldev.io';
+export const corporateOpenAICompatibleModelName = 'gpt-5.6-luna';
+export const corporateOpenAICompatibleWireModelName = 'gpt-4.1';
+
+export const isCorporateOpenAICompatibleEndpoint = (endpoint: string | undefined) => endpoint === corporateOpenAICompatibleEndpoint;
+
+export const wireModelNameFor = (providerName: ProviderName, modelName: string) =>
+	providerName === 'openAICompatible' && modelName.toLowerCase() === corporateOpenAICompatibleModelName
+		? corporateOpenAICompatibleWireModelName
+		: modelName;
+
 
 
 
@@ -29,7 +42,7 @@ export const defaultProviderSettings = {
 		apiKey: '',
 	},
 	openAICompatible: {
-		endpoint: '',
+		endpoint: corporateOpenAICompatibleEndpoint,
 		apiKey: '',
 		headersJSON: '{}', // default to {}
 	},
@@ -148,7 +161,7 @@ export const defaultModelsOfProvider = {
 		'ministral-3b-latest',
 		'ministral-8b-latest',
 	],
-	openAICompatible: [], // fallback
+	openAICompatible: [corporateOpenAICompatibleModelName],
 	googleVertex: [],
 	microsoftAzure: [],
 	awsBedrock: [],
@@ -1245,7 +1258,18 @@ const ollamaSettings: VoidStaticProviderInfo = {
 
 const openaiCompatible: VoidStaticProviderInfo = {
 	modelOptionsFallback: (modelName) => extensiveModelOptionsFallback(modelName),
-	modelOptions: {},
+	modelOptions: {
+		[corporateOpenAICompatibleModelName]: {
+			contextWindow: 1_050_000,
+			reservedOutputTokenSpace: 128_000,
+			cost: { input: 0, output: 0 },
+			downloadable: false,
+			supportsFIM: false,
+			specialToolFormat: 'openai-style',
+			supportsSystemMessage: 'developer-role',
+			reasoningCapabilities: false,
+		},
+	},
 	providerReasoningIOSettings: {
 		// reasoning: we have no idea what endpoint they used, so we can't consistently parse out reasoning
 		input: { includeInPayload: openAICompatIncludeInPayloadReasoning },
@@ -1494,7 +1518,9 @@ export const getModelCapabilities = (
 	const { modelOptions, modelOptionsFallback } = modelSettingsOfProvider[providerName]
 
 	// Get any override settings for this model
-	const overrides = overridesOfModel?.[providerName]?.[modelName];
+	const overrides = providerName === 'openAICompatible' && lowercaseModelName === corporateOpenAICompatibleModelName
+		? undefined
+		: overridesOfModel?.[providerName]?.[modelName];
 
 	// search model options object directly first
 	for (const modelName_ in modelOptions) {

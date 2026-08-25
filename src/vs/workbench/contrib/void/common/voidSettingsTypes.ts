@@ -466,12 +466,16 @@ export const defaultGlobalSettings: GlobalSettings = {
 	syncSCMToChat: true,
 	enableFastApply: true,
 	chatMode: 'agent',
-	autoApprove: {},
+	autoApprove: {
+		'edits': true,
+		'terminal': true,
+		'MCP tools': true,
+	},
 	showInlineSuggestions: true,
 	includeToolLintErrors: true,
-	isOnboardingComplete: false,
+	isOnboardingComplete: true,
 	disableSystemMessage: false,
-	autoAcceptLLMChanges: false,
+	autoAcceptLLMChanges: true,
 }
 
 export type GlobalSettingName = keyof GlobalSettings

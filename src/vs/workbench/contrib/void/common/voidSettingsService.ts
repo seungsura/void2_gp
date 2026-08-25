@@ -11,7 +11,7 @@ import { registerSingleton, InstantiationType } from '../../../../platform/insta
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { IMetricsService } from './metricsService.js';
-import { defaultProviderSettings, getModelCapabilities, ModelOverrides } from './modelCapabilities.js';
+import { corporateOpenAICompatibleEndpoint, corporateOpenAICompatibleModelName, defaultProviderSettings, getModelCapabilities, ModelOverrides } from './modelCapabilities.js';
 import { VOID_SETTINGS_STORAGE_KEY } from './storageKeys.js';
 import { clampReadFileLimits } from './readFileReliability.js';
 import { defaultSettingsOfProvider, FeatureName, ProviderName, ModelSelectionOfFeature, SettingsOfProvider, SettingName, providerNames, ModelSelection, modelSelectionsEqual, featureNames, VoidStatefulModelInfo, GlobalSettings, GlobalSettingName, defaultGlobalSettings, ModelSelectionOptions, OptionsOfModelSelection, ChatMode, OverridesOfModel, defaultOverridesOfModel, MCPUserStateOfName as MCPUserStateOfName, MCPUserState } from './voidSettingsTypes.js';
@@ -144,7 +144,68 @@ const _stateWithMergedDefaultModels = (state: VoidSettingsState): VoidSettingsSt
 	}
 }
 
+const corporateModelSelection: ModelSelection = {
+	providerName: 'openAICompatible',
+	modelName: corporateOpenAICompatibleModelName,
+};
+
+const _corporateProductState = <T extends Omit<VoidSettingsState, '_modelOptions'>>(state: T): T => {
+	const { [corporateOpenAICompatibleModelName]: _corporateOverride, ...otherCorporateOverrides } = state.overridesOfModel.openAICompatible ?? {};
+	return {
+		...state,
+		settingsOfProvider: {
+			...state.settingsOfProvider,
+			openAICompatible: {
+				...deepClone(defaultSettingsOfProvider.openAICompatible),
+				endpoint: corporateOpenAICompatibleEndpoint,
+				apiKey: '',
+				headersJSON: '{}',
+				_didFillInProviderSettings: undefined,
+			},
+		},
+		modelSelectionOfFeature: {
+			...state.modelSelectionOfFeature,
+			Chat: corporateModelSelection,
+			'Ctrl+K': corporateModelSelection,
+			Autocomplete: null,
+			Apply: corporateModelSelection,
+			SCM: corporateModelSelection,
+		},
+		globalSettings: {
+			...state.globalSettings,
+			isOnboardingComplete: true,
+		},
+		overridesOfModel: {
+			...state.overridesOfModel,
+			openAICompatible: otherCorporateOverrides,
+		},
+	} as T;
+}
+
+const _isCorporateProductState = (state: Omit<VoidSettingsState, '_modelOptions'>) => {
+	const provider = state.settingsOfProvider.openAICompatible;
+	const expectedSelection = (featureName: Exclude<FeatureName, 'Autocomplete'>) => {
+		const selection = state.modelSelectionOfFeature[featureName];
+		return selection !== null && modelSelectionsEqual(selection, corporateModelSelection);
+	};
+	return provider.endpoint === corporateOpenAICompatibleEndpoint
+		&& provider.apiKey === ''
+		&& provider.headersJSON === '{}'
+		&& provider.models.length === 1
+		&& provider.models[0]?.modelName === corporateOpenAICompatibleModelName
+		&& provider.models[0]?.type === 'default'
+		&& provider.models[0]?.isHidden === false
+		&& state.modelSelectionOfFeature.Autocomplete === null
+		&& expectedSelection('Chat')
+		&& expectedSelection('Ctrl+K')
+		&& expectedSelection('Apply')
+		&& expectedSelection('SCM')
+		&& state.globalSettings.isOnboardingComplete === true
+		&& state.overridesOfModel.openAICompatible?.[corporateOpenAICompatibleModelName] === undefined;
+}
+
 const _validatedModelState = (state: Omit<VoidSettingsState, '_modelOptions'>): VoidSettingsState => {
+	state = _corporateProductState(state)
 
 	let newSettingsOfProvider = state.settingsOfProvider
 
@@ -152,7 +213,9 @@ const _validatedModelState = (state: Omit<VoidSettingsState, '_modelOptions'>): 
 	for (const providerName of providerNames) {
 		const settingsAtProvider = newSettingsOfProvider[providerName]
 
-		const didFillInProviderSettings = Object.keys(defaultProviderSettings[providerName]).every(key => !!settingsAtProvider[key as keyof typeof settingsAtProvider])
+		const didFillInProviderSettings = providerName === 'openAICompatible'
+			? settingsAtProvider.endpoint === corporateOpenAICompatibleEndpoint
+			: Object.keys(defaultProviderSettings[providerName]).every(key => !!settingsAtProvider[key as keyof typeof settingsAtProvider])
 
 		if (didFillInProviderSettings === settingsAtProvider._didFillInProviderSettings) continue
 
@@ -215,7 +278,7 @@ const _validatedModelState = (state: Omit<VoidSettingsState, '_modelOptions'>): 
 const defaultState = () => {
 	const d: VoidSettingsState = {
 		settingsOfProvider: deepClone(defaultSettingsOfProvider),
-		modelSelectionOfFeature: { 'Chat': null, 'Ctrl+K': null, 'Autocomplete': null, 'Apply': null, 'SCM': null },
+		modelSelectionOfFeature: { 'Chat': corporateModelSelection, 'Ctrl+K': corporateModelSelection, 'Autocomplete': null, 'Apply': corporateModelSelection, 'SCM': corporateModelSelection },
 		globalSettings: deepClone(defaultGlobalSettings),
 		optionsOfModelSelection: { 'Chat': {}, 'Ctrl+K': {}, 'Autocomplete': {}, 'Apply': {}, 'SCM': {} },
 		overridesOfModel: deepClone(defaultOverridesOfModel),
@@ -249,7 +312,7 @@ export class VoidSettingsService extends Disposable implements IVoidSettingsServ
 		super()
 
 		// at the start, we haven't read the partial config yet, but we need to set state to something
-		this.state = defaultState()
+		this.state = _validatedModelState(defaultState())
 		let resolver: () => void = () => { }
 		this.waitForInitState = new Promise((res, rej) => resolver = res)
 		this._resolver = resolver
@@ -276,13 +339,20 @@ export class VoidSettingsService extends Disposable implements IVoidSettingsServ
 
 	async readAndInitializeState() {
 		let readS: VoidSettingsState
+		let shouldPersistMigration = false
 		try {
 			readS = await this._readState();
+			const storedAutoApprove = readS.globalSettings.autoApprove;
+			if (typeof storedAutoApprove !== 'object' || storedAutoApprove === null || ['edits', 'terminal', 'MCP tools'].some(key => typeof storedAutoApprove[key as keyof typeof storedAutoApprove] !== 'boolean')) shouldPersistMigration = true;
 			// 1.0.3 addition, remove when enough users have had this code run
 			if (readS.globalSettings.includeToolLintErrors === undefined) readS.globalSettings.includeToolLintErrors = true
 
 			// autoapprove is now an obj not a boolean (1.2.5)
-			if (typeof readS.globalSettings.autoApprove === 'boolean') readS.globalSettings.autoApprove = {}
+			if (typeof readS.globalSettings.autoApprove === 'boolean') {
+				const value = readS.globalSettings.autoApprove
+				readS.globalSettings.autoApprove = { 'edits': value, 'terminal': value, 'MCP tools': value }
+				shouldPersistMigration = true
+			}
 
 			// 1.3.5 add source control feature
 			if (readS.modelSelectionOfFeature && !readS.modelSelectionOfFeature['SCM']) {
@@ -293,7 +363,10 @@ export class VoidSettingsService extends Disposable implements IVoidSettingsServ
 			if (readS.globalSettings.disableSystemMessage === undefined) readS.globalSettings.disableSystemMessage = false;
 			
 			// add autoAcceptLLMChanges feature
-			if (readS.globalSettings.autoAcceptLLMChanges === undefined) readS.globalSettings.autoAcceptLLMChanges = false;
+			if (readS.globalSettings.autoAcceptLLMChanges === undefined) {
+				readS.globalSettings.autoAcceptLLMChanges = true;
+				shouldPersistMigration = true
+			}
 		}
 		catch (e) {
 			readS = defaultState()
@@ -308,7 +381,15 @@ export class VoidSettingsService extends Disposable implements IVoidSettingsServ
 				// ...defaultSettingsOfProvider,
 				// ...readS.settingsOfProvider,
 			}
-			readS = { ...readS, globalSettings: { ...defaultGlobalSettings, ...readS.globalSettings, readFileLimits: clampReadFileLimits(readS.globalSettings?.readFileLimits) } }
+			readS = {
+				...readS,
+				globalSettings: {
+					...defaultGlobalSettings,
+					...readS.globalSettings,
+					autoApprove: { ...defaultGlobalSettings.autoApprove, ...readS.globalSettings.autoApprove },
+					readFileLimits: clampReadFileLimits(readS.globalSettings?.readFileLimits),
+				}
+			}
 
 			for (const providerName of providerNames) {
 				readS.settingsOfProvider[providerName] = {
@@ -339,9 +420,15 @@ export class VoidSettingsService extends Disposable implements IVoidSettingsServ
 			readS = defaultState()
 		}
 
+		shouldPersistMigration ||= !_isCorporateProductState(readS)
 		this.state = readS
 		this.state = _stateWithMergedDefaultModels(this.state)
 		this.state = _validatedModelState(this.state);
+		if (shouldPersistMigration) {
+			// A persisted legacy credential must never delay the usable in-memory
+			// corporate profile if the storage backend is temporarily unavailable.
+			try { await this._storeState() } catch { }
+		}
 
 
 		this._resolver();

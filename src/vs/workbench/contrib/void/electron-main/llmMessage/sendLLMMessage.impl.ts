@@ -8,6 +8,8 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { Ollama } from 'ollama';
 import OpenAI, { ClientOptions, AzureOpenAI } from 'openai';
+import * as fs from 'fs';
+import * as path from 'path';
 import { MistralCore } from '@mistralai/mistralai/core.js';
 import { fimComplete } from '@mistralai/mistralai/funcs/fimComplete.js';
 import { Tool as GeminiTool, FunctionDeclaration, GoogleGenAI, ThinkingConfig, Schema, Type } from '@google/genai';
@@ -16,7 +18,7 @@ import { GoogleAuth } from 'google-auth-library'
 
 import { AnthropicLLMChatMessage, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, LLMRequestProfile, ModelListParams, OllamaModelResponse, OnError, OnFinalMessage, OnText, RawToolCallObj, RawToolParamsObj } from '../../common/sendLLMMessageTypes.js';
 import { ChatMode, displayInfoOfProviderName, ModelSelectionOptions, OverridesOfModel, ProviderName, SettingsOfProvider } from '../../common/voidSettingsTypes.js';
-import { getSendableReasoningInfo, getModelCapabilities, getProviderCapabilities, defaultProviderSettings, getReservedOutputTokenSpace } from '../../common/modelCapabilities.js';
+import { corporateOpenAICompatibleEndpoint, getSendableReasoningInfo, getModelCapabilities, getProviderCapabilities, defaultProviderSettings, getReservedOutputTokenSpace, isCorporateOpenAICompatibleEndpoint, wireModelNameFor } from '../../common/modelCapabilities.js';
 import { extractReasoningWrapper, extractXMLToolsWrapper } from './extractGrammar.js';
 import { availableTools, InternalToolInfo } from '../../common/prompt/prompts.js';
 import { AgentSubagentToolSnapshot, ToolExecutionProfile } from '../../common/agentSubagents.js';
@@ -73,6 +75,46 @@ const parseHeadersJSON = (s: string | undefined): Record<string, string | null |
 	} catch (e) {
 		throw new Error(`Error parsing OpenAI-Compatible headers: ${s} is not a valid JSON.`)
 	}
+}
+
+const corporateCredentialUnavailableMessage = 'Corporate provider credential is unavailable. Set VOID_CORPORATE_API_KEY or provide the external API_KEY companion file.';
+
+const corporateTestEndpoint = () => {
+	const candidate = process.env.VOID_CORPORATE_TEST_ENDPOINT;
+	if (!candidate) return undefined;
+	try {
+		const endpoint = new URL(candidate);
+		const isLoopback = endpoint.hostname === '127.0.0.1' || endpoint.hostname === 'localhost' || endpoint.hostname === '[::1]' || endpoint.hostname === '::1';
+		const isBareOrigin = (endpoint.pathname === '/' || endpoint.pathname === '') && !endpoint.username && !endpoint.password && !endpoint.search && !endpoint.hash;
+		return endpoint.protocol === 'http:' && isLoopback && isBareOrigin ? endpoint.origin : undefined;
+	}
+	catch {
+		return undefined;
+	}
+}
+
+const readNonEmptyCredential = async (credentialPath: string | undefined) => {
+	if (!credentialPath) return undefined;
+	try {
+		const credential = (await fs.promises.readFile(credentialPath, 'utf8')).trim();
+		return credential || undefined;
+	}
+	catch {
+		return undefined;
+	}
+}
+
+const resolveCorporateCredential = async () => {
+	const environmentCredential = process.env.VOID_CORPORATE_API_KEY?.trim();
+	if (environmentCredential) return environmentCredential;
+
+	const explicitCredential = await readNonEmptyCredential(process.env.VOID_CORPORATE_API_KEY_PATH);
+	if (explicitCredential) return explicitCredential;
+
+	const companionCredential = await readNonEmptyCredential(path.join(path.dirname(process.execPath), 'API_KEY'));
+	if (companionCredential) return companionCredential;
+
+	throw new Error(corporateCredentialUnavailableMessage);
 }
 
 const newOpenAICompatibleSDK = async ({ settingsOfProvider, providerName, includeInPayload }: { settingsOfProvider: SettingsOfProvider, providerName: ProviderName, includeInPayload?: { [s: string]: any } }) => {
@@ -158,6 +200,10 @@ const newOpenAICompatibleSDK = async ({ settingsOfProvider, providerName, includ
 	}
 	else if (providerName === 'openAICompatible') {
 		const thisConfig = settingsOfProvider[providerName]
+		if (isCorporateOpenAICompatibleEndpoint(thisConfig.endpoint)) {
+			const apiKey = await resolveCorporateCredential()
+			return new OpenAI({ baseURL: corporateTestEndpoint() ?? corporateOpenAICompatibleEndpoint, apiKey, ...commonPayloadOpts })
+		}
 		const headers = parseHeadersJSON(thisConfig.headersJSON)
 		return new OpenAI({ baseURL: thisConfig.endpoint, apiKey: thisConfig.apiKey, defaultHeaders: headers, ...commonPayloadOpts })
 	}
@@ -313,7 +359,7 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 		(openai as AzureOpenAI).deploymentName = modelName;
 	}
 	const options = {
-		model: modelName,
+		model: wireModelNameFor(providerName, modelName),
 		messages: messages as any,
 		stream: true,
 		...nativeToolsObj,

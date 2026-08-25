@@ -3,8 +3,9 @@ import { InMemoryStorageService } from '../../../../../platform/storage/common/s
 import { IEncryptionService, KnownStorageProvider } from '../../../../../platform/encryption/common/encryptionService.js';
 import { IMetricsService } from '../../common/metricsService.js';
 import { VoidSettingsService } from '../../common/voidSettingsService.js';
-import { StorageScope } from '../../../../../platform/storage/common/storage.js';
+import { StorageScope, StorageTarget } from '../../../../../platform/storage/common/storage.js';
 import { VOID_SETTINGS_STORAGE_KEY } from '../../common/storageKeys.js';
+import { corporateOpenAICompatibleEndpoint, corporateOpenAICompatibleModelName, getModelCapabilities } from '../../common/modelCapabilities.js';
 
 class TestEncryptionService implements IEncryptionService {
 	_serviceBrand: undefined;
@@ -42,7 +43,90 @@ const waitForCallCount = async (encryption: DeferredEncryptionService, expected:
 	assert.fail(`Expected ${expected} encryption calls, received ${encryption.calls.length}`);
 };
 
+const storeLegacyCorporateSettings = (storage: InMemoryStorageService, state: object) => {
+	storage.store(VOID_SETTINGS_STORAGE_KEY, `encrypted+${JSON.stringify(state)}`, StorageScope.APPLICATION, StorageTarget.USER);
+};
+
 suite('Void settings persistence', () => {
+	test('initializes the fixed corporate profile and preserves the generic OpenAI gpt-4.1 capability record', async () => {
+		const storage = new InMemoryStorageService();
+		const service = new VoidSettingsService(storage, new TestEncryptionService(), new TestMetricsService());
+		await service.waitForInitState;
+
+		const corporate = service.state.settingsOfProvider.openAICompatible;
+		assert.strictEqual(corporate.endpoint, corporateOpenAICompatibleEndpoint);
+		assert.strictEqual(corporate.apiKey, '');
+		assert.deepStrictEqual(corporate.models, [{ modelName: corporateOpenAICompatibleModelName, type: 'default', isHidden: false }]);
+		assert.deepStrictEqual(
+			[service.state.modelSelectionOfFeature.Chat, service.state.modelSelectionOfFeature['Ctrl+K'], service.state.modelSelectionOfFeature.Apply, service.state.modelSelectionOfFeature.SCM],
+			Array.from({ length: 4 }, () => ({ providerName: 'openAICompatible', modelName: corporateOpenAICompatibleModelName })),
+		);
+		assert.strictEqual(service.state.modelSelectionOfFeature.Autocomplete, null);
+		assert.deepStrictEqual(service.state.globalSettings.autoApprove, { edits: true, terminal: true, 'MCP tools': true });
+		assert.strictEqual(service.state.globalSettings.autoAcceptLLMChanges, true);
+		assert.strictEqual(service.state.globalSettings.isOnboardingComplete, true);
+
+		const corporateCapabilities = getModelCapabilities('openAICompatible', corporateOpenAICompatibleModelName, service.state.overridesOfModel);
+		assert.deepStrictEqual(
+			[corporateCapabilities.contextWindow, corporateCapabilities.reservedOutputTokenSpace, corporateCapabilities.supportsSystemMessage, corporateCapabilities.specialToolFormat, corporateCapabilities.supportsFIM],
+			[1_050_000, 128_000, 'developer-role', 'openai-style', false],
+		);
+		const genericOpenAI = getModelCapabilities('openAI', 'gpt-4.1', service.state.overridesOfModel);
+		assert.deepStrictEqual([genericOpenAI.contextWindow, genericOpenAI.reservedOutputTokenSpace], [1_047_576, 32_768]);
+		service.dispose(); storage.dispose();
+	});
+
+	test('normalizes the corporate profile without overwriting explicit existing approval choices', async () => {
+		const storage = new InMemoryStorageService();
+		storeLegacyCorporateSettings(storage, {
+			settingsOfProvider: {
+				openAICompatible: {
+					endpoint: 'https://legacy.invalid/v1', apiKey: 'previous-value', headersJSON: '{"X-Legacy":"1"}',
+					models: [{ modelName: 'legacy-model', type: 'custom', isHidden: false }], _didFillInProviderSettings: true,
+				},
+			},
+			modelSelectionOfFeature: {
+				Chat: { providerName: 'openAI', modelName: 'gpt-4.1' }, 'Ctrl+K': { providerName: 'openAI', modelName: 'gpt-4.1' },
+				Autocomplete: { providerName: 'openAI', modelName: 'gpt-4.1' }, Apply: { providerName: 'openAI', modelName: 'gpt-4.1' }, SCM: { providerName: 'openAI', modelName: 'gpt-4.1' },
+			},
+			globalSettings: { autoApprove: { edits: false }, autoAcceptLLMChanges: false, isOnboardingComplete: false },
+			overridesOfModel: { openAICompatible: { [corporateOpenAICompatibleModelName]: { contextWindow: 1 } } },
+		});
+		const service = new VoidSettingsService(storage, new TestEncryptionService(), new TestMetricsService());
+		await service.waitForInitState;
+
+		assert.strictEqual(service.state.settingsOfProvider.openAICompatible.endpoint, corporateOpenAICompatibleEndpoint);
+		assert.strictEqual(service.state.settingsOfProvider.openAICompatible.apiKey, '');
+		assert.strictEqual(service.state.settingsOfProvider.openAICompatible.headersJSON, '{}');
+		assert.deepStrictEqual(service.state.modelSelectionOfFeature.Chat, { providerName: 'openAICompatible', modelName: corporateOpenAICompatibleModelName });
+		assert.strictEqual(service.state.modelSelectionOfFeature.Autocomplete, null);
+		assert.deepStrictEqual(service.state.globalSettings.autoApprove, { edits: false, terminal: true, 'MCP tools': true });
+		assert.strictEqual(service.state.globalSettings.autoAcceptLLMChanges, false);
+		assert.strictEqual(service.state.globalSettings.isOnboardingComplete, true);
+		assert.strictEqual(service.state.overridesOfModel.openAICompatible?.[corporateOpenAICompatibleModelName], undefined);
+		await service.setSettingOfProvider('openAICompatible', 'apiKey', 'runtime-provided-value');
+		assert.strictEqual(service.state.settingsOfProvider.openAICompatible.apiKey, '');
+		const persisted = storage.get(VOID_SETTINGS_STORAGE_KEY, StorageScope.APPLICATION);
+		assert.ok(persisted);
+		const persistedState = JSON.parse(persisted.slice('encrypted+'.length));
+		assert.strictEqual(persistedState.settingsOfProvider.openAICompatible.apiKey, '');
+		assert.strictEqual(persistedState.globalSettings.isOnboardingComplete, true);
+		assert.deepStrictEqual(persistedState.globalSettings.autoApprove, { edits: false, terminal: true, 'MCP tools': true });
+		service.dispose(); storage.dispose();
+	});
+
+	test('settles initialization when a corporate migration cannot be persisted', async () => {
+		const storage = new InMemoryStorageService();
+		storeLegacyCorporateSettings(storage, { settingsOfProvider: { openAICompatible: { endpoint: '', apiKey: 'previous-value', headersJSON: '{}', models: [], _didFillInProviderSettings: false } }, globalSettings: {} });
+		const encryption = new DeferredEncryptionService();
+		const service = new VoidSettingsService(storage, encryption, new TestMetricsService());
+		await waitForCallCount(encryption, 1);
+		encryption.calls[0].reject(new Error('migration storage unavailable'));
+		await service.waitForInitState;
+		assert.strictEqual(service.state.settingsOfProvider.openAICompatible.apiKey, '');
+		service.dispose(); storage.dispose();
+	});
+
 	test('serializes concurrent state writes before a later encryption can start', async () => {
 		const storage = new InMemoryStorageService();
 		const encryption = new DeferredEncryptionService();
@@ -71,7 +155,7 @@ suite('Void settings persistence', () => {
 		await service.setSettingOfProvider('openAI', 'apiKey', 'smoke-test-key');
 		const deferred = new DeferredEncryptionService();
 		encryption.deferred = deferred;
-		const selection = { providerName: 'openAI' as const, modelName: 'gpt-4.1' };
+		const selection = { providerName: 'openAICompatible' as const, modelName: corporateOpenAICompatibleModelName };
 		const completion = service.setModelSelectionOfFeature('Chat', selection);
 		let settled = false;
 		void completion.then(() => { settled = true; });

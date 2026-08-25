@@ -1,9 +1,13 @@
 import * as assert from 'assert';
 import { createServer, ServerResponse } from 'http';
 import { AddressInfo } from 'net';
+import { mkdtemp, rm, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { LLMMessageChannel } from '../../electron-main/sendLLMMessageChannel.js';
 import { sendLLMMessage } from '../../electron-main/llmMessage/sendLLMMessage.js';
 import { sendLLMMessageToProviderImplementation } from '../../electron-main/llmMessage/sendLLMMessage.impl.js';
+import { corporateOpenAICompatibleEndpoint, corporateOpenAICompatibleModelName, corporateOpenAICompatibleWireModelName } from '../../common/modelCapabilities.js';
 
 const params = (requestId: string) => ({ requestId, messagesType: 'chatMessages', messages: [{ role: 'user', content: 'fixture' }], separateSystemMessage: undefined, chatMode: 'agent', logging: { loggingName: 'fixture' }, settingsOfProvider: {}, modelSelection: { providerName: 'openAI', modelName: 'fixture' }, modelSelectionOptions: undefined, overridesOfModel: undefined, mcpTools: undefined }) as any;
 const ghostParams = (requestId: string, endpoint = 'http://127.0.0.1:1/v1') => ({
@@ -41,7 +45,27 @@ const emptyToolParams = (requestId: string, endpoint: string) => ({
 	toolExecutionProfile: undefined,
 	agentDelegationAllowed: false,
 }) as any;
+const corporateParams = (requestId: string) => ({
+	requestId,
+	messagesType: 'chatMessages',
+	messages: [{ role: 'user', content: 'corporate loopback fixture' }],
+	separateSystemMessage: undefined,
+	chatMode: 'agent',
+	logging: { loggingName: 'Corporate loopback' },
+	settingsOfProvider: { openAICompatible: { endpoint: corporateOpenAICompatibleEndpoint, apiKey: '', headersJSON: '{}' } },
+	modelSelection: { providerName: 'openAICompatible', modelName: corporateOpenAICompatibleModelName },
+	modelSelectionOptions: undefined,
+	overridesOfModel: undefined,
+	mcpTools: [],
+	toolExecutionProfile: undefined,
+	agentDelegationAllowed: false,
+}) as any;
 const metrics = { capture() { } } as any;
+
+const restoreEnvironment = (key: string, value: string | undefined) => {
+	if (value === undefined) delete process.env[key];
+	else process.env[key] = value;
+};
 
 suite('Void LLM message channel lifecycle', () => {
 	test('immediate abort returns without awaiting setup and invokes a late aborter', async () => {
@@ -224,6 +248,77 @@ suite('Void LLM message channel lifecycle', () => {
 			assert.strictEqual((channel as any)._infoOfRunningRequest['empty-tool-loopback'], undefined);
 		}
 		finally {
+			server.closeAllConnections?.();
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
+	});
+
+	test('corporate Luna profile uses the fixed endpoint adapter and gpt-4.1 wire model', async () => {
+		let requestPath = '';
+		let requestBody: any;
+		const server = createServer((request, response) => {
+			const chunks: Buffer[] = [];
+			request.on('data', chunk => chunks.push(Buffer.from(chunk)));
+			request.on('end', () => {
+				requestPath = request.url ?? '';
+				requestBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+				response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+				response.write(`data: ${JSON.stringify({ id: 'chatcmpl-corporate', object: 'chat.completion.chunk', created: 0, model: corporateOpenAICompatibleWireModelName, choices: [{ index: 0, delta: { role: 'assistant', content: 'ready' }, finish_reason: null }] })}\n\n`);
+				response.write(`data: ${JSON.stringify({ id: 'chatcmpl-corporate', object: 'chat.completion.chunk', created: 0, model: corporateOpenAICompatibleWireModelName, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
+				response.end('data: [DONE]\n\n');
+			});
+		});
+		await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+		const originalEndpoint = process.env.VOID_CORPORATE_TEST_ENDPOINT;
+		const originalKey = process.env.VOID_CORPORATE_API_KEY;
+		const originalPath = process.env.VOID_CORPORATE_API_KEY_PATH;
+		const credentialDirectory = await mkdtemp(join(tmpdir(), 'void-corporate-credential-fixture-'));
+		const credentialPath = join(credentialDirectory, 'credential.txt');
+		await writeFile(credentialPath, 'test-only-corporate-key\n', 'utf8');
+		try {
+			const address = server.address() as AddressInfo;
+			process.env.VOID_CORPORATE_TEST_ENDPOINT = `http://127.0.0.1:${address.port}`;
+			delete process.env.VOID_CORPORATE_API_KEY;
+			process.env.VOID_CORPORATE_API_KEY_PATH = credentialPath;
+			const channel = new LLMMessageChannel(metrics);
+			const completed = new Promise<void>(resolve => channel.listen(undefined, 'onFinalMessage_sendLLMMessage')(event => event.requestId === 'corporate-loopback' && resolve()));
+			(channel as any)._callSendLLMMessage(corporateParams('corporate-loopback'));
+			await completed;
+			assert.strictEqual(requestPath, '/chat/completions');
+			assert.strictEqual(requestBody.model, corporateOpenAICompatibleWireModelName);
+			assert.strictEqual(requestBody.stream, true);
+		}
+		finally {
+			restoreEnvironment('VOID_CORPORATE_TEST_ENDPOINT', originalEndpoint);
+			restoreEnvironment('VOID_CORPORATE_API_KEY', originalKey);
+			restoreEnvironment('VOID_CORPORATE_API_KEY_PATH', originalPath);
+			await rm(credentialDirectory, { recursive: true, force: true });
+			server.closeAllConnections?.();
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
+	});
+
+	test('corporate profile fails before network dispatch when no external credential is available', async () => {
+		let requests = 0;
+		const server = createServer((request, response) => { requests++; request.resume(); response.end(); });
+		await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+		const originalEndpoint = process.env.VOID_CORPORATE_TEST_ENDPOINT;
+		const originalKey = process.env.VOID_CORPORATE_API_KEY;
+		const originalPath = process.env.VOID_CORPORATE_API_KEY_PATH;
+		try {
+			const address = server.address() as AddressInfo;
+			process.env.VOID_CORPORATE_TEST_ENDPOINT = `http://127.0.0.1:${address.port}`;
+			delete process.env.VOID_CORPORATE_API_KEY;
+			delete process.env.VOID_CORPORATE_API_KEY_PATH;
+			let error = '';
+			await sendLLMMessage({ ...corporateParams('corporate-missing-key'), abortRef: { current: null }, onText: () => { }, onFinalMessage: () => assert.fail('unexpected final'), onError: ({ message }: { message: string }) => error = message } as any, metrics);
+			assert.match(error, /Corporate provider credential is unavailable/);
+			assert.strictEqual(requests, 0);
+		}
+		finally {
+			restoreEnvironment('VOID_CORPORATE_TEST_ENDPOINT', originalEndpoint);
+			restoreEnvironment('VOID_CORPORATE_API_KEY', originalKey);
+			restoreEnvironment('VOID_CORPORATE_API_KEY_PATH', originalPath);
 			server.closeAllConnections?.();
 			await new Promise<void>(resolve => server.close(() => resolve()));
 		}
