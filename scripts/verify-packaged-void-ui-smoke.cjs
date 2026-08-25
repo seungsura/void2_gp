@@ -293,19 +293,14 @@ async function runFakeAcceptance(page, evidence, fakeServer) {
 	if (!/Running/i.test(await childSummary.innerText())) throw new Error('Child run did not remain visibly Running before held response settled.');
 	const childControlStop = page.locator('[data-testid="void-tool-card-stop"][disabled]'); await waitVisible(childControlStop, 'disabled child control Stop'); if (!/child control/i.test(await childControlStop.getAttribute('title') || '')) throw new Error('Child control Stop did not explain its disabled scope.');
 	fakeServer.releaseChild(); await waitVisible(childRuns.locator('summary[aria-label^="Child Run "]').filter({ hasText: /completed/i }), 'completed child run'); if (await childSummary.count() !== 1) throw new Error('Child run history was duplicated.'); evidence.assertions.push('child-running-and-completed'); await waitForCurrentRunToSettle(page);
-	await chat.fill('VOID_SMOKE_TERMINAL'); await waitForEnabledCurrentSend(page); await chat.press('Enter'); const terminalStop = page.getByRole('button', { name: 'Stop this tool', exact: true }); await waitVisible(terminalStop, 'Terminal card Stop'); if (await terminalStop.isDisabled()) throw new Error('Terminal card Stop was not independently enabled.');
+	const terminalCommand = '"ping -n 30 127.0.0.1 > nul"';
+	await chat.fill('VOID_SMOKE_TERMINAL'); await waitForEnabledCurrentSend(page); await chat.press('Enter'); const terminalCard = page.getByText(terminalCommand, { exact: true }).locator('xpath=ancestor::div[contains(@class, "border-void-border-3")][1]'); await waitVisible(terminalCard, 'Terminal card'); const terminalStop = terminalCard.getByRole('button', { name: 'Stop this tool', exact: true }); await waitVisible(terminalStop, 'Terminal card Stop'); if (await terminalStop.isDisabled()) throw new Error('Terminal card Stop was not independently enabled.');
 	await page.waitForTimeout(1_050); const elapsed = page.getByTestId('void-tool-elapsed').last(); await waitVisible(elapsed, 'Visible tool elapsed'); if (!/Elapsed\s+\d+s/.test(await elapsed.innerText())) throw new Error('Live tool elapsed text was not rendered.');
 	await chat.fill('VOID_SMOKE_QUEUE'); await page.getByRole('button', { name: 'Queue message', exact: true }).press('Enter'); await chat.fill('VOID_SMOKE_STEER'); await page.getByRole('combobox', { name: 'More message actions', exact: true }).selectOption('steer');
 	const pending = page.locator('section[aria-label="Queued messages"]'); await waitVisible(pending, 'Queued messages'); const pendingText = await pending.innerText(); if (!pendingText.includes('Queue') || !pendingText.includes('Steer')) throw new Error('Queue and Steer were not retained while terminal was live.'); evidence.assertions.push('queue-and-steer-during-live-tool');
-	// A fast physical terminal close can replace the transient Cancelling button
-	// before Playwright observes it. The terminal row then exposes the exact
-	// rejected-card marker, whose user-facing tooltip is "Canceled".
-	const canceledMarkers = page.locator('[data-tooltip-content="Canceled"]');
-	const canceledBefore = await canceledMarkers.count();
 	await terminalStop.press('Enter');
 	await terminalStop.waitFor({ state: 'hidden', timeout: timeoutMs });
-	await canceledMarkers.nth(canceledBefore).waitFor({ state: 'visible', timeout: timeoutMs });
-	if (await canceledMarkers.count() !== canceledBefore + 1) throw new Error('Terminal card Stop did not settle exactly one cancelled receipt.');
+	await terminalCard.getByText('Cancelled', { exact: true }).waitFor({ state: 'visible', timeout: timeoutMs });
 	evidence.assertions.push('receipt-local-terminal-stop');
 }
 async function runProductionAcceptance(page, electronApp, evidence) {

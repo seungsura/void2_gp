@@ -1770,6 +1770,7 @@ const CommandTool = ({ toolMessage, type, threadId }: { threadId: string } & ({
 		title,
 		desc1: isCancelling ? 'Cancelling' : desc1,
 		desc1Info,
+		desc2: toolMessage.type === 'rejected' && toolMessage.content === 'Tool call was interrupted by the user.' ? 'Cancelled' : undefined,
 		elapsed,
 		rightAction: toolMessage.type === 'running_now' ? <ToolCardStop threadId={threadId} toolMessage={toolMessage} /> : undefined,
 		isError,
