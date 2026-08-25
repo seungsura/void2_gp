@@ -109,6 +109,7 @@ suite('Void agent subagents', () => {
 	});
 
 	test('bounds terminal summaries and completion wins cancellation race once', () => { const lifecycle = new AgentSubagentLifecycle(); lifecycle.start(); assert.strictEqual(lifecycle.settle('completed', 'id', 'x'.repeat(9000)), true); assert.strictEqual(lifecycle.settle('cancelled', 'id', 'late'), false); const receipt = lifecycle.receipt(true).receipt!; assert.strictEqual(receipt.summary.length, 8000); assert.strictEqual(receipt.usage, null); });
+	test('keeps explicit aggregate-result compaction on the terminal receipt only', () => { const lifecycle = new AgentSubagentLifecycle(); lifecycle.start(); lifecycle.settle('completed', 'id', '', true); const receipt = lifecycle.receipt(true).receipt!; assert.strictEqual(receipt.resultTruncated, true); assert.strictEqual(lifecycle.receipt(false).receipt?.resultTruncated, true); });
 
 	test('presents transient child status without coercing usage', () => {
 		const running = { id: 'child', status: 'running' as const, usage: null };

@@ -31,7 +31,7 @@ suite('Void AgentSubagentPresentation', () => {
 	});
 	test('keeps active counts and capacity compact without usage in the header', () => {
 		const value = getAgentSubagentPresentation(budget({ accepted: 2 }), [run('running'), run('queued', 'child-b')], diagnostics())!;
-		assert.strictEqual(value.summary, 'Child runs · 1 running · 1 queued · 2/4 accepted'); assert.strictEqual(value.summary.includes('usage'), false);
+		assert.strictEqual(value.summary, 'Child runs · 1 running · 1 queued · 2/4 open capacity'); assert.strictEqual(value.summary.includes('usage'), false);
 	});
 	test('counts scheduler-active leases and labels waiting and ready child rows truthfully', () => {
 		const value = getAgentSubagentPresentation(budget({ accepted: 2, running: 1 }), [{ ...run('running', 'parent'), schedulerActivity: 'waiting_children' }, { ...run('running', 'nested'), schedulerActivity: 'active' }], diagnostics())!;
@@ -56,6 +56,11 @@ suite('Void AgentSubagentPresentation', () => {
 	test('reports completed runs without action required', () => {
 		const value = getAgentSubagentPresentation(budget({ accepted: 1 }), [run('completed')], diagnostics())!;
 		assert.strictEqual(value.completed, 1); assert.strictEqual(value.actionRequired, false);
+	});
+	test('keeps aggregate result compaction visible on the matching terminal row', () => {
+		const value = getAgentSubagentPresentation(budget({ retainedResultChars: 32_000, maxResultChars: 32_000, truncatedResultCount: 1 }), [{ ...run('completed'), resultTruncated: true }], diagnostics())!;
+		assert.strictEqual(value.budget?.truncatedResultCount, 1);
+		assert.strictEqual(value.runs[0].resultTruncated, true);
 	});
 	test('makes failed runs and failed admission action required', () => {
 		const failed = getAgentSubagentPresentation(budget({ accepted: 1 }), [{ ...run('failed'), summary: 'Provider request failed.' }], diagnostics())!;

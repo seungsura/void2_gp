@@ -91,16 +91,16 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 		}))
 		// .list()
 		this._register((this.channel.listen('onSuccess_list_ollama') satisfies Event<EventModelListOnSuccessParams<OllamaModelResponse>>)(e => {
-			this.listHooks.ollama.success[e.requestId]?.(e)
+			this._settleListHook('ollama', 'success', e.requestId, e)
 		}))
 		this._register((this.channel.listen('onError_list_ollama') satisfies Event<EventModelListOnErrorParams<OllamaModelResponse>>)(e => {
-			this.listHooks.ollama.error[e.requestId]?.(e)
+			this._settleListHook('ollama', 'error', e.requestId, e)
 		}))
 		this._register((this.channel.listen('onSuccess_list_openAICompatible') satisfies Event<EventModelListOnSuccessParams<OpenaiCompatibleModelResponse>>)(e => {
-			this.listHooks.openAICompat.success[e.requestId]?.(e)
+			this._settleListHook('openAICompat', 'success', e.requestId, e)
 		}))
 		this._register((this.channel.listen('onError_list_openAICompatible') satisfies Event<EventModelListOnErrorParams<OpenaiCompatibleModelResponse>>)(e => {
-			this.listHooks.openAICompat.error[e.requestId]?.(e)
+			this._settleListHook('openAICompat', 'error', e.requestId, e)
 		}))
 
 	}
@@ -171,7 +171,7 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 		this.listHooks.ollama.success[requestId_] = onSuccess
 		this.listHooks.ollama.error[requestId_] = onError
 
-		this.channel.call('ollamaList', {
+		this._callModelList('ollama', 'ollamaList', requestId_, {
 			...proxyParams,
 			settingsOfProvider,
 			providerName: 'ollama',
@@ -190,11 +190,28 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 		this.listHooks.openAICompat.success[requestId_] = onSuccess
 		this.listHooks.openAICompat.error[requestId_] = onError
 
-		this.channel.call('openAICompatibleList', {
+		this._callModelList('openAICompat', 'openAICompatibleList', requestId_, {
 			...proxyParams,
 			settingsOfProvider,
 			requestId: requestId_,
 		} satisfies MainModelListParams<OpenaiCompatibleModelResponse>)
+	}
+
+	private _callModelList(provider: 'ollama' | 'openAICompat', command: 'ollamaList' | 'openAICompatibleList', requestId: string, params: MainModelListParams<OllamaModelResponse | OpenaiCompatibleModelResponse>): void {
+		try {
+			void this.channel.call(command, params).then(undefined, error => this._settleListHook(provider, 'error', requestId, { error }));
+		} catch (error) {
+			this._settleListHook(provider, 'error', requestId, { error });
+		}
+	}
+
+	private _settleListHook(provider: 'ollama' | 'openAICompat', outcome: 'success' | 'error', requestId: string, params: unknown): void {
+		const callbacks = this.listHooks[provider][outcome] as Record<string, ((value: unknown) => void) | undefined>;
+		try {
+			callbacks[requestId]?.(params);
+		} finally {
+			this._clearChannelHooks(requestId);
+		}
 	}
 
 	private _clearChannelHooks(requestId: string) {
@@ -209,6 +226,22 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 
 		delete this.listHooks.openAICompat.success[requestId]
 		delete this.listHooks.openAICompat.error[requestId]
+	}
+
+	override dispose(): void {
+		const requestIds = new Set([
+			...Object.keys(this.llmMessageHooks.onText),
+			...Object.keys(this.llmMessageHooks.onFinalMessage),
+			...Object.keys(this.llmMessageHooks.onError),
+			...Object.keys(this.llmMessageHooks.onAbort),
+			...Object.keys(this.suppressErrorLogOfRequestId),
+			...Object.keys(this.listHooks.ollama.success),
+			...Object.keys(this.listHooks.ollama.error),
+			...Object.keys(this.listHooks.openAICompat.success),
+			...Object.keys(this.listHooks.openAICompat.error),
+		]);
+		for (const requestId of requestIds) this._clearChannelHooks(requestId);
+		super.dispose();
 	}
 }
 

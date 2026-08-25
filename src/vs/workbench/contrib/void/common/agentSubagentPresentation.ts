@@ -16,6 +16,7 @@ export type AgentSubagentPresentationRun = Readonly<{
 	schedulerActivity?: AgentSubagentRunView['schedulerActivity'];
 	statusLabel: string;
 	summary?: string;
+	resultTruncated?: true;
 	queuedMs: number;
 	runningMs: number;
 	totalMs: number;
@@ -86,6 +87,7 @@ export const getAgentSubagentPresentation = (
 		...(run.schedulerActivity ? { schedulerActivity: run.schedulerActivity } : {}),
 		statusLabel: activityLabel(run),
 		...(run.summary ? { summary: run.summary } : {}),
+		...(run.resultTruncated ? { resultTruncated: true as const } : {}),
 		queuedMs: run.queuedMs,
 		runningMs: run.runningMs,
 		totalMs: run.totalMs,

@@ -107,12 +107,12 @@ export const assertCanonicalReadOnlyChildRawPaths = (name: string, raw: Record<s
 };
 
 export type AgentSubagentStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
-export type AgentSubagentBudgetView = Readonly<{ accepted: number; running: number; queued: number; maxAccepted: number; maxConcurrent: number; providerSends: number; activeProviderSends: number; maxProviderSends: number; resultChars: number; retainedResultChars: number; maxResultChars: number; maxChildTurns: number; maxChildRunMs: number; maxChildSummaryChars: number; deadlineMsRemaining: number; usage: null }>;
+export type AgentSubagentBudgetView = Readonly<{ accepted: number; running: number; queued: number; maxAccepted: number; maxConcurrent: number; providerSends: number; activeProviderSends: number; maxProviderSends: number; resultChars: number; retainedResultChars: number; maxResultChars: number; truncatedResultCount: number; maxChildTurns: number; maxChildRunMs: number; maxChildSummaryChars: number; deadlineMsRemaining: number; usage: null }>;
 /** Scheduler state is intentionally separate from terminal status: a timed-out wait may be ready to resume but still queued behind another lease. */
-export type AgentSubagentRunView = Readonly<{ id: string; parentRunId?: string; depth: number; remainingDepth: number; status: AgentSubagentStatus; schedulerActivity: 'active' | 'waiting_children' | 'ready_to_resume' | 'quiescing'; summary?: string; roleName?: string; roleDescription?: string; capabilityProfile?: 'read_only' | 'inherit_parent_write'; toolPresentation?: Readonly<{ toolNames: readonly string[]; approvals: readonly string[]; undoAvailable: boolean; applicationBoundary: 'no_os_sandbox' }>; queuedMs: number; runningMs: number; totalMs: number; authority: Readonly<{ runtimeRevision: string; instructionsRevision: string; catalogRevision: string; modelFingerprint?: string; roleRevision?: string; selectedSkills: readonly Readonly<{ identity: string; bodyRevision: string }>[] }>; usage: null }>;
+export type AgentSubagentRunView = Readonly<{ id: string; parentRunId?: string; depth: number; remainingDepth: number; status: AgentSubagentStatus; schedulerActivity: 'active' | 'waiting_children' | 'ready_to_resume' | 'quiescing'; summary?: string; resultTruncated?: true; roleName?: string; roleDescription?: string; capabilityProfile?: 'read_only' | 'inherit_parent_write'; toolPresentation?: Readonly<{ toolNames: readonly string[]; approvals: readonly string[]; undoAvailable: boolean; applicationBoundary: 'no_os_sandbox' }>; queuedMs: number; runningMs: number; totalMs: number; authority: Readonly<{ runtimeRevision: string; instructionsRevision: string; catalogRevision: string; modelFingerprint?: string; roleRevision?: string; selectedSkills: readonly Readonly<{ identity: string; bodyRevision: string }>[] }>; usage: null }>;
 export type AgentSubagentTraceKind = 'group_created' | 'admission_started' | 'admission_failed' | 'child_queued' | 'child_running' | 'provider_send' | 'child_completed' | 'child_failed' | 'child_cancelled' | 'receipt_delivered' | 'group_cancelled';
 export type AgentSubagentTraceEvent = Readonly<{ sequence: number; parentId: string; generation: number; childId?: string; kind: AgentSubagentTraceKind; timestamp: number; elapsedMs: number; status?: Exclude<AgentSubagentStatus, 'queued' | 'running'>; diagnostic?: AgentSubagentTraceDiagnostic; budget: Readonly<{ accepted: number; running: number; queued: number; providerSends: number; resultChars: number }> }>;
-export type AgentSubagentTraceDiagnostic = 'cancelled' | 'model_missing' | 'provider_invalid' | 'owner_changed' | 'role_not_found' | 'role_stale' | 'skill_unavailable' | 'budget_exhausted' | 'provider_error' | 'timeout' | 'turn_limit' | 'unknown';
+export type AgentSubagentTraceDiagnostic = 'cancelled' | 'model_missing' | 'provider_invalid' | 'owner_changed' | 'role_not_found' | 'role_stale' | 'skill_unavailable' | 'budget_exhausted' | 'provider_error' | 'result_retention_truncated' | 'timeout' | 'turn_limit' | 'unknown';
 export type AgentSubagentDiagnosticsView = Readonly<{ parentId: string; generation: number; elapsedMs: number; events: readonly AgentSubagentTraceEvent[]; droppedEvents: number; completed: number; failed: number; cancelled: number; usage: null }>;
 export const isActiveChildRun = <T extends { readonly status: AgentSubagentStatus }>(view: T | undefined): boolean => view?.status === 'queued' || view?.status === 'running';
 export const agentSubagentStatusLabel = (status: AgentSubagentStatus): string => ({ queued: 'Queued', running: 'Running', completed: 'Completed', failed: 'Failed', cancelled: 'Cancelled' })[status];
@@ -183,7 +183,7 @@ export const validateAgentSubagentControlParams = (name: AgentSubagentControlNam
 export const isAgentSubagentControlName = (name: string): name is AgentSubagentControlName =>
 	name === 'spawn_agent' || name === 'wait_agent' || name === 'interrupt_agent';
 
-export type AgentSubagentReceipt = Readonly<{ id: string; status: Exclude<AgentSubagentStatus, 'queued' | 'running'>; summary: string; usage: null }>;
+export type AgentSubagentReceipt = Readonly<{ id: string; status: Exclude<AgentSubagentStatus, 'queued' | 'running'>; summary: string; resultTruncated?: true; usage: null }>;
 
 /** A small CAS-like state holder: completion/interrupt/late callbacks cannot settle twice. */
 export class AgentSubagentLifecycle {
@@ -193,10 +193,10 @@ export class AgentSubagentLifecycle {
 
 	get status(): AgentSubagentStatus { return this._status; }
 	start(): boolean { if (this._status !== 'queued') return false; this._status = 'running'; return true; }
-	settle(status: Exclude<AgentSubagentStatus, 'queued' | 'running'>, id: string, summary: string): boolean {
+	settle(status: Exclude<AgentSubagentStatus, 'queued' | 'running'>, id: string, summary: string, resultTruncated = false): boolean {
 		if (this._receipt) return false;
 		this._status = status;
-		this._receipt = Object.freeze({ id, status, summary: summary.slice(0, AGENT_SUBAGENT_MAX_MESSAGE_CHARS), usage: null });
+		this._receipt = Object.freeze({ id, status, summary: summary.slice(0, AGENT_SUBAGENT_MAX_MESSAGE_CHARS), ...(resultTruncated ? { resultTruncated: true as const } : {}), usage: null });
 		return true;
 	}
 	receipt(deliverSummary: boolean): { receipt: AgentSubagentReceipt | undefined; deliverSummary: boolean } {
