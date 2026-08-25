@@ -199,6 +199,19 @@ function Get-PeMachineFromFile {
     try { if ($reader.ReadUInt16() -ne 0x5a4d) { throw "Runtime payload is not a PE file: $Path" }; $stream.Position = 0x3c; $offset = $reader.ReadInt32(); if ($offset -lt 0 -or $offset -gt ($stream.Length - 6)) { throw "Runtime payload has an invalid PE offset: $Path" }; $stream.Position = $offset; if ($reader.ReadUInt32() -ne 0x00004550) { throw "Runtime payload has no PE signature: $Path" }; return $reader.ReadUInt16() } finally { $reader.Dispose(); $stream.Dispose() }
 }
 
+function Assert-CorporateCredentialArchiveEntries {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Entries,
+        [ValidateSet('Current', 'Historical')][string]$ArchiveMode = 'Current'
+    )
+
+    $matches = @($Entries | Where-Object { $_.FullName.Split('/')[-1] -ieq 'API_KEY' })
+    if ($ArchiveMode -ceq 'Historical' -and $matches.Count -eq 0) { return }
+    if ($matches.Count -ne 1 -or $matches[0].FullName -cne 'resources/app/.corporate/API_KEY' -or $matches[0].Length -le 0) {
+        throw 'Portable archive credential payload is missing, empty, or not at its only approved location.'
+    }
+}
+
 function Assert-PortableArchive {
     param(
         [Parameter(Mandatory = $true)][string]$ArchivePath,
@@ -225,6 +238,7 @@ function Assert-PortableArchive {
         foreach ($required in @('Void.exe', 'data/README.txt', 'resources/app/product.json')) {
             if ($entries.NormalizedArchivePath -notcontains (ConvertTo-NormalizedArchivePath -Path $required)) { throw "Portable ZIP is missing required entry: $required" }
         }
+        Assert-CorporateCredentialArchiveEntries -Entries $entries -ArchiveMode $ArchiveMode
         if (@($entries | Where-Object { $_.NormalizedArchivePath -eq 'data/argv.json' -or $_.NormalizedArchivePath -like 'data/user-data/*' }).Count -gt 0) { throw 'Portable ZIP contains generated test data.' }
         foreach ($payload in $PayloadEntries) {
             $matches = @($entries | Where-Object { $_.NormalizedArchivePath -eq $payload.NormalizedArchivePath })

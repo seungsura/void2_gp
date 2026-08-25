@@ -76,12 +76,49 @@ function Get-RuntimeManifest {
     return $out
 }
 function Get-ProductVersionFromText { param([string]$Text) $v=($Text|ConvertFrom-Json).version;if([string]::IsNullOrWhiteSpace([string]$v)){throw 'product.json has no version.'};[string]$v }
+function Get-CorporateCredentialSourcePath { [IO.Path]::GetFullPath((Join-Path $SourceRoot 'API_KEY')) }
+function Get-CorporateCredentialArtifactPath { [IO.Path]::GetFullPath((Join-Path $ArtifactRoot 'resources\app\.corporate\API_KEY')) }
+function Assert-CorporateCredentialLocation {
+    param([string]$Root,[string]$RelativePath,[string]$CandidatePath)
+    try {
+        $rootPath=[IO.Path]::GetFullPath($Root).TrimEnd([char[]]@($DirectorySeparatorChar,[IO.Path]::AltDirectorySeparatorChar));$expected=[IO.Path]::GetFullPath((Join-Path $rootPath $RelativePath));$candidate=[IO.Path]::GetFullPath($CandidatePath)
+        if(-not [StringComparer]::OrdinalIgnoreCase.Equals($expected,$candidate)){throw 'mismatch'}
+        if(-not $candidate.StartsWith($rootPath+$DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)){throw 'outside'}
+        $expected
+    } catch { throw 'Corporate credential location validation failed.' }
+}
+function Assert-CorporateCredentialDirectory {
+    param([string]$Path)
+    try { if(-not(Test-Path -LiteralPath $Path -PathType Container)){throw 'missing'};$item=Get-Item -LiteralPath $Path -Force;if(($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'reparse'};$item } catch { throw 'Corporate credential location validation failed.' }
+}
+function Assert-CorporateCredentialFile {
+    param([string]$Path)
+    try { if(-not(Test-Path -LiteralPath $Path -PathType Leaf)){throw 'missing'};$item=Get-Item -LiteralPath $Path -Force;if($item.PSIsContainer -or $item.Length -le 0 -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)){throw 'invalid'};$item } catch { throw 'Corporate credential payload is unavailable or invalid.' }
+}
+function Assert-CorporateCredentialArtifactPayload {
+    $destination=Assert-CorporateCredentialLocation $ArtifactRoot 'resources\app\.corporate\API_KEY' (Get-CorporateCredentialArtifactPath);$artifact=Assert-CorporateCredentialDirectory $ArtifactRoot;$resources=Assert-CorporateCredentialDirectory (Join-Path $ArtifactRoot 'resources');$app=Assert-CorporateCredentialDirectory (Join-Path $ArtifactRoot 'resources\app');$corporate=Assert-CorporateCredentialDirectory (Join-Path $ArtifactRoot 'resources\app\.corporate');$credential=Assert-CorporateCredentialFile $destination
+    try {foreach($unexpected in @((Join-Path $ArtifactRoot 'API_KEY'),(Join-Path $ArtifactRoot 'resources\API_KEY'),(Join-Path $app.FullName 'API_KEY'))){if(Test-Path -LiteralPath $unexpected -PathType Leaf){throw 'unexpected'}};$credential} catch { throw 'Artifact credential payload is missing, empty, or not at its only approved location.' }
+}
+function Install-CorporateCredentialPayload {
+    try {
+        $source=Assert-CorporateCredentialLocation $SourceRoot 'API_KEY' (Get-CorporateCredentialSourcePath);$destination=Assert-CorporateCredentialLocation $ArtifactRoot 'resources\app\.corporate\API_KEY' (Get-CorporateCredentialArtifactPath);$null=Assert-CorporateCredentialDirectory $SourceRoot;$sourceItem=Assert-CorporateCredentialFile $source;$null=Assert-CorporateCredentialDirectory $ArtifactRoot;$null=Assert-CorporateCredentialDirectory (Join-Path $ArtifactRoot 'resources');$null=Assert-CorporateCredentialDirectory (Join-Path $ArtifactRoot 'resources\app')
+        $corporateDirectory=Join-Path $ArtifactRoot 'resources\app\.corporate';if(Test-Path -LiteralPath $corporateDirectory){$null=Assert-CorporateCredentialDirectory $corporateDirectory}else{[IO.Directory]::CreateDirectory($corporateDirectory)|Out-Null;$null=Assert-CorporateCredentialDirectory $corporateDirectory}
+        if(Test-Path -LiteralPath $destination){$null=Assert-CorporateCredentialFile $destination}
+        [IO.File]::Copy($source,$destination,$true)
+        $destinationItem=Assert-CorporateCredentialFile $destination;if($destinationItem.Length -ne $sourceItem.Length){throw 'length'}
+    } catch { throw 'Corporate credential installation failed.' }
+}
+function Assert-CorporateCredentialArchiveEntries {
+    param([hashtable]$EntriesByPath,[switch]$HistoricalArchive)
+    $matches=@($EntriesByPath.GetEnumerator()|Where-Object{($_.Key.Split('/')[-1]) -ieq 'API_KEY'});if($HistoricalArchive -and $matches.Count -eq 0){return};if($matches.Count -ne 1 -or $matches[0].Key -cne 'resources/app/.corporate/API_KEY' -or $matches[0].Value.Length -le 0){throw 'Portable archive credential payload is missing, empty, or not at its only approved location.'}
+}
 function Assert-Artifact {
     $void=Join-Path $ArtifactRoot 'Void.exe';$product=Join-Path $ArtifactRoot (Join-Path 'resources' (Join-Path 'app' 'product.json'))
     foreach($p in @($void,$product)){if(-not (Test-Path -LiteralPath $p -PathType Leaf)){throw "Artifact missing: $p"};if((Get-Item -LiteralPath $p).Length -eq 0){throw "Artifact is empty: $p"};Assert-NotReparsePoint $p|Out-Null}
     $data=Join-Path $ArtifactRoot 'data';if(Test-Path -LiteralPath $data){Assert-NotReparsePoint $data|Out-Null;foreach($bad in @((Join-Path $data 'argv.json'),(Join-Path $data 'user-data'))){if(Test-Path -LiteralPath $bad){throw "Artifact includes generated user data: $bad"}}}
     Assert-X64PeFile $void; $payload=Get-RuntimeManifest
     foreach($x in $payload){if(-not (Test-Path -LiteralPath $x.SourcePath -PathType Leaf)){throw "Manifest artifact missing: $($x.SourcePath)"};if((Get-Item -LiteralPath $x.SourcePath).Length -eq 0){throw "Manifest artifact empty: $($x.SourcePath)"};Assert-X64PeFile $x.SourcePath}
+    $null=Assert-CorporateCredentialArtifactPayload
     [pscustomobject]@{Version=(Get-ProductVersionFromText (Read-Utf8NoBomText $product));PayloadCount=$payload.Count;Manifest=$payload}
 }
 function Assert-PortableArchive {
@@ -90,6 +127,7 @@ function Assert-PortableArchive {
     try {
         $by=@{};foreach($e in $zip.Entries){$n=Assert-CanonicalArchiveEntryPath $e.FullName;if($by.ContainsKey($n)){throw "Duplicate archive path: $n"};$by[$n]=$e}
         $actual=@($by.Values|ForEach-Object{$_.FullName});foreach($n in @('Void.exe','resources/app/product.json','data/README.txt')){if(-not ($actual -ccontains $n) -or $by[$n].Length -le 0){throw "Portable archive missing or empty: $n"}}
+        Assert-CorporateCredentialArchiveEntries -EntriesByPath $by -HistoricalArchive:$HistoricalArchive
         $userData=@($actual|Where-Object{$_ -clike 'data/user-data/*'});if(($actual -ccontains 'data/argv.json') -or $userData.Count -gt 0){throw 'Portable archive contains test user data.'}
         $s=$by['Void.exe'].Open();try{Assert-X64PeStream $s}finally{$s.Dispose()};$payload=Get-RuntimeManifest
         foreach($x in $payload){if(-not ($actual -ccontains $x.ArchivePath) -or $by[$x.ArchivePath].Length -le 0){throw "Portable archive missing payload: $($x.ArchivePath)"};$s=$by[$x.ArchivePath].Open();try{Assert-X64PeStream $s}finally{$s.Dispose()}}
@@ -405,7 +443,7 @@ function Assert-FocusedCommandsHaveExactPassCounts {
     param($Context)
 	$null=. (Join-Path $PSScriptRoot 'activate-build-env.ps1');$Context.summary.environment=Get-BuildEnvironment;$commands=@(Get-CanonicalBuildAndTestCommands);$focusedExpectedPassCounts=[ordered]@{'focused-native-modules'=25;'focused-write-file-planner'=6;'focused-read-file-reliability'=13;'focused-read-file-no-progress'=3;'focused-write-file-editor-transaction'=4;'focused-write-file-schema'=2;'focused-terminal-tool-instructions'=2;'focused-openai-compatible-diagnostics'=5;'focused-openai-compatible-electron-main'=3;'focused-agents-instruction-resolver'=14;'focused-agents-instruction-lifecycle'=8;'focused-agents-prompt-assembly'=6;'focused-agent-skills'=21;'focused-agent-skill-resources'=6;'focused-agent-skill-resource-tool'=6;'focused-agent-skill-typed-selector'=4;'focused-agent-skills-build-validation'=3;'focused-agent-subagents'=16;'focused-agent-custom-agents'=9;'focused-agent-subagent-presentation'=16;'focused-application-tool-presentation'=7;'focused-chat-current-status'=12;'focused-chat-history'=10;'focused-autocomplete-runtime-admission'=1;'focused-selection-helper-runtime-admission'=1;'focused-agents-instruction-runtime'=9;'focused-agent-skills-service'=9;'focused-agent-skills-runtime'=8;'focused-agent-skill-resource-read'=6;'focused-agent-skill-resource-runtime'=11;'focused-agent-custom-agent-service'=4;'focused-agent-subagent-service'=55;'focused-controlled-search-fallback'=11;'focused-agent-subagent-runtime'=14;'focused-chat-composer-draft'=6;'focused-ghost-chat-service'=22;'focused-assistant-message-lifecycle'=13;'focused-agent-subagent-channel'=11;'focused-agent-skill-resource-tool-serialization'=8;'focused-controlled-search-channel'=16;'focused-void-settings-persistence'=4;'focused-settings-switch-style'=4};Assert-FocusedCommandsHaveExactPassCounts $commands $focusedExpectedPassCounts;$Context.summary.commandPlan=@($commands|ForEach-Object{[pscustomobject]@{name=$_.name;file=$_.file;arguments=@($_.args);allowNonZero=[bool]$_.allowNonZero;expectedPreHelper=[bool]$_.expectedPreHelper}});Save-ReleaseSummary $Context.summary $Context.summaryPath
     foreach($command in $commands){Assert-CanonicalCommandArguments $command.file $command.args;$record=Invoke-ReleaseCommand -Stage $Context.stage -Name $command.name -FilePath $command.file -Arguments $command.args -LogDirectory $Context.logs -Summary $Context.summary -SummaryPath $Context.summaryPath -AllowNonZero:([bool]$command.allowNonZero);if($focusedExpectedPassCounts.Contains($command.name)){Assert-FocusedExactPassCount $record ([int]$focusedExpectedPassCounts[$command.name])};if($command.expectedPreHelper){Get-ExpectedPreHelperFailure $record $Context.summary $Context.summaryPath|Out-Null};if($command.name -ceq 'post-runtime-validation'){if($record.exitCode -ne 0){throw 'Post runtime validation failed.'};$payloads=@(Assert-SourceRuntimePayloads);if($payloads.Count -ne 24){throw 'Post runtime validation did not verify 24 source payloads.'}}}
-    $artifact=Assert-Artifact;$Context.summary.newMetadata=[pscustomobject]@{artifact=[pscustomobject]@{root=$ArtifactRoot;version=$artifact.Version;payloadCount=$artifact.PayloadCount;voidExe=(Get-ExistingFileMetadata (Join-Path $ArtifactRoot 'Void.exe'));productJson=(Get-ExistingFileMetadata (Join-Path $ArtifactRoot 'resources\app\product.json'))}};$Context.summary.gates.buildAndTestComplete=$true;$Context.summary.gates.buildAndTestSourceHead=$Context.head.head;Save-ReleaseSummary $Context.summary $Context.summaryPath;$artifact
+    Install-CorporateCredentialPayload;$artifact=Assert-Artifact;$Context.summary.newMetadata=[pscustomobject]@{artifact=[pscustomobject]@{root=$ArtifactRoot;version=$artifact.Version;payloadCount=$artifact.PayloadCount;voidExe=(Get-ExistingFileMetadata (Join-Path $ArtifactRoot 'Void.exe'));productJson=(Get-ExistingFileMetadata (Join-Path $ArtifactRoot 'resources\app\product.json'))}};$Context.summary.gates.buildAndTestComplete=$true;$Context.summary.gates.buildAndTestSourceHead=$Context.head.head;Save-ReleaseSummary $Context.summary $Context.summaryPath;$artifact
 }
 function Assert-ExistingReleaseStateUnchanged {
     param($Expected,$Actual)

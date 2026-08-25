@@ -77,7 +77,7 @@ const parseHeadersJSON = (s: string | undefined): Record<string, string | null |
 	}
 }
 
-const corporateCredentialUnavailableMessage = 'Corporate provider credential is unavailable. Set VOID_CORPORATE_API_KEY or provide the external API_KEY companion file.';
+const corporateCredentialUnavailableMessage = 'Corporate provider credential is unavailable.';
 
 const corporateTestEndpoint = () => {
 	const candidate = process.env.VOID_CORPORATE_TEST_ENDPOINT;
@@ -110,6 +110,10 @@ const resolveCorporateCredential = async () => {
 
 	const explicitCredential = await readNonEmptyCredential(process.env.VOID_CORPORATE_API_KEY_PATH);
 	if (explicitCredential) return explicitCredential;
+
+	const resourcesPath = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
+	const packagedCredential = await readNonEmptyCredential(resourcesPath ? path.join(resourcesPath, 'app', '.corporate', 'API_KEY') : undefined);
+	if (packagedCredential) return packagedCredential;
 
 	const companionCredential = await readNonEmptyCredential(path.join(path.dirname(process.execPath), 'API_KEY'));
 	if (companionCredential) return companionCredential;
