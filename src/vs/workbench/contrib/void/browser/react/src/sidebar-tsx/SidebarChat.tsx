@@ -813,6 +813,9 @@ type ToolHeaderParams = {
 	desc2OnClick?: () => void;
 	isOpen?: boolean;
 	className?: string;
+	/** Always-visible active duration; unlike desc1Info this is never tooltip-only. */
+	elapsed?: string;
+	rightAction?: React.ReactNode;
 }
 
 const ToolHeaderWrapper = ({
@@ -834,6 +837,8 @@ const ToolHeaderWrapper = ({
 	isOpen,
 	isRejected,
 	className, // applies to the main content
+	elapsed,
+	rightAction,
 }: ToolHeaderParams) => {
 
 	const [isOpen_, setIsOpen] = useState(false);
@@ -932,12 +937,14 @@ const ToolHeaderWrapper = ({
 							data-tooltip-content={'Canceled'}
 							data-tooltip-place='top'
 						/>}
+						{elapsed && <span data-testid='void-tool-elapsed' className="text-void-fg-4 text-xs whitespace-nowrap">{elapsed}</span>}
 						{desc2 && (desc2OnClick ? <button type="button" className="text-void-fg-4 text-xs focus-ring" onClick={desc2OnClick}>{desc2}</button> : <span className="text-void-fg-4 text-xs">{desc2}</span>)}
 						{numResults !== undefined && (
 							<span className="text-void-fg-4 text-xs ml-auto mr-1">
 								{`${numResults}${hasNextPage ? '+' : ''} result${numResults !== 1 ? 's' : ''}`}
 							</span>
 						)}
+						{rightAction}
 					</div>
 				</div>
 			</div>
@@ -1756,6 +1763,28 @@ const useLiveElapsed = (startedAt: number | undefined, active: boolean): string 
 	return seconds >= 60 ? `Elapsed ${Math.floor(seconds / 60)}m ${seconds % 60}s` : `Elapsed ${seconds}s`
 }
 
+/** A card Stop is intentionally narrower than the composer Stop: the service validates
+ * this opaque receipt against its exact live row before it invokes any interrupt. */
+const ToolCardStop = ({ threadId, toolMessage }: { threadId: string; toolMessage: Extract<ToolMessage<ToolName>, { type: 'running_now' }> }) => {
+	const chatThreadsService = useAccessor().get('IChatThreadService')
+	const isCancelling = toolMessage.lifecycle === 'cancelling'
+	const canStop = !isCancelling && !!toolMessage.receiptId && toolMessage.cardStopAvailable === true
+	const reason = isCancelling
+		? 'Waiting for this tool to stop.'
+		: toolMessage.cardStopUnavailableReason ?? 'This live tool does not expose an independent cancellation handle.'
+	return <ButtonStop
+		data-testid='void-tool-card-stop'
+		className='h-5 w-5 !rounded-sm disabled:cursor-default disabled:opacity-50'
+		aria-label={canStop ? 'Stop this tool' : isCancelling ? 'Cancelling this tool' : 'Tool Stop unavailable'}
+		title={canStop ? 'Stop this tool' : reason}
+		disabled={!canStop}
+		onClick={event => {
+			event.stopPropagation()
+			if (canStop && toolMessage.receiptId) chatThreadsService.cancelToolReceipt(threadId, toolMessage.receiptId, toolMessage.id)
+		}}
+	/>
+}
+
 const CommandTool = ({ toolMessage, type, threadId }: { threadId: string } & ({
 	toolMessage: Exclude<ToolMessage<'run_command'>, { type: 'invalid_params' }>
 	type: 'run_command'
@@ -1780,7 +1809,16 @@ const CommandTool = ({ toolMessage, type, threadId }: { threadId: string } & ({
 	const isCancelling = toolMessage.type === 'running_now' && toolMessage.lifecycle === 'cancelling'
 	const elapsed = useLiveElapsed(toolMessage.startedAt, toolMessage.type === 'running_now')
 	const { rawParams, params } = toolMessage
-	const componentParams: ToolHeaderParams = { title, desc1: isCancelling ? 'Cancelling' : desc1, desc1Info: elapsed ?? desc1Info, isError, icon, isRejected, }
+	const componentParams: ToolHeaderParams = {
+		title,
+		desc1: isCancelling ? 'Cancelling' : desc1,
+		desc1Info,
+		elapsed,
+		rightAction: toolMessage.type === 'running_now' ? <ToolCardStop threadId={threadId} toolMessage={toolMessage} /> : undefined,
+		isError,
+		icon,
+		isRejected,
+	}
 
 
 	useEffect(() => {
@@ -2454,14 +2492,13 @@ const ChatBubble = (props: ChatBubbleProps) => {
 
 /** One shared live card keeps every tool call visible under its original call id.
  * Completed tool-specific renderers still own their detailed result views. */
-const LiveToolCard = ({ toolMessage }: { toolMessage: Exclude<ToolMessage<ToolName>, { type: 'invalid_params' }> }) => {
-	const accessor = useAccessor()
+const LiveToolCard = ({ threadId, toolMessage }: { threadId: string; toolMessage: Exclude<ToolMessage<ToolName>, { type: 'invalid_params' }> }) => {
 	const route = applicationToolRoute(toolMessage.name, isABuiltinToolName(toolMessage.name))
 	const application = route === 'application' ? applicationToolPresentation(toolMessage.name, toolMessage.type, toolMessage.params) : undefined
 	const title = getTitle(toolMessage)
 	const desc1 = toolMessage.lifecycle === 'cancelling' ? 'Cancelling' : application?.status ?? (route === 'mcp' ? removeMCPToolNamePrefix(toolMessage.name) : 'Running')
 	const elapsed = useLiveElapsed(toolMessage.startedAt, toolMessage.type === 'running_now')
-	return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={elapsed} isRejected={false} />
+	return <ToolHeaderWrapper title={title} desc1={desc1} elapsed={elapsed} rightAction={toolMessage.type === 'running_now' ? <ToolCardStop threadId={threadId} toolMessage={toolMessage} /> : undefined} isRejected={false} />
 }
 
 const _ChatBubble = ({ threadId, chatMessage, isCommitted, messageIdx, _scrollToBottom, editable }: ChatBubbleProps) => {
@@ -2491,7 +2528,7 @@ const _ChatBubble = ({ threadId, chatMessage, isCommitted, messageIdx, _scrollTo
 			if (route === 'application') return <ApplicationToolWrapper toolMessage={chatMessage} />
 			return <InvalidTool toolName={chatMessage.name} message={chatMessage.content} mcpServerName={chatMessage.mcpServerName} />
 		}
-		if (chatMessage.type === 'running_now' && chatMessage.name !== 'run_command' && chatMessage.name !== 'run_persistent_command') return <LiveToolCard toolMessage={chatMessage} />
+		if (chatMessage.type === 'running_now' && chatMessage.name !== 'run_command' && chatMessage.name !== 'run_persistent_command') return <LiveToolCard threadId={threadId} toolMessage={chatMessage} />
 
 		const ToolResultWrapper = isBuiltinTool ? builtinToolNameToComponent[toolName]?.resultWrapper as ResultWrapper<ToolName>
 			: route === 'application' ? ApplicationToolWrapper as ResultWrapper<ToolName>
@@ -3064,7 +3101,7 @@ export const SidebarChat = () => {
 			: null
 		: null
 	const transientControl = currThreadStreamState?.isRunning === 'idle' && currThreadStreamState.toolInfo?.transient ?
-		<LiveToolCard key={`control-${currThreadStreamState.toolInfo.receiptId}`} toolMessage={{ role: 'tool', type: 'running_now', name: currThreadStreamState.toolInfo.toolName, params: currThreadStreamState.toolInfo.toolParams, content: currThreadStreamState.toolInfo.content, result: null, id: currThreadStreamState.toolInfo.id, rawParams: currThreadStreamState.toolInfo.rawParams, mcpServerName: currThreadStreamState.toolInfo.mcpServerName, lifecycle: currThreadStreamState.toolInfo.lifecycle, startedAt: currThreadStreamState.toolInfo.startedAt } as any} /> : null
+		<LiveToolCard key={`control-${currThreadStreamState.toolInfo.receiptId}`} threadId={threadId} toolMessage={{ role: 'tool', type: 'running_now', name: currThreadStreamState.toolInfo.toolName, params: currThreadStreamState.toolInfo.toolParams, content: currThreadStreamState.toolInfo.content, result: null, id: currThreadStreamState.toolInfo.id, rawParams: currThreadStreamState.toolInfo.rawParams, mcpServerName: currThreadStreamState.toolInfo.mcpServerName, receiptId: currThreadStreamState.toolInfo.receiptId, lifecycle: currThreadStreamState.toolInfo.lifecycle, startedAt: currThreadStreamState.toolInfo.startedAt, cardStopAvailable: false, cardStopUnavailableReason: currThreadStreamState.toolInfo.cardStopUnavailableReason } as any} /> : null
 
 	const messagesHTML = <ScrollToBottomContainer
 		key={'messages' + chatThreadsState.currentThreadId} // force rerender on all children if id changes

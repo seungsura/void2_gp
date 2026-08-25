@@ -42,6 +42,12 @@ export type ToolMessage<T extends ToolName> = {
 	/** Not persisted as a requirement: older stored tool records simply omit it. */
 	lifecycle?: 'cancelling';
 	startedAt?: number;
+	/** Private execution receipt for a live card. Completed history intentionally omits it. */
+	receiptId?: string;
+	/** Card-local cancellation is only enabled after an exact underlying interrupt exists. */
+	cardStopAvailable?: boolean;
+	/** A truthful explanation when an independently cancellable receipt does not exist. */
+	cardStopUnavailableReason?: string;
 } & (
 		// in order of events:
 		| { type: 'invalid_params', result: null, name: T, }

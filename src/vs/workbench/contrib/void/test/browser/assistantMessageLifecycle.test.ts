@@ -61,13 +61,14 @@ type TestRunChatOptions = {
 	instructionSnapshot: ReturnType<typeof instructionSnapshot>;
 	callThisToolFirst?: { role: 'tool'; type: 'tool_request'; name: 'read_file'; id: string; params: Record<string, unknown>; rawParams: Record<string, unknown>; content: string; result: null; mcpServerName: undefined };
 };
-type TestToolCallResult = { awaitingUserApproval?: boolean; interrupted?: boolean };
+type TestToolCallResult = { awaitingUserApproval?: boolean; interrupted?: boolean; receiptCancelled?: boolean };
 interface ChatLifecycleTestAdapter {
 	_runChatAgent(this: unknown, options: TestRunChatOptions & { parentRun: TestParentRun }): Promise<void>;
 	_runToolCall(this: unknown, threadId: string, toolName: string, toolId: string, mcpServerName: string | undefined, options: { preapproved: true; unvalidatedToolParams: Record<string, unknown>; validatedParams: Record<string, unknown> }, snapshot: ReturnType<typeof instructionSnapshot>, authority: undefined, skillReadAllowed: boolean, generation: number, isActive: () => boolean): Promise<TestToolCallResult>;
 	_wrapRunAgentToNotify(this: unknown, promise: Promise<void>, threadId: string, parentRun: TestParentRun): Promise<void>;
 	_revokeAgentDelegation(this: unknown, threadId: string, forget?: boolean): void;
 	abortRunning(this: unknown, threadId: string): Promise<void>;
+	cancelToolReceipt(this: unknown, threadId: string, receiptId: string, toolId: string): boolean;
 }
 const chatLifecycle = ChatThreadService.prototype as unknown as ChatLifecycleTestAdapter;
 let nextTestParentRunId = 0;
@@ -245,6 +246,7 @@ suite('Assistant message lifecycle', () => {
 				_updateLatestTool(_threadId: string, message: TestToolMutation) { mutations.push(message); },
 				_setStreamState(threadId: string, value: TestStream | undefined) { streamState[threadId] = value; },
 			};
+			Object.setPrototypeOf(receiver, ChatThreadService.prototype);
 			const run = chatLifecycle._runToolCall.call(receiver, 'task', 'deferred_mcp', `tool-${settlement}`, 'fixture', { preapproved: true, unvalidatedToolParams: {}, validatedParams: {} }, instructionSnapshot(), undefined, false, 0, () => current);
 			await Promise.resolve();
 			assert.strictEqual(mutations.length, 1);
@@ -626,8 +628,10 @@ suite('Assistant message lifecycle', () => {
 				stringOfResult: { run_command: () => { throw new Error('must not stringify a nonzero terminal result as success'); } },
 			},
 			_updateLatestTool(_threadId: string, message: any) { if (messages.length) messages[messages.length - 1] = message; else messages.push(message); },
+			_editMessageInThread(_threadId: string, index: number, message: any) { messages[index] = message; },
 			_setStreamState(threadId: string, value: any) { this.streamState[threadId] = value; },
 		};
+		Object.setPrototypeOf(receiver, ChatThreadService.prototype);
 		const result = await chatLifecycle._runToolCall.call(receiver, 'task', 'run_command', 'terminal-7', undefined, { preapproved: true, unvalidatedToolParams: {}, validatedParams: {} }, instructionSnapshot(), undefined, false, 0, () => true);
 		assert.strictEqual((result as any).failure, 'terminal_exit_7');
 		assert.strictEqual(messages.length, 1);
@@ -655,6 +659,140 @@ suite('Assistant message lifecycle', () => {
 		second.resolve({ result: '', resolveReason: { type: 'cancelled' } }); await runB;
 		assert.strictEqual(messages.at(-1).type, 'rejected');
 		assert.strictEqual(interrupts, 2);
+	});
+
+	test('card Stop owns one exact live receipt without revoking a parent or sibling', async () => {
+		const first = deferred<any>(); const replacement = deferred<any>(); const sibling = deferred<any>();
+		const messages: any[] = []; const otherMessages: any[] = []; const streamState: any = {};
+		const interrupts = { first: 0, replacement: 0, sibling: 0 }; let stringifyCalls = 0; let revocations = 0; let reentrantStop: boolean | undefined;
+		const receiver: any = {
+			state: {
+				allThreads: {
+					task: { messages, state: {}, filesWithUserChanges: new Set<string>() },
+					other: { messages: otherMessages, state: {}, filesWithUserChanges: new Set<string>() },
+				},
+			},
+			streamState,
+			_activeToolCardReceiptsOfThread: new Map(),
+			_cancellingToolReceiptsOfThread: new Map(),
+			toolErrMsgs: { interrupted: 'Tool call was interrupted by the user.' },
+			_revokeAgentDelegation() { revocations++; },
+			_toolsService: {
+				callTool: {
+					run_command: async (params: any) => {
+						const key = params.command as keyof typeof interrupts;
+						const result = key === 'first' ? first.promise : key === 'replacement' ? replacement.promise : sibling.promise;
+						return { result, interruptTool: () => { interrupts[key]++; } };
+					},
+				},
+				stringOfResult: { run_command: () => { stringifyCalls++; return 'finished'; } },
+			},
+			_updateLatestTool(threadId: string, message: any) {
+				const target = threadId === 'task' ? messages : otherMessages;
+				const last = target.at(-1);
+				if (last?.role === 'tool' && last.type !== 'invalid_params') target[target.length - 1] = message;
+				else target.push(message);
+			},
+			_editMessageInThread(threadId: string, index: number, message: any) {
+				const target = threadId === 'task' ? messages : otherMessages;
+				target[index] = message;
+				if (threadId === 'task' && message.lifecycle === 'cancelling' && reentrantStop === undefined) reentrantStop = chatLifecycle.cancelToolReceipt.call(receiver, 'task', message.receiptId, message.id);
+			},
+			_setStreamState(threadId: string, value: any) { streamState[threadId] = value; },
+		};
+		Object.setPrototypeOf(receiver, ChatThreadService.prototype);
+		const start = (threadId: 'task' | 'other', command: keyof typeof interrupts) => chatLifecycle._runToolCall.call(receiver, threadId, 'run_command', 'same-provider-id', undefined, { preapproved: true, unvalidatedToolParams: { command, terminalId: command }, validatedParams: { command, terminalId: command } }, instructionSnapshot(), undefined, false, 0, () => true);
+
+		const runFirst = start('task', 'first'); const runSibling = start('other', 'sibling');
+		await flushMicrotasks();
+		const firstReceipt = messages[0].receiptId as string;
+		assert.ok(firstReceipt);
+		assert.strictEqual(chatLifecycle.cancelToolReceipt.call(receiver, 'other', firstReceipt, 'same-provider-id'), false);
+		assert.strictEqual(chatLifecycle.cancelToolReceipt.call(receiver, 'task', 'wrong-receipt', 'same-provider-id'), false);
+		assert.strictEqual(chatLifecycle.cancelToolReceipt.call(receiver, 'task', firstReceipt, 'same-provider-id'), true);
+		assert.strictEqual(reentrantStop, false);
+		assert.deepStrictEqual({ lifecycle: messages[0].lifecycle, first: interrupts.first, sibling: interrupts.sibling, revocations }, { lifecycle: 'cancelling', first: 1, sibling: 0, revocations: 0 });
+		assert.strictEqual(chatLifecycle.cancelToolReceipt.call(receiver, 'task', firstReceipt, 'same-provider-id'), false);
+		first.resolve({ result: 'late success must not render', resolveReason: { type: 'cancelled' } });
+		assert.deepStrictEqual(await runFirst, { receiptCancelled: true });
+		assert.deepStrictEqual({ type: messages[0].type, result: messages[0].result, stringifyCalls }, { type: 'rejected', result: null, stringifyCalls: 0 });
+
+		const runReplacement = start('task', 'replacement'); await flushMicrotasks();
+		const replacementReceipt = messages[0].receiptId as string;
+		assert.notStrictEqual(replacementReceipt, firstReceipt);
+		assert.strictEqual(chatLifecycle.cancelToolReceipt.call(receiver, 'task', firstReceipt, 'same-provider-id'), false);
+		assert.strictEqual(interrupts.replacement, 0);
+		assert.strictEqual(chatLifecycle.cancelToolReceipt.call(receiver, 'task', replacementReceipt, 'same-provider-id'), true);
+		replacement.resolve({ result: '', resolveReason: { type: 'cancelled' } });
+		assert.deepStrictEqual(await runReplacement, { receiptCancelled: true });
+		assert.strictEqual(messages[0].type, 'rejected');
+
+		sibling.resolve({ result: 'unrelated finished', resolveReason: { type: 'done', exitCode: 0 } });
+		await runSibling;
+		assert.strictEqual(otherMessages[0].type, 'success');
+		assert.strictEqual(interrupts.sibling, 0);
+	});
+
+	test('card Stop rejects a stale parent receipt before touching its live row', () => {
+		let interrupts = 0;
+		const row: any = { role: 'tool', type: 'running_now', name: 'run_command', params: { command: 'stale', terminalId: 'stale' }, content: '', result: null, id: 'same-provider-id', rawParams: {}, mcpServerName: undefined, receiptId: 'stale-receipt', cardStopAvailable: true };
+		const receiver: any = {
+			state: { allThreads: { task: { messages: [row], state: {}, filesWithUserChanges: new Set<string>() } } },
+			_activeToolCardReceiptsOfThread: new Map([['task', new Map([['stale-receipt', { toolId: 'same-provider-id', messageIndex: 0, cancel: () => { interrupts++; }, isCurrent: () => false, interruptInstalled: true, cancelling: false }]])]]),
+			_cancellingToolReceiptsOfThread: new Map(),
+		};
+		Object.setPrototypeOf(receiver, ChatThreadService.prototype);
+		assert.strictEqual(chatLifecycle.cancelToolReceipt.call(receiver, 'task', 'stale-receipt', 'same-provider-id'), false);
+		assert.strictEqual(interrupts, 0);
+		assert.deepStrictEqual({ lifecycle: row.lifecycle, available: row.cardStopAvailable }, { lifecycle: undefined, available: true });
+	});
+
+	test('global Stop published synchronously with a live row settles that exact receipt before tool setup', async () => {
+		const messages: any[] = []; const streamState: any = {}; let current = true; let toolCalls = 0; let stop: Promise<void> | undefined;
+		const receiver: any = {
+			state: { allThreads: { task: { messages, state: {}, filesWithUserChanges: new Set<string>() } } },
+			streamState,
+			_activeToolCardReceiptsOfThread: new Map(),
+			_cancellingToolReceiptsOfThread: new Map(),
+			toolErrMsgs: { interrupted: 'Tool call was interrupted by the user.' },
+			_revokeAgentDelegation() { current = false; },
+			_toolsService: {
+				callTool: { run_command: async () => { toolCalls++; throw new Error('tool setup must not start after synchronous Stop'); } },
+				stringOfResult: { run_command: () => { throw new Error('cancelled tool must not stringify'); } },
+			},
+			_updateLatestTool(threadId: string, message: any) {
+				if (messages.length) messages[messages.length - 1] = message; else messages.push(message);
+				if (message.type === 'running_now' && !message.lifecycle && !stop) stop = chatLifecycle.abortRunning.call(receiver, threadId);
+			},
+			_editMessageInThread(_threadId: string, index: number, message: any) { messages[index] = message; },
+			_setStreamState(threadId: string, value: any) { streamState[threadId] = value; },
+		};
+		Object.setPrototypeOf(receiver, ChatThreadService.prototype);
+		const result = await chatLifecycle._runToolCall.call(receiver, 'task', 'run_command', 'publish-stop', undefined, { preapproved: true, unvalidatedToolParams: { command: 'echo stale', terminalId: 'publish-stop' }, validatedParams: { command: 'echo stale', terminalId: 'publish-stop' } }, instructionSnapshot(), undefined, false, 0, () => current);
+		await stop;
+		assert.deepStrictEqual(result, { interrupted: true });
+		assert.deepStrictEqual({ calls: toolCalls, type: messages[0].type, lifecycle: messages[0].lifecycle, receipt: messages[0].receiptId, stream: streamState.task }, { calls: 0, type: 'rejected', lifecycle: undefined, receipt: undefined, stream: undefined });
+	});
+
+	test('receipt-local cancellation continues the parent loop without entering the failure circuit', async () => {
+		const snapshot = instructionSnapshot(); const streamState: any = {}; let sends = 0; let toolCalls = 0;
+		const receiver: any = {
+			state: { allThreads: { task: { messages: [{ role: 'user', content: 'continue after cancellation' }], state: {}, filesWithUserChanges: new Set<string>() } } },
+			streamState,
+			_agentControlGeneration: new Map([['task', 0]]), _parentRunTokenOfThread: new Map(), _agentDelegationAuthorityOfThread: new Map(),
+			_settingsService: { state: { globalSettings: { chatMode: 'agent' } } },
+			_convertToLLMMessagesService: { prepareLLMChatMessages: async () => ({ messages: [], separateSystemMessage: false }) },
+			_llmMessageService: {
+				sendLLMMessage: (options: any) => { const call = ++sends; queueMicrotask(() => void options.onFinalMessage({ fullText: call === 1 ? '' : 'continued', fullReasoning: '', toolCall: call === 1 ? { name: 'run_command', id: 'same', rawParams: { command: 'cancelled', terminalId: 'terminal' } } : undefined, anthropicReasoning: null })); return `provider-${call}`; },
+				abort() { },
+			},
+			_mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } },
+			_setStreamState(threadId: string, value: any) { streamState[threadId] = value; },
+			_addMessageToThread() { },
+			_runToolCall: async () => { toolCalls++; return { receiptCancelled: true }; },
+		};
+		await runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot });
+		assert.deepStrictEqual({ sends, toolCalls, error: streamState.task.error }, { sends: 2, toolCalls: 1, error: undefined });
 	});
 
 	test('stops the parent loop after three identical normalized tool failures without a fourth provider send', async () => {
