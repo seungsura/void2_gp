@@ -5,7 +5,7 @@
 
 export type ChatCurrentParentRunning = 'LLM' | 'tool' | 'awaiting_user' | 'idle';
 export type ChatCurrentStatusKind = 'idle' | 'unavailable' | 'preparing' | 'running' | 'awaiting_user' | 'error';
-export type ChatCurrentLiveLabel = 'Preparing' | 'Running' | 'Needs approval' | 'Error';
+export type ChatCurrentLiveLabel = 'Preparing' | 'Running' | 'Retrying' | 'Needs approval' | 'Error';
 
 export type ChatCurrentStatusInput = Readonly<{
 	parentIsRunning?: ChatCurrentParentRunning;
@@ -14,6 +14,7 @@ export type ChatCurrentStatusInput = Readonly<{
 	hasDraft: boolean;
 	chatModelUnavailable: boolean;
 	pendingPreparing?: boolean;
+	retry?: Readonly<{ attempt: number; maxAttempts: number; retryAt: number }>;
 }>;
 
 export type ChatCurrentSubmitInput = Readonly<{
@@ -99,6 +100,11 @@ export const getChatCurrentStatusPresentation = (input: ChatCurrentStatusInput):
 		kind = 'preparing';
 		liveLabel = 'Preparing';
 		detail = 'Esc to cancel';
+	} else if (input.retry) {
+		kind = 'running';
+		liveLabel = 'Retrying';
+		const remainingSeconds = Math.max(0, Math.ceil((input.retry.retryAt - Date.now()) / 1000));
+		detail = `Provider request ${input.retry.attempt} of ${input.retry.maxAttempts}${remainingSeconds ? ` · retrying in ${remainingSeconds}s` : ''} · Esc to stop`;
 	} else if (input.parentIsRunning === 'awaiting_user') {
 		kind = 'awaiting_user';
 		liveLabel = 'Needs approval';

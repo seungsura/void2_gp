@@ -55,6 +55,24 @@ import { sanitizeAssistantDisplayContent } from '../common/assistantMessagePrese
 // related to retrying when LLM message has error
 const CHAT_RETRIES = 3
 const RETRY_DELAY = 2500
+const stableToolValue = (value: unknown): string => {
+	if (value instanceof URI) return JSON.stringify(value.toString())
+	if (value === undefined) return '[undefined]'
+	if (typeof value === 'number' && !Number.isFinite(value)) return `[${String(value)}]`
+	if (typeof value === 'bigint') return `${value}n`
+	if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? '[undefined]'
+	if (Array.isArray(value)) return `[${value.map(stableToolValue).join(',')}]`
+	const record = value as Record<string, unknown>
+	return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${stableToolValue(record[key])}`).join(',')}}`
+}
+const semanticToolArgs = (toolName: ToolName, params: ToolCallParams<ToolName>): unknown => {
+	if (!params || typeof params !== 'object') return params
+	const value = { ...(params as Record<string, unknown>) }
+	// Generated execution ids are receipts, not model intent; including them makes
+	// a repeated terminal command look different on every attempt.
+	if (toolName.toLowerCase() === 'run_command') delete value.terminalId
+	return value
+}
 type AgentDelegationTurnAuthority = Readonly<{ allowed: boolean; generation: number; limits: AgentDelegationLimits; runtimeSnapshot: AgentRuntimeTurnSnapshot; parentTools: AgentSubagentToolSnapshot; autoApprove: Readonly<{ edits: boolean; terminal: boolean; mcp: boolean }>; roles?: CustomAgentCatalog; settingsState?: IVoidSettingsService['state']; settingsOfProvider?: SettingsOfProvider }>
 type ParentRunOwnership = Readonly<{ token: symbol; generation: number; isLatest: () => boolean; isActive: () => boolean; deactivate: () => void; releaseLatest: () => void }>
 
@@ -204,6 +222,7 @@ export type ThreadStreamState = {
 		llmInfo?: undefined;
 		toolInfo?: undefined;
 		interrupt?: undefined;
+		retry?: { attempt: number; maxAttempts: number; retryAt: number; };
 	} | { // an assistant message is being written
 		isRunning: 'LLM';
 		error?: undefined;
@@ -214,6 +233,7 @@ export type ThreadStreamState = {
 		};
 		toolInfo?: undefined;
 		interrupt: Promise<() => void>; // calling this should have no effect on state - would be too confusing. it just cancels the tool
+		retry?: undefined;
 	} | { // a tool is being run
 		isRunning: 'tool';
 		error?: undefined;
@@ -225,20 +245,24 @@ export type ThreadStreamState = {
 			content: string;
 			rawParams: RawToolParamsObj;
 			mcpServerName: string | undefined;
+			receiptId?: string;
 		};
 		interrupt: Promise<() => void>;
+		retry?: undefined;
 	} | {
 		isRunning: 'awaiting_user';
 		error?: undefined;
 		llmInfo?: undefined;
 		toolInfo?: undefined;
 		interrupt?: undefined;
+		retry?: undefined;
 	} | {
 		isRunning: 'idle';
 		error?: undefined;
 		llmInfo?: undefined;
-		toolInfo?: undefined;
+		toolInfo?: { toolName: ToolName; toolParams: ToolCallParams<ToolName>; id: string; content: string; rawParams: RawToolParamsObj; mcpServerName: string | undefined; receiptId: string; transient: true; startedAt: number; lifecycle?: 'cancelling'; };
 		interrupt: 'not_needed' | Promise<() => void>; // calling this should have no effect on state - would be too confusing. it just cancels the tool
+		retry?: { attempt: number; maxAttempts: number; retryAt: number; };
 	}
 }
 
@@ -400,6 +424,10 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	private readonly _instructionTurnOfThread = new Map<string, AgentRuntimeTurnSnapshot>();
 	private readonly _agentControlGeneration = new Map<string, number>();
 	private readonly _parentRunTokenOfThread = new Map<string, symbol>();
+	/** Cancellation is retained separately from the persisted tool message until the
+	 * underlying operation settles. This lets the card truthfully remain Cancelling
+	 * while generation fences keep a late result from replacing it. */
+	private readonly _cancellingToolReceiptsOfThread = new Map<string, Map<string, { toolId: string; messageIndex: number }>>();
 	private readonly _agentDelegationAuthorityOfThread = new Map<string, AgentDelegationTurnAuthority>();
 	private readonly _childToolApprovals = new Map<string, { view: ChildToolApprovalView; resolve: (decision: 'approved' | 'rejected' | 'cancelled') => void }>();
 	getChildToolApprovals(parentId: string): readonly ChildToolApprovalView[] { return Object.freeze([...this._childToolApprovals.values()].map(entry => entry.view).filter(view => view.key.parentId === parentId)); }
@@ -582,6 +610,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		for (const threadId of Object.keys(this.state.allThreads)) this._revokeAgentDelegation(threadId, true)
 		this._agentControlGeneration.clear()
 		this._parentRunTokenOfThread.clear()
+		this._cancellingToolReceiptsOfThread.clear()
 		this._agentInstructionSessionOfThread.clear()
 		this._transientComposerDraftOfThread.clear()
 		this._restoreInstructionTurns(newState.allThreads)
@@ -593,6 +622,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		for (const threadId of Object.keys(this.state.allThreads)) this._revokeAgentDelegation(threadId, true)
 		this._agentControlGeneration.clear()
 		this._parentRunTokenOfThread.clear()
+		this._cancellingToolReceiptsOfThread.clear()
 		this._agentInstructionSessionOfThread.clear()
 		this._instructionTurnOfThread.clear()
 		this._transientComposerDraftOfThread.clear()
@@ -899,6 +929,18 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 	async abortRunning(threadId: string) {
 		if (this._pendingChatSubmissionOfThread?.get(threadId) && this._cancelPendingChatSubmission(threadId)) return
+		// Child controls deliberately use an idle stream projection so they never enter
+		// parent/model history. Capture and mark it before revocation: revocation wakes a
+		// deferred wait, but the card must remain visibly Cancelling until that wait has
+		// actually observed the fence and clears its own receipt.
+		const streamAtAbort = this.streamState[threadId]
+		const transientControl = streamAtAbort?.isRunning === 'idle' && streamAtAbort.toolInfo?.transient
+			? { state: streamAtAbort, toolInfo: streamAtAbort.toolInfo }
+			: undefined
+		if (transientControl?.toolInfo.lifecycle === 'cancelling') return
+		if (transientControl && transientControl.toolInfo.lifecycle !== 'cancelling') {
+			this._setStreamState(threadId, { ...transientControl.state, toolInfo: { ...transientControl.toolInfo, lifecycle: 'cancelling' } })
+		}
 		this._revokeAgentDelegation(threadId)
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
@@ -911,9 +953,13 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		}
 		// add tool that's running
 		else if (this.streamState[threadId]?.isRunning === 'tool') {
-			const { toolName, toolParams, id, content: content_, rawParams, mcpServerName } = this.streamState[threadId].toolInfo
+			const { toolName, toolParams, id, content: content_, rawParams, mcpServerName, receiptId } = this.streamState[threadId].toolInfo
 			const content = content_ || this.toolErrMsgs.interrupted
-			this._updateLatestTool(threadId, { role: 'tool', name: toolName, params: toolParams, id, content, rawParams, type: 'rejected', result: null, mcpServerName })
+			const messages = this.state.allThreads[threadId]?.messages ?? []
+			const messageIndex = messages.length - 1
+			const latest = messages[messageIndex]
+			if (receiptId && messageIndex >= 0 && latest?.role === 'tool' && latest.id === id && latest.type === 'running_now') { const receipts = this._cancellingToolReceiptsOfThread.get(threadId) ?? new Map(); receipts.set(receiptId, { toolId: id, messageIndex }); this._cancellingToolReceiptsOfThread.set(threadId, receipts) }
+			this._updateLatestTool(threadId, { role: 'tool', name: toolName, params: toolParams, id, content, rawParams, type: 'running_now', result: null, mcpServerName, lifecycle: 'cancelling' })
 		}
 		// reject the tool for the user if relevant
 		else if (this.streamState[threadId]?.isRunning === 'awaiting_user') {
@@ -929,7 +975,19 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			interrupt()
 
 
-		this._setStreamState(threadId, undefined)
+		if (!transientControl) this._setStreamState(threadId, undefined)
+	}
+
+	private _settleCancelledTool(threadId: string, receiptId: string, toolId: string, toolName: ToolName, toolParams: ToolCallParams<ToolName>, rawParams: RawToolParamsObj, mcpServerName: string | undefined): void {
+		const receipts = this._cancellingToolReceiptsOfThread?.get(threadId); const receipt = receipts?.get(receiptId)
+		if (!receipt || receipt.toolId !== toolId) return
+		receipts!.delete(receiptId); if (receipts!.size === 0) this._cancellingToolReceiptsOfThread?.delete(threadId)
+		const messages = this.state.allThreads[threadId]?.messages
+		const index = receipt.messageIndex
+		// Replace exactly the cancelling receipt, rather than the latest row: old A
+		// settles without touching a newer B and does not strand A as Cancelling.
+		if (index < 0 || messages?.[index]?.role !== 'tool' || messages[index].id !== toolId || messages[index].type !== 'running_now' || messages[index].lifecycle !== 'cancelling') return
+		this._editMessageInThread(threadId, index, { role: 'tool', name: toolName, params: toolParams, id: toolId, content: this.toolErrMsgs.interrupted, rawParams, type: 'rejected', result: null, mcpServerName })
 	}
 
 
@@ -956,7 +1014,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		agentSkillResourceReadAllowed: boolean,
 		agentRunGeneration: number | undefined,
 		isCurrentParentRun: () => boolean,
-	): Promise<{ awaitingUserApproval?: boolean, interrupted?: boolean }> {
+	): Promise<{ awaitingUserApproval?: boolean, interrupted?: boolean, failure?: string, validatedParams?: ToolCallParams<ToolName> }> {
 		if (!isCurrentParentRun()) return { interrupted: true }
 
 		// compute these below
@@ -999,7 +1057,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			try { params = validateReadSkillResourceToolParams(opts.unvalidatedToolParams); }
 			catch (error) { if (!isCurrentParentRun()) return { interrupted: true }; addFailure('invalid_params', getErrorMessage(error)); return {}; }
 			const selection = instructionSnapshot.selected.find(item => item.identity === params.skill);
-			if (!selection) { if (!isCurrentParentRun()) return { interrupted: true }; addFailure('tool_error', 'skill_not_selected'); return {}; }
+			if (!selection) { if (!isCurrentParentRun()) return { interrupted: true }; addFailure('tool_error', 'skill_not_selected'); return { failure: 'skill_not_selected', validatedParams: params }; }
 			const historyAtRead = this.state.allThreads[threadId]?.messages ?? [];
 			const maxReadOutputTokens = instructionSnapshot.model.hasModel
 				? computeMaxReadOutputTokens(instructionSnapshot.model.contextWindow, instructionSnapshot.model.reservedOutputTokens, estimateHistoryTokensForReadBudget(historyAtRead))
@@ -1010,13 +1068,15 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			const maxResourceBytes = maxResourceChars > 0 ? Math.min(Number.MAX_SAFE_INTEGER, maxResourceChars * 3 + 3) : 0;
 			const applicationParams = opts.unvalidatedToolParams;
 			if (!isCurrentParentRun() || !sameResourceAuthority()) return { interrupted: true };
-			this._updateLatestTool(threadId, { role: 'tool', type: 'running_now', name: toolName, params: applicationParams, content: '(value not received yet...)', result: null, id: toolId, rawParams: applicationParams, mcpServerName: undefined });
+			this._updateLatestTool(threadId, { role: 'tool', type: 'running_now', name: toolName, params: applicationParams, content: '(value not received yet...)', result: null, id: toolId, rawParams: applicationParams, mcpServerName: undefined, startedAt: Date.now() });
+			const receiptId = generateUuid();
+			const settleCancelled = () => this._settleCancelledTool?.(threadId, receiptId, toolId, toolName, applicationParams, applicationParams, undefined);
 			let interrupted = false;
 			const readCancellation = new CancellationTokenSource();
 			let resolveInterruptor: (interruptor: () => void) => void = () => { };
 			const interruptorPromise = new Promise<() => void>(resolve => { resolveInterruptor = resolve; });
 			if (!isCurrentParentRun()) return { interrupted: true };
-			this._setStreamState(threadId, { isRunning: 'tool', interrupt: interruptorPromise, toolInfo: { toolName, toolParams: applicationParams, id: toolId, content: 'interrupted...', rawParams: applicationParams, mcpServerName: undefined } });
+			this._setStreamState(threadId, { isRunning: 'tool', interrupt: interruptorPromise, toolInfo: { toolName, toolParams: applicationParams, id: toolId, content: 'interrupted...', rawParams: applicationParams, mcpServerName: undefined, receiptId } });
 			resolveInterruptor(() => { interrupted = true; readCancellation.cancel(); });
 			try {
 				const cancelled = Object.freeze({ cancelled: true as const });
@@ -1064,8 +1124,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				const errorMessage = getErrorMessage(error);
 				const content = errorMessage.includes('skill_resource_context_admission_failed') ? 'skill_resource_context_admission_failed' : errorMessage;
 				this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: applicationParams, result: content, name: toolName, content, id: toolId, rawParams: applicationParams, mcpServerName: undefined });
-				return {};
+				return { failure: content.trim().replace(/\s+/g, ' ').toLowerCase(), validatedParams: params };
 			} finally {
+				if (interrupted || !isCurrentParentRun() || !sameGeneration()) settleCancelled();
 				readCancellation.dispose();
 			}
 		}
@@ -1083,23 +1144,41 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			}
 			const controlGeneration = agentDelegationAuthority.generation;
 			const isControlCurrent = () => isCurrentParentRun() && this._agentDelegationAuthorityOfThread?.get(threadId) === agentDelegationAuthority && (this._agentControlGeneration.get(threadId) ?? 0) === controlGeneration;
+			let control;
 			try {
-				const control = validateAgentSubagentControlParams(toolName, opts.unvalidatedToolParams);
-				if (!isControlCurrent()) return { interrupted: true };
+				control = validateAgentSubagentControlParams(toolName, opts.unvalidatedToolParams);
+			} catch (error) {
+				const content = getErrorMessage(error);
+				this._addMessageToThread(threadId, { role: 'tool', type: 'invalid_params', rawParams: opts.unvalidatedToolParams, result: null, name: toolName, content, id: toolId, mcpServerName: undefined });
+				return {};
+			}
+			if (!isControlCurrent()) return { interrupted: true };
+			const validatedParams = control.name === 'spawn_agent'
+				? { message: control.message, ...(control.agentType === undefined ? {} : { agent_type: control.agentType }) }
+				: control.name === 'wait_agent'
+					? { timeout_ms: control.timeoutMs, ...(control.targets === undefined ? {} : { targets: [...control.targets] }) }
+					: { target: control.target };
+			const receiptId = generateUuid();
+			this._setStreamState?.(threadId, { isRunning: 'idle', interrupt: Promise.resolve(() => { }), toolInfo: { toolName, toolParams: validatedParams as never, id: toolId, content: '(child control in progress...)', rawParams: opts.unvalidatedToolParams, mcpServerName: undefined, receiptId, transient: true, startedAt: Date.now() } });
+			const clearTransient = () => { const state = this.streamState[threadId]; if (state?.isRunning === 'idle' && state.toolInfo?.transient && state.toolInfo.receiptId === receiptId) this._setStreamState?.(threadId, { isRunning: 'idle', interrupt: 'not_needed' }); };
+			try {
 				let result: object;
 				if (control.name === 'spawn_agent') result = await this._agentSubagentService.spawn(threadId, control.message, instructionSnapshot, control.agentType, agentDelegationAuthority.roles, agentDelegationAuthority.settingsState, agentDelegationAuthority.settingsOfProvider, controlGeneration, agentDelegationAuthority.parentTools, this._createAgentSubagentToolBroker?.(threadId, agentDelegationAuthority));
 				else if (control.name === 'wait_agent') result = await this._agentSubagentService.wait(threadId, control.timeoutMs, control.targets, controlGeneration);
 				else result = this._agentSubagentService.interrupt(threadId, control.target, controlGeneration);
 				if (!isControlCurrent()) return { interrupted: true };
+				clearTransient();
 				const content = JSON.stringify(result);
 				if (!isControlCurrent()) return { interrupted: true };
-				this._addMessageToThread(threadId, { role: 'tool', type: 'success', rawParams: opts.unvalidatedToolParams, result: result as never, name: toolName, params: opts.unvalidatedToolParams, content, id: toolId, mcpServerName: undefined });
+				this._addMessageToThread(threadId, { role: 'tool', type: 'success', rawParams: opts.unvalidatedToolParams, result: result as never, name: toolName, params: validatedParams as never, content, id: toolId, mcpServerName: undefined });
 				return {};
 			} catch (error) {
 				if (!isControlCurrent()) return { interrupted: true };
 				const content = getErrorMessage(error);
-				this._addMessageToThread(threadId, { role: 'tool', type: 'invalid_params', rawParams: opts.unvalidatedToolParams, result: null, name: toolName, content, id: toolId, mcpServerName: undefined });
-				return {};
+				this._addMessageToThread(threadId, { role: 'tool', type: 'tool_error', rawParams: opts.unvalidatedToolParams, result: content, name: toolName, params: validatedParams as never, content, id: toolId, mcpServerName: undefined });
+				return { failure: content.trim().replace(/\s+/g, ' ').toLowerCase(), validatedParams };
+			} finally {
+				clearTransient();
 			}
 		}
 
@@ -1147,9 +1226,11 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 		// 3. call the tool
 		// this._setStreamState(threadId, { isRunning: 'tool' }, 'merge')
-		const runningTool = { role: 'tool', type: 'running_now', name: toolName, params: toolParams, content: '(value not received yet...)', result: null, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName } as const
+		const runningTool = { role: 'tool', type: 'running_now', name: toolName, params: toolParams, content: '(value not received yet...)', result: null, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName, startedAt: Date.now() } as const
 		if (!isCurrentParentRun()) return { interrupted: true }
 		this._updateLatestTool(threadId, runningTool)
+		const receiptId = generateUuid()
+		const settleCancelled = () => this._settleCancelledTool?.(threadId, receiptId, toolId, toolName, toolParams, opts.unvalidatedToolParams, mcpServerName)
 
 
 		let interrupted = false
@@ -1160,7 +1241,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 			// set stream state
 			if (!isCurrentParentRun()) return { interrupted: true }
-			this._setStreamState(threadId, { isRunning: 'tool', interrupt: interruptorPromise, toolInfo: { toolName, toolParams, id: toolId, content: 'interrupted...', rawParams: opts.unvalidatedToolParams, mcpServerName } })
+			this._setStreamState(threadId, { isRunning: 'tool', interrupt: interruptorPromise, toolInfo: { toolName, toolParams, id: toolId, content: 'interrupted...', rawParams: opts.unvalidatedToolParams, mcpServerName, receiptId } })
 
 			if (isBuiltInTool) {
 				if (!isCurrentParentRun()) return { interrupted: true }
@@ -1174,27 +1255,33 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				if (toolName === 'write_file') {
 					if (!isCurrentParentRun()) return { interrupted: true }
 					preparedWrite = await this._toolsService.prepareWriteFile(toolParams as BuiltinToolCallParams['write_file'], threadId)
-					if (interrupted || !isCurrentParentRun()) return { interrupted: true }
+					if (interrupted || !isCurrentParentRun()) { settleCancelled(); return { interrupted: true } }
 					if (!preparedWrite) throw new Error('Internal error: write_file did not produce a receipt.')
 				}
-				if (interrupted || !isCurrentParentRun()) return { interrupted: true }
+				if (interrupted || !isCurrentParentRun()) { settleCancelled(); return { interrupted: true } }
 				const call = preparedWrite
 					? { result: preparedWrite.execute(), interruptTool: undefined }
 					: await this._toolsService.callTool[toolName](toolParams as any, readContext)
 				const { result, interruptTool: installedInterruptTool } = call
 				interruptTool = installedInterruptTool
-				if (interrupted || !isCurrentParentRun()) { interruptTool?.(); return { interrupted: true } }
+				if (interrupted || !isCurrentParentRun()) {
+					interruptTool?.()
+					// An installed terminal receipt owns physical cleanup. Retain Cancelling
+					// until its result settles so a late-created terminal cannot outlive the row.
+					try { await result } catch { }
+					settleCancelled(); return { interrupted: true }
+				}
 
 				toolResult = await result
-				if (interrupted || !isCurrentParentRun()) return { interrupted: true }
+				if (interrupted || !isCurrentParentRun()) { settleCancelled(); return { interrupted: true } }
 			}
 			else {
-				if (!isCurrentParentRun()) return { interrupted: true }
+				if (!isCurrentParentRun()) { settleCancelled(); return { interrupted: true } }
 				const mcpTools = this._mcpService.getMCPTools()
 				const mcpTool = mcpTools?.find(t => t.name === toolName)
 				if (!mcpTool) { throw new Error(`MCP tool ${toolName} not found`) }
 
-				if (!isCurrentParentRun()) return { interrupted: true }
+				if (!isCurrentParentRun()) { settleCancelled(); return { interrupted: true } }
 				toolResult = (await this._mcpService.callMCPTool({
 					serverName: mcpTool.mcpServerName ?? 'unknown_mcp_server',
 					toolName: toolName,
@@ -1203,20 +1290,27 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				if (!isCurrentParentRun()) return { interrupted: true }
 			}
 
-			if (interrupted || !isCurrentParentRun()) { return { interrupted: true } } // the tool result is added where we interrupt, not here
+			if (interrupted || !isCurrentParentRun()) { settleCancelled(); return { interrupted: true } }
 		}
 		catch (error) {
-			if (!isCurrentParentRun()) return { interrupted: true }
-			if (interrupted) { return { interrupted: true } } // the tool result is added where we interrupt, not here
+			if (!isCurrentParentRun()) { settleCancelled(); return { interrupted: true } }
+			if (interrupted) { settleCancelled(); return { interrupted: true } }
 
 			const errorMessage = getErrorMessage(error)
 			this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: toolParams, result: errorMessage, name: toolName, content: errorMessage, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName })
-			return {}
+			return { failure: errorMessage.trim().replace(/\s+/g, ' ').toLowerCase(), validatedParams: toolParams }
 		}
 
 		// 4. stringify the result to give to the LLM
 		if (!isCurrentParentRun()) return { interrupted: true }
 		try {
+			const isTerminalCommand = toolName === 'run_command' || toolName === 'run_persistent_command'
+			const terminalResult = toolResult as { resolveReason?: { type?: string; exitCode?: number }; result?: string }
+			if (isTerminalCommand && terminalResult.resolveReason?.type === 'done' && terminalResult.resolveReason.exitCode !== 0) {
+				const content = `${terminalResult.result ?? ''}\n(exit code ${terminalResult.resolveReason.exitCode})`
+				this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: toolParams, result: content, name: toolName, content, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName })
+				return { failure: `terminal_exit_${terminalResult.resolveReason.exitCode}`, validatedParams: toolParams }
+			}
 			if (isBuiltInTool) {
 				toolResultStr = this._toolsService.stringOfResult[toolName](toolParams as any, toolResult as any)
 			}
@@ -1228,7 +1322,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			if (!isCurrentParentRun()) return { interrupted: true }
 			const errorMessage = this.toolErrMsgs.errWhenStringifying(error)
 			this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: toolParams, result: errorMessage, name: toolName, content: errorMessage, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName })
-			return {}
+			return { failure: errorMessage.trim().replace(/\s+/g, ' ').toLowerCase(), validatedParams: toolParams }
 		}
 
 		// 5. add to history and keep going
@@ -1237,7 +1331,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			if (!isCurrentParentRun()) return { interrupted: true }
 			const errorMessage = 'read_file rejected: bounded history validation failed; re-read a smaller continuation.'
 			this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: toolParams, result: errorMessage, name: toolName, content: errorMessage, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName })
-			return {}
+			return { failure: errorMessage.trim().replace(/\s+/g, ' ').toLowerCase(), validatedParams: toolParams }
 		}
 		if (!isCurrentParentRun()) return { interrupted: true }
 		this._updateLatestTool(threadId, { role: 'tool', type: 'success', params: toolParams, result: toolResult, name: toolName, content: toolResultStr, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName })
@@ -1281,6 +1375,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		let nMessagesSent = 0
 		let shouldSendAnotherMessage = true
 		let isRunningWhenEnd: IsRunningType = undefined
+		// Parent-run local: successful calls, invalid requests and cancellations never
+		// enter it, and a new user turn gets a fresh map.
+		const identicalFailures = new Map<string, number>()
 
 		// before enter loop, call tool
 		if (callThisToolFirst) {
@@ -1405,7 +1502,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 					// error, should retry
 					if (nAttempts < CHAT_RETRIES) {
 						shouldRetryLLM = true
-						this._setStreamState(threadId, { isRunning: 'idle', interrupt: idleInterruptor })
+						// Keep the first retry observable. It is only stream/UI state: the user
+						// message and already-completed tools are never replayed or duplicated.
+						this._setStreamState(threadId, { isRunning: 'idle', interrupt: idleInterruptor, retry: { attempt: nAttempts, maxAttempts: CHAT_RETRIES, retryAt: Date.now() + RETRY_DELAY } })
 						await timeout(RETRY_DELAY)
 						if (!isCurrentRun()) return
 						if (interruptedWhenIdle) {
@@ -1438,13 +1537,23 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				if (toolCall) {
 					const mcpTool = isAgentSubagentControlName(toolCall.name) || isReadSkillResourceToolName(toolCall.name) ? undefined : this._mcpService.getMCPTools()?.find(t => t.name === toolCall.name)
 
-					const { awaitingUserApproval, interrupted } = await this._runToolCall(threadId, toolCall.name, toolCall.id, mcpTool?.mcpServerName, { preapproved: false, unvalidatedToolParams: toolCall.rawParams }, snapshot, agentDelegationAuthority, chatMode === 'agent', agentRunGeneration, isCurrentRun)
+					const { awaitingUserApproval, interrupted, failure, validatedParams } = await this._runToolCall(threadId, toolCall.name, toolCall.id, mcpTool?.mcpServerName, { preapproved: false, unvalidatedToolParams: toolCall.rawParams }, snapshot, agentDelegationAuthority, chatMode === 'agent', agentRunGeneration, isCurrentRun)
 					if (!isCurrentRun()) return
 					if (interrupted) {
 						this._setStreamState(threadId, undefined)
 						return
 					}
 					if (awaitingUserApproval) { isRunningWhenEnd = 'awaiting_user' }
+					else if (failure) {
+						const key = `${toolCall.name.toLowerCase()}|${mcpTool?.mcpServerName ?? ''}|${stableToolValue(semanticToolArgs(toolCall.name, validatedParams ?? toolCall.rawParams))}|${failure}`
+						const count = (identicalFailures.get(key) ?? 0) + 1
+						identicalFailures.set(key, count)
+						if (count >= 3) {
+							this._setStreamState(threadId, { isRunning: undefined, error: { message: 'The same tool failed three times. Change the request or recover the command before continuing.', fullError: null } })
+							return
+						}
+						shouldSendAnotherMessage = true
+					}
 					else { shouldSendAnotherMessage = true }
 
 					this._setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' }) // just decorative, for clarity
@@ -2063,6 +2172,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		this._cancelPendingChatSubmission(threadId)
 		this._revokeAgentDelegation(threadId, true)
 		this._parentRunTokenOfThread.delete(threadId)
+		this._cancellingToolReceiptsOfThread.delete(threadId)
 		this._agentControlGeneration.delete(threadId)
 		this.clearTransientComposerDraft(threadId)
 		const { allThreads: currentThreads } = this.state
@@ -2080,7 +2190,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	override dispose(): void {
 		for (const threadId of this._pendingChatSubmissionOfThread.keys()) this._cancelPendingChatSubmission(threadId)
 		for (const threadId of Object.keys(this.state.allThreads)) this._revokeAgentDelegation(threadId, true)
-		this._agentDelegationAuthorityOfThread.clear(); this._agentControlGeneration.clear(); this._parentRunTokenOfThread.clear(); this._transientComposerDraftOfThread.clear(); super.dispose();
+		this._agentDelegationAuthorityOfThread.clear(); this._agentControlGeneration.clear(); this._parentRunTokenOfThread.clear(); this._cancellingToolReceiptsOfThread.clear(); this._transientComposerDraftOfThread.clear(); super.dispose();
 	}
 
 	duplicateThread(threadId: string) {

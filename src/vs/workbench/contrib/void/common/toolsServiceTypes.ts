@@ -6,7 +6,7 @@ import { SearchBackendTrace } from './controlledSearchFallback.js';
 
 
 
-export type TerminalResolveReason = { type: 'timeout' } | { type: 'done', exitCode: number }
+export type TerminalResolveReason = { type: 'timeout' } | { type: 'done', exitCode: number } | { type: 'cancelled' }
 
 export type LintErrorItem = { code: string, message: string, startLineNumber: number, endLineNumber: number }
 

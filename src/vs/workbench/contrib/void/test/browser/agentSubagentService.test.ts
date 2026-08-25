@@ -839,4 +839,41 @@ suite('Void AgentSubagentService', () => {
 		const active = fixture(); const child = await active.service.spawn('active', 'inspect', snapshot()); for (let i = 0; i < 10 && active.providerCalls.length === 0; i++) await Promise.resolve(); assert.strictEqual(active.providerCalls.length, 1); const activeViews: Array<unknown> = []; const activeListener = active.service.onDidChangeRun(event => { if (event.parentId === 'active') activeViews.push(active.service.getRunView('active')); }); active.service.forgetParent('active'); assert.strictEqual(active.service.getRunView('active'), undefined); assert.strictEqual(activeViews.at(-1), undefined); assert.strictEqual(active.events.at(-1).removed, true); assert.strictEqual(active.aborts(), 1); assert.deepStrictEqual(active.invalidations, [child.id]); activeListener.dispose();
 		first.service.dispose(); active.service.dispose(); restarted.service.dispose();
 	});
+
+	test('shows deferred wait control without contaminating persisted parent history', async () => {
+		let release!: () => void; const gate = new Promise<void>(resolve => release = resolve); const messages: any[] = []; const streamState: any = {}; const authority: any = { allowed: true, generation: 1 };
+		const receiver: any = { state: { allThreads: { parent: { messages } } }, streamState, _agentDelegationAuthorityOfThread: new Map([['parent', authority]]), _agentControlGeneration: new Map([['parent', 1]]), _agentSubagentService: { wait: async () => { await gate; return { id: 'child', status: 'completed', deliverSummary: true }; } }, _setStreamState(id: string, state: any) { streamState[id] = state; }, _addMessageToThread(_id: string, message: any) { messages.push(message); } };
+		const pending = (ChatThreadService.prototype as any)._runToolCall.call(receiver, 'parent', 'wait_agent', 'wait-provider-id', undefined, { preapproved: false, unvalidatedToolParams: { timeout_ms: 0 } }, { ownerProjectRoot: 'file:///workspace' }, authority, false, 1, () => true);
+		await Promise.resolve();
+		assert.strictEqual(streamState.parent.isRunning, 'idle'); assert.strictEqual(streamState.parent.toolInfo.transient, true); assert.strictEqual(streamState.parent.toolInfo.toolName, 'wait_agent'); assert.strictEqual(streamState.parent.toolInfo.id, 'wait-provider-id'); assert.ok(streamState.parent.toolInfo.receiptId); assert.deepStrictEqual(messages, []);
+		release(); await pending;
+		assert.strictEqual(messages.length, 1); assert.deepStrictEqual({ type: messages[0].type, id: messages[0].id }, { type: 'success', id: 'wait-provider-id' }); assert.strictEqual(streamState.parent.toolInfo, undefined);
+	});
+
+	test('keeps deferred wait control Cancelling until its private receipt settles', async () => {
+		let release!: () => void; const gate = new Promise<void>(resolve => release = resolve); const messages: any[] = []; const streamState: any = {}; const authority: any = { allowed: true, generation: 1 }; let cancelParent = 0;
+		const receiver: any = {
+			state: { allThreads: { parent: { messages } } }, streamState,
+			_agentDelegationAuthorityOfThread: new Map([['parent', authority]]), _agentControlGeneration: new Map([['parent', 1]]),
+			_agentSubagentService: { wait: async () => { await gate; return { id: 'child', status: 'cancelled', deliverSummary: false }; }, cancelParent: () => { cancelParent++; } },
+			_setStreamState(id: string, state: any) { streamState[id] = state; }, _addMessageToThread(_id: string, message: any) { messages.push(message); },
+			_revokeAgentDelegation(id: string) { this._agentDelegationAuthorityOfThread.delete(id); this._agentControlGeneration.delete(id); this._agentSubagentService.cancelParent(id); },
+		};
+		const pending = (ChatThreadService.prototype as any)._runToolCall.call(receiver, 'parent', 'wait_agent', 'overlapping-provider-id', undefined, { preapproved: false, unvalidatedToolParams: { timeout_ms: 0 } }, { ownerProjectRoot: 'file:///workspace' }, authority, false, 1, () => true);
+		await Promise.resolve();
+		const receiptId = streamState.parent.toolInfo.receiptId;
+		await (ChatThreadService.prototype as any).abortRunning.call(receiver, 'parent');
+		assert.strictEqual(cancelParent, 1); assert.strictEqual(streamState.parent.toolInfo.receiptId, receiptId); assert.strictEqual(streamState.parent.toolInfo.lifecycle, 'cancelling'); assert.deepStrictEqual(messages, []);
+		release(); assert.deepStrictEqual(await pending, { interrupted: true });
+		assert.strictEqual(streamState.parent.toolInfo, undefined); assert.deepStrictEqual(messages, []);
+	});
+
+	test('classifies validated child-control execution failures without confusing malformed input', async () => {
+		const authority: any = { allowed: true, generation: 1 }; const messages: any[] = []; const streamState: any = {};
+		const receiver: any = { state: { allThreads: { parent: { messages } } }, streamState, _agentDelegationAuthorityOfThread: new Map([['parent', authority]]), _agentControlGeneration: new Map([['parent', 1]]), _agentSubagentService: { wait: async () => { throw new Error('child wait backend failed'); } }, _setStreamState(id: string, state: any) { streamState[id] = state; }, _addMessageToThread(_id: string, message: any) { messages.push(message); } };
+		const failed = await (ChatThreadService.prototype as any)._runToolCall.call(receiver, 'parent', 'wait_agent', 'valid-id', undefined, { preapproved: false, unvalidatedToolParams: { timeout_ms: 0 } }, { ownerProjectRoot: 'file:///workspace' }, authority, false, 1, () => true);
+		assert.deepStrictEqual(failed, { failure: 'error: child wait backend failed', validatedParams: { timeout_ms: 0 } }); assert.deepStrictEqual({ type: messages[0].type, id: messages[0].id, params: messages[0].params }, { type: 'tool_error', id: 'valid-id', params: { timeout_ms: 0 } }); assert.strictEqual(streamState.parent.toolInfo, undefined);
+		const malformed = await (ChatThreadService.prototype as any)._runToolCall.call(receiver, 'parent', 'wait_agent', 'bad-id', undefined, { preapproved: false, unvalidatedToolParams: { timeout_ms: -1 } }, { ownerProjectRoot: 'file:///workspace' }, authority, false, 1, () => true);
+		assert.deepStrictEqual(malformed, {}); assert.deepStrictEqual({ type: messages[1].type, id: messages[1].id }, { type: 'invalid_params', id: 'bad-id' });
+	});
 });

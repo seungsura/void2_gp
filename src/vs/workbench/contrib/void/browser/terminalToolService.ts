@@ -14,7 +14,6 @@ import { IWorkspaceContextService } from '../../../../platform/workspace/common/
 import { ITerminalService, ITerminalInstance, ICreateTerminalOptions } from '../../../../workbench/contrib/terminal/browser/terminal.js';
 import { MAX_TERMINAL_BG_COMMAND_TIME, MAX_TERMINAL_CHARS, MAX_TERMINAL_INACTIVE_TIME } from '../common/prompt/prompts.js';
 import { TerminalResolveReason } from '../common/toolsServiceTypes.js';
-import { timeout } from '../../../../base/common/async.js';
 
 
 
@@ -237,13 +236,14 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 		return result
 	};
 
-	private async _waitForCommandDetectionCapability(terminal: ITerminalInstance) {
+	private async _waitForCommandDetectionCapability(terminal: ITerminalInstance, cancellation?: Promise<void>) {
 		const cmdCap = terminal.capabilities.get(TerminalCapability.CommandDetection);
 		if (cmdCap) return cmdCap
 
 		const disposables: IDisposable[] = []
 
-		const waitTimeout = timeout(10_000)
+		let timeoutId: ReturnType<typeof setTimeout> | undefined
+		const waitTimeout = new Promise<undefined>(resolve => { timeoutId = setTimeout(resolve, 10_000) })
 		const waitForCapability = new Promise<ITerminalCapabilityImplMap[TerminalCapability.CommandDetection]>((res) => {
 			disposables.push(
 				terminal.capabilities.onDidAddCapability((e) => {
@@ -252,51 +252,73 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 			)
 		})
 
-		const capability = await Promise.any([waitTimeout, waitForCapability])
-			.finally(() => { disposables.forEach((d) => d.dispose()) })
+		const capability = await Promise.race([waitTimeout, waitForCapability, cancellation ?? new Promise<void>(() => { })])
+			.finally(() => { if (timeoutId !== undefined) clearTimeout(timeoutId); disposables.forEach((d) => d.dispose()) })
 
 		return capability ?? undefined
 	}
 
-	runCommand: ITerminalToolService['runCommand'] = async (command, params) => {
-		await this.terminalService.whenConnected;
-
+	runCommand: ITerminalToolService['runCommand'] = (command, params) => {
 		const { type } = params
 		const isPersistent = type === 'persistent'
 
-		let terminal: ITerminalInstance
+		let terminal: ITerminalInstance | undefined
 		const disposables: IDisposable[] = []
+		let resourcesDisposed = false
+		const disposeResources = () => { if (resourcesDisposed) return; resourcesDisposed = true; disposables.forEach(d => d.dispose()) }
+		let cancelled = false
+		let disposed = false
+		let settled = false
+		let signalCancelled: () => void = () => { }
+		const cancellation = new Promise<void>(resolve => { signalCancelled = resolve })
 
-		if (isPersistent) { // BG process
-			const { persistentTerminalId } = params
-			terminal = this.persistentTerminalInstanceOfId[persistentTerminalId];
-			if (!terminal) throw new Error(`Unexpected internal error: Terminal with ID ${persistentTerminalId} did not exist.`);
-		}
-		else {
-			const { cwd } = params
-			terminal = await this._createTerminal({ cwd: cwd, config: undefined, hidden: true })
-			this.temporaryTerminalInstanceOfId[params.terminalId] = terminal
-		}
-
-		const interrupt = () => {
+		const disposeTerminal = () => {
+			if (!terminal || disposed) return
+			disposed = true
 			terminal.dispose()
 			if (!isPersistent)
 				delete this.temporaryTerminalInstanceOfId[params.terminalId]
 			else
 				delete this.persistentTerminalInstanceOfId[params.persistentTerminalId]
 		}
+		const interrupt = () => { if (cancelled || settled) return; cancelled = true; signalCancelled(); disposeResources(); disposeTerminal() }
 
 		const waitForResult = async () => {
+			await Promise.race([this.terminalService.whenConnected, cancellation])
+			if (cancelled) return { result: '', resolveReason: { type: 'cancelled' as const } }
+			if (isPersistent) { // BG process
+				const { persistentTerminalId } = params
+				terminal = this.persistentTerminalInstanceOfId[persistentTerminalId];
+				if (!terminal) throw new Error(`Unexpected internal error: Terminal with ID ${persistentTerminalId} did not exist.`);
+			}
+			else {
+				const { cwd } = params
+				const created = this._createTerminal({ cwd: cwd, config: undefined, hidden: true })
+				const createdTerminal = await Promise.race([created, cancellation.then(() => undefined)])
+				if (!createdTerminal) {
+					// Cancellation has won admission, but the late terminal still belongs to
+					// this receipt. Do not settle the visible Cancelling card until it is closed.
+					try { terminal = await created } catch { return { result: '', resolveReason: { type: 'cancelled' as const } } }
+					disposeTerminal()
+					return { result: '', resolveReason: { type: 'cancelled' as const } }
+				}
+				terminal = createdTerminal
+				this.temporaryTerminalInstanceOfId[params.terminalId] = terminal
+			}
+			if (cancelled) { disposeTerminal(); return { result: '', resolveReason: { type: 'cancelled' as const } } }
+			const activeTerminal = terminal
 			if (isPersistent) {
 				// focus the terminal about to run
-				this.terminalService.setActiveInstance(terminal)
-				await this.terminalService.focusActiveInstance()
+				this.terminalService.setActiveInstance(activeTerminal)
+				try { await Promise.race([this.terminalService.focusActiveInstance(), cancellation]) } catch (error) { if (cancelled) return { result: '', resolveReason: { type: 'cancelled' as const } }; throw error }
+				if (cancelled) return { result: '', resolveReason: { type: 'cancelled' as const } }
 			}
 			let result: string = ''
 			let resolveReason: TerminalResolveReason | undefined
 
 
-			const cmdCap = await this._waitForCommandDetectionCapability(terminal)
+			const cmdCap = await this._waitForCommandDetectionCapability(activeTerminal, cancellation)
+			if (cancelled) return { result: '', resolveReason: { type: 'cancelled' as const } }
 			// if (!cmdCap) throw new Error(`There was an error using the terminal: CommandDetection capability did not mount yet. Please try again in a few seconds or report this to the Void team.`)
 
 			// Prefer the structured command-detection capability when available
@@ -315,15 +337,17 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 
 
 			// send the command now that listeners are attached
-			await terminal.sendText(command, true)
+			try { await Promise.race([activeTerminal.sendText(command, true), cancellation]) } catch (error) { if (cancelled) return { result: '', resolveReason: { type: 'cancelled' as const } }; throw error }
+			if (cancelled) return { result: '', resolveReason: { type: 'cancelled' as const } }
 
 			const waitUntilInterrupt = isPersistent ?
 				// timeout after X seconds
 				new Promise<void>((res) => {
-					setTimeout(() => {
+					const timer = setTimeout(() => {
 						resolveReason = { type: 'timeout' };
 						res()
 					}, MAX_TERMINAL_BG_COMMAND_TIME * 1000)
+					disposables.push(toDisposable(() => clearTimeout(timer)))
 				})
 				// inactivity-based timeout
 				: new Promise<void>(res => {
@@ -338,25 +362,27 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 						}, MAX_TERMINAL_INACTIVE_TIME * 1000);
 					};
 
-					const dTimeout = terminal.onData(() => { resetTimer(); });
+					const dTimeout = activeTerminal.onData(() => { resetTimer(); });
 					disposables.push(dTimeout, toDisposable(() => clearTimeout(globalTimeoutId)));
 					resetTimer();
 				})
 
 			// wait for result
-			await Promise.any([waitUntilDone, waitUntilInterrupt])
-				.finally(() => disposables.forEach(d => d.dispose()))
+			await Promise.race([waitUntilDone, waitUntilInterrupt, cancellation])
+				.finally(disposeResources)
+			if (cancelled) return { result: '', resolveReason: { type: 'cancelled' as const } }
 
 
 
 			// read result if timed out, since we didn't get it (could clean this code up but it's ok)
 			if (resolveReason?.type === 'timeout') {
 				const terminalId = isPersistent ? params.persistentTerminalId : params.terminalId
-				result = await this.readTerminal(terminalId)
+				try { result = (await Promise.race([this.readTerminal(terminalId), cancellation])) ?? '' } catch (error) { if (cancelled) return { result: '', resolveReason: { type: 'cancelled' as const } }; throw error }
+				if (cancelled) return { result: '', resolveReason: { type: 'cancelled' as const } }
 			}
 
 			if (!isPersistent) {
-				interrupt()
+				disposeTerminal()
 			}
 
 			if (!resolveReason) throw new Error('Unexpected internal error: Promise.any should have resolved with a reason.')
@@ -374,12 +400,12 @@ export class TerminalToolService extends Disposable implements ITerminalToolServ
 			return { result, resolveReason }
 
 		}
-		const resPromise = waitForResult()
+		const resPromise = waitForResult().finally(() => { settled = true; disposeResources() })
 
-		return {
+		return Promise.resolve({
 			interrupt,
 			resPromise,
-		}
+		})
 	}
 
 

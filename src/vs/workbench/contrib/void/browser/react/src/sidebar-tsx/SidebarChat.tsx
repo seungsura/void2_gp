@@ -1738,6 +1738,19 @@ const CanceledTool = ({ toolName, mcpServerName }: { toolName: ToolName, mcpServ
 	return <ToolHeaderWrapper {...componentParams} />
 }
 
+/** Refresh only active cards; terminal history never acquires a timer. */
+const useLiveElapsed = (startedAt: number | undefined, active: boolean): string | undefined => {
+	const [now, setNow] = useState(() => Date.now())
+	useEffect(() => {
+		if (!active) return
+		setNow(Date.now())
+		const interval = window.setInterval(() => setNow(Date.now()), 1000)
+		return () => window.clearInterval(interval)
+	}, [active, startedAt])
+	if (!active || startedAt === undefined) return undefined
+	const seconds = Math.max(0, Math.floor((now - startedAt) / 1000))
+	return seconds >= 60 ? `Elapsed ${Math.floor(seconds / 60)}m ${seconds % 60}s` : `Elapsed ${seconds}s`
+}
 
 const CommandTool = ({ toolMessage, type, threadId }: { threadId: string } & ({
 	toolMessage: Exclude<ToolMessage<'run_command'>, { type: 'invalid_params' }>
@@ -1760,45 +1773,32 @@ const CommandTool = ({ toolMessage, type, threadId }: { threadId: string } & ({
 	const divRef = useRef<HTMLDivElement | null>(null)
 
 	const isRejected = toolMessage.type === 'rejected'
+	const isCancelling = toolMessage.type === 'running_now' && toolMessage.lifecycle === 'cancelling'
+	const elapsed = useLiveElapsed(toolMessage.startedAt, toolMessage.type === 'running_now')
 	const { rawParams, params } = toolMessage
-	const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected, }
+	const componentParams: ToolHeaderParams = { title, desc1: isCancelling ? 'Cancelling' : desc1, desc1Info: elapsed ?? desc1Info, isError, icon, isRejected, }
 
-
-	const effect = async () => {
-		if (streamState?.isRunning !== 'tool') return
-		if (type !== 'run_command' || toolMessage.type !== 'running_now') return;
-
-		// wait for the interruptor so we know it's running
-
-		await streamState?.interrupt
-		const container = divRef.current;
-		if (!container) return;
-
-		const terminal = terminalToolsService.getTemporaryTerminal(toolMessage.params.terminalId);
-		if (!terminal) return;
-
-		try {
-			terminal.attachToElement(container);
-			terminal.setVisible(true)
-		} catch {
-		}
-
-		// Listen for size changes of the container and keep the terminal layout in sync.
-		const resizeObserver = new ResizeObserver((entries) => {
-			const height = entries[0].borderBoxSize[0].blockSize;
-			const width = entries[0].borderBoxSize[0].inlineSize;
-			if (typeof terminal.layout === 'function') {
-				terminal.layout({ width, height });
-			}
-		});
-
-		resizeObserver.observe(container);
-		return () => { terminal.detachFromElement(); resizeObserver?.disconnect(); }
-	}
 
 	useEffect(() => {
-		effect()
-	}, [terminalToolsService, toolMessage, toolMessage.type, type]);
+		if (streamState?.isRunning !== 'tool' || type !== 'run_command' || toolMessage.type !== 'running_now') return;
+		let disposed = false;
+		let cleanup: (() => void) | undefined;
+		void streamState.interrupt.then(() => {
+			if (disposed) return;
+			const container = divRef.current;
+			const terminal = container && terminalToolsService.getTemporaryTerminal(toolMessage.params.terminalId);
+			if (!container || !terminal) return;
+			try { terminal.attachToElement(container); terminal.setVisible(true); } catch { return; }
+			const resizeObserver = new ResizeObserver((entries) => {
+				const size = entries[0].borderBoxSize[0];
+				if (typeof terminal.layout === 'function') terminal.layout({ width: size.inlineSize, height: size.blockSize });
+			});
+			resizeObserver.observe(container);
+			cleanup = () => { terminal.detachFromElement(); resizeObserver.disconnect(); };
+			if (disposed) cleanup();
+		});
+		return () => { disposed = true; cleanup?.(); };
+	}, [streamState, terminalToolsService, toolMessage.id, toolMessage.type, type]);
 
 	if (toolMessage.type === 'success') {
 		const { result } = toolMessage
@@ -1830,7 +1830,7 @@ const CommandTool = ({ toolMessage, type, threadId }: { threadId: string } & ({
 			</CodeChildren>
 		</BottomChildren>
 	}
-	else if (toolMessage.type === 'running_now') {
+	else if (toolMessage.type === 'running_now' && !isCancelling) {
 		if (type === 'run_command')
 			componentParams.children = <div ref={divRef} className='relative h-[300px] text-sm' />
 	}
@@ -1838,7 +1838,7 @@ const CommandTool = ({ toolMessage, type, threadId }: { threadId: string } & ({
 	}
 
 	return <>
-		<ToolHeaderWrapper {...componentParams} isOpen={type === 'run_command' && toolMessage.type === 'running_now' ? true : undefined} />
+		<ToolHeaderWrapper {...componentParams} isOpen={type === 'run_command' && toolMessage.type === 'running_now' && !isCancelling ? true : undefined} />
 	</>
 }
 
@@ -1862,7 +1862,7 @@ const MCPToolWrapper = ({ toolMessage }: WrapperProps<string>) => {
 	const icon = null
 
 
-	if (toolMessage.type === 'running_now') return null // do not show running
+	// Live rows are routed through LiveToolCard before tool-specific renderers.
 
 	const isError = false
 	const isRejected = toolMessage.type === 'rejected'
@@ -1918,7 +1918,7 @@ const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapper: Res
 			const icon = null
 
 			if (toolMessage.type === 'tool_request') return null // do not show past requests
-			if (toolMessage.type === 'running_now') return null // do not show running
+			// Live rows are routed through LiveToolCard before tool-specific renderers.
 
 			const isError = false
 			const isRejected = toolMessage.type === 'rejected'
@@ -1963,7 +1963,7 @@ const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapper: Res
 			const icon = null
 
 			if (toolMessage.type === 'tool_request') return null // do not show past requests
-			if (toolMessage.type === 'running_now') return null // do not show running
+			// Live rows are routed through LiveToolCard before tool-specific renderers.
 
 			const isError = false
 			const isRejected = toolMessage.type === 'rejected'
@@ -2011,7 +2011,7 @@ const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapper: Res
 			const icon = null
 
 			if (toolMessage.type === 'tool_request') return null // do not show past requests
-			if (toolMessage.type === 'running_now') return null // do not show running
+			// Live rows are routed through LiveToolCard before tool-specific renderers.
 
 			const isError = false
 			const isRejected = toolMessage.type === 'rejected'
@@ -2067,7 +2067,7 @@ const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapper: Res
 			const icon = null
 
 			if (toolMessage.type === 'tool_request') return null // do not show past requests
-			if (toolMessage.type === 'running_now') return null // do not show running
+			// Live rows are routed through LiveToolCard before tool-specific renderers.
 
 			const { rawParams, params } = toolMessage
 			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected, }
@@ -2117,7 +2117,7 @@ const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapper: Res
 			const icon = null
 
 			if (toolMessage.type === 'tool_request') return null // do not show past requests
-			if (toolMessage.type === 'running_now') return null // do not show running
+			// Live rows are routed through LiveToolCard before tool-specific renderers.
 
 			const { rawParams, params } = toolMessage
 			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected, }
@@ -2173,7 +2173,7 @@ const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapper: Res
 			const icon = null;
 
 			if (toolMessage.type === 'tool_request') return null // do not show past requests
-			if (toolMessage.type === 'running_now') return null // do not show running
+			// Live rows are routed through LiveToolCard before tool-specific renderers.
 
 			const { rawParams, params } = toolMessage;
 			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected };
@@ -2221,7 +2221,7 @@ const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapper: Res
 			const icon = null
 
 			if (toolMessage.type === 'tool_request') return null // do not show past requests
-			if (toolMessage.type === 'running_now') return null // do not show running
+			// Live rows are routed through LiveToolCard before tool-specific renderers.
 
 			const isError = false
 			const isRejected = toolMessage.type === 'rejected'
@@ -2366,7 +2366,7 @@ const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapper: Res
 			const icon = null
 
 			if (toolMessage.type === 'tool_request') return null // do not show past requests
-			if (toolMessage.type === 'running_now') return null // do not show running
+			// Live rows are routed through LiveToolCard before tool-specific renderers.
 
 			const isError = false
 			const isRejected = toolMessage.type === 'rejected'
@@ -2405,7 +2405,7 @@ const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapper: Res
 			const icon = null
 
 			if (toolMessage.type === 'tool_request') return null // do not show past requests
-			if (toolMessage.type === 'running_now') return null // do not show running
+			// Live rows are routed through LiveToolCard before tool-specific renderers.
 
 			const isError = false
 			const isRejected = toolMessage.type === 'rejected'
@@ -2448,6 +2448,18 @@ const ChatBubble = (props: ChatBubbleProps) => {
 	</ErrorBoundary>
 }
 
+/** One shared live card keeps every tool call visible under its original call id.
+ * Completed tool-specific renderers still own their detailed result views. */
+const LiveToolCard = ({ toolMessage }: { toolMessage: Exclude<ToolMessage<ToolName>, { type: 'invalid_params' }> }) => {
+	const accessor = useAccessor()
+	const route = applicationToolRoute(toolMessage.name, isABuiltinToolName(toolMessage.name))
+	const application = route === 'application' ? applicationToolPresentation(toolMessage.name, toolMessage.type, toolMessage.params) : undefined
+	const title = getTitle(toolMessage)
+	const desc1 = toolMessage.lifecycle === 'cancelling' ? 'Cancelling' : application?.status ?? (route === 'mcp' ? removeMCPToolNamePrefix(toolMessage.name) : 'Running')
+	const elapsed = useLiveElapsed(toolMessage.startedAt, toolMessage.type === 'running_now')
+	return <ToolHeaderWrapper title={title} desc1={desc1} desc1Info={elapsed} isRejected={false} />
+}
+
 const _ChatBubble = ({ threadId, chatMessage, isCommitted, messageIdx, _scrollToBottom, editable }: ChatBubbleProps) => {
 	const role = chatMessage.role
 
@@ -2475,6 +2487,7 @@ const _ChatBubble = ({ threadId, chatMessage, isCommitted, messageIdx, _scrollTo
 			if (route === 'application') return <ApplicationToolWrapper toolMessage={chatMessage} />
 			return <InvalidTool toolName={chatMessage.name} message={chatMessage.content} mcpServerName={chatMessage.mcpServerName} />
 		}
+		if (chatMessage.type === 'running_now' && chatMessage.name !== 'run_command' && chatMessage.name !== 'run_persistent_command') return <LiveToolCard toolMessage={chatMessage} />
 
 		const ToolResultWrapper = isBuiltinTool ? builtinToolNameToComponent[toolName]?.resultWrapper as ResultWrapper<ToolName>
 			: route === 'application' ? ApplicationToolWrapper as ResultWrapper<ToolName>
@@ -2557,6 +2570,7 @@ const CommandBarInChat = () => {
 
 	const threadStatus = (
 		chatThreadsStreamState?.isRunning === 'awaiting_user' ? { title: 'Needs Approval', color: 'yellow', } as const
+			: chatThreadsStreamState?.retry ? { title: `Retrying ${chatThreadsStreamState.retry.attempt}/${chatThreadsStreamState.retry.maxAttempts}`, color: 'orange', } as const
 			: chatThreadsStreamState?.isRunning ? { title: 'Running', color: 'orange', } as const
 				: { title: 'Done', color: 'dark', } as const
 	)
@@ -2851,6 +2865,7 @@ export const SidebarChat = () => {
 	const chatModelUnavailable = !!isFeatureNameDisabled('Chat', settingsState)
 	const currentStatusPresentation = getChatCurrentStatusPresentation({
 		parentIsRunning: isRunning,
+		retry: currThreadStreamState?.retry,
 		childActive: childIsActive,
 		hasError: !!latestError,
 		hasDraft,
@@ -2925,7 +2940,7 @@ export const SidebarChat = () => {
 	const hasVisibleConversation = previousMessagesHTML.length > 0 || !!pendingMessageHTML
 
 	const streamingChatIdx = previousMessagesHTML.length
-	const currStreamingMessageHTML = reasoningSoFar || displayContentSoFar || isRunning ?
+	const currStreamingMessageHTML = reasoningSoFar || displayContentSoFar || (isRunning && !(currThreadStreamState?.isRunning === 'idle' && currThreadStreamState.toolInfo?.transient)) ?
 		<ChatBubble
 			key={'curr-streaming-msg'}
 			chatMessage={{
@@ -2947,6 +2962,8 @@ export const SidebarChat = () => {
 		toolCallSoFar.name === 'write_file' ? <SimplifiedToolHeader key={'curr-streaming-tool'} title='Writing file' />
 			: null
 		: null
+	const transientControl = currThreadStreamState?.isRunning === 'idle' && currThreadStreamState.toolInfo?.transient ?
+		<LiveToolCard key={`control-${currThreadStreamState.toolInfo.receiptId}`} toolMessage={{ role: 'tool', type: 'running_now', name: currThreadStreamState.toolInfo.toolName, params: currThreadStreamState.toolInfo.toolParams, content: currThreadStreamState.toolInfo.content, result: null, id: currThreadStreamState.toolInfo.id, rawParams: currThreadStreamState.toolInfo.rawParams, mcpServerName: currThreadStreamState.toolInfo.mcpServerName, lifecycle: currThreadStreamState.toolInfo.lifecycle, startedAt: currThreadStreamState.toolInfo.startedAt } as any} /> : null
 
 	const messagesHTML = <ScrollToBottomContainer
 		key={'messages' + chatThreadsState.currentThreadId} // force rerender on all children if id changes
@@ -2963,6 +2980,7 @@ export const SidebarChat = () => {
 		{/* previous messages */}
 		{previousMessagesHTML}
 		{pendingMessageHTML}
+		{transientControl}
 		{currStreamingMessageHTML}
 
 		{/* Generating tool */}

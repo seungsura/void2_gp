@@ -39,6 +39,9 @@ export type ToolMessage<T extends ToolName> = {
 	id: string;
 	rawParams: RawToolParamsObj;
 	mcpServerName: string | undefined; // the server name at the time of the call
+	/** Not persisted as a requirement: older stored tool records simply omit it. */
+	lifecycle?: 'cancelling';
+	startedAt?: number;
 } & (
 		// in order of events:
 		| { type: 'invalid_params', result: null, name: T, }

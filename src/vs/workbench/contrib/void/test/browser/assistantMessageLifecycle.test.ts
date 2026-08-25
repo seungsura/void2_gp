@@ -9,6 +9,7 @@ import { projectAgentConfig, resolveAgentInstructions, stableAgentInstructionRev
 import { assistantMessagePresentation, INTERNAL_EMPTY_MESSAGE_SENTINEL, sanitizeAssistantDisplayContent } from '../../common/assistantMessagePresentation.js';
 import { THREAD_STORAGE_KEY } from '../../common/storageKeys.js';
 import { Severity } from '../../../../../platform/notification/common/notification.js';
+import { TerminalToolService } from '../../browser/terminalToolService.js';
 
 const bytes = (value: string) => new TextEncoder().encode(value);
 
@@ -523,5 +524,119 @@ suite('Assistant message lifecycle', () => {
 		const legacy = JSON.stringify({ task: { id: 'task', messages: [{ role: 'assistant', displayContent: INTERNAL_EMPTY_MESSAGE_SENTINEL, reasoning: 'legacy reasoning', anthropicReasoning: null }, { role: 'assistant', displayContent: `keep ${INTERNAL_EMPTY_MESSAGE_SENTINEL}`, reasoning: '', anthropicReasoning: null }], state: {} } });
 		const migrated = (ChatThreadService.prototype as any)._convertThreadDataFromStorage.call({}, legacy);
 		assert.deepStrictEqual(migrated.task.messages.map((message: any) => message.displayContent), ['', `keep ${INTERNAL_EMPTY_MESSAGE_SENTINEL}`]);
+	});
+
+	test('terminal cancellation latches before connection, creation, and send without leaks', async () => {
+		const makeService = (connected: Promise<void>, create: () => Promise<any>) => {
+			const service: any = new TerminalToolService({ whenConnected: connected, instances: [], onDidCreateInstance: () => ({ dispose() { } }) } as any, {} as any);
+			service._createTerminal = create;
+			return service;
+		};
+		const connection = deferred<void>(); let created = 0;
+		const beforeConnection = makeService(connection.promise, async () => { created++; throw new Error('must not create after pre-connect cancellation'); });
+		const early = await beforeConnection.runCommand('echo early', { type: 'temporary', cwd: null, terminalId: 'early' }); early.interrupt(); early.interrupt();
+		assert.deepStrictEqual(await early.resPromise, { result: '', resolveReason: { type: 'cancelled' } }); assert.strictEqual(created, 0); connection.resolve();
+
+		const createGate = deferred<any>(); const createEntered = deferred<void>(); let disposeCount = 0; let sendCount = 0;
+		const lateCreate = makeService(Promise.resolve(), () => { createEntered.resolve(); return createGate.promise; });
+		const createdCall = await lateCreate.runCommand('echo late', { type: 'temporary', cwd: null, terminalId: 'late' }); await createEntered.promise; createdCall.interrupt();
+		let lateCreateSettled = false; void createdCall.resPromise.then(() => lateCreateSettled = true); await Promise.resolve(); assert.strictEqual(lateCreateSettled, false);
+		createGate.resolve({ dispose: () => { disposeCount++; }, capabilities: { get: () => undefined, onDidAddCapability: () => ({ dispose() { } }) }, sendText: async () => { sendCount++; }, onData: () => ({ dispose() { } }) });
+		assert.deepStrictEqual(await createdCall.resPromise, { result: '', resolveReason: { type: 'cancelled' } }); assert.strictEqual(disposeCount, 1); assert.strictEqual(sendCount, 0);
+
+		const sendGate = deferred<void>(); const sendEntered = deferred<void>(); let listenerDisposals = 0; let sendDisposals = 0;
+		const capability = { onCommandFinished: () => ({ dispose: () => { listenerDisposals++; } }) };
+		const duringSend = makeService(Promise.resolve(), async () => ({ dispose: () => { sendDisposals++; }, capabilities: { get: () => capability, onDidAddCapability: () => ({ dispose() { } }) }, sendText: () => { sendEntered.resolve(); return sendGate.promise; }, onData: () => ({ dispose() { } }) }));
+		const sending = await duringSend.runCommand('echo sending', { type: 'temporary', cwd: null, terminalId: 'sending' }); await sendEntered.promise; sending.interrupt(); sending.interrupt();
+		assert.deepStrictEqual(await sending.resPromise, { result: '', resolveReason: { type: 'cancelled' } }); assert.strictEqual(listenerDisposals, 1); assert.strictEqual(sendDisposals, 1);
+
+		let capabilityDisposals = 0; let capabilitySendCalls = 0; const capabilityEntered = deferred<void>();
+		const waitingCapability = makeService(Promise.resolve(), async () => ({ dispose() { sendDisposals++; }, capabilities: { get: () => undefined, onDidAddCapability: () => { capabilityEntered.resolve(); return { dispose: () => { capabilityDisposals++; } }; } }, sendText: async () => { capabilitySendCalls++; }, onData: () => ({ dispose() { } }) }));
+		const capabilityCall = await waitingCapability.runCommand('echo capability', { type: 'temporary', cwd: null, terminalId: 'capability' }); await capabilityEntered.promise; capabilityCall.interrupt();
+		assert.deepStrictEqual(await capabilityCall.resPromise, { result: '', resolveReason: { type: 'cancelled' } }); assert.strictEqual(capabilityDisposals, 1); assert.strictEqual(capabilitySendCalls, 0);
+
+		let persistentDisposals = 0; let finished: ((value: any) => void) | undefined;
+		const persistent = makeService(Promise.resolve(), async () => { throw new Error('persistent must not create'); });
+		persistent.terminalService.setActiveInstance = () => { }; persistent.terminalService.focusActiveInstance = async () => { };
+		persistent.persistentTerminalInstanceOfId.p = { dispose: () => { persistentDisposals++; }, capabilities: { get: () => ({ onCommandFinished: (listener: any) => { finished = listener; return { dispose() { } }; } }), onDidAddCapability: () => ({ dispose() { } }) }, sendText: async () => { }, onData: () => ({ dispose() { } }) };
+		const persistentCall = await persistent.runCommand('echo done', { type: 'persistent', persistentTerminalId: 'p' }); for (let i = 0; i < 4 && !finished; i++) await Promise.resolve(); finished!({ exitCode: 0, getOutput: () => 'done' });
+		assert.strictEqual((await persistentCall.resPromise).resolveReason.type, 'done'); persistentCall.interrupt(); assert.strictEqual(persistentDisposals, 0);
+	});
+
+	test('a terminal nonzero exit produces one visible tool error and one model-facing result', async () => {
+		const messages: any[] = [];
+		const receiver: any = {
+			state: { allThreads: { task: { messages, state: {}, filesWithUserChanges: new Set<string>() } } }, streamState: {},
+			_toolsService: {
+				callTool: { run_command: async () => ({ result: Promise.resolve({ result: 'stderr output', resolveReason: { type: 'done', exitCode: 7 } }), interruptTool: () => { } }) },
+				stringOfResult: { run_command: () => { throw new Error('must not stringify a nonzero terminal result as success'); } },
+			},
+			_updateLatestTool(_threadId: string, message: any) { if (messages.length) messages[messages.length - 1] = message; else messages.push(message); },
+			_setStreamState(threadId: string, value: any) { this.streamState[threadId] = value; },
+		};
+		const result = await chatLifecycle._runToolCall.call(receiver, 'task', 'run_command', 'terminal-7', undefined, { preapproved: true, unvalidatedToolParams: {}, validatedParams: {} }, instructionSnapshot(), undefined, false, 0, () => true);
+		assert.strictEqual((result as any).failure, 'terminal_exit_7');
+		assert.strictEqual(messages.length, 1);
+		assert.deepStrictEqual({ type: messages[0].type, id: messages[0].id, result: messages[0].result }, { type: 'tool_error', id: 'terminal-7', result: 'stderr output\n(exit code 7)' });
+	});
+
+	test('same provider tool ids settle their own cancelled receipts across replacement runs', async () => {
+		const first = deferred<any>(); const second = deferred<any>(); const messages: any[] = []; let call = 0; let current = true; let interrupts = 0;
+		const receiver: any = {
+			state: { allThreads: { task: { messages, state: {}, filesWithUserChanges: new Set<string>() } } }, streamState: {},
+			_cancellingToolReceiptsOfThread: new Map(), toolErrMsgs: { interrupted: 'Tool call was interrupted by the user.' }, _revokeAgentDelegation() { current = false; },
+			_toolsService: { callTool: { run_command: async () => ({ result: (++call === 1 ? first : second).promise, interruptTool: () => { interrupts++; } }) }, stringOfResult: { run_command: () => { throw new Error('cancelled command must not stringify'); } } },
+			_updateLatestTool(_threadId: string, message: any) { const last = messages.at(-1); if (last?.role === 'tool' && last.type !== 'invalid_params') messages[messages.length - 1] = message; else messages.push(message); },
+			_editMessageInThread(_threadId: string, index: number, message: any) { messages[index] = message; },
+			_setStreamState(threadId: string, value: any) { this.streamState[threadId] = value; },
+		}; Object.setPrototypeOf(receiver, ChatThreadService.prototype);
+		const start = () => chatLifecycle._runToolCall.call(receiver, 'task', 'run_command', 'same', undefined, { preapproved: true, unvalidatedToolParams: {}, validatedParams: {} }, instructionSnapshot(), undefined, false, 0, () => current);
+		const runA = start(); await Promise.resolve(); await chatLifecycle.abortRunning.call(receiver, 'task');
+		assert.deepStrictEqual({ type: messages[0].type, lifecycle: messages[0].lifecycle, interrupts }, { type: 'running_now', lifecycle: 'cancelling', interrupts: 1 });
+		messages.push({ role: 'assistant', displayContent: 'replacement', reasoning: '', anthropicReasoning: null }); current = true;
+		const runB = start(); await Promise.resolve(); await chatLifecycle.abortRunning.call(receiver, 'task');
+		first.resolve({ result: '', resolveReason: { type: 'cancelled' } }); await runA;
+		assert.strictEqual(messages[0].type, 'rejected');
+		assert.strictEqual(messages.at(-1).type, 'running_now');
+		second.resolve({ result: '', resolveReason: { type: 'cancelled' } }); await runB;
+		assert.strictEqual(messages.at(-1).type, 'rejected');
+		assert.strictEqual(interrupts, 2);
+	});
+
+	test('stops the parent loop after three identical normalized tool failures without a fourth provider send', async () => {
+		const snapshot = instructionSnapshot(); const messages: any[] = [{ role: 'user', content: 'start', displayContent: 'start' }]; const streamState: any = {}; let sends = 0; let toolRuns = 0;
+		const receiver: any = {
+			state: { allThreads: { task: { messages, state: {}, filesWithUserChanges: new Set<string>() } } }, streamState,
+			_agentControlGeneration: new Map([['task', 0]]), _parentRunTokenOfThread: new Map(), _agentDelegationAuthorityOfThread: new Map(),
+			_settingsService: { state: { globalSettings: { chatMode: 'agent' } } }, _convertToLLMMessagesService: { prepareLLMChatMessages: async () => ({ messages: [], separateSystemMessage: false }) },
+			_llmMessageService: { sendLLMMessage: (options: any) => { const n = ++sends; queueMicrotask(() => void options.onFinalMessage({ fullText: '', fullReasoning: '', toolCall: { name: 'run_command', id: `provider-${n}`, rawParams: n % 2 ? { command: 'false', terminalId: `generated-${n}`, cwd: null } : { cwd: null, terminalId: `generated-${n}`, command: 'false' } }, anthropicReasoning: null })); return `request-${n}`; }, abort() { } },
+			_mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } }, _setStreamState(threadId: string, value: any) { streamState[threadId] = value; }, _addMessageToThread(_threadId: string, message: any) { messages.push(message); },
+			_runToolCall: async () => ({ failure: 'terminal_exit_1', validatedParams: { command: 'false', cwd: null, terminalId: `validated-${++toolRuns}` }, interrupted: false }),
+		};
+		await runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot });
+		assert.strictEqual(sends, 3); assert.strictEqual(toolRuns, 3); assert.strictEqual(streamState.task.error.message, 'The same tool failed three times. Change the request or recover the command before continuing.');
+	});
+
+	test('different failures, different arguments, and successful calls do not trip the failure circuit', async () => {
+		const snapshot = instructionSnapshot();
+		for (const [label, outcomes] of [
+			['different failures', [{ failure: 'terminal_exit_1', params: { command: 'false', cwd: null, terminalId: 'a' } }, { failure: 'terminal_exit_2', params: { command: 'false', cwd: null, terminalId: 'b' } }, { failure: 'terminal_exit_3', params: { command: 'false', cwd: null, terminalId: 'c' } }]],
+			['different arguments', [{ failure: 'terminal_exit_1', params: { command: 'false-a', cwd: null, terminalId: 'a' } }, { failure: 'terminal_exit_1', params: { command: 'false-b', cwd: null, terminalId: 'b' } }, { failure: 'terminal_exit_1', params: { command: 'false-c', cwd: null, terminalId: 'c' } }]],
+			['successful calls', [{ params: { command: 'false', cwd: null, terminalId: 'a' } }, { params: { command: 'false', cwd: null, terminalId: 'b' } }, { params: { command: 'false', cwd: null, terminalId: 'c' } }]],
+		] as const) {
+			const streamState: any = {}; let sends = 0; let runs = 0;
+			const receiver: any = { state: { allThreads: { task: { messages: [{ role: 'user', content: label }], state: {}, filesWithUserChanges: new Set<string>() } } }, streamState, _agentControlGeneration: new Map([['task', 0]]), _parentRunTokenOfThread: new Map(), _agentDelegationAuthorityOfThread: new Map(), _settingsService: { state: { globalSettings: { chatMode: 'agent' } } }, _convertToLLMMessagesService: { prepareLLMChatMessages: async () => ({ messages: [], separateSystemMessage: false }) }, _llmMessageService: { sendLLMMessage: (options: any) => { const n = ++sends; queueMicrotask(() => void options.onFinalMessage({ fullText: '', fullReasoning: '', toolCall: n <= 3 ? { name: 'run_command', id: `${label}-${n}`, rawParams: outcomes[n - 1].params } : undefined, anthropicReasoning: null })); return `request-${n}`; }, abort() { } }, _mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } }, _setStreamState(id: string, value: any) { streamState[id] = value; }, _addMessageToThread() { }, _runToolCall: async () => { const outcome = outcomes[runs++]; return { interrupted: false, ...(outcome.failure ? { failure: outcome.failure } : {}), validatedParams: outcome.params }; } };
+			await runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot });
+			assert.strictEqual(sends, 4, label); assert.strictEqual(runs, 3, label); assert.strictEqual(streamState.task.error, undefined, label);
+		}
+	});
+
+	test('publishes first provider retry before retrying without replaying user or tool effects', async () => {
+		const snapshot = instructionSnapshot(); const messages: any[] = [{ role: 'user', content: 'original', displayContent: 'original' }]; const states: any[] = []; let sends = 0; let toolEffects = 0; const started = Date.now();
+		const receiver: any = { state: { allThreads: { task: { messages, state: {}, filesWithUserChanges: new Set<string>() } } }, streamState: {}, _agentControlGeneration: new Map([['task', 0]]), _parentRunTokenOfThread: new Map(), _agentDelegationAuthorityOfThread: new Map(), _settingsService: { state: { globalSettings: { chatMode: 'agent' } } }, _convertToLLMMessagesService: { prepareLLMChatMessages: async () => ({ messages: [], separateSystemMessage: false }) }, _llmMessageService: { sendLLMMessage: (options: any) => { const n = ++sends; queueMicrotask(() => n === 1 ? void options.onError({ message: 'transient', fullError: null }) : void options.onFinalMessage({ fullText: 'recovered', fullReasoning: '', anthropicReasoning: null })); return `request-${n}`; }, abort() { } }, _mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } }, _setStreamState(id: string, value: any) { this.streamState[id] = value; states.push(value); }, _addMessageToThread(_id: string, message: any) { messages.push(message); }, _runToolCall: async () => { toolEffects++; return {}; } };
+		await runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot });
+		const retry = states.find(state => state?.isRunning === 'idle' && state.retry)?.retry;
+		assert.deepStrictEqual({ attempt: retry?.attempt, maxAttempts: retry?.maxAttempts }, { attempt: 1, maxAttempts: 3 }); assert.ok(retry.retryAt >= started + 2_400);
+		assert.strictEqual(sends, 2); assert.strictEqual(toolEffects, 0); assert.strictEqual(messages.filter(message => message.role === 'user').length, 1); assert.strictEqual(messages.at(-1).displayContent, 'recovered');
 	});
 });

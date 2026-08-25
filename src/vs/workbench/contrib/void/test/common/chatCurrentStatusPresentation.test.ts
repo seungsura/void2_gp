@@ -81,6 +81,16 @@ suite('Void ChatCurrentStatusPresentation', () => {
 		assert.strictEqual(value.sendDisabled, true);
 	});
 
+	test('makes the first provider retry visible and stoppable', () => {
+		const value = present({ parentIsRunning: 'idle', hasDraft: false, retry: { attempt: 1, maxAttempts: 3, retryAt: Date.now() } });
+		assert.strictEqual(value.kind, 'running');
+		assert.strictEqual(value.liveLabel, 'Retrying');
+		assert.strictEqual(value.detail, 'Provider request 1 of 3 · Esc to stop');
+		assert.strictEqual(value.announcement, 'Retrying · Provider request 1 of 3 · Esc to stop');
+		assert.strictEqual(value.showStop, true);
+		assert.strictEqual(value.sendDisabled, true);
+	});
+
 	test('disables Send when the Chat model is unavailable', () => {
 		const value = present({ chatModelUnavailable: true });
 		assert.strictEqual(value.showStop, false);

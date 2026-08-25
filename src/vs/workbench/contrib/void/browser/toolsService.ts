@@ -702,6 +702,7 @@ export class ToolsService implements IToolsService {
 				if (resolveReason.type === 'timeout') {
 					return `${result_}\nTerminal command ran, but was automatically killed by Void after ${MAX_TERMINAL_INACTIVE_TIME}s of inactivity and did not finish successfully. To try with more time, open a persistent terminal and run the command there.`
 				}
+				if (resolveReason.type === 'cancelled') return 'Terminal command was cancelled by the user.'
 				throw new Error(`Unexpected internal error: Terminal command did not resolve with a valid reason.`)
 			},
 
@@ -716,6 +717,7 @@ export class ToolsService implements IToolsService {
 				if (resolveReason.type === 'timeout') {
 					return `${result_}\nTerminal command is running in terminal ${persistentTerminalId}. The given outputs are the results after ${MAX_TERMINAL_BG_COMMAND_TIME} seconds.`
 				}
+				if (resolveReason.type === 'cancelled') return 'Terminal command was cancelled by the user.'
 				throw new Error(`Unexpected internal error: Terminal command did not resolve with a valid reason.`)
 			},
 
