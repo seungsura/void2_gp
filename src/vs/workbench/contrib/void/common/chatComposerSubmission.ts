@@ -11,14 +11,21 @@ export const submitChatComposer = async ({
 	clearCurrentInput,
 }: {
 	threadId: string;
-	submit: () => Promise<boolean>;
+	submit: () => Promise<boolean> | { accepted: boolean; settled: Promise<boolean> };
 	clearSubmittedState: (threadId: string) => void;
 	getCurrentThreadId: () => string;
 	clearCurrentInput: () => void;
 }) => {
-	const admitted = await submit();
-	if (!admitted) return false;
+	const receipt = submit();
+	if ('then' in receipt) {
+		const admitted = await receipt;
+		if (!admitted) return false;
+		clearSubmittedState(threadId);
+		if (getCurrentThreadId() === threadId) clearCurrentInput();
+		return true;
+	}
+	if (!receipt.accepted) return false;
 	clearSubmittedState(threadId);
 	if (getCurrentThreadId() === threadId) clearCurrentInput();
-	return true;
+	return receipt.settled;
 };

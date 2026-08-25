@@ -4,8 +4,8 @@
  *--------------------------------------------------------------------------------------*/
 
 export type ChatCurrentParentRunning = 'LLM' | 'tool' | 'awaiting_user' | 'idle';
-export type ChatCurrentStatusKind = 'idle' | 'unavailable' | 'running' | 'awaiting_user' | 'error';
-export type ChatCurrentLiveLabel = 'Running' | 'Needs approval' | 'Error';
+export type ChatCurrentStatusKind = 'idle' | 'unavailable' | 'preparing' | 'running' | 'awaiting_user' | 'error';
+export type ChatCurrentLiveLabel = 'Preparing' | 'Running' | 'Needs approval' | 'Error';
 
 export type ChatCurrentStatusInput = Readonly<{
 	parentIsRunning?: ChatCurrentParentRunning;
@@ -13,6 +13,7 @@ export type ChatCurrentStatusInput = Readonly<{
 	hasError: boolean;
 	hasDraft: boolean;
 	chatModelUnavailable: boolean;
+	pendingPreparing?: boolean;
 }>;
 
 export type ChatCurrentSubmitInput = Readonly<{
@@ -84,7 +85,7 @@ export const canSubmitChatCurrent = (input: ChatCurrentSubmitInput): boolean =>
 export const getChatCurrentStatusPresentation = (input: ChatCurrentStatusInput): ChatCurrentStatusPresentation => {
 	const parentStoppable = input.parentIsRunning === 'LLM' || input.parentIsRunning === 'tool' || input.parentIsRunning === 'idle';
 	const stoppable = parentStoppable || input.childActive;
-	const busy = input.parentIsRunning !== undefined || input.childActive;
+	const busy = input.parentIsRunning !== undefined || input.childActive || !!input.pendingPreparing;
 
 	let kind: ChatCurrentStatusKind;
 	let liveLabel: ChatCurrentLiveLabel | undefined;
@@ -94,6 +95,10 @@ export const getChatCurrentStatusPresentation = (input: ChatCurrentStatusInput):
 		kind = 'error';
 		liveLabel = 'Error';
 		detail = withActiveChildStopDetail('Review the message above', input.childActive);
+	} else if (input.pendingPreparing) {
+		kind = 'preparing';
+		liveLabel = 'Preparing';
+		detail = 'Esc to cancel';
 	} else if (input.parentIsRunning === 'awaiting_user') {
 		kind = 'awaiting_user';
 		liveLabel = 'Needs approval';
@@ -123,7 +128,7 @@ export const getChatCurrentStatusPresentation = (input: ChatCurrentStatusInput):
 		...(liveLabel ? { liveLabel } : {}),
 		detail,
 		announcement,
-		showStop: stoppable,
+		showStop: stoppable || !!input.pendingPreparing,
 		sendDisabled: !canSubmitChatCurrent({ busy, hasDraft: input.hasDraft, chatModelUnavailable: input.chatModelUnavailable }),
 		textarea,
 		statusHelp,

@@ -6,7 +6,7 @@
 import React, { ButtonHTMLAttributes, FormEvent, FormHTMLAttributes, Fragment, KeyboardEvent, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 
 
-import { useAccessor, useAgentSubagentBudget, useAgentSubagentDiagnostics, useAgentSubagentRuns, useChatThreadsState, useChatThreadsStreamState, useSettingsState, useActiveURI, useChildToolApprovals, useCommandBarState } from '../util/services.js';
+import { useAccessor, useAgentSubagentBudget, useAgentSubagentDiagnostics, useAgentSubagentRuns, useChatThreadsState, useChatThreadsStreamState, usePendingChatSubmission, useSettingsState, useActiveURI, useChildToolApprovals, useCommandBarState } from '../util/services.js';
 import { ScrollType } from '../../../../../../../editor/common/editorCommon.js';
 
 import { ChatMarkdownRender, ChatMessageLocation, getApplyBoxId } from '../markdown/ChatMarkdownRender.js';
@@ -1011,7 +1011,7 @@ const SimplifiedToolHeader = ({
 
 
 
-const UserMessageComponent = ({ chatMessage, messageIdx, _scrollToBottom }: { chatMessage: ChatMessage & { role: 'user' }, messageIdx: number, _scrollToBottom: (() => void) | null }) => {
+const UserMessageComponent = ({ chatMessage, messageIdx, _scrollToBottom, editable = true }: { chatMessage: ChatMessage & { role: 'user' }, messageIdx: number, _scrollToBottom: (() => void) | null, editable?: boolean }) => {
 
 	const accessor = useAccessor()
 	const chatThreadsService = accessor.get('IChatThreadService')
@@ -1022,7 +1022,7 @@ const UserMessageComponent = ({ chatMessage, messageIdx, _scrollToBottom }: { ch
 	let setIsBeingEdited = (_: boolean) => { }
 	let setStagingSelections = (_: StagingSelectionItem[]) => { }
 
-	if (messageIdx !== undefined) {
+	if (editable && messageIdx !== undefined) {
 		const _state = chatThreadsService.getCurrentMessageState(messageIdx)
 		isBeingEdited = _state.isBeingEdited
 		stagingSelections = _state.stagingSelections
@@ -2439,6 +2439,7 @@ type ChatBubbleProps = {
 	isCommitted: boolean,
 	threadId: string,
 	_scrollToBottom: (() => void) | null,
+	editable?: boolean,
 }
 
 const ChatBubble = (props: ChatBubbleProps) => {
@@ -2447,7 +2448,7 @@ const ChatBubble = (props: ChatBubbleProps) => {
 	</ErrorBoundary>
 }
 
-const _ChatBubble = ({ threadId, chatMessage, isCommitted, messageIdx, _scrollToBottom }: ChatBubbleProps) => {
+const _ChatBubble = ({ threadId, chatMessage, isCommitted, messageIdx, _scrollToBottom, editable }: ChatBubbleProps) => {
 	const role = chatMessage.role
 
 	if (role === 'user') {
@@ -2455,6 +2456,7 @@ const _ChatBubble = ({ threadId, chatMessage, isCommitted, messageIdx, _scrollTo
 			chatMessage={chatMessage}
 			messageIdx={messageIdx}
 			_scrollToBottom={_scrollToBottom}
+			editable={editable}
 		/>
 	}
 	else if (role === 'assistant') {
@@ -2823,6 +2825,7 @@ export const SidebarChat = () => {
 
 	// stream state
 	const currThreadStreamState = useChatThreadsStreamState(chatThreadsState.currentThreadId)
+	const pendingSubmission = usePendingChatSubmission(threadId)
 	const isRunning = currThreadStreamState?.isRunning
 	const childRuns = useAgentSubagentRuns(currentThread.id)
 	const childBudget = useAgentSubagentBudget(currentThread.id)
@@ -2830,7 +2833,7 @@ export const SidebarChat = () => {
 	const childToolApprovals = useChildToolApprovals(currentThread.id)
 	const childPresentation = getAgentSubagentPresentation(childBudget, childRuns, childDiagnostics)
 	const childIsActive = childRuns.some(isActiveChildRun)
-	const isAnyRunning = !!isRunning || childIsActive
+	const isAnyRunning = !!isRunning || childIsActive || !!pendingSubmission
 	const latestError = currThreadStreamState?.error
 	const { displayContentSoFar, toolCallSoFar, reasoningSoFar } = currThreadStreamState?.llmInfo ?? {}
 
@@ -2852,6 +2855,7 @@ export const SidebarChat = () => {
 		hasError: !!latestError,
 		hasDraft,
 		chatModelUnavailable,
+		pendingPreparing: !!pendingSubmission,
 	})
 
 	const sidebarRef = useRef<HTMLDivElement>(null)
@@ -2868,7 +2872,7 @@ export const SidebarChat = () => {
 		try {
 			await submitChatComposer({
 				threadId,
-				submit: () => chatThreadsService.addUserMessageAndStreamResponse({ userMessage, threadId }),
+				submit: () => chatThreadsService.beginUserMessageAndStreamResponse({ userMessage, threadId }),
 				clearSubmittedState: submittedThreadId => chatThreadsService.clearSubmittedComposerState(submittedThreadId),
 				getCurrentThreadId: () => chatThreadsService.state.currentThreadId,
 				clearCurrentInput: () => {
@@ -2917,6 +2921,8 @@ export const SidebarChat = () => {
 			/>
 		})
 	}, [previousMessages, threadId, isRunning])
+	const pendingMessageHTML = pendingSubmission ? <div data-testid='chat-pending-user' className='pointer-events-none'><ChatBubble key={`pending-${pendingSubmission.id}`} chatMessage={{ role: 'user', content: '', displayContent: pendingSubmission.displayContent, selections: [...pendingSubmission.selections], state: { stagingSelections: [], isBeingEdited: false } }} messageIdx={previousMessagesHTML.length} isCommitted={false} threadId={threadId} _scrollToBottom={null} editable={false} /></div> : null
+	const hasVisibleConversation = previousMessagesHTML.length > 0 || !!pendingMessageHTML
 
 	const streamingChatIdx = previousMessagesHTML.length
 	const currStreamingMessageHTML = reasoningSoFar || displayContentSoFar || isRunning ?
@@ -2951,11 +2957,12 @@ export const SidebarChat = () => {
 			w-full h-full
 			overflow-x-hidden
 			overflow-y-auto
-			${previousMessagesHTML.length === 0 && !displayContentSoFar ? 'hidden' : ''}
+			${!hasVisibleConversation && !displayContentSoFar ? 'hidden' : ''}
 		`}
 	>
 		{/* previous messages */}
 		{previousMessagesHTML}
+		{pendingMessageHTML}
 		{currStreamingMessageHTML}
 
 		{/* Generating tool */}
@@ -3037,7 +3044,7 @@ export const SidebarChat = () => {
 	</VoidChatArea>
 
 
-	const isLandingPage = previousMessages.length === 0
+	const isLandingPage = previousMessages.length === 0 && !pendingSubmission
 
 
 	const initiallySuggestedPromptsHTML = <div className='flex flex-col gap-2 w-full text-nowrap text-void-fg-3 select-none'>

@@ -112,6 +112,24 @@ const findStagingSelectionIndex = (currentSelections: StagingSelectionItem[] | u
 
 type UserMessageType = ChatMessage & { role: 'user' }
 type UserMessageState = UserMessageType['state']
+export type PendingChatSubmission = Readonly<{
+	id: string;
+	threadId: string;
+	generation: number;
+	displayContent: string;
+	selections: readonly StagingSelectionItem[];
+	phase: 'preparing';
+}>;
+export type ChatSubmissionReceipt = Readonly<{
+	id: string;
+	accepted: boolean;
+	settled: Promise<boolean>;
+}>;
+type PendingChatSubmissionRecord = PendingChatSubmission & {
+	draft: string;
+	composerCleared: boolean;
+	priorRun?: Promise<void>;
+};
 type AgentInstructionTaskSessionRecord = {
 	ownerProjectRoot: string | undefined;
 	trustedAtStart: boolean;
@@ -253,6 +271,8 @@ export interface IChatThreadService {
 
 	onDidChangeCurrentThread: Event<void>;
 	onDidChangeStreamState: Event<{ threadId: string }>
+	onDidChangePendingChatSubmission: Event<{ threadId: string }>;
+	getPendingChatSubmission(threadId: string): PendingChatSubmission | undefined;
 	onDidChangeChildToolApprovals: Event<void>;
 	getChildToolApprovals(parentId: string): readonly ChildToolApprovalView[];
 	approveChildToolApproval(key: ChildToolApprovalKey): boolean;
@@ -309,6 +329,7 @@ export interface IChatThreadService {
 
 	// call to add a message
 	addUserMessageAndStreamResponse({ userMessage, threadId }: { userMessage: string, threadId: string }): Promise<boolean>;
+	beginUserMessageAndStreamResponse({ userMessage, threadId }: { userMessage: string, threadId: string }): ChatSubmissionReceipt;
 
 	// approve/reject
 	approveLatestToolRequest(threadId: string): void;
@@ -328,6 +349,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 	private readonly _onDidChangeStreamState = new Emitter<{ threadId: string }>();
 	readonly onDidChangeStreamState: Event<{ threadId: string }> = this._onDidChangeStreamState.event;
+	private readonly _onDidChangePendingChatSubmission = new Emitter<{ threadId: string }>();
+	readonly onDidChangePendingChatSubmission: Event<{ threadId: string }> = this._onDidChangePendingChatSubmission.event;
 	private readonly _onDidChangeChildToolApprovals = this._register(new Emitter<void>());
 	readonly onDidChangeChildToolApprovals: Event<void> = this._onDidChangeChildToolApprovals.event;
 
@@ -395,16 +418,43 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	}
 	private _cancelChildToolApprovalsForParent(parentId: string): void { for (const view of this.getChildToolApprovals(parentId)) this._cancelChildToolApproval(view.key); }
 	private readonly _transientComposerDraftOfThread = new Map<string, string>();
+	private readonly _pendingChatSubmissionOfThread = new Map<string, PendingChatSubmissionRecord>();
+	getPendingChatSubmission(threadId: string): PendingChatSubmission | undefined { return this._pendingChatSubmissionOfThread.get(threadId); }
 	getTransientComposerDraft(threadId: string): string { return this.state.allThreads[threadId] ? this._transientComposerDraftOfThread.get(threadId) ?? '' : '' }
 	setTransientComposerDraft(threadId: string, draft: string): void {
 		if (!draft) { this.clearTransientComposerDraft(threadId); return }
 		if (!this.state.allThreads[threadId]) return
+		const pending = this._pendingChatSubmissionOfThread.get(threadId)
+		if (pending) pending.composerCleared = false
 		this._transientComposerDraftOfThread.set(threadId, draft)
 	}
 	clearTransientComposerDraft(threadId: string): void { this._transientComposerDraftOfThread.delete(threadId) }
 	clearSubmittedComposerState(threadId: string): void {
+		const pending = this._pendingChatSubmissionOfThread.get(threadId)
+		if (pending) pending.composerCleared = true
 		this.clearTransientComposerDraft(threadId)
-		this._setThreadState(threadId, { stagingSelections: [] }, true)
+		this._setThreadState(threadId, { stagingSelections: [] }, true, true)
+	}
+	private _setPendingChatSubmission(pending: PendingChatSubmissionRecord): void {
+		this._pendingChatSubmissionOfThread.set(pending.threadId, pending)
+		this._onDidChangePendingChatSubmission.fire({ threadId: pending.threadId })
+	}
+	private _settlePendingChatSubmission(pending: PendingChatSubmissionRecord, accepted: boolean): boolean {
+		if (this._pendingChatSubmissionOfThread.get(pending.threadId) !== pending) return false
+		this._pendingChatSubmissionOfThread.delete(pending.threadId)
+		if (!accepted && pending.composerCleared && this.state.allThreads[pending.threadId] && !this.getTransientComposerDraft(pending.threadId) && this.state.allThreads[pending.threadId]!.state.stagingSelections.length === 0) {
+			this._transientComposerDraftOfThread.set(pending.threadId, pending.draft)
+			this._setThreadState(pending.threadId, { stagingSelections: [...pending.selections] }, true, true)
+		}
+		this._onDidChangePendingChatSubmission.fire({ threadId: pending.threadId })
+		return accepted
+	}
+	private _cancelPendingChatSubmission(threadId: string): boolean {
+		const pending = this._pendingChatSubmissionOfThread.get(threadId)
+		if (!pending) return false
+		this._revokeAgentDelegation(threadId, true)
+		this._settlePendingChatSubmission(pending, false)
+		return true
 	}
 	async getSkillCatalog(threadId = this.state.currentThreadId) {
 		const owner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString();
@@ -528,6 +578,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 
 	dangerousSetState(newState: ThreadsState) {
+		for (const threadId of this._pendingChatSubmissionOfThread.keys()) this._cancelPendingChatSubmission(threadId)
 		for (const threadId of Object.keys(this.state.allThreads)) this._revokeAgentDelegation(threadId, true)
 		this._agentControlGeneration.clear()
 		this._parentRunTokenOfThread.clear()
@@ -538,6 +589,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		this._onDidChangeCurrentThread.fire()
 	}
 	resetState() {
+		for (const threadId of this._pendingChatSubmissionOfThread.keys()) this._cancelPendingChatSubmission(threadId)
 		for (const threadId of Object.keys(this.state.allThreads)) this._revokeAgentDelegation(threadId, true)
 		this._agentControlGeneration.clear()
 		this._parentRunTokenOfThread.clear()
@@ -846,6 +898,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	}
 
 	async abortRunning(threadId: string) {
+		if (this._pendingChatSubmissionOfThread?.get(threadId) && this._cancelPendingChatSubmission(threadId)) return
 		this._revokeAgentDelegation(threadId)
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
@@ -1484,7 +1537,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	}
 
 
-	private async _addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string }) {
+	private async _addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, pending }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string, pending?: PendingChatSubmissionRecord }) {
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return false // should never happen
 		const capturedSelections = [...(_chatSelections ?? thread.state.stagingSelections)]
@@ -1506,11 +1559,11 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			this._setStreamState(threadId, { isRunning: undefined, error: { message: 'The selected Chat model does not support native Agent tools. Select a supported model before sending.', fullError: null } });
 			return false;
 		}
-		const priorRun = this.streamState[threadId]?.isRunning ? this.abortRunning(threadId) : undefined
-		if (!priorRun) this._revokeAgentDelegation(threadId, true)
-		const turnGeneration = this._agentControlGeneration.get(threadId)
+		const priorRun = pending?.priorRun ?? (this.streamState[threadId]?.isRunning ? this.abortRunning(threadId) : undefined)
+		if (!pending && !priorRun) this._revokeAgentDelegation(threadId, true)
+		const turnGeneration = pending?.generation ?? this._agentControlGeneration.get(threadId)
 		if (turnGeneration === undefined) return false
-		const isCurrentTurn = () => this._agentControlGeneration.has(threadId) && this._agentControlGeneration.get(threadId) === turnGeneration
+		const isCurrentTurn = () => this._agentControlGeneration.has(threadId) && this._agentControlGeneration.get(threadId) === turnGeneration && (!pending || this._pendingChatSubmissionOfThread.get(threadId) === pending)
 		if (priorRun) await priorRun
 		if (!isCurrentTurn()) return false
 		const owner = this._workspaceContextService.getWorkspace().folders[0]?.uri
@@ -1594,6 +1647,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const agentDelegationAuthority = Object.freeze({ allowed: agentDelegationAllowed, generation: turnGeneration, limits: delegationLimits, runtimeSnapshot, parentTools, autoApprove: Object.freeze({ edits: !!autoApprove.edits, terminal: !!autoApprove.terminal, mcp: !!autoApprove['MCP tools'] }), ...(roleCatalog ? { roles: roleCatalog, settingsState: capturedSettingsState, settingsOfProvider: capturedSettingsOfProvider } : {}) })
 		this._agentDelegationAuthorityOfThread.set(threadId, agentDelegationAuthority)
 		this._rememberInstructionTurn(threadId, runtimeSnapshot)
+		if (pending && !this._settlePendingChatSubmission(pending, true)) return false
 		const userHistoryElt: ChatMessage = { role: 'user', content: userMessageContent, displayContent: instructions, selections: currSelns, state: defaultMessageState }
 		this._addMessageToThread(threadId, userHistoryElt)
 
@@ -1612,8 +1666,44 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	}
 
 
+	beginUserMessageAndStreamResponse({ userMessage, threadId }: { userMessage: string, threadId: string }): ChatSubmissionReceipt {
+		const reject = (): ChatSubmissionReceipt => Object.freeze({ id: '', accepted: false, settled: Promise.resolve(false) })
+		const thread = this.state.allThreads[threadId]
+		if (!thread || this._pendingChatSubmissionOfThread.has(threadId)) return reject()
+		const capturedModel = this._currentModelSelectionProps()
+		const isAgentChat = this._settingsService.state.globalSettings.chatMode === 'agent'
+		if (isAgentChat && !capturedModel.modelSelection) {
+			this._setStreamState(threadId, { isRunning: undefined, error: { message: 'Agent chat requires a selected Chat model with native Agent tools. Select a supported model before sending.', fullError: null } })
+			return reject()
+		}
+		if (isAgentChat) {
+			const override = this._settingsService.state.overridesOfModel[capturedModel.modelSelection!.providerName]?.[capturedModel.modelSelection!.modelName] ?? {}
+			if (!isNativeAgentToolFormat(getModelCapabilities(capturedModel.modelSelection!.providerName, capturedModel.modelSelection!.modelName, { [capturedModel.modelSelection!.providerName]: { [capturedModel.modelSelection!.modelName]: override } } as never).specialToolFormat)) {
+				this._setStreamState(threadId, { isRunning: undefined, error: { message: 'The selected Chat model does not support native Agent tools. Select a supported model before sending.', fullError: null } })
+				return reject()
+			}
+		}
+		const priorRun = this.streamState[threadId]?.isRunning ? this.abortRunning(threadId) : undefined
+		if (!priorRun) this._revokeAgentDelegation(threadId, true)
+		const generation = this._agentControlGeneration.get(threadId)
+		if (generation === undefined) return reject()
+		const pending: PendingChatSubmissionRecord = { id: generateUuid(), threadId, generation, displayContent: userMessage, selections: [...thread.state.stagingSelections], phase: 'preparing', draft: this.getTransientComposerDraft(threadId) || userMessage, composerCleared: false, ...(priorRun ? { priorRun } : {}) }
+		this._setPendingChatSubmission(pending)
+		const settled = this._addUserMessageAndStreamResponse({ userMessage, _chatSelections: [...pending.selections], threadId, pending }).then(
+			accepted => accepted ? (this._pendingChatSubmissionOfThread.get(threadId) === pending ? this._settlePendingChatSubmission(pending, true) : true) : this._settlePendingChatSubmission(pending, false),
+			error => {
+				const current = this._pendingChatSubmissionOfThread.get(threadId) === pending && this.state.allThreads[threadId] !== undefined && this._agentControlGeneration.get(threadId) === pending.generation
+				this._settlePendingChatSubmission(pending, false)
+				if (current) this._setStreamState(threadId, { isRunning: undefined, error: { message: getErrorMessage(error), fullError: null } })
+				throw error
+			},
+		)
+		return Object.freeze({ id: pending.id, accepted: true, settled })
+	}
+
 	async addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string }) {
-		return this._addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId });
+		if (_chatSelections) return this._addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId });
+		return this.beginUserMessageAndStreamResponse({ userMessage, threadId }).settled
 	}
 
 	editUserMessageAndStreamResponse: IChatThreadService['editUserMessageAndStreamResponse'] = async ({ userMessage, messageIdx, threadId }) => {
@@ -1970,6 +2060,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 
 	deleteThread(threadId: string): void {
+		this._cancelPendingChatSubmission(threadId)
 		this._revokeAgentDelegation(threadId, true)
 		this._parentRunTokenOfThread.delete(threadId)
 		this._agentControlGeneration.delete(threadId)
@@ -1987,6 +2078,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		this._setState({ ...this.state, allThreads: newThreads })
 	}
 	override dispose(): void {
+		for (const threadId of this._pendingChatSubmissionOfThread.keys()) this._cancelPendingChatSubmission(threadId)
 		for (const threadId of Object.keys(this.state.allThreads)) this._revokeAgentDelegation(threadId, true)
 		this._agentDelegationAuthorityOfThread.clear(); this._agentControlGeneration.clear(); this._parentRunTokenOfThread.clear(); this._transientComposerDraftOfThread.clear(); super.dispose();
 	}
@@ -2139,9 +2231,13 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	}
 
 	// set thread.state
-	private _setThreadState(threadId: string, state: Partial<ThreadType['state']>, doNotRefreshMountInfo?: boolean): void {
+	private _setThreadState(threadId: string, state: Partial<ThreadType['state']>, doNotRefreshMountInfo?: boolean, preservePendingComposerOwnership = false): void {
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return
+		if (!preservePendingComposerOwnership && Object.prototype.hasOwnProperty.call(state, 'stagingSelections')) {
+			const pending = this._pendingChatSubmissionOfThread.get(threadId)
+			if (pending) pending.composerCleared = false
+		}
 
 		this._setState({
 			allThreads: {

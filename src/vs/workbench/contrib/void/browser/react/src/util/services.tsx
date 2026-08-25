@@ -38,7 +38,7 @@ import { IConfigurationService } from '../../../../../../../platform/configurati
 import { IPathService } from '../../../../../../../workbench/services/path/common/pathService.js'
 import { IMetricsService } from '../../../../../../../workbench/contrib/void/common/metricsService.js'
 import { URI } from '../../../../../../../base/common/uri.js'
-import { IChatThreadService, ThreadsState, ThreadStreamState } from '../../../chatThreadService.js'
+import { IChatThreadService, PendingChatSubmission, ThreadsState, ThreadStreamState } from '../../../chatThreadService.js'
 import { ITerminalToolService } from '../../../terminalToolService.js'
 import { ILanguageService } from '../../../../../../../editor/common/languages/language.js'
 import { IVoidModelService } from '../../../../common/voidModelService.js'
@@ -309,6 +309,18 @@ export const useChatThreadsStreamState = (threadId: string) => {
 		return () => { chatThreadsStreamStateListeners.delete(listener) }
 	}, [ss, threadId])
 	return s
+}
+
+export const usePendingChatSubmission = (threadId: string): PendingChatSubmission | undefined => {
+	const service = useAccessor().get('IChatThreadService')
+	const [state, setState] = useState(() => ({ threadId, value: service.getPendingChatSubmission(threadId) }))
+	useEffect(() => {
+		const refresh = () => setState({ threadId, value: service.getPendingChatSubmission(threadId) })
+		refresh()
+		const disposable = service.onDidChangePendingChatSubmission(event => { if (event.threadId === threadId) refresh() })
+		return () => disposable.dispose()
+	}, [service, threadId])
+	return selectThreadScopedValue(state, threadId, () => service.getPendingChatSubmission(threadId))
 }
 
 export const useAgentSubagentRun = (threadId: string): AgentSubagentRunView | undefined => {

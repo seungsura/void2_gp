@@ -13,6 +13,8 @@ const draftReceiver = () => {
 	const value: any = Object.create(ChatThreadService.prototype);
 	value.state = { allThreads: { A: { ...thread(['selection-a']), id: 'A' }, B: { ...thread(['selection-b']), id: 'B' } }, currentThreadId: 'A' };
 	value._transientComposerDraftOfThread = new Map<string, string>();
+	value._pendingChatSubmissionOfThread = new Map<string, unknown>();
+	value._onDidChangePendingChatSubmission = { fire() { } };
 	value._parentRunTokenOfThread = new Map<string, symbol>();
 	value._toolsService = { invalidateReadReceipts() { } };
 	value._childToolApprovals = new Map<string, unknown>(); value._onDidChangeChildToolApprovals = { fire() { } };
@@ -37,6 +39,41 @@ suite('Void transient chat composer drafts', () => {
 		assert.strictEqual(value.getTransientComposerDraft('B'), 'draft-b'); assert.deepStrictEqual(value.state.allThreads.B.state.stagingSelections, ['selection-b']); assert.strictEqual(domClears, 0);
 	});
 
+	test('accepted receipt clears synchronously before deferred preparation settles', async () => {
+		const value = draftReceiver(); value.setTransientComposerDraft('A', 'draft-a'); let release!: (accepted: boolean) => void; let domClears = 0;
+		const pending = submitChatComposer({
+			threadId: 'A',
+			submit: () => ({ accepted: true, settled: new Promise<boolean>(resolve => release = resolve) }),
+			clearSubmittedState: id => value.clearSubmittedComposerState(id),
+			getCurrentThreadId: () => value.state.currentThreadId,
+			clearCurrentInput: () => domClears++,
+		});
+		assert.strictEqual(value.getTransientComposerDraft('A'), '');
+		assert.deepStrictEqual(value.state.allThreads.A.state.stagingSelections, []);
+		assert.strictEqual(domClears, 1);
+		release(true);
+		assert.strictEqual(await pending, true);
+	});
+
+	test('pending receipt projects before deferred admission, rejects duplicates, and never persists the row', async () => {
+		const value = draftReceiver(); let release!: (accepted: boolean) => void; let changes = 0;
+		Object.assign(value, {
+			streamState: {},
+			_agentControlGeneration: new Map<string, number>(),
+			_agentDelegationAuthorityOfThread: new Map(),
+			_agentSubagentService: { cancelParent() { }, forgetParent() { } },
+			_currentModelSelectionProps: () => ({ modelSelection: undefined }),
+			_settingsService: { state: { globalSettings: { chatMode: 'chat' }, overridesOfModel: {} } },
+			_onDidChangePendingChatSubmission: { fire() { changes++; } },
+			_addUserMessageAndStreamResponse: () => new Promise<boolean>(resolve => release = resolve),
+		});
+		const receipt = value.beginUserMessageAndStreamResponse({ threadId: 'A', userMessage: 'deferred' });
+		assert.strictEqual(receipt.accepted, true); assert.strictEqual(value.getPendingChatSubmission('A')?.displayContent, 'deferred');
+		assert.strictEqual(value.state.allThreads.A.messages.length, 0); assert.ok(changes >= 1);
+		assert.strictEqual(value.beginUserMessageAndStreamResponse({ threadId: 'A', userMessage: 'duplicate' }).accepted, false);
+		release(true); assert.strictEqual(await receipt.settled, true); assert.strictEqual(value.getPendingChatSubmission('A'), undefined);
+	});
+
 	test('failed or non-admitted submission preserves draft, selections, and input', async () => {
 		const value = draftReceiver(); value.setTransientComposerDraft('A', 'draft-a'); let domClears = 0;
 		const options = { threadId: 'A', clearSubmittedState: (id: string) => value.clearSubmittedComposerState(id), getCurrentThreadId: () => value.state.currentThreadId, clearCurrentInput: () => domClears++ };
@@ -56,12 +93,12 @@ suite('Void transient chat composer drafts', () => {
 		const value: any = { state: { allThreads: { A: { messages: [] } } } };
 		let resolveSuperseded!: (admitted: boolean) => void;
 		value._addUserMessageAndStreamResponse = () => new Promise<boolean>(resolve => resolveSuperseded = resolve);
-		const superseded = ChatThreadService.prototype.addUserMessageAndStreamResponse.call(value, { userMessage: 'older', threadId: 'A' });
+		const superseded = value._addUserMessageAndStreamResponse({ userMessage: 'older', threadId: 'A' });
 		value.state.allThreads.A.messages.push({ role: 'user', displayContent: 'newer' });
 		resolveSuperseded(false);
 		assert.strictEqual(await superseded, false);
 		value._addUserMessageAndStreamResponse = async () => true;
-		assert.strictEqual(await ChatThreadService.prototype.addUserMessageAndStreamResponse.call(value, { userMessage: 'newer', threadId: 'A' }), true);
+		assert.strictEqual(await value._addUserMessageAndStreamResponse({ userMessage: 'newer', threadId: 'A' }), true);
 	});
 
 	test('delete, destructive replacement, reset, duplicate, and dispose respect transient lifecycle', () => {

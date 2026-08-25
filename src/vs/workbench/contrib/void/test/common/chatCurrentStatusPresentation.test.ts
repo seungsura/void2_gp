@@ -71,6 +71,16 @@ suite('Void ChatCurrentStatusPresentation', () => {
 		assert.strictEqual(value.sendDisabled, true);
 	});
 
+	test('projects Preparing synchronously as a cancellable busy state', () => {
+		const value = present({ pendingPreparing: true, hasDraft: false });
+		assert.strictEqual(value.kind, 'preparing');
+		assert.strictEqual(value.liveLabel, 'Preparing');
+		assert.strictEqual(value.detail, 'Esc to cancel');
+		assert.strictEqual(value.announcement, 'Preparing · Esc to cancel');
+		assert.strictEqual(value.showStop, true);
+		assert.strictEqual(value.sendDisabled, true);
+	});
+
 	test('disables Send when the Chat model is unavailable', () => {
 		const value = present({ chatModelUnavailable: true });
 		assert.strictEqual(value.showStop, false);
