@@ -41,9 +41,9 @@ max_concurrent_threads_per_session = 2
 max_depth = 1
 ```
 
-- `max_accepted_children`: `1..8`, default `4`
-- `max_concurrent_threads_per_session`: `1..4`이면서 accepted 이하, default `2`
-- `max_depth`: `1..2`, default `1`
+- `max_accepted_children`: 양의 정수, default `4`
+- `max_concurrent_threads_per_session`: 양의 정수이면서 accepted 이하, default `2`
+- `max_depth`: 0 이상 정수, default `1`
 
 각 key는 user 값 뒤 trusted Project 값이 override합니다. Invalid integer/range, unknown `[agents]` key와 concurrent가 accepted를 넘는 조합은 bounded `agent_delegation_limits_invalid` diagnostic을 남기며 더 큰 authority로 보정하지 않습니다. Valid lower-precedence 값 또는 default가 유지되고 concurrent는 effective accepted를 넘지 않습니다. Config 변경을 확실히 적용하려면 새 Task/session을 시작하세요.
 
@@ -109,7 +109,7 @@ Void는 다음 위치의 direct-child TOML file을 custom agent role로 읽습�
 - user: `$HOME/.codex/agents/*.toml`
 - trusted Project: `<root>/.codex/agents/*.toml`
 
-각 file에는 `name`, `description`, `developer_instructions`가 필요합니다. 선택적으로 `model`, `model_reasoning_effort`, `capability_profile = "read_only" | "inherit_parent_write"`와 exact-name `[[skills.config]]` rule을 사용할 수 있습니다. Legacy `sandbox_mode = "read-only"`는 `read_only` compatibility spelling일 뿐 OS sandbox가 아닙니다.
+각 file에는 `name`, `description`, `developer_instructions`가 필요합니다. child는 fixed parent model을 상속하며, 선택적으로 `capability_profile = "read_only" | "inherit_parent_write"`와 exact-name `[[skills.config]]` rule을 사용할 수 있습니다. Legacy `sandbox_mode = "read-only"`는 `read_only` compatibility spelling일 뿐 OS sandbox가 아닙니다.
 
 ```toml
 name = "reviewer"
@@ -117,8 +117,6 @@ description = "Review a small change and report correctness risks."
 developer_instructions = """
 Inspect the requested scope and separate facts from remaining risks.
 """
-model = "gpt-4.1"
-model_reasoning_effort = "medium"
 capability_profile = "read_only"
 
 [[skills.config]]
@@ -138,7 +136,7 @@ Role catalog 또는 selected role revision이 send 전에 바뀌면 stale role�
 
 Child는 Agent mode의 supported native route에서만 사용합니다. `@Agent` selection 유무와 관계없이 실제 실행은 parent가 `spawn_agent`를 호출할 때 시작됩니다.
 
-Default group은 accepted `4`, concurrent `2`, depth `1`이고 `[agents]` config의 ceiling은 accepted `8`, concurrent `4`, depth `2`입니다. 전체 parent group은 direct와 nested child를 함께 세며 나머지는 admission 순서대로 **FIFO** queue에 머뭅니다. Admission 자체가 실패하면 reservation을 돌려주지만 accepted child가 terminal state가 되어도 그 generation quota는 돌아오지 않습니다. Depth `2`일 때만 child가 nested child를 요청할 수 있고 nested child도 동일한 root owner, frozen authority와 shared nested group budget을 사용합니다.
+Default group은 accepted `4`, concurrent `2`, depth `1`이며 `[agents]` config에서 유효한 값을 선택할 수 있습니다. 전체 parent group은 direct와 nested child를 함께 세며 나머지는 admission 순서대로 **FIFO** queue에 머뭅니다. Admission 자체가 실패하면 reservation을 돌려주고 terminal child가 settle되면 open capacity도 다음 FIFO admission에 반환됩니다. Nested child는 configured depth 안에서만 요청할 수 있고 동일한 root owner, frozen authority와 shared nested group budget을 사용합니다.
 
 Generic child는 parent effective provider/model/reasoning을 상속합니다. Named child만 앞 절의 frozen same-provider role 설정을 적용합니다. 각 child는 parent history와 parent-selected Skill body 전체를 복제하지 않는 별도 context에서 delegated task 하나로 시작합니다. parent에는 bounded identity/status와 새 terminal `receipt` 또는 `receipts`만 전달하며 raw child transcript 전체를 복사하지 않습니다.
 
@@ -172,9 +170,9 @@ Content primary는 bounded raw-match budget을 유지합니다. 한 file의 많�
 
 `wait_agent`는 target을 생략하면 current children 전체를 관찰합니다. `targets`를 사용하면 서로 다른 child `1..8`개를 선택할 수 있습니다. 새 terminal, timeout 또는 removed event에 깨어나고 결과 순서는 spawn order를 유지합니다. 이미 전달한 terminal summary는 다시 주입하지 않습니다. `interrupt_agent`는 current generation의 선택된 queued 또는 running child를 취소합니다. Parent Stop은 nested work를 포함한 current group 전체에 fanout합니다. Child failure나 targeted cancellation은 다른 child나 parent 전체를 자동 abort하지 않습니다.
 
-Group 한도는 provider send 64회, shared deadline 240초와 stored terminal result 합계 32,000 characters입니다. 각 child는 최대 16 turns, 120초와 terminal summary 8,000 characters를 사용합니다. 자동 retry는 없습니다.
+Group은 configured accepted/concurrent/depth로 live work를 조절하고, retained terminal result는 derived aggregate character budget 안에서 보관합니다. budget이 차면 later terminal row와 parent receipt는 남기되 result truncated metadata와 concise diagnostic을 표시합니다. 이 policy는 historical child count 또는 provider send에 임의 상한을 추가하지 않습니다.
 
-Direct/nested child의 provider send, accepted/concurrent count, group deadline과 result characters는 root group 하나에서 차감됩니다. Nested wait 중인 parent child는 scheduler state를 별도로 표시하지만 별도 quota나 live authority를 만들지 않습니다.
+Direct/nested child의 accepted/concurrent state와 result characters는 root group 하나에서 추적됩니다. Nested wait 중인 parent child는 scheduler state를 별도로 표시하지만 별도 quota나 live authority를 만들지 않습니다.
 
 ## Child, Chat history와 composer UI
 
@@ -184,7 +182,7 @@ Local diagnostics는 parent generation마다 처음 **128 events**만 insertion 
 
 Landing의 Chat history는 non-empty chat을 newest-first로 보여 주며 current row와 `Error > Action required > Needs approval > Running > Queued` 우선순위를 구분합니다. Persistent history is not rendered below the current Chat composer. Header의 `View Past Chats` action은 New Chat landing으로 돌아가는 현재 access path입니다. Current 또는 active parent/child row는 실행 중 삭제할 수 없고 삭제 뒤 focus는 남은 safe row/header로 이동합니다. Chat을 바꾸어도 background Running과 Current selection은 서로 다른 상태입니다.
 
-Current Chat composer는 `Error > Needs approval > Running > unavailable > idle` 상태와 Send/Stop 가능 여부를 같은 기준으로 표시합니다. Running 중에도 draft를 편집할 수 있지만 전송되지는 않으며 Escape는 실제 stoppable work만 중단합니다. approval-only 상태에는 parent Stop이 없고 active child가 함께 있을 때만 child Stop을 제공합니다. 각 chat draft는 A→B→A 이동에서 독립적으로 복원되지만 memory-only이므로 restart 뒤에는 보존되지 않습니다.
+Current Chat composer는 `Error > Needs approval > Running > unavailable > idle` 상태와 Send/Stop 가능 여부를 같은 기준으로 표시합니다. Running 중에도 draft를 편집할 수 있고 Queue는 FIFO pending으로, Steer는 safe boundary instruction으로 보존됩니다. Escape는 실제 stoppable work만 중단합니다. Live tool card는 elapsed와 exact receipt-scoped Stop 또는 unavailable reason을 표시합니다. approval-only 상태에는 parent Stop이 없고 active child가 함께 있을 때만 child Stop을 제공합니다. 각 chat draft는 A→B→A 이동에서 독립적으로 복원되지만 memory-only이므로 restart 뒤에는 보존되지 않습니다.
 
 ## Assistant message와 native tool-only history
 
@@ -194,10 +192,10 @@ Exact `(empty message)` sentinel은 parent storage, child history/summary, conve
 
 ## 현재 지원하지 않는 범위
 
-이 릴리스는 direct user/Project custom role, configurable depth-2 ceiling과 profile-aware bounded group을 지원합니다. 다음 범위는 제공하지 않습니다.
+이 릴리스는 direct user/Project custom role, configurable depth와 profile-aware bounded group을 지원합니다. 다음 범위는 제공하지 않습니다.
 
 - persistent child group, restart replay 또는 full child transcript history
-- configured ceiling을 넘는 admission/concurrency/depth
+- configured valid range를 벗어나는 admission/concurrency/depth
 - arbitrary live provider/tool/permission override, independent child elevation 또는 broker 밖 mutation
 - plugin-local custom agent package와 broader permission model
 - Project persistence/routing 또는 full Task/Run history

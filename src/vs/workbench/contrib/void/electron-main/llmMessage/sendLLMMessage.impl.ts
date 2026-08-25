@@ -79,6 +79,32 @@ const parseHeadersJSON = (s: string | undefined): Record<string, string | null |
 
 const corporateCredentialUnavailableMessage = 'Corporate provider credential is unavailable.';
 
+type CorporateProductionSmokeCounters = { requests: number; completed: number; nativeAgentToolSchema: boolean };
+type RuntimeFetch = (this: unknown, ...args: any[]) => Promise<any>;
+type OpenAIClientWithRuntimeFetch = { fetch: RuntimeFetch };
+
+const corporateProductionSmokeClients = new WeakSet<OpenAI>();
+const corporateProductionSmokeNativeToolNames = new Set(['read_file', 'write_file', 'run_command', 'spawn_agent', 'wait_agent', 'interrupt_agent']);
+
+const getCorporateProductionSmokeCounters = () => {
+	if (process.env.VOID_CORPORATE_PRODUCTION_SMOKE !== '1') return undefined;
+	const runtime = globalThis as typeof globalThis & { __voidCorporateProductionSmokeCounters?: CorporateProductionSmokeCounters };
+	return runtime.__voidCorporateProductionSmokeCounters ??= { requests: 0, completed: 0, nativeAgentToolSchema: false };
+};
+
+const configureCorporateProductionSmokeClient = (client: OpenAI) => {
+	const counters = getCorporateProductionSmokeCounters();
+	if (!counters) return;
+	const clientWithFetch = client as unknown as OpenAIClientWithRuntimeFetch;
+	const originalFetch = clientWithFetch.fetch;
+	clientWithFetch.fetch = function (this: unknown, ...args: any[]) {
+		if (counters.requests >= 1) return Promise.reject(new Error('Corporate production smoke permits one request.'));
+		counters.requests += 1;
+		return originalFetch.apply(this, args);
+	};
+	corporateProductionSmokeClients.add(client);
+};
+
 const corporateTestEndpoint = () => {
 	const candidate = process.env.VOID_CORPORATE_TEST_ENDPOINT;
 	if (!candidate) return undefined;
@@ -206,7 +232,9 @@ const newOpenAICompatibleSDK = async ({ settingsOfProvider, providerName, includ
 		const thisConfig = settingsOfProvider[providerName]
 		if (isCorporateOpenAICompatibleEndpoint(thisConfig.endpoint)) {
 			const apiKey = await resolveCorporateCredential()
-			return new OpenAI({ baseURL: corporateTestEndpoint() ?? corporateOpenAICompatibleEndpoint, apiKey, ...commonPayloadOpts })
+			const client = new OpenAI({ baseURL: corporateTestEndpoint() ?? corporateOpenAICompatibleEndpoint, apiKey, ...commonPayloadOpts, ...(getCorporateProductionSmokeCounters() ? { maxRetries: 0 } : {}) })
+			configureCorporateProductionSmokeClient(client)
+			return client
 		}
 		const headers = parseHeadersJSON(thisConfig.headersJSON)
 		return new OpenAI({ baseURL: thisConfig.endpoint, apiKey: thisConfig.apiKey, defaultHeaders: headers, ...commonPayloadOpts })
@@ -362,6 +390,10 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 		// Required to select the model
 		(openai as AzureOpenAI).deploymentName = modelName;
 	}
+	if (corporateProductionSmokeClients.has(openai)) {
+		const counters = getCorporateProductionSmokeCounters();
+		if (counters) counters.nativeAgentToolSchema = specialToolFormat === 'openai-style' && !!potentialTools?.some(tool => corporateProductionSmokeNativeToolNames.has(tool.function.name));
+	}
 	const options = {
 		model: wireModelNameFor(providerName, modelName),
 		messages: messages as any,
@@ -439,11 +471,13 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 			// on final
 			if (!fullTextSoFar && !fullReasoningSoFar && !toolName) {
 				onError({ message: 'Void: Response from model was empty.', fullError: null })
+				return false
 			}
 			else {
 				const toolCall = rawToolCallObjOfParamsStr(toolName, toolParamsStr, toolId)
 				const toolCallObj = toolCall ? { toolCall } : {}
 				onFinalMessage({ fullText: fullTextSoFar, fullReasoning: fullReasoningSoFar, anthropicReasoning: null, ...toolCallObj });
+				return true
 			}
 	}
 	const onErrorFromStream = (error: any, diagnostics: OpenAICompatibleStreamDiagnostics | undefined) => {
@@ -473,7 +507,11 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 			diagnostics.responseHeadersReceived = true;
 			diagnostics.httpStatus = rawResponse.status;
 			diagnostics.requestId = request_id ?? undefined;
-			await consumeResponse(response, diagnostics);
+			const completed = await consumeResponse(response, diagnostics);
+			if (completed && corporateProductionSmokeClients.has(openai)) {
+				const counters = getCorporateProductionSmokeCounters();
+				if (counters) counters.completed += 1;
+			}
 		}
 		catch (error) {
 			onErrorFromStream(error, diagnostics)

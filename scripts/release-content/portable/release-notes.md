@@ -2,6 +2,10 @@
 
 이 문서는 이 portable의 현재 사용자 동작과 검증 경계만 설명합니다. 누적 변경 이력, 내부 장애 기록 또는 향후 계획은 포함하지 않습니다.
 
+## Fixed start
+
+이 portable은 조직용 연결과 model을 package가 관리합니다. provider나 model을 선택하거나 연결 정보를 입력할 필요가 없고 Chat에는 `gpt-5.6-luna`가 표시됩니다. 초기 Settings에는 edits, terminal, MCP tools와 LLM changes의 자동 승인이 켜져 있습니다.
+
 ## Native file tools
 
 ### `write_file`
@@ -23,18 +27,18 @@ OpenAI-compatible Agent의 flat tool schema는 conditional composition에 의존
 ## Agent instructions, Skills와 custom agents
 
 - active owner Project의 `AGENTS.md` chain은 top-level user turn마다 reload되고 같은 turn에는 동일 revision을 유지합니다.
-- user와 trusted Project의 `.codex/config.toml`에서 제한된 developer instruction, Skill enable/disable과 `[agents]` limits를 읽습니다. `max_accepted_children`, `max_concurrent_threads_per_session`, `max_depth`의 범위는 `1..8`, `1..4`(accepted 이하), `1..2`이고 default는 `4`, `2`, `1`입니다. Trusted Project 값이 우선합니다.
+- user와 trusted Project의 `.codex/config.toml`에서 제한된 developer instruction, Skill enable/disable과 `[agents]` limits를 읽습니다. `max_accepted_children`, `max_concurrent_threads_per_session`, `max_depth`의 default는 `4`, `2`, `1`입니다. accepted/concurrent는 양의 정수이고 concurrent는 accepted 이하이며 depth는 0 이상 정수입니다. Trusted Project 값이 우선합니다.
 - `$` direct selector와 `@` menu는 같은 repository/user/plugin `.agents/skills/<name>/SKILL.md` catalog를 사용합니다. Markdown code는 literal이고 missing/ambiguous selection은 draft/staging을 보존한 visible error로 중단합니다.
 - user와 trusted Project의 `.codex/agents/*.toml`은 strict named role을 제공합니다. Duplicate/invalid role은 bounded diagnostic으로 격리되며 stale selection은 provider send 전에 reselect를 요구합니다.
 - Native Agent route는 generic child controls를 marker 없이 제공합니다. `@Agent`는 optional intent이며 named selection은 exact `agent_type`을 고정합니다. Unsupported/no-model route는 provider send 전에 진단됩니다.
 
 ## Profile-aware bounded subagent와 current Chat UI
 
-- Default group limit은 accepted `4`, concurrent `2`, depth `1`이고 configurable ceiling은 `8`, `4`, `2`입니다. FIFO와 shared nested group budget을 사용하고 `wait_agent` targets는 `1..8`개입니다.
+- Default group limit은 accepted `4`, concurrent `2`, depth `1`입니다. FIFO와 shared nested group budget을 사용하고 `wait_agent` targets는 `1..8`개입니다. Terminal child가 settle되면 open capacity는 다음 FIFO admission에 반환되고 retained terminal result는 capacity-derived budget 안에서 truthful truncation metadata를 표시할 수 있습니다.
 - `read_only` role은 `read_file`, `ls_dir`, `search_pathnames_only`, `search_for_files`, `search_in_file`만 노출하며 exact copy는 **Void application-level read-only — terminal disabled, no OS sandbox**입니다.
 - `inherit_parent_write` role은 frozen parent tool snapshot을 broker로 사용합니다. Child Run은 tools, required approval categories와 Undo availability를 표시합니다. Captured parent approval policy가 적용되며 manual approval policy에서는 card settlement를 기다립니다. One mutation-capable child만 동시에 실행되며 nested child도 같은 group budget/cancellation을 공유하고 live authority를 얻지 않습니다.
 - `read_skill_resource`, `spawn_agent`, `wait_agent`, `interrupt_agent`는 각각 **Read Skill resource**, **Start child Agent**, **Wait for child Agent**, **Interrupt child Agent** application card를 사용합니다. Running/Completed/Failed/Rejected/Invalid request/Cancelled/Requested 상태를 표시하고 MCP fallback이나 generic approval을 사용하지 않습니다.
-- transient Child Run panel은 capacity, state, timing과 failure를 표시합니다. Local trace는 first 128 lifecycle events와 이후 dropped count만 보존하며 provider usage가 없으면 `Usage unavailable`을 표시합니다.
+- transient Child Run panel은 capacity, state, timing과 failure를 표시합니다. Running tool card는 always-visible elapsed와 exact card Stop 또는 unavailable reason을 보여 주고 Queue/Steer는 safe boundary까지 pending 상태를 보존합니다. Local trace는 first 128 lifecycle events와 이후 dropped count만 보존하며 provider usage가 없으면 `Usage unavailable`을 표시합니다.
 - Landing의 non-empty Chat history는 newest-first로 Current와 background Running/action-required 상태를 분리합니다. Persistent history is not rendered below the current Chat composer; header의 `View Past Chats`로 landing에 돌아갑니다. Current/active row의 Delete guard와 focus handoff를 유지하며 Chat별 unsent draft는 이동 뒤 복원되지만 restart에는 persist하지 않습니다.
 
 ## Assistant message 표시
@@ -72,4 +76,4 @@ OpenAI-compatible Agent의 flat tool schema는 conditional composition에 의존
 
 ## 확인된 범위와 남은 관찰
 
-Focused schema/planner/service/UI tests는 위 source 계약을 확인합니다. 전체 chat/tool/UI provider E2E, `read_file`의 실제 환경 성능, persistent child group/restart replay, full child transcript history와 arbitrary live provider/tool/permission elevation은 검증 또는 지원 범위를 넘어섭니다. Configured depth-2 nesting과 inherited frozen-parent profile을 arbitrary child authority로 확대 해석하지 마세요. 동봉 prompt의 예상 결과를 통과 사실로 간주하지 말고 실제 환경에서 별도로 기록하세요.
+Focused schema/planner/service/UI tests는 위 source 계약을 확인합니다. 정식 package gate는 fixed startup, controlled Chat 관찰과 project instruction child UI를 포함합니다. 일반 chat/tool/UI provider matrix, `read_file`의 실제 환경 성능, persistent child group/restart replay, full child transcript history와 arbitrary live provider/tool/permission elevation은 검증 또는 지원 범위를 넘어섭니다. Configured depth nesting과 inherited frozen-parent profile을 arbitrary child authority로 확대 해석하지 마세요. 동봉 prompt의 예상 결과를 통과 사실로 간주하지 말고 실제 환경에서 별도로 기록하세요.

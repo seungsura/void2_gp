@@ -362,6 +362,78 @@ suite('Void LLM message channel lifecycle', () => {
 		}
 	});
 
+	test('corporate production smoke permits one fake loopback request without changing ordinary calls', async () => {
+		let requests = 0;
+		let failNextSmokeRequest = false;
+		const server = createServer((request, response) => {
+			requests++;
+			request.resume();
+			if (failNextSmokeRequest) {
+				failNextSmokeRequest = false;
+				response.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
+				response.end('{"error":{"message":"fixture failure"}}');
+				return;
+			}
+			response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+			response.write(`data: ${JSON.stringify({ id: 'chatcmpl-corporate-smoke', object: 'chat.completion.chunk', created: 0, model: corporateOpenAICompatibleWireModelName, choices: [{ index: 0, delta: { role: 'assistant', content: 'ready' }, finish_reason: null }] })}\n\n`);
+			response.write(`data: ${JSON.stringify({ id: 'chatcmpl-corporate-smoke', object: 'chat.completion.chunk', created: 0, model: corporateOpenAICompatibleWireModelName, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
+			response.end('data: [DONE]\n\n');
+		});
+		await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+		const originalEndpoint = process.env.VOID_CORPORATE_TEST_ENDPOINT;
+		const originalKey = process.env.VOID_CORPORATE_API_KEY;
+		const originalPath = process.env.VOID_CORPORATE_API_KEY_PATH;
+		const originalSmoke = process.env.VOID_CORPORATE_PRODUCTION_SMOKE;
+		const runtime = globalThis as typeof globalThis & { __voidCorporateProductionSmokeCounters?: { requests: number; completed: number; nativeAgentToolSchema: boolean } };
+		const originalCounters = runtime.__voidCorporateProductionSmokeCounters;
+		const send = async (requestId: string) => {
+			let finals = 0;
+			let error = '';
+			await sendLLMMessage({ ...corporateParams(requestId), abortRef: { current: null }, onText: () => { }, onFinalMessage: () => finals++, onError: ({ message }: { message: string }) => error = message } as any, metrics);
+			return { finals, error };
+		};
+		try {
+			const address = server.address() as AddressInfo;
+			process.env.VOID_CORPORATE_TEST_ENDPOINT = `http://127.0.0.1:${address.port}`;
+			process.env.VOID_CORPORATE_API_KEY = 'corporate-production-smoke-fake-key';
+			delete process.env.VOID_CORPORATE_API_KEY_PATH;
+			delete process.env.VOID_CORPORATE_PRODUCTION_SMOKE;
+			Reflect.deleteProperty(runtime, '__voidCorporateProductionSmokeCounters');
+
+			assert.deepStrictEqual(await send('ordinary-corporate-first'), { finals: 1, error: '' });
+			assert.deepStrictEqual(await send('ordinary-corporate-second'), { finals: 1, error: '' });
+			assert.strictEqual(requests, 2);
+			assert.strictEqual(runtime.__voidCorporateProductionSmokeCounters, undefined);
+
+			process.env.VOID_CORPORATE_PRODUCTION_SMOKE = '1';
+			failNextSmokeRequest = true;
+			const failed = await send('corporate-production-smoke-no-retry');
+			assert.strictEqual(failed.finals, 0);
+			assert.notStrictEqual(failed.error, '');
+			assert.strictEqual(requests, 3);
+			assert.deepStrictEqual(runtime.__voidCorporateProductionSmokeCounters, { requests: 1, completed: 0, nativeAgentToolSchema: true });
+
+			Reflect.deleteProperty(runtime, '__voidCorporateProductionSmokeCounters');
+			assert.deepStrictEqual(await send('corporate-production-smoke-first'), { finals: 1, error: '' });
+			assert.deepStrictEqual(runtime.__voidCorporateProductionSmokeCounters, { requests: 1, completed: 1, nativeAgentToolSchema: true });
+			const rejected = await send('corporate-production-smoke-second');
+			assert.strictEqual(rejected.finals, 0);
+			assert.notStrictEqual(rejected.error, '');
+			assert.strictEqual(requests, 4);
+			assert.deepStrictEqual(runtime.__voidCorporateProductionSmokeCounters, { requests: 1, completed: 1, nativeAgentToolSchema: true });
+		}
+		finally {
+			restoreEnvironment('VOID_CORPORATE_TEST_ENDPOINT', originalEndpoint);
+			restoreEnvironment('VOID_CORPORATE_API_KEY', originalKey);
+			restoreEnvironment('VOID_CORPORATE_API_KEY_PATH', originalPath);
+			restoreEnvironment('VOID_CORPORATE_PRODUCTION_SMOKE', originalSmoke);
+			if (originalCounters === undefined) Reflect.deleteProperty(runtime, '__voidCorporateProductionSmokeCounters');
+			else runtime.__voidCorporateProductionSmokeCounters = originalCounters;
+			server.closeAllConnections?.();
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
+	});
+
 	test('abort before response headers closes the transport once without terminal emission', async () => {
 		let requestReceivedResolve!: () => void;
 		let transportClosedResolve!: () => void;

@@ -122,7 +122,7 @@ Exact prompt:
 서로 다른 네 child를 sequential spawn_agent call로 시작하세요. 각 child는 temp workspace의 서로 다른 최상위 항목 하나를 읽기 전용으로 조사해야 합니다. 시작 뒤 wait_agent로 전체 상태와 완료 receipt를 수집하세요.
 ```
 
-Expected A: default는 accepted `4`, concurrent `2`, depth `1`입니다. 세 번째와 네 번째 accepted child는 먼저 시작한 running slot이 끝날 때까지 `queued`이고 FIFO admission 순서로 승격됩니다. Child failure는 다른 child를 자동 중단하지 않습니다. Terminal child도 accepted quota를 반환하지 않으므로 다섯 번째 spawn 시도는 같은 generation에서 거부됩니다.
+Expected A: default는 accepted `4`, concurrent `2`, depth `1`입니다. 세 번째와 네 번째 accepted child는 먼저 시작한 running slot이 끝날 때까지 `queued`이고 FIFO admission 순서로 승격됩니다. Child failure는 다른 child를 자동 중단하지 않습니다. Terminal child가 settle되면 open capacity가 반환되어 later sequential child가 admission될 수 있습니다. Child Run row와 ordered receipt는 그대로 남습니다.
 
 작업이 너무 빨라 두 running과 queue를 관찰하지 못하면 capacity header와 tool trace를 확인합니다. 둘 다 확보하지 못하면 timing 부분은 `BLOCKED`로 남기세요.
 
@@ -141,9 +141,9 @@ Exact prompt B:
 한 read_only child를 시작해 temp workspace의 file 이름 하나를 조사하게 하세요. 그 child가 nested read_only child 하나를 시작해 다른 file 이름 하나를 조사하고 자기 `wait_agent`로 nested receipt를 받은 뒤 root parent에게 summary를 반환하게 하세요. Root parent는 root-direct child만 `wait_agent`로 수집하세요.
 ```
 
-Expected B: effective capacity는 accepted `3`, concurrent `1`, depth `2`입니다. Direct/nested work가 같은 FIFO, provider-send/deadline/result budget과 cancellation을 공유하고 nested child는 독립 quota나 live authority를 얻지 않습니다. Root/child receipt가 duplicate 없이 bounded하게 전달됩니다.
+Expected B: effective capacity는 accepted `3`, concurrent `1`, depth `2`입니다. Direct/nested work가 같은 FIFO, cancellation과 aggregate retained-result budget을 공유하고 nested child는 독립 quota나 live authority를 얻지 않습니다. Result budget이 차면 later terminal row와 receipt는 남되 truthful truncation metadata를 표시합니다. Root/child receipt가 duplicate 없이 ordered하게 전달됩니다.
 
-Invalid variation: temp Project의 values를 `9`, `5`, `3`으로 바꾸고 unknown key 하나를 추가한 새 Task/session을 시작합니다. Expected: bounded `agent_delegation_limits_invalid` diagnostics가 보이며 hard ceiling보다 큰 authority로 실행되지 않습니다. Invalid test 뒤에는 즉시 valid fixture를 복원하세요.
+Invalid variation: temp Project의 values를 `0`, `-1`, `-1`으로 바꾸고 unknown key 하나를 추가한 새 Task/session을 시작합니다. Expected: bounded `agent_delegation_limits_invalid` diagnostics가 보이며 invalid value로 authority가 확대되지 않습니다. Invalid test 뒤에는 즉시 valid fixture를 복원하세요.
 
 Record: config scope / new Task 여부 / effective accepted·concurrent·depth / spawn order / queued promotion / nested parent/child / shared budget / invalid diagnostics / receipt order·dedupe.
 
@@ -217,7 +217,7 @@ Landing에서 non-empty Chat A와 B가 newest-first로 보이는지 확인합니
 
 Chat A에 전송하지 않은 `draft-a`를 입력하고 Chat B로 이동해 `draft-b`를 입력한 뒤 A→B로 다시 이동합니다.
 
-Expected: Landing list와 current composer가 동시에 보이지 않습니다. A와 B의 draft가 byte-for-byte 분리되어 복원됩니다. Current marker는 선택한 chat을 따르고 background child/parent work는 별도 `Running` 상태로 남습니다. Current 또는 active row에는 Delete action이 나타나지 않습니다. Inactive safe row를 삭제하면 focus가 남은 row 또는 header로 이동합니다. Composer는 `Error > Needs approval > Running > unavailable > idle` 우선순위에 맞는 Send/Stop 상태를 표시합니다.
+Expected: Landing list와 current composer가 동시에 보이지 않습니다. A와 B의 draft가 byte-for-byte 분리되어 복원됩니다. Current marker는 선택한 chat을 따르고 background child/parent work는 별도 `Running` 상태로 남습니다. Current 또는 active row에는 Delete action이 나타나지 않습니다. Inactive safe row를 삭제하면 focus가 남은 row 또는 header로 이동합니다. Composer는 `Error > Needs approval > Running > unavailable > idle` 우선순위에 맞는 Send/Stop 상태를 표시합니다. Running tool card는 visible elapsed와 exact receipt Stop 또는 unavailable reason을 표시하고, concurrent draft는 Queue 또는 Steer pending row로 관찰합니다.
 
 Void를 정상 종료하고 같은 portable data로 다시 시작합니다. Expected: draft map은 memory-only이므로 A와 B의 unsent draft가 restart 뒤 복원되지 않습니다. Chat storage 또는 Project routing이 구현됐다고 추정하지 마세요.
 
@@ -257,4 +257,4 @@ Record: saved file / pathname result / content result / approval count / termina
 
 ## 해석 주의
 
-이 릴리스는 direct custom role, configured depth-2 nesting, `read_only`와 brokered `inherit_parent_write` profile을 지원합니다. Persistent group/restart replay, full child transcript history, configured ceiling 밖 nesting과 arbitrary live provider/tool/permission elevation은 지원하지 않습니다. 테스트 중 다른 동작이 보이더라도 지원 계약으로 일반화하지 말고 실제 trace와 재현 조건을 기록하세요. Source fixture, compile, React/Windows build와 visible artifact smoke는 actual provider request, UI acceptance, token usage 또는 performance를 증명하지 않습니다.
+이 릴리스는 direct custom role, configured depth nesting, `read_only`와 brokered `inherit_parent_write` profile을 지원합니다. Persistent group/restart replay, full child transcript history, invalid configured values와 arbitrary live provider/tool/permission elevation은 지원하지 않습니다. 정식 package gate에는 fixed startup, controlled Chat과 project instruction child UI 관찰이 포함되지만, 테스트 중 다른 동작이 보이더라도 지원 계약으로 일반화하지 말고 실제 trace와 재현 조건을 기록하세요. Source fixture, compile, React/Windows build와 visible artifact smoke는 general provider matrix, token usage 또는 performance를 증명하지 않습니다.

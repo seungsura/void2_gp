@@ -25,6 +25,8 @@ portable ZIP 자체의 `docs/`에도 시작 안내, current-only release notes�
 
 portable ZIP을 새 폴더에 풀고 일반 사용자 권한으로 `Void.exe`를 실행하세요. portable 데이터는 압축 해제 폴더의 `data` 아래에 만들어집니다. 기존 설치본이나 다른 portable 복사본 위에 덮어 풀지 마세요.
 
+이 portable은 조직용 연결과 model을 package가 관리합니다. provider나 model을 선택하거나 연결 정보를 입력할 필요가 없고 Chat에는 `gpt-5.6-luna`가 표시됩니다.
+
 ```powershell
 Get-FileHash -Algorithm SHA256 .\Void-1.99.3-win32-x64-portable.zip
 Expand-Archive .\Void-1.99.3-win32-x64-portable.zip .\Void-1.99.3-portable
@@ -35,7 +37,7 @@ Expand-Archive .\Void-1.99.3-win32-x64-portable.zip .\Void-1.99.3-portable
 
 이 릴리스는 Agent mode에서 `AGENTS.md`, user/trusted Project `.codex/config.toml`, `.agents/skills` catalog와 user/trusted Project `.codex/agents/*.toml` custom role을 제공합니다. Native Agent route에서는 child control이 marker 없이 generic하게 제공됩니다. `@Agent`는 optional generic/named intent이며 named role selection은 exact `agent_type`을 고정합니다. 지원하지 않는 provider format이나 사용할 model이 없는 경우에는 history/provider send 전에 bounded diagnostic으로 중단합니다.
 
-`[agents]`의 `max_accepted_children`, `max_concurrent_threads_per_session`, `max_depth`는 각각 `1..8`, `1..4`(accepted 이하), `1..2`이고 default는 `4`, `2`, `1`입니다. Trusted Project 값이 user 값을 override합니다. FIFO와 shared nested group budget을 사용하며 `wait_agent`는 target `1..8`개를 받을 수 있습니다.
+`[agents]`의 `max_accepted_children`, `max_concurrent_threads_per_session`, `max_depth` default는 각각 `4`, `2`, `1`입니다. accepted/concurrent는 양의 정수이고 concurrent는 accepted 이하이며 depth는 0 이상 정수입니다. Trusted Project 값이 user 값을 override합니다. FIFO와 shared nested group budget을 사용하며 `wait_agent`는 target `1..8`개를 받을 수 있습니다. Terminal child가 settle되면 open capacity는 다음 FIFO admission에 반환됩니다.
 
 Role의 `read_only` profile은 exact five read tools만 제공하고 terminal, MCP와 mutation을 제공하지 않습니다. `inherit_parent_write` profile은 parent가 turn admission 때 가진 frozen parent tool snapshot만 broker를 통해 사용합니다. Child Run은 available tools, required approval categories와 Undo 가능 여부를 표시합니다. Captured parent approval policy가 적용되며 manual approval policy에서는 그 card가 settle될 때까지 기다립니다. Mutation-capable child는 한 번에 하나만 실행되고 nested child도 같은 group budget과 cancellation을 공유하며 live authority 또는 독립 elevation을 얻지 않습니다.
 
@@ -45,7 +47,7 @@ Child Run UI는 capacity/status, 실패와 bounded timing/timeline을 표시합�
 
 Provider/tool loop의 native empty tool-call content는 fake display text로 바꾸지 않습니다. Exact `(empty message)` sentinel은 parent/child outbound history, persisted display와 renderer에 남지 않으며 non-empty reasoning-only content는 reasoning bubble로 계속 보입니다.
 
-focused tests, compile·React·Windows build와 visible artifact smoke는 actual provider/network E2E 증거가 아닙니다. prompt의 예상 결과를 미리 통과 사실로 기록하지 마세요.
+focused tests, compile·React·Windows build와 packaged fixed-start/Chat/child UI smoke는 release gate입니다. 다만 일반 provider matrix, mutation 결과와 performance 전체를 대신하는 증거는 아닙니다. prompt의 예상 결과를 미리 통과 사실로 기록하지 마세요.
 
 ## Ghost Chat
 
@@ -61,7 +63,7 @@ Settings의 shared switch는 실제 native checkbox를 interaction owner로 유�
 
 OpenAI-compatible Agent의 `write_file`은 root `type: object`, `create`/`modify` operation enum과 optional branch fields를 가진 flat model-facing schema를 사용합니다. `oneOf`, `anyOf`, `allOf`, `if`, `then`, `else`, `const`는 사용하지 않습니다. create/modify의 required·forbidden 조합, unknown key 거부, current read receipt와 stale snapshot 검사는 runtime이 계속 엄격하게 강제합니다.
 
-완료 전에 닫힌 stream은 tool success로 처리하지 않습니다. 사용자에게 보이는 진단은 configured route, tool/schema posture와 stream phase를 구분할 수 있으며 API key, custom headers, request content를 기록하지 않아야 합니다. 중요한 파일을 변경하기 전 작은 임시 workspace에서 실제 chat, tool trace, editor 결과와 Undo를 함께 확인하세요.
+완료 전에 닫힌 stream은 tool success로 처리하지 않습니다. 사용자에게 보이는 진단은 tool/schema posture와 stream phase를 구분할 수 있으며 secret 또는 request content를 기록하지 않아야 합니다. 중요한 파일을 변경하기 전 작은 임시 workspace에서 실제 chat, tool trace, editor 결과와 Undo를 함께 확인하세요.
 
 ## 현재 패키지 gate
 
@@ -71,8 +73,8 @@ OpenAI-compatible Agent의 `write_file`은 root `type: object`, `create`/`modify
 
 ## 확인된 범위와 남은 경계
 
-focused schema/planner/diagnostic, Agent orchestration과 production suggestion admission tests는 현재 source 계약을 확인하지만 전체 actual-provider/UI E2E를 대신하지 않습니다. Built production에서는 persisted setting 값과 관계없이 automatic Ghost request와 selection helper UI가 0이어야 합니다.
+focused schema/planner/diagnostic, Agent orchestration과 production suggestion admission tests는 현재 source 계약을 확인합니다. 정식 package gate는 fixed startup, Agent workspace instruction/child UI와 한 번의 controlled Chat 관찰을 포함하지만, 전체 provider/UI matrix를 대신하지는 않습니다. Built production에서는 persisted setting 값과 관계없이 automatic Ghost request와 selection helper UI가 0이어야 합니다.
 
-실제 chat/provider request, 승인 UI, create/modify 적용과 Undo, AGENTS/Skill/custom-agent/subagent 동작은 동봉 prompt를 사용해 확인하세요. `read_file`의 실제 provider/UI E2E와 read performance/closed-file streaming gate도 미검증입니다.
+일반 provider 조합, 승인 UI, create/modify 적용과 Undo, AGENTS/Skill/custom-agent/subagent의 넓은 작업 사례는 동봉 prompt를 사용해 확인하세요. `read_file`의 실제 performance/closed-file streaming gate와 mutation workflow 전체도 별도 관찰 대상입니다.
 
 프롬프트는 탐색적 테스트이지 통과 사실이 아닙니다. 실제 결과, provider/model, tool trace, UI 상태를 기록한 경우에만 해당 환경의 관찰 증거가 됩니다.

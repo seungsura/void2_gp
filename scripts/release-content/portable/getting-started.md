@@ -21,11 +21,11 @@ Expand-Archive .\Void-*-win32-x64-portable.zip .\Void-portable
 
 일반 사용자 권한으로 실행하세요. portable 설정, 로그, 확장과 작업 데이터는 압축을 푼 폴더의 `data/` 아래에 만들어집니다. portable 폴더를 교체하기 전에는 필요한 `data/`를 별도로 보관하세요.
 
-## 3. provider와 model 설정
+## 3. 첫 Chat
 
-조직 또는 서비스가 제공한 정확한 endpoint와 model 이름을 사용하세요. OpenAI-compatible provider는 기본 model 목록이 비어 있어 model을 직접 추가해야 할 수 있습니다. 화면에 설정한 model 이름과 실제 service route가 같다고 가정하지 말고, 첫 대화와 도구 호출 결과를 확인한 뒤 중요한 파일 작업을 시작하세요.
+이 portable은 조직용 연결과 model을 package가 관리합니다. provider나 model을 선택하거나 연결 정보를 입력할 필요가 없습니다. Chat에는 `gpt-5.6-luna`가 표시됩니다. 첫 대화와 도구 결과를 확인한 뒤 중요한 파일 작업을 시작하세요.
 
-자동 retry나 다른 chat mode로의 묵시적 전환을 기대하지 마세요. 연결 오류가 나면 표시된 진단 단계와 provider/model 설정을 기록하고, 같은 요청을 반복하기 전에 원인을 확인하세요.
+초기 Settings에는 edits, terminal, MCP tools와 LLM changes의 자동 승인이 켜져 있습니다. 필요하면 현재 Project의 작업 방식에 맞게 명시적으로 바꾸세요. 연결 오류가 나면 표시된 진단을 기록하고, 같은 요청을 반복하기 전에 원인을 확인하세요.
 
 ## 4. Agent instructions를 작은 workspace에서 확인
 
@@ -40,7 +40,7 @@ max_concurrent_threads_per_session = 2
 max_depth = 1
 ```
 
-허용 범위는 각각 `1..8`, `1..4`(accepted 이하), `1..2`입니다. 위 값은 default와 같습니다. 범위를 벗어난 값, unknown key와 concurrent가 accepted를 넘는 조합은 bounded diagnostic을 만들며 authority를 확대하지 않습니다.
+`max_accepted_children`와 `max_concurrent_threads_per_session`은 양의 정수이고 concurrent는 accepted 이하이어야 합니다. `max_depth`는 0 이상 정수입니다. 이 값에는 별도 고정 상한이 없으며, 잘못된 값이나 unknown key는 bounded diagnostic을 만들고 authority를 확대하지 않습니다.
 
 Custom role은 `capability_profile = "read_only"` 또는 `capability_profile = "inherit_parent_write"`를 사용할 수 있습니다. 먼저 `read_only`와 작은 read task로 role을 확인하세요. Inherited profile을 확인할 때에는 폐기 가능한 fixture file 하나만 사용하고, Child Run의 frozen tool list·manual approval·Undo를 읽은 뒤 원래 bytes로 되돌리세요. 중요한 workspace에서 permission 경계를 처음 시험하지 마세요.
 
