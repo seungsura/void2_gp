@@ -5,6 +5,7 @@
 
 const fs = require('node:fs');
 const http = require('node:http');
+const os = require('node:os');
 const path = require('node:path');
 const { StringDecoder } = require('node:string_decoder');
 const { _electron } = require('@playwright/test');
@@ -38,6 +39,7 @@ function argument(name) {
 	if (index < 0 || index + 1 >= process.argv.length) throw new Error(`Missing required argument: ${name}`);
 	return process.argv[index + 1];
 }
+function hasArgument(name) { return process.argv.includes(name); }
 function sanitize(value) {
 	return String(value).replaceAll(FAKE_KEY, '[redacted]').replace(/(?:sk-|Bearer\s+)[A-Za-z0-9._-]+/gi, '[redacted]').replace(/[\r\n]+/g, ' ').slice(0, 500);
 }
@@ -45,6 +47,27 @@ function assertRegularPath(value, label) {
 	const resolved = path.resolve(value);
 	if (!fs.existsSync(resolved) || fs.lstatSync(resolved).isSymbolicLink()) throw new Error(`${label} is unavailable.`);
 	return resolved;
+}
+function assertRegularDirectory(value, label) {
+	const resolved = assertRegularPath(value, label);
+	if (!fs.lstatSync(resolved).isDirectory()) throw new Error(`${label} is unavailable.`);
+	return resolved;
+}
+function assertRegularFile(value, label) {
+	const resolved = assertRegularPath(value, label);
+	if (!fs.lstatSync(resolved).isFile()) throw new Error(`${label} is unavailable.`);
+	return resolved;
+}
+function samePath(left, right) {
+	const normalize = value => process.platform === 'win32' ? path.resolve(value).toLowerCase() : path.resolve(value);
+	return normalize(left) === normalize(right);
+}
+function isWithin(root, value) {
+	const relative = path.relative(path.resolve(root), path.resolve(value));
+	return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`));
+}
+function assertDisjoint(root, value, label) {
+	if (isWithin(root, value) || isWithin(value, root)) throw new Error(`${label} must be outside the development source.`);
 }
 function assertContained(root, value, label) {
 	const resolvedRoot = path.resolve(root);
@@ -58,10 +81,18 @@ function makeDirectory(root, leaf) {
 	fs.mkdirSync(target, { recursive: true });
 	return assertRegularPath(target, leaf);
 }
+function assertFreshDevelopmentRunRoot(value, developmentAppRoot) {
+	const runRoot = assertRegularDirectory(value, 'development run root');
+	const temporaryRoot = assertRegularDirectory(os.tmpdir(), 'OS temporary directory');
+	assertContained(temporaryRoot, runRoot, 'development run root');
+	assertDisjoint(developmentAppRoot, runRoot, 'development run root');
+	if (fs.readdirSync(runRoot).length !== 0) throw new Error('Development run root must be empty.');
+	return runRoot;
+}
 function sleep(milliseconds) { return new Promise(resolve => setTimeout(resolve, milliseconds)); }
 function expectedAssertions(mode) { return mode === 'fake' ? fakeAssertions : productionAssertions; }
-function newEvidence(mode) {
-	return {
+function newEvidence(mode, development = false) {
+	const evidence = {
 		kind: 'void-packaged-ui-smoke', schemaVersion: 2, mode, pass: false, assertions: [], errors: [], mainStderr: [],
 		close: { attempted: false, completed: false, error: null },
 		launch: { isolated: true, provider: 'openAICompatible', network: mode === 'fake' ? 'loopback fake endpoint only' : 'packaged provider one-request smoke', credentials: mode === 'fake' ? 'fake key redacted' : 'packaged resolver only' },
@@ -69,6 +100,8 @@ function newEvidence(mode) {
 			? { requests: 0, pathExact: false, wireModelGpt41: false, parentAgentsMarker: false, parentConfigMarker: false, parentSpawnAgentControlTool: false, childRequests: 0, childRoleMarker: false, childReadOnlyToolsExact: false, childControlToolsAbsent: false }
 			: { requests: 0, completed: 0, nativeAgentToolSchema: false },
 	};
+	if (development) evidence.launch.provenance = 'development-source-app fake-only';
+	return evidence;
 }
 function writeEvidence(evidence) {
 	if (evidenceWritten || !evidencePath) return;
@@ -84,7 +117,8 @@ function recordMainStderrLine(evidence, line) {
 	const dep0168 = /^\(node:\d+\) \[DEP0168\] DeprecationWarning: Uncaught N-API callback exception detected/;
 	const watcher = /^\[main .*UtilityProcess id: \d+, type: fileWatcher, pid: <none>\]: unable to kill the process$/;
 	const disposable = /^Error: Trying to add a disposable to a DisposableStore that has already been disposed of\./;
-	if (dep0168.test(message) || (evidence.close.attempted && (watcher.test(message) || disposable.test(message)))) return;
+	const developmentJumpList = evidence.launch.provenance === 'development-source-app fake-only' && /^\[\d+:\d+\/\d+\.\d+:ERROR:electron_api_app\.cc\(\d+\)\] Failed to begin Jump List transaction\.$/.test(message);
+	if (dep0168.test(message) || developmentJumpList || (evidence.close.attempted && (watcher.test(message) || disposable.test(message)))) return;
 	if (/\b(?:ReferenceError|TypeError|SyntaxError|Unhandled|uncaught|fatal|ERR_[A-Z_]+)\b|\bError:|\bunable to kill\b/i.test(message)) addError(evidence, 'main-stderr', message);
 }
 function createMainStderrRecorder(evidence) {
@@ -191,13 +225,26 @@ function writeFixtureWorkspace(workspace, mode) {
 	fs.writeFileSync(assertContained(codex, path.join(codex, 'config.toml'), 'fixture config'), 'developer_instructions = "VOID_SMOKE_CONFIG_MARKER"\n\n[agents]\nmax_accepted_children = 5\nmax_concurrent_threads_per_session = 2\nmax_depth = 1\n', 'utf8');
 	fs.writeFileSync(assertContained(agents, path.join(agents, 'fixture-reader.toml'), 'fixture role'), 'name = "fixture-reader"\ndescription = "Read the fixture only."\ndeveloper_instructions = "VOID_SMOKE_ROLE_MARKER"\nsandbox_mode = "read-only"\ncapability_profile = "read_only"\n', 'utf8');
 }
-function launchEnvironment(mode, home, fakeEndpoint) {
+function launchEnvironment(mode, home, fakeEndpoint, developmentAppRoot) {
 	const env = { ...process.env, HOME: home, USERPROFILE: home, APPDATA: path.join(home, 'AppData'), LOCALAPPDATA: path.join(home, 'AppData', 'Local') };
 	for (const key of ['VOID_CORPORATE_TEST_ENDPOINT', 'VOID_CORPORATE_API_KEY', 'VOID_CORPORATE_API_KEY_PATH', 'VOID_CORPORATE_PRODUCTION_SMOKE', 'DEBUG', 'OPENAI_LOG', 'NODE_DEBUG']) delete env[key];
-	if (mode === 'fake') { env.VOID_CORPORATE_TEST_ENDPOINT = fakeEndpoint; env.VOID_CORPORATE_API_KEY = FAKE_KEY; } else env.VOID_CORPORATE_PRODUCTION_SMOKE = '1';
+	if (mode === 'fake') {
+		env.VOID_CORPORATE_TEST_ENDPOINT = fakeEndpoint;
+		env.VOID_CORPORATE_API_KEY = FAKE_KEY;
+		if (developmentAppRoot) {
+			delete env.ELECTRON_RUN_AS_NODE;
+			env.NODE_ENV = 'development';
+			env.VSCODE_DEV = '1';
+			env.VSCODE_CLI = '1';
+		}
+	} else env.VOID_CORPORATE_PRODUCTION_SMOKE = '1';
 	return env;
 }
 async function waitVisible(locator, label) { await locator.waitFor({ state: 'visible', timeout: timeoutMs }); if (!(await locator.isVisible())) throw new Error(`${label} was not visible.`); }
+async function waitForCurrentRunToSettle(page) {
+	await page.locator('#void-chat-current-stop:visible').waitFor({ state: 'hidden', timeout: timeoutMs });
+}
+async function waitForEnabledCurrentSend(page) { await waitVisible(page.locator('#void-chat-current-send:not([disabled])'), 'enabled current Send'); }
 async function assertNoOnboarding(page) {
 	const onboarding = page.getByRole('button', { name: 'Get Started', exact: true });
 	if (await onboarding.count() > 0 && await onboarding.first().isVisible().catch(() => false)) throw new Error('Fixed product rendered onboarding.');
@@ -205,16 +252,16 @@ async function assertNoOnboarding(page) {
 async function openVoidSettings(page) {
 	await page.keyboard.press('Control+Shift+P');
 	const commandBox = page.getByPlaceholder('Type the name of a command to run.'); await waitVisible(commandBox, 'Command Palette');
-	await commandBox.fill('Void: Open Settings');
-	const command = page.getByText('Void: Open Settings', { exact: true }).last(); await waitVisible(command, 'Void Settings command'); await command.click();
+	await commandBox.fill('>Void: Open Settings');
+	await page.keyboard.press('Enter');
 }
 async function assertSettings(page) {
 	await openVoidSettings(page);
-	const general = page.getByText('General', { exact: true }).last(); if (await general.count()) await general.click();
+	const general = page.getByRole('button', { name: 'General', exact: true }); if (await general.count()) await general.click();
 	const heading = page.getByRole('heading', { name: 'Agent delegation', exact: true }); await waitVisible(heading, 'Agent delegation settings');
 	const text = await heading.locator('..').innerText();
 	for (const required of ['Open children', '5', 'Concurrent children', '2', 'Maximum depth', '1', 'project']) if (!text.includes(required)) throw new Error(`Agent delegation settings did not show ${required}.`);
-	const featureOptions = page.getByText('Feature Options', { exact: true }).last(); await waitVisible(featureOptions, 'Feature Options settings'); await featureOptions.click();
+	const featureOptions = page.getByRole('button', { name: 'Feature Options', exact: true }); await waitVisible(featureOptions, 'Feature Options settings'); await featureOptions.click();
 	for (const label of ['Auto-approve edits', 'Auto-approve terminal', 'Auto-approve MCP tools', 'Auto-accept LLM changes']) { const checkbox = page.getByRole('switch', { name: label, exact: true }); await waitVisible(checkbox, label); if (!(await checkbox.isChecked())) throw new Error(`${label} was not enabled by defaults.`); }
 }
 async function assertFixedAgentOnlyComposer(luna) {
@@ -225,8 +272,12 @@ async function assertFixedAgentOnlyComposer(luna) {
 	}
 }
 async function selectFixtureAgent(page, chat) {
-	await chat.fill('@'); const agentOption = page.getByText('Agent', { exact: true }).last(); await waitVisible(agentOption, 'Agent mention category'); await agentOption.click();
-	const fixtureRole = page.getByText('fixture-reader', { exact: true }).last(); await waitVisible(fixtureRole, 'fixture-reader role'); await fixtureRole.click();
+	await chat.click(); await page.keyboard.type('@');
+	const agent = page.getByRole('option', { name: 'Agent', exact: true }); await waitVisible(agent, 'Agent picker option');
+	for (let index = 0; index < 3; index++) await page.keyboard.press('ArrowDown');
+	await page.keyboard.press('Enter');
+	const fixtureRole = page.getByRole('option', { name: 'fixture-reader', exact: true }); await waitVisible(fixtureRole, 'fixture-reader picker option');
+	await page.keyboard.press('ArrowDown'); await page.keyboard.press('Enter');
 }
 async function runFakeAcceptance(page, evidence, fakeServer) {
 	await assertNoOnboarding(page); evidence.assertions.push('fixed-start-without-onboarding');
@@ -236,15 +287,24 @@ async function runFakeAcceptance(page, evidence, fakeServer) {
 	await waitVisible(chat, 'Chat composer after Settings'); await selectFixtureAgent(page, chat); await chat.fill('Inspect the fixture with the selected Agent.'); await send.click(); await fakeServer.waitForChild();
 	if (!evidence.transport.pathExact || !evidence.transport.wireModelGpt41 || !evidence.transport.parentAgentsMarker || !evidence.transport.parentConfigMarker || !evidence.transport.parentSpawnAgentControlTool || evidence.transport.childRequests !== 1 || !evidence.transport.childRoleMarker || !evidence.transport.childReadOnlyToolsExact || !evidence.transport.childControlToolsAbsent) throw new Error('Fixed route, project instructions, parent control, or read-only child tool contract did not reach fake provider.');
 	evidence.assertions.push('child-agent-project-instructions');
-	const childRuns = page.locator('section[aria-label="Child runs"]'); await waitVisible(childRuns, 'Child runs'); const childSummary = childRuns.locator('summary'); await waitVisible(childSummary, 'Child run summary');
+	const childRuns = page.locator('section[aria-label="Child runs"]'); await waitVisible(childRuns, 'Child runs'); const childSummary = childRuns.locator('summary[aria-label^="Child Run "]'); await waitVisible(childSummary, 'Child run summary');
 	if (!/Running/i.test(await childSummary.innerText())) throw new Error('Child run did not remain visibly Running before held response settled.');
-	await page.waitForFunction(() => [...document.querySelectorAll('[data-testid="void-tool-card-stop"]')].some(element => element.disabled && String(element.getAttribute('title') || '').includes('child control')), undefined, { timeout: timeoutMs });
-	fakeServer.releaseChild(); await page.waitForFunction(() => /completed/i.test(document.querySelector('section[aria-label="Child runs"] summary')?.textContent || ''), undefined, { timeout: timeoutMs }); if (await childSummary.count() !== 1) throw new Error('Child run history was duplicated.'); evidence.assertions.push('child-running-and-completed');
-	await chat.fill('VOID_SMOKE_TERMINAL'); await send.click(); const terminalStop = page.getByRole('button', { name: 'Stop this tool', exact: true }); await waitVisible(terminalStop, 'Terminal card Stop'); if (await terminalStop.isDisabled()) throw new Error('Terminal card Stop was not independently enabled.');
+	const childControlStop = page.locator('[data-testid="void-tool-card-stop"][disabled]'); await waitVisible(childControlStop, 'disabled child control Stop'); if (!/child control/i.test(await childControlStop.getAttribute('title') || '')) throw new Error('Child control Stop did not explain its disabled scope.');
+	fakeServer.releaseChild(); await waitVisible(childRuns.locator('summary[aria-label^="Child Run "]').filter({ hasText: /completed/i }), 'completed child run'); if (await childSummary.count() !== 1) throw new Error('Child run history was duplicated.'); evidence.assertions.push('child-running-and-completed'); await waitForCurrentRunToSettle(page);
+	await chat.fill('VOID_SMOKE_TERMINAL'); await waitForEnabledCurrentSend(page); await chat.press('Enter'); const terminalStop = page.getByRole('button', { name: 'Stop this tool', exact: true }); await waitVisible(terminalStop, 'Terminal card Stop'); if (await terminalStop.isDisabled()) throw new Error('Terminal card Stop was not independently enabled.');
 	await page.waitForTimeout(1_050); const elapsed = page.getByTestId('void-tool-elapsed').last(); await waitVisible(elapsed, 'Visible tool elapsed'); if (!/Elapsed\s+\d+s/.test(await elapsed.innerText())) throw new Error('Live tool elapsed text was not rendered.');
-	await chat.fill('VOID_SMOKE_QUEUE'); await page.getByRole('button', { name: 'Queue message', exact: true }).click(); await chat.fill('VOID_SMOKE_STEER'); await page.getByRole('combobox', { name: 'More message actions', exact: true }).selectOption('steer');
+	await chat.fill('VOID_SMOKE_QUEUE'); await page.getByRole('button', { name: 'Queue message', exact: true }).press('Enter'); await chat.fill('VOID_SMOKE_STEER'); await page.getByRole('combobox', { name: 'More message actions', exact: true }).selectOption('steer');
 	const pending = page.locator('section[aria-label="Queued messages"]'); await waitVisible(pending, 'Queued messages'); const pendingText = await pending.innerText(); if (!pendingText.includes('Queue') || !pendingText.includes('Steer')) throw new Error('Queue and Steer were not retained while terminal was live.'); evidence.assertions.push('queue-and-steer-during-live-tool');
-	await terminalStop.click(); await page.getByRole('button', { name: 'Cancelling this tool', exact: true }).waitFor({ state: 'visible', timeout: timeoutMs }); await page.getByText(/Cancelled|Canceled/i).last().waitFor({ state: 'visible', timeout: timeoutMs }); evidence.assertions.push('receipt-local-terminal-stop');
+	// A fast physical terminal close can replace the transient Cancelling button
+	// before Playwright observes it. The terminal row then exposes the exact
+	// rejected-card marker, whose user-facing tooltip is "Canceled".
+	const canceledMarkers = page.locator('[data-tooltip-content="Canceled"]');
+	const canceledBefore = await canceledMarkers.count();
+	await terminalStop.press('Enter');
+	await terminalStop.waitFor({ state: 'hidden', timeout: timeoutMs });
+	await canceledMarkers.nth(canceledBefore).waitFor({ state: 'visible', timeout: timeoutMs });
+	if (await canceledMarkers.count() !== canceledBefore + 1) throw new Error('Terminal card Stop did not settle exactly one cancelled receipt.');
+	evidence.assertions.push('receipt-local-terminal-stop');
 }
 async function runProductionAcceptance(page, electronApp, evidence) {
 	await assertNoOnboarding(page); evidence.assertions.push('fixed-start-without-onboarding');
@@ -264,13 +324,17 @@ async function runProductionAcceptance(page, electronApp, evidence) {
 	await waitVisible(page.getByText('OK', { exact: true }).last(), 'Production smoke exact response');
 	evidence.transport = counters; evidence.assertions.push('production-single-completed-request');
 }
-async function launchAndExercise(mode, evidence, smokeRoot, exe) {
-	const workspace = makeDirectory(smokeRoot, `${mode}-workspace`); const userData = makeDirectory(smokeRoot, `${mode}-user-data`); const extensions = makeDirectory(smokeRoot, `${mode}-extensions`); const logs = makeDirectory(smokeRoot, `${mode}-logs`); const crash = makeDirectory(smokeRoot, `${mode}-crash`); const home = makeDirectory(smokeRoot, `${mode}-home`);
+async function launchAndExercise(mode, evidence, runRoot, exe, developmentAppRoot) {
+	const workspace = makeDirectory(runRoot, `${mode}-workspace`); const userData = makeDirectory(runRoot, `${mode}-user-data`); const extensions = makeDirectory(runRoot, `${mode}-extensions`); const logs = makeDirectory(runRoot, `${mode}-logs`); const crash = makeDirectory(runRoot, `${mode}-crash`); const home = makeDirectory(runRoot, `${mode}-home`);
+	if (developmentAppRoot) { const editorHome = makeDirectory(home, '.void-editor'); makeDirectory(editorHome, 'extensions'); }
 	writeFixtureWorkspace(workspace, mode);
 	let fakeServer; let electronApp; let mainOutput = Promise.resolve(); const stderr = createMainStderrRecorder(evidence);
 	try {
 		if (mode === 'fake') fakeServer = await startFakeServer(evidence);
-		electronApp = await _electron.launch({ executablePath: exe, args: [workspace, `--user-data-dir=${userData}`, `--extensions-dir=${extensions}`, `--logsPath=${logs}`, `--crash-reporter-directory=${crash}`, '--disable-extensions', '--disable-gpu', '--disable-background-networking', '--disable-component-update', '--no-proxy-server', '--disable-telemetry', '--disable-workspace-trust', '--disable-updates', '--use-inmemory-secretstorage', '--skip-release-notes', '--skip-welcome', '--no-cached-data', '--enable-smoke-test-driver'], env: launchEnvironment(mode, home, fakeServer?.endpoint) });
+		const launchArguments = [...(developmentAppRoot ? [developmentAppRoot] : []), workspace, `--user-data-dir=${userData}`, `--extensions-dir=${extensions}`, `--logsPath=${logs}`, `--crash-reporter-directory=${crash}`, '--disable-extensions', '--disable-gpu', '--disable-background-networking', '--disable-component-update', '--no-proxy-server', '--disable-telemetry', '--disable-workspace-trust', '--disable-updates', '--use-inmemory-secretstorage', '--skip-release-notes', '--skip-welcome', '--no-cached-data', '--enable-smoke-test-driver'];
+		const launchOptions = { executablePath: exe, args: launchArguments, env: launchEnvironment(mode, home, fakeServer?.endpoint, developmentAppRoot) };
+		if (developmentAppRoot) launchOptions.cwd = runRoot;
+		electronApp = await _electron.launch(launchOptions);
 		const pages = new WeakSet(); const context = electronApp.context(); context.on('page', page => attachPageListeners(page, evidence, pages)); for (const page of context.pages()) attachPageListeners(page, evidence, pages);
 		const child = electronApp.process(); if (child.stderr) child.stderr.on('data', stderr.accept); mainOutput = waitForMainProcessOutput(child);
 		const page = await electronApp.firstWindow({ timeout: timeoutMs }); attachPageListeners(page, evidence, pages);
@@ -282,13 +346,41 @@ async function launchAndExercise(mode, evidence, smokeRoot, exe) {
 		if (fakeServer) await fakeServer.close().catch(error => addError(evidence, 'fake-loopback-close', error));
 	}
 }
+function resolveLaunchContract(mode) {
+	const hasDevelopmentAppRoot = hasArgument('--development-app-root');
+	const hasDevelopmentRunRoot = hasArgument('--development-run-root');
+	if (mode !== 'fake' && (hasDevelopmentAppRoot || hasDevelopmentRunRoot)) throw new Error('Development launch flags are fake-only.');
+	if (hasDevelopmentAppRoot !== hasDevelopmentRunRoot) throw new Error('Development app and run roots must be supplied together.');
+	const smokeRoot = assertRegularPath(argument('--smoke-root'), 'smoke root');
+	if (!hasDevelopmentAppRoot) {
+		const resolvedEvidencePath = assertContained(smokeRoot, argument('--evidence'), 'evidence path');
+		if (fs.existsSync(resolvedEvidencePath)) throw new Error('Evidence path must be absent before launch.');
+		const productRoot = assertRegularPath(argument('--product-root'), 'extracted product root');
+		assertContained(smokeRoot, productRoot, 'extracted product root');
+		const exe = assertRegularPath(argument('--exe'), 'Void executable');
+		if (path.dirname(exe) !== productRoot) throw new Error('Void executable was not the immediate extracted product child.');
+		return { smokeRoot, runRoot: smokeRoot, productRoot, exe, evidencePath: resolvedEvidencePath, developmentAppRoot: undefined };
+	}
+	if (hasArgument('--product-root') || hasArgument('--exe')) throw new Error('Development launch derives the product root and executable.');
+	const developmentAppRoot = assertRegularDirectory(argument('--development-app-root'), 'development app root');
+	assertRegularFile(path.join(developmentAppRoot, 'package.json'), 'development package manifest');
+	assertRegularFile(path.join(developmentAppRoot, 'out', 'main.js'), 'development entrypoint');
+	if (!samePath(smokeRoot, path.join(developmentAppRoot, '.build'))) throw new Error('Development smoke root must be the source build directory.');
+	assertRegularDirectory(smokeRoot, 'development build root');
+	const productRoot = assertRegularDirectory(path.join(smokeRoot, 'electron'), 'development product root');
+	const exe = assertRegularFile(path.join(productRoot, 'Void.exe'), 'development Void executable');
+	const runRoot = assertFreshDevelopmentRunRoot(argument('--development-run-root'), developmentAppRoot);
+	const resolvedEvidencePath = assertContained(runRoot, argument('--evidence'), 'evidence path');
+	if (fs.existsSync(resolvedEvidencePath)) throw new Error('Evidence path must be absent before launch.');
+	return { smokeRoot, runRoot, productRoot, exe, evidencePath: resolvedEvidencePath, developmentAppRoot };
+}
 async function main() {
 	const mode = argument('--mode'); if (mode !== 'fake' && mode !== 'production') throw new Error('Smoke mode must be fake or production.');
-	const evidence = newEvidence(mode); activeEvidence = evidence;
+	const development = mode === 'fake' && hasArgument('--development-app-root') && hasArgument('--development-run-root');
+	const evidence = newEvidence(mode, development); activeEvidence = evidence;
 	try {
-		const smokeRoot = assertRegularPath(argument('--smoke-root'), 'smoke root'); evidencePath = assertContained(smokeRoot, argument('--evidence'), 'evidence path'); if (fs.existsSync(evidencePath)) throw new Error('Evidence path must be absent before launch.');
-		const productRoot = assertRegularPath(argument('--product-root'), 'extracted product root'); assertContained(smokeRoot, productRoot, 'extracted product root'); const exe = assertRegularPath(argument('--exe'), 'Void executable'); if (path.dirname(exe) !== productRoot) throw new Error('Void executable was not the immediate extracted product child.');
-		await launchAndExercise(mode, evidence, smokeRoot, exe);
+		const launch = resolveLaunchContract(mode); evidencePath = launch.evidencePath;
+		await launchAndExercise(mode, evidence, launch.runRoot, launch.exe, launch.developmentAppRoot);
 	} catch (error) { addError(evidence, 'assertion', error); }
 	finally { const expected = expectedAssertions(mode); evidence.pass = evidence.assertions.length === expected.length && expected.every((value, index) => evidence.assertions[index] === value) && evidence.errors.length === 0 && evidence.close.attempted && evidence.close.completed; writeEvidence(evidence); }
 	if (!evidence.pass) process.exitCode = 1;
