@@ -15,7 +15,17 @@ const draftReceiver = () => {
 	value._transientComposerDraftOfThread = new Map<string, string>();
 	value._pendingChatSubmissionOfThread = new Map<string, unknown>();
 	value._onDidChangePendingChatSubmission = { fire() { } };
+	value._pendingChatInputsOfThread = new Map<string, unknown[]>();
+	value._drainingPendingChatInputs = new Set<string>();
+	value._runQuiescenceOfThread = new Map<string, unknown>();
+	value._startingParentRunOfThread = new Map<string, unknown>();
+	value._deletingPendingInputThreads = new Set<string>();
+	value._stopAndSendFlights = new Map<string, Promise<void>>();
+	value._onDidChangePendingChatInputs = { fire() { } };
+	value._storePendingChatInputs = () => { };
+	value.streamState = {};
 	value._parentRunTokenOfThread = new Map<string, symbol>();
+	value._cancellingToolReceiptsOfThread = new Map<string, unknown>();
 	value._toolsService = { invalidateReadReceipts() { } };
 	value._childToolApprovals = new Map<string, unknown>(); value._onDidChangeChildToolApprovals = { fire() { } };
 	value._setState = (partial: any) => { value.state = { ...value.state, ...partial }; };
@@ -80,6 +90,38 @@ suite('Void transient chat composer drafts', () => {
 		await assert.rejects(() => submitChatComposer({ ...options, submit: async () => { throw new Error('admission failed') } }), /admission failed/);
 		assert.strictEqual(await submitChatComposer({ ...options, submit: async () => false }), false);
 		assert.strictEqual(value.getTransientComposerDraft('A'), 'draft-a'); assert.deepStrictEqual(value.state.allThreads.A.state.stagingSelections, ['selection-a']); assert.strictEqual(domClears, 0);
+	});
+
+	test('Queue clears only its captured thread, preserves rejected drafts, and keeps row edits ordered', async () => {
+		const value = draftReceiver();
+		const fileA: any = { type: 'File', uri: { toString: () => 'file:///workspace/a.ts' }, language: 'typescript', state: { wasAddedAsCurrentFile: false } };
+		value.state.allThreads.A.state.stagingSelections = [fileA];
+		value._workspaceContextService = { getWorkspace: () => ({ folders: [{ uri: { toString: () => 'file:///workspace' } }] }) };
+		value._workspaceTrustManagementService = { isWorkspaceTrusted: () => true };
+		value._runQuiescenceOfThread.set('A', { runId: 'active', generation: 0, settled: new Promise<void>(() => { }) });
+		value.setTransientComposerDraft('A', 'queue A'); value.setTransientComposerDraft('B', 'draft-b');
+		let domClears = 0;
+		const accepted = await submitChatComposer({
+			threadId: 'A',
+			submit: async () => !!value.submitPendingInput({ threadId: 'A', text: 'queue A', mode: 'queue', selections: [...value.state.allThreads.A.state.stagingSelections] }),
+			clearSubmittedState: (id: string) => value.clearSubmittedComposerState(id),
+			getCurrentThreadId: () => value.state.currentThreadId,
+			clearCurrentInput: () => { domClears++; },
+		});
+		assert.strictEqual(accepted, true); assert.strictEqual(domClears, 1);
+		assert.strictEqual(value.getTransientComposerDraft('A'), ''); assert.deepStrictEqual(value.state.allThreads.A.state.stagingSelections, []);
+		assert.strictEqual(value.getTransientComposerDraft('B'), 'draft-b'); assert.deepStrictEqual(value.state.allThreads.B.state.stagingSelections, ['selection-b']);
+		assert.strictEqual(value.getPendingChatInputs('A')[0].selections[0].type, 'File');
+
+		value.setTransientComposerDraft('A', 'keep rejected'); value.state.allThreads.A.state.stagingSelections = [fileA];
+		assert.strictEqual(await submitChatComposer({ threadId: 'A', submit: async () => false, clearSubmittedState: (id: string) => value.clearSubmittedComposerState(id), getCurrentThreadId: () => value.state.currentThreadId, clearCurrentInput: () => { domClears++; } }), false);
+		assert.strictEqual(value.getTransientComposerDraft('A'), 'keep rejected'); assert.deepStrictEqual(value.state.allThreads.A.state.stagingSelections, [fileA]);
+
+		const second = value.submitPendingInput({ threadId: 'A', text: 'second', mode: 'queue', selections: [] })!;
+		const first = value.getPendingChatInputs('A')[0];
+		assert.strictEqual(value.reorderPendingInput('A', second.id, first.id), true);
+		assert.strictEqual(value.editPendingInput('A', second.id, 'second edited'), true);
+		assert.deepStrictEqual(value.getPendingChatInputs('A').map((input: any) => input.text), ['second edited', 'queue A']);
 	});
 
 	test('missing Skill admission false keeps exact draft bytes and the staged array identity', async () => {

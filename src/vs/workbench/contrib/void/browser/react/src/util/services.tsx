@@ -38,7 +38,7 @@ import { IConfigurationService } from '../../../../../../../platform/configurati
 import { IPathService } from '../../../../../../../workbench/services/path/common/pathService.js'
 import { IMetricsService } from '../../../../../../../workbench/contrib/void/common/metricsService.js'
 import { URI } from '../../../../../../../base/common/uri.js'
-import { IChatThreadService, PendingChatSubmission, ThreadsState, ThreadStreamState } from '../../../chatThreadService.js'
+import { IChatThreadService, PendingChatInput, PendingChatSubmission, ThreadsState, ThreadStreamState } from '../../../chatThreadService.js'
 import { ITerminalToolService } from '../../../terminalToolService.js'
 import { ILanguageService } from '../../../../../../../editor/common/languages/language.js'
 import { IVoidModelService } from '../../../../common/voidModelService.js'
@@ -321,6 +321,19 @@ export const usePendingChatSubmission = (threadId: string): PendingChatSubmissio
 		return () => disposable.dispose()
 	}, [service, threadId])
 	return selectThreadScopedValue(state, threadId, () => service.getPendingChatSubmission(threadId))
+}
+
+/** Durable Queue/Steer inputs are thread-scoped UI state, never transcript rows. */
+export const usePendingChatInputs = (threadId: string): readonly PendingChatInput[] => {
+	const service = useAccessor().get('IChatThreadService')
+	const [state, setState] = useState(() => ({ threadId, value: service.getPendingChatInputs(threadId) }))
+	useEffect(() => {
+		const refresh = () => setState({ threadId, value: service.getPendingChatInputs(threadId) })
+		refresh()
+		const disposable = service.onDidChangePendingChatInputs(event => { if (event.threadId === threadId) refresh() })
+		return () => disposable.dispose()
+	}, [service, threadId])
+	return selectThreadScopedValue(state, threadId, () => service.getPendingChatInputs(threadId))
 }
 
 export const useAgentSubagentRun = (threadId: string): AgentSubagentRunView | undefined => {

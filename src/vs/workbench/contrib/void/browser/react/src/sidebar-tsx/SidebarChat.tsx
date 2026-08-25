@@ -6,7 +6,7 @@
 import React, { ButtonHTMLAttributes, FormEvent, FormHTMLAttributes, Fragment, KeyboardEvent, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 
 
-import { useAccessor, useAgentSubagentBudget, useAgentSubagentDiagnostics, useAgentSubagentRuns, useChatThreadsState, useChatThreadsStreamState, usePendingChatSubmission, useSettingsState, useActiveURI, useChildToolApprovals, useCommandBarState } from '../util/services.js';
+import { useAccessor, useAgentSubagentBudget, useAgentSubagentDiagnostics, useAgentSubagentRuns, useChatThreadsState, useChatThreadsStreamState, usePendingChatInputs, usePendingChatSubmission, useSettingsState, useActiveURI, useChildToolApprovals, useCommandBarState } from '../util/services.js';
 import { ScrollType } from '../../../../../../../editor/common/editorCommon.js';
 
 import { ChatMarkdownRender, ChatMessageLocation, getApplyBoxId } from '../markdown/ChatMarkdownRender.js';
@@ -28,6 +28,7 @@ import { ChildToolApprovalView, isActiveChildRun } from '../../../../common/agen
 import { AgentSubagentPresentation, getAgentSubagentPresentation } from '../../../../common/agentSubagentPresentation.js';
 import { canSubmitChatCurrent, ChatCurrentStatusPresentation, getChatCurrentStatusPresentation } from '../../../../common/chatCurrentStatusPresentation.js';
 import { submitChatComposer } from '../../../../common/chatComposerSubmission.js';
+import { PendingChatInput, PendingInputMode } from '../../../chatThreadService.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, ToolName, LintErrorItem, ToolApprovalType, toolApprovalTypes } from '../../../../common/toolsServiceTypes.js';
 import { CopyButton, IconShell1, JumpToFileButton, JumpToTerminalButton, StatusIndicator, useApplyStreamState } from '../markdown/ApplyBlockHoverButtons.js';
 import { acceptAllBg, acceptBorder, buttonFontSize, buttonTextColor, rejectAllBg, rejectBg, rejectBorder } from '../../../../common/helpers/colors.js';
@@ -315,6 +316,8 @@ interface VoidChatAreaProps {
 	showProspectiveSelections?: boolean;
 	loadingIcon?: React.ReactNode;
 	statusHelp?: React.ReactNode;
+	/** Replaces only this area's normal Send/Stop control for an opt-in consumer. */
+	actionSlot?: React.ReactNode;
 	showStop?: boolean;
 	controlSemantics?: ChatCurrentStatusPresentation['controls'];
 
@@ -348,6 +351,7 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 	featureName,
 	loadingIcon,
 	statusHelp,
+	actionSlot,
 	showStop,
 	controlSemantics,
 }) => {
@@ -415,7 +419,7 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 
 					{isStreaming && loadingIcon}
 
-					{shouldShowStop ? (
+					{actionSlot !== undefined ? actionSlot : shouldShowStop ? (
 						<ButtonStop
 							className={controlSemantics ? 'focus-ring' : ''}
 							id={controlSemantics?.stop.id}
@@ -1335,7 +1339,7 @@ const AssistantMessageComponent = ({ chatMessage, isCommitted, messageIdx }: { c
 				<ReasoningWrapper isDoneReasoning={isDoneReasoning} isStreaming={!isCommitted}>
 					<SmallProseWrapper>
 						<ChatMarkdownRender
-							string={renderReasoning}
+							string={renderReasoning ?? ''}
 							chatMessageLocation={chatMessageLocation}
 							isApplyEnabled={false}
 							isLinkDetectionEnabled={true}
@@ -2816,6 +2820,73 @@ const ChildRunPanel = ({ presentation, approvals }: { presentation: AgentSubagen
 	</section>;
 };
 
+const pendingInputModeLabel = (mode: PendingInputMode): string => {
+	switch (mode) {
+		case 'queue': return 'Queue';
+		case 'steer': return 'Steer';
+		case 'stop_and_send': return 'Stop and send';
+	}
+}
+
+const pendingInputPhaseLabel = (input: PendingChatInput): string => {
+	switch (input.phase) {
+		case 'queued': return input.mode === 'stop_and_send' ? 'Stopping and sending' : 'Queued';
+		case 'steering': return 'Waiting for a safe boundary';
+		case 'claiming': return 'Sending';
+		case 'dormant': return 'Ready to resume';
+	}
+}
+
+const PendingChatInputsPanel = ({
+	threadId,
+	inputs,
+	onEdit,
+	onDelete,
+	onReorder,
+	onResume,
+}: {
+	threadId: string;
+	inputs: readonly PendingChatInput[];
+	onEdit: (threadId: string, id: string, text: string) => boolean;
+	onDelete: (threadId: string, id: string) => boolean;
+	onReorder: (threadId: string, id: string, beforeId?: string) => boolean;
+	onResume: (threadId: string, id: string) => boolean;
+}) => {
+	const [editing, setEditing] = useState<{ id: string; text: string } | undefined>()
+	if (!inputs.length) return null
+	return <section id='void-chat-pending-inputs' aria-label='Queued messages' className='mb-2 border border-void-border-2 rounded px-2 py-1 text-xs text-void-fg-3' onClick={event => event.stopPropagation()}>
+		<div className='font-medium text-void-fg-2 pb-1'>Queued messages</div>
+		<div role='list' className='flex flex-col gap-1'>
+			{inputs.map((input, index) => {
+				const locked = input.phase === 'claiming'
+				const isEditing = editing?.id === input.id
+				return <div key={input.id} role='listitem' className='rounded border border-void-border-3 px-2 py-1'>
+					<div className='flex flex-wrap items-center gap-x-1 text-void-fg-2'>
+						<span>{pendingInputModeLabel(input.mode)}</span><span aria-hidden='true'>·</span><span>{pendingInputPhaseLabel(input)}</span><span aria-hidden='true'>·</span><span>{input.selections.length} selection{input.selections.length === 1 ? '' : 's'}</span>
+					</div>
+					{isEditing ? <textarea
+						aria-label='Edit queued message'
+						className='focus-ring mt-1 w-full rounded border border-void-border-2 bg-void-bg-1 px-1 py-0.5 text-void-fg-1'
+						value={editing.text}
+						onChange={event => setEditing({ id: input.id, text: event.currentTarget.value })}
+						onClick={event => event.stopPropagation()}
+					/> : <div className='mt-1 whitespace-pre-wrap break-words text-void-fg-1'>{input.text}</div>}
+					<div className='mt-1 flex flex-wrap gap-1'>
+						{isEditing ? <>
+							<button type='button' className='focus-ring rounded border border-void-border-2 px-1' onClick={() => { if (onEdit(threadId, input.id, editing.text)) setEditing(undefined) }}>Save</button>
+							<button type='button' className='focus-ring rounded border border-void-border-2 px-1' onClick={() => setEditing(undefined)}>Cancel</button>
+						</> : <button type='button' disabled={locked} className='focus-ring rounded border border-void-border-2 px-1 disabled:opacity-50' onClick={() => setEditing({ id: input.id, text: input.text })}>Edit</button>}
+						<button type='button' disabled={locked} className='focus-ring rounded border border-void-border-2 px-1 disabled:opacity-50' onClick={() => { onDelete(threadId, input.id); if (isEditing) setEditing(undefined) }}>Delete</button>
+						<button type='button' disabled={locked || index === 0} className='focus-ring rounded border border-void-border-2 px-1 disabled:opacity-50' onClick={() => onReorder(threadId, input.id, inputs[index - 1]?.id)}>Move up</button>
+						<button type='button' disabled={locked || index === inputs.length - 1} className='focus-ring rounded border border-void-border-2 px-1 disabled:opacity-50' onClick={() => onReorder(threadId, input.id, inputs[index + 2]?.id)}>Move down</button>
+						{input.phase === 'dormant' ? <button type='button' className='focus-ring rounded border border-void-border-2 px-1' onClick={() => onResume(threadId, input.id)}>Resume</button> : null}
+					</div>
+				</div>
+			})}
+		</div>
+	</section>
+}
+
 export const SidebarChat = () => {
 	const textAreaRef = useRef<HTMLTextAreaElement | null>(null)
 	const textAreaFnsRef = useRef<TextAreaFns | null>(null)
@@ -2840,6 +2911,7 @@ export const SidebarChat = () => {
 	// stream state
 	const currThreadStreamState = useChatThreadsStreamState(chatThreadsState.currentThreadId)
 	const pendingSubmission = usePendingChatSubmission(threadId)
+	const pendingInputs = usePendingChatInputs(threadId)
 	const isRunning = currThreadStreamState?.isRunning
 	const childRuns = useAgentSubagentRuns(currentThread.id)
 	const childBudget = useAgentSubagentBudget(currentThread.id)
@@ -2875,19 +2947,44 @@ export const SidebarChat = () => {
 
 	const sidebarRef = useRef<HTMLDivElement>(null)
 	const scrollContainerRef = useRef<HTMLDivElement | null>(null)
+	const [pendingAction, setPendingAction] = useState<'' | PendingInputMode>('')
+	const submitPendingComposerInput = useCallback(async (mode: PendingInputMode, forcedText?: string): Promise<boolean> => {
+		const submissionThreadId = threadId
+		const userMessage = forcedText ?? textAreaRef.current?.value ?? chatThreadsService.getTransientComposerDraft(submissionThreadId)
+		if (!userMessage.trim() || chatModelUnavailable) return false
+		const capturedSelections = [...selections]
+		return submitChatComposer({
+			threadId: submissionThreadId,
+			submit: async () => !!chatThreadsService.submitPendingInput({ threadId: submissionThreadId, text: userMessage, mode, selections: capturedSelections }),
+			clearSubmittedState: submittedThreadId => chatThreadsService.clearSubmittedComposerState(submittedThreadId),
+			getCurrentThreadId: () => chatThreadsService.state.currentThreadId,
+			clearCurrentInput: () => {
+				textAreaFnsRef.current?.setValue('')
+				textAreaRef.current?.focus()
+			},
+		})
+	}, [chatThreadsService, threadId, selections, chatModelUnavailable])
 	const onSubmit = useCallback(async (_forceSubmit?: string) => {
+		if (isAnyRunning) {
+			try {
+				await submitPendingComposerInput('queue', _forceSubmit)
+			} catch (e) {
+				console.error('Error while queueing message in chat:', e)
+			}
+			return
+		}
 
 		if (!canSubmitChatCurrent({ busy: isAnyRunning, hasDraft, chatModelUnavailable, forcedText: _forceSubmit })) return
 
-		const threadId = chatThreadsService.state.currentThreadId
+		const submissionThreadId = threadId
 
 		// send message to LLM
 		const userMessage = _forceSubmit || textAreaRef.current?.value || ''
 
 		try {
 			await submitChatComposer({
-				threadId,
-				submit: () => chatThreadsService.beginUserMessageAndStreamResponse({ userMessage, threadId }),
+				threadId: submissionThreadId,
+				submit: () => chatThreadsService.beginUserMessageAndStreamResponse({ userMessage, threadId: submissionThreadId }),
 				clearSubmittedState: submittedThreadId => chatThreadsService.clearSubmittedComposerState(submittedThreadId),
 				getCurrentThreadId: () => chatThreadsService.state.currentThreadId,
 				clearCurrentInput: () => {
@@ -2900,7 +2997,10 @@ export const SidebarChat = () => {
 			return
 		}
 
-	}, [chatThreadsService, isAnyRunning, hasDraft, chatModelUnavailable])
+	}, [chatThreadsService, threadId, isAnyRunning, hasDraft, chatModelUnavailable, submitPendingComposerInput])
+	const submitSelectedPendingAction = useCallback((mode: PendingInputMode) => {
+		void submitPendingComposerInput(mode).catch(error => console.error('Error while queueing message in chat:', error))
+	}, [submitPendingComposerInput])
 
 	const onAbort = async () => {
 		const threadId = currentThread.id
@@ -3028,6 +3128,51 @@ export const SidebarChat = () => {
 	>
 		<span role='status' aria-live='polite' aria-atomic={true} className='text-void-fg-2'>{currentStatusPresentation.announcement}</span>
 	</div>
+	const busyComposerActions = isAnyRunning ? <div className='flex items-center gap-1' onClick={event => event.stopPropagation()}>
+		<button
+			type='button'
+			id='void-chat-current-queue'
+			aria-label='Queue message'
+			title='Queue message'
+			disabled={!hasDraft || chatModelUnavailable}
+			className='focus-ring rounded border border-void-border-2 px-2 py-0.5 text-xs disabled:cursor-default disabled:opacity-50'
+			onClick={() => submitSelectedPendingAction('queue')}
+		>Queue</button>
+		<select
+			id='void-chat-current-actions'
+			aria-label='More message actions'
+			title='More message actions'
+			value={pendingAction}
+			disabled={!hasDraft || chatModelUnavailable}
+			className='focus-ring rounded border border-void-border-2 bg-void-bg-1 px-1 py-0.5 text-xs disabled:cursor-default disabled:opacity-50'
+			onChange={event => {
+				const mode = event.currentTarget.value as '' | PendingInputMode
+				setPendingAction('')
+				if (mode) submitSelectedPendingAction(mode)
+			}}
+		>
+			<option value='' disabled>More actions</option>
+			<option value='queue'>Queue</option>
+			<option value='steer'>Steer</option>
+			<option value='stop_and_send'>Stop and send</option>
+		</select>
+		{currentStatusPresentation.showStop ? <ButtonStop
+			className={currentStatusPresentation.controls ? 'focus-ring' : ''}
+			id={currentStatusPresentation.controls?.stop.id}
+			aria-label={currentStatusPresentation.controls?.stop.ariaLabel}
+			title={currentStatusPresentation.controls?.stop.title}
+			onClick={onAbort}
+		/> : null}
+	</div> : undefined
+	const pendingInputPanel = <PendingChatInputsPanel
+		key={`pending-inputs-${threadId}`}
+		threadId={threadId}
+		inputs={pendingInputs}
+		onEdit={(originThreadId, id, text) => chatThreadsService.editPendingInput(originThreadId, id, text)}
+		onDelete={(originThreadId, id) => chatThreadsService.deletePendingInput(originThreadId, id)}
+		onReorder={(originThreadId, id, beforeId) => chatThreadsService.reorderPendingInput(originThreadId, id, beforeId)}
+		onResume={(originThreadId, id) => chatThreadsService.resumePendingInput(originThreadId, id)}
+	/>
 
 	const inputChatArea = <VoidChatArea
 		featureName='Chat'
@@ -3038,6 +3183,7 @@ export const SidebarChat = () => {
 		isDisabled={currentStatusPresentation.sendDisabled}
 		statusHelp={currentStatusHelp}
 		controlSemantics={currentStatusPresentation.controls}
+		actionSlot={busyComposerActions}
 		showSelections={true}
 		// showProspectiveSelections={previousMessagesHTML.length === 0}
 		selections={selections}
@@ -3062,7 +3208,7 @@ export const SidebarChat = () => {
 	</VoidChatArea>
 
 
-	const isLandingPage = previousMessages.length === 0 && !pendingSubmission
+	const isLandingPage = previousMessages.length === 0 && !pendingSubmission && pendingInputs.length === 0
 
 
 	const initiallySuggestedPromptsHTML = <div className='flex flex-col gap-2 w-full text-nowrap text-void-fg-3 select-none'>
@@ -3086,6 +3232,7 @@ export const SidebarChat = () => {
 		<div className='px-4'>
 			<ChildRunPanel presentation={childPresentation} approvals={childToolApprovals} />
 			<CommandBarInChat />
+			{pendingInputPanel}
 		</div>
 		<div className='px-2 pb-2'>
 			{inputChatArea}
@@ -3094,7 +3241,7 @@ export const SidebarChat = () => {
 
 	const landingPageInput = <div>
 		<div className='pt-8'>
-			<div className='px-4'><ChildRunPanel presentation={childPresentation} approvals={childToolApprovals} /></div>
+			<div className='px-4'><ChildRunPanel presentation={childPresentation} approvals={childToolApprovals} />{pendingInputPanel}</div>
 			{inputChatArea}
 		</div>
 	</div>
