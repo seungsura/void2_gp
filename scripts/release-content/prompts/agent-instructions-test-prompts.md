@@ -1,6 +1,6 @@
 # Agent instructions, Skills, custom agents와 bounded subagent 직접 테스트 프롬프트
 
-모든 항목은 실제 제품 관찰용입니다. 예상 결과를 미리 PASS로 기록하지 마세요. 별도 임시 workspace와 Agent mode를 사용하고 `PASS`/`FAIL`/`BLOCKED`/`EXPLORATORY`, provider/model, top-level turn, selector, bounded tool trace, Child Run·Chat UI와 실제 file state를 함께 기록하세요. Source fixture, build와 artifact smoke는 actual provider/network E2E를 대체하지 않습니다.
+모든 항목은 실제 제품 관찰용입니다. 예상 결과를 미리 PASS로 기록하지 마세요. 별도 임시 workspace에서 Chat을 사용하세요. Chat은 항상 Agent로 동작합니다. `PASS`/`FAIL`/`BLOCKED`/`EXPLORATORY`, provider/model, top-level turn, selector, bounded tool trace, Child Run·Chat UI와 실제 file state를 함께 기록하세요. Source fixture, build와 artifact smoke는 actual provider/network E2E를 대체하지 않습니다.
 
 ## 1. `AGENTS.md` next-turn reload와 same-turn revision
 
@@ -96,7 +96,7 @@ developer_instructions = "Inspect only. Separate facts from remaining risks."
 capability_profile = "read_only"
 ```
 
-Agent mode에서 marker 없이 다음 prompt를 먼저 실행하고, 이어 입력창의 `@` menu에서 generic Agent와 exact `reviewer` role을 각각 선택해 비교합니다. Selection만 한 시점에는 Child Run이 생기지 않는지 먼저 봅니다.
+Chat은 항상 Agent로 동작합니다. marker 없이 다음 prompt를 먼저 실행하고, 이어 입력창의 `@` menu에서 generic Agent와 exact `reviewer` role을 각각 선택해 비교합니다. Selection만 한 시점에는 Child Run이 생기지 않는지 먼저 봅니다.
 
 Exact prompt:
 

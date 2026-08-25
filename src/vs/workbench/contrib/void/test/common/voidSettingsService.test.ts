@@ -64,6 +64,7 @@ suite('Void settings persistence', () => {
 		assert.strictEqual(service.state.modelSelectionOfFeature.Autocomplete, null);
 		assert.deepStrictEqual(service.state.globalSettings.autoApprove, { edits: true, terminal: true, 'MCP tools': true });
 		assert.strictEqual(service.state.globalSettings.autoAcceptLLMChanges, true);
+		assert.strictEqual(service.state.globalSettings.chatMode, 'agent');
 		assert.strictEqual(service.state.globalSettings.isOnboardingComplete, true);
 
 		const corporateCapabilities = getModelCapabilities('openAICompatible', corporateOpenAICompatibleModelName, service.state.overridesOfModel);
@@ -77,6 +78,7 @@ suite('Void settings persistence', () => {
 	});
 
 	test('normalizes the corporate profile without overwriting explicit existing approval choices', async () => {
+		for (const persistedChatMode of ['normal', 'gather', 'agent'] as const) {
 		const storage = new InMemoryStorageService();
 		storeLegacyCorporateSettings(storage, {
 			settingsOfProvider: {
@@ -89,7 +91,7 @@ suite('Void settings persistence', () => {
 				Chat: { providerName: 'openAI', modelName: 'gpt-4.1' }, 'Ctrl+K': { providerName: 'openAI', modelName: 'gpt-4.1' },
 				Autocomplete: { providerName: 'openAI', modelName: 'gpt-4.1' }, Apply: { providerName: 'openAI', modelName: 'gpt-4.1' }, SCM: { providerName: 'openAI', modelName: 'gpt-4.1' },
 			},
-			globalSettings: { autoApprove: { edits: false }, autoAcceptLLMChanges: false, isOnboardingComplete: false },
+			globalSettings: { chatMode: persistedChatMode, autoApprove: { edits: false, terminal: false, 'MCP tools': false }, autoAcceptLLMChanges: false, isOnboardingComplete: false },
 			overridesOfModel: { openAICompatible: { [corporateOpenAICompatibleModelName]: { contextWindow: 1 } } },
 		});
 		const service = new VoidSettingsService(storage, new TestEncryptionService(), new TestMetricsService());
@@ -100,19 +102,25 @@ suite('Void settings persistence', () => {
 		assert.strictEqual(service.state.settingsOfProvider.openAICompatible.headersJSON, '{}');
 		assert.deepStrictEqual(service.state.modelSelectionOfFeature.Chat, { providerName: 'openAICompatible', modelName: corporateOpenAICompatibleModelName });
 		assert.strictEqual(service.state.modelSelectionOfFeature.Autocomplete, null);
-		assert.deepStrictEqual(service.state.globalSettings.autoApprove, { edits: false, terminal: true, 'MCP tools': true });
+		assert.deepStrictEqual(service.state.globalSettings.autoApprove, { edits: false, terminal: false, 'MCP tools': false });
 		assert.strictEqual(service.state.globalSettings.autoAcceptLLMChanges, false);
+		assert.strictEqual(service.state.globalSettings.chatMode, 'agent');
 		assert.strictEqual(service.state.globalSettings.isOnboardingComplete, true);
 		assert.strictEqual(service.state.overridesOfModel.openAICompatible?.[corporateOpenAICompatibleModelName], undefined);
 		await service.setSettingOfProvider('openAICompatible', 'apiKey', 'runtime-provided-value');
 		assert.strictEqual(service.state.settingsOfProvider.openAICompatible.apiKey, '');
+		await service.setGlobalSetting('chatMode', 'normal');
+		await service.setGlobalSetting('chatMode', 'gather');
+		assert.strictEqual(service.state.globalSettings.chatMode, 'agent');
 		const persisted = storage.get(VOID_SETTINGS_STORAGE_KEY, StorageScope.APPLICATION);
 		assert.ok(persisted);
 		const persistedState = JSON.parse(persisted.slice('encrypted+'.length));
 		assert.strictEqual(persistedState.settingsOfProvider.openAICompatible.apiKey, '');
 		assert.strictEqual(persistedState.globalSettings.isOnboardingComplete, true);
-		assert.deepStrictEqual(persistedState.globalSettings.autoApprove, { edits: false, terminal: true, 'MCP tools': true });
+		assert.strictEqual(persistedState.globalSettings.chatMode, 'agent');
+		assert.deepStrictEqual(persistedState.globalSettings.autoApprove, { edits: false, terminal: false, 'MCP tools': false });
 		service.dispose(); storage.dispose();
+		}
 	});
 
 	test('settles initialization when a corporate migration cannot be persisted', async () => {

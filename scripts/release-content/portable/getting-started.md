@@ -29,7 +29,7 @@ Expand-Archive .\Void-*-win32-x64-portable.zip .\Void-portable
 
 ## 4. Agent instructions를 작은 workspace에서 확인
 
-중요한 Project에 적용하기 전에 별도 임시 workspace를 Agent mode로 여세요. Project root의 `AGENTS.md`, user `$HOME/.codex/config.toml`, trusted Project의 `<root>/.codex/config.toml`, `.agents/skills/<name>/SKILL.md`와 필요한 `.codex/agents/<name>.toml` role을 작은 범위로 작성합니다. legacy `.voidrules`가 자동으로 옮겨지거나 새 instruction으로 읽힐 것이라 기대하지 마세요.
+중요한 Project에 적용하기 전에 별도 임시 workspace에서 Chat을 여세요. Chat은 항상 Agent로 동작합니다. Project root의 `AGENTS.md`, user `$HOME/.codex/config.toml`, trusted Project의 `<root>/.codex/config.toml`, `.agents/skills/<name>/SKILL.md`와 필요한 `.codex/agents/<name>.toml` role을 작은 범위로 작성합니다. legacy `.voidrules`가 자동으로 옮겨지거나 새 instruction으로 읽힐 것이라 기대하지 마세요.
 
 Child limit을 바꾸려면 user 또는 trusted Project config에 다음 table을 둡니다. Trusted Project 값이 user 값을 override하며 변경은 새 Task/session에서 확인하세요.
 

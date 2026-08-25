@@ -12,7 +12,7 @@ There is no production workflow for enabling either automatic editor suggestion.
 
 ## Unaffected features
 
-This boundary does not disable the Chat sidebar, Quick Edit or Agent mode. Configure and use those features through their existing controls and guides. Selecting text also does not open the retired selection helper, but normal editor selection and the unrelated Chat, Quick Edit and Agent actions remain available.
+This boundary does not disable the Chat sidebar, Quick Edit or the always-active Agent behavior. Configure and use those features through their existing controls and guides. Selecting text also does not open the retired selection helper, but normal editor selection and the unrelated Chat, Quick Edit and Agent actions remain available.
 
 ## Verification boundary
 

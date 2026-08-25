@@ -1,10 +1,10 @@
 # Agent instructions, Skills, custom agents와 profile-aware bounded subagent 안내
 
-이 안내서는 현재 릴리스의 Agent mode에 포함된 instruction, Skills, custom role, configurable child limits와 capability profile을 설명합니다. Source와 focused tests에서 확인한 계약을 실제 provider/network에서 이미 통과한 결과로 확대하지 마세요. 동봉 prompt는 현재 환경에서 UI와 tool trace를 직접 관찰하기 위한 절차입니다.
+이 안내서는 Chat이 항상 Agent로 동작하는 현재 릴리스의 instruction, Skills, custom role, configurable child limits와 capability profile을 설명합니다. Source와 focused tests에서 확인한 계약을 실제 provider/network에서 이미 통과한 결과로 확대하지 마세요. 동봉 prompt는 현재 환경에서 UI와 tool trace를 직접 관찰하기 위한 절차입니다.
 
 ## `AGENTS.md`: owner root, CWD와 turn revision
 
-한 Run은 active owner Project 하나와 CWD 하나를 사용합니다. 현재 Agent mode의 CWD는 owner workspace folder root이며 active file이나 tool target 때문에 자동 이동하지 않습니다. resolver는 owner root부터 CWD까지 각 level의 non-empty UTF-8 `AGENTS.md` 내용을 root→CWD 순서로 append합니다. 가까운 directory의 내용이 뒤에 오므로 의미상 나중 지침이 우선합니다. 현재 일반적인 root=CWD Run에서는 root의 `AGENTS.md` 하나가 적용됩니다.
+한 Run은 active owner Project 하나와 CWD 하나를 사용합니다. 현재 Chat의 CWD는 owner workspace folder root이며 active file이나 tool target 때문에 자동 이동하지 않습니다. resolver는 owner root부터 CWD까지 각 level의 non-empty UTF-8 `AGENTS.md` 내용을 root→CWD 순서로 append합니다. 가까운 directory의 내용이 뒤에 오므로 의미상 나중 지침이 우선합니다. 현재 일반적인 root=CWD Run에서는 root의 `AGENTS.md` 하나가 적용됩니다.
 
 combined project instruction의 기본 한도는 32 KiB입니다. `project_doc_max_bytes`로 한도를 설정할 수 있지만 허용된 전체 bytes를 넘은 내용을 무제한으로 주입하지 않습니다.
 
@@ -132,9 +132,9 @@ Native Agent tool format을 지원하는 Agent route는 marker가 없어도 gene
 
 Role catalog 또는 selected role revision이 send 전에 바뀌면 stale role로 fail-closed하고 reselect를 요구합니다. Stop, Task reset/purge, delete/replacement와 disposal은 해당 generation authority와 child work를 revoke/cancel합니다. 다른 Chat을 단순히 선택하는 동작이 새 authority를 부여하지 않습니다. Role의 developer instruction은 Task/session developer instruction 뒤에 붙고 기존 AGENTS revision은 유지되며, role Skill body 전체를 읽을 수 있을 때만 child admission을 atomic하게 완료합니다.
 
-## Agent mode의 configurable child group
+## Chat의 configurable child group
 
-Child는 Agent mode의 supported native route에서만 사용합니다. `@Agent` selection 유무와 관계없이 실제 실행은 parent가 `spawn_agent`를 호출할 때 시작됩니다.
+Child는 Chat의 supported native route에서만 사용합니다. `@Agent` selection 유무와 관계없이 실제 실행은 parent가 `spawn_agent`를 호출할 때 시작됩니다.
 
 Default group은 accepted `4`, concurrent `2`, depth `1`이며 `[agents]` config에서 유효한 값을 선택할 수 있습니다. 전체 parent group은 direct와 nested child를 함께 세며 나머지는 admission 순서대로 **FIFO** queue에 머뭅니다. Admission 자체가 실패하면 reservation을 돌려주고 terminal child가 settle되면 open capacity도 다음 FIFO admission에 반환됩니다. Nested child는 configured depth 안에서만 요청할 수 있고 동일한 root owner, frozen authority와 shared nested group budget을 사용합니다.
 

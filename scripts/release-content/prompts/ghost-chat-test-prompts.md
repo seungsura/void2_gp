@@ -28,7 +28,7 @@ Expected observation: no Void selection helper overlay or widget is mounted, sho
 
 ## 5. Unaffected product surfaces
 
-Open the Chat sidebar, invoke Quick Edit on disposable text and open Agent mode without making an important workspace change.
+Open the Chat sidebar, invoke Quick Edit on disposable text and use the always-active Agent Chat behavior without making an important workspace change.
 
 Expected observation: those existing surfaces remain available. Their provider success is a separate check; this prompt verifies only that the production automatic-suggestion boundary did not remove them.
 

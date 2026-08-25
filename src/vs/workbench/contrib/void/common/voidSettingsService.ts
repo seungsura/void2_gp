@@ -173,6 +173,7 @@ const _corporateProductState = <T extends Omit<VoidSettingsState, '_modelOptions
 		},
 		globalSettings: {
 			...state.globalSettings,
+			chatMode: 'agent',
 			isOnboardingComplete: true,
 		},
 		overridesOfModel: {
@@ -200,6 +201,7 @@ const _isCorporateProductState = (state: Omit<VoidSettingsState, '_modelOptions'
 		&& expectedSelection('Ctrl+K')
 		&& expectedSelection('Apply')
 		&& expectedSelection('SCM')
+		&& state.globalSettings.chatMode === 'agent'
 		&& state.globalSettings.isOnboardingComplete === true
 		&& state.overridesOfModel.openAICompatible?.[corporateOpenAICompatibleModelName] === undefined;
 }

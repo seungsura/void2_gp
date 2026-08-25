@@ -35,7 +35,7 @@ Expand-Archive .\Void-1.99.3-win32-x64-portable.zip .\Void-1.99.3-portable
 
 ## Agent instructions, Skills, custom agents와 bounded subagent
 
-이 릴리스는 Agent mode에서 `AGENTS.md`, user/trusted Project `.codex/config.toml`, `.agents/skills` catalog와 user/trusted Project `.codex/agents/*.toml` custom role을 제공합니다. Native Agent route에서는 child control이 marker 없이 generic하게 제공됩니다. `@Agent`는 optional generic/named intent이며 named role selection은 exact `agent_type`을 고정합니다. 지원하지 않는 provider format이나 사용할 model이 없는 경우에는 history/provider send 전에 bounded diagnostic으로 중단합니다.
+이 릴리스의 Chat은 항상 Agent로 동작하며 `AGENTS.md`, user/trusted Project `.codex/config.toml`, `.agents/skills` catalog와 user/trusted Project `.codex/agents/*.toml` custom role을 제공합니다. Native Agent route에서는 child control이 marker 없이 generic하게 제공됩니다. `@Agent`는 optional generic/named intent이며 named role selection은 exact `agent_type`을 고정합니다. 지원하지 않는 provider format이나 사용할 model이 없는 경우에는 history/provider send 전에 bounded diagnostic으로 중단합니다.
 
 `[agents]`의 `max_accepted_children`, `max_concurrent_threads_per_session`, `max_depth` default는 각각 `4`, `2`, `1`입니다. accepted/concurrent는 양의 정수이고 concurrent는 accepted 이하이며 depth는 0 이상 정수입니다. Trusted Project 값이 user 값을 override합니다. FIFO와 shared nested group budget을 사용하며 `wait_agent`는 target `1..8`개를 받을 수 있습니다. Terminal child가 settle되면 open capacity는 다음 FIFO admission에 반환됩니다.
 
