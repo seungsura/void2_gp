@@ -153,7 +153,6 @@ suite('Void Settings switch style delivery', function () {
 	test('keeps the native input as the sole interaction owner and imports scoped styles at the independent entry', () => {
 		const entry = read(sourceEntryPath);
 		const component = between(read(sourceInputsPath), 'export const VoidSwitch =', 'export const VoidCheckBox =');
-		const styles = read(sourceStylesPath);
 		const styleImport = "import '../styles.css'";
 
 		assert.strictEqual(occurrences(entry, styleImport), 1);
@@ -168,6 +167,12 @@ suite('Void Settings switch style delivery', function () {
 		assert.strictEqual(occurrences(component, '<span'), 2);
 		assert.strictEqual(occurrences(component, 'aria-hidden="true"'), 1);
 		assert.strictEqual(occurrences(component, 'switch-track pointer-events-none'), 1);
+	});
+
+	test('keeps the native switch input visually hidden beside its adjacent-track focus ring', () => {
+		const styles = read(sourceStylesPath);
+		assert.strictEqual(occurrences(styles, '.void-switch-input {'), 1);
+		assert.match(styles, /\.void-switch-input\s*\{\s*opacity:\s*0\s*!important;/);
 		assert.strictEqual(occurrences(styles, '.void-switch-input:focus-visible + .void-switch-track'), 1);
 	});
 
@@ -188,9 +193,11 @@ suite('Void Settings switch style delivery', function () {
 		assert.strictEqual(occurrences(component, 'void-void-switch'), 0);
 		assert.doesNotMatch(component, /(?:^|[\s"'`])switch-(?:input|track)(?:[\s"'`])/m);
 		assert.strictEqual(occurrences(generatedStyles, '.void-scope .void-opacity-0 {'), 1);
+		assert.strictEqual(occurrences(generatedStyles, '.void-scope .void-switch-input {'), 1);
 		assert.strictEqual(occurrences(generatedStyles, '.void-switch-input:focus-visible + .void-switch-track'), 1);
 		const injection = getStyleInjectionContract(bundle);
 		assert.strictEqual(occurrences(injection.css, '.void-scope .void-opacity-0 {'), 1);
+		assert.strictEqual(occurrences(injection.css, '.void-scope .void-switch-input {'), 1);
 		assert.strictEqual(occurrences(injection.css, '.void-switch-input:focus-visible + .void-switch-track'), 1);
 		assert.ok(injection.helperIndex < injection.callIndex);
 		assert.ok(injection.callIndex < injection.mountInitializationIndex);
@@ -204,8 +211,16 @@ suite('Void Settings switch style delivery', function () {
 		try {
 			browser = await chromium.launch({ headless: true });
 			const page = await browser.newPage();
-			await page.setContent(`<!doctype html><html><body>
-				<div class="void-scope" id="settings-root" style="--void-ring-color:#1177cb"></div>
+			const pageErrors: string[] = [];
+			const consoleErrors: string[] = [];
+			page.on('pageerror', error => pageErrors.push(error.message));
+			page.on('console', message => {
+				if (message.type() === 'error') { consoleErrors.push(message.text()); }
+			});
+			await page.setContent(`<!doctype html><html><head>
+				<style id="host-workbench-style">.monaco-workbench input[type="checkbox"]:focus { opacity: 1; }</style>
+			</head><body>
+				<div class="monaco-workbench"><div class="void-scope" id="settings-root" style="--void-ring-color:#1177cb"></div></div>
 			</body></html>`);
 			await page.evaluate(() => {
 				(window as unknown as { __voidSwitchOrder: string[] }).__voidSwitchOrder = [];
@@ -215,14 +230,15 @@ suite('Void Settings switch style delivery', function () {
 					return appendChild(node) as T;
 				}) as typeof document.head.appendChild;
 			});
-			assert.strictEqual(await page.locator('head style').count(), 0);
-			await page.addScriptTag({ content: injection.program });
+			assert.strictEqual(await page.locator('#host-workbench-style').count(), 1);
 			assert.strictEqual(await page.locator('head style').count(), 1);
-			assert.strictEqual(await page.locator('head style').textContent(), injection.css);
+			await page.addScriptTag({ content: injection.program });
+			assert.strictEqual(await page.locator('head style').count(), 2);
+			assert.strictEqual(await page.locator('head style:not(#host-workbench-style)').textContent(), injection.css);
 			await page.addScriptTag({ content: runtime.script });
 			await page.locator('#settings-root').evaluate(rootNode => (window as any).__voidSwitchFixture.mount(rootNode));
 			assert.deepStrictEqual(await page.evaluate(() => (window as unknown as { __voidSwitchOrder: string[] }).__voidSwitchOrder), ['style', 'mount']);
-			assert.strictEqual(await page.locator('head style').count(), 1, 'The runtime component bundle must not inject a second stylesheet.');
+			assert.strictEqual(await page.locator('head style').count(), 2, 'The runtime component bundle must not inject a second stylesheet.');
 
 			const inspect = async () => page.getByRole('switch', { name: 'Enable fixture' }).evaluate((input) => {
 				const track = input.nextElementSibling as HTMLElement;
@@ -273,11 +289,13 @@ suite('Void Settings switch style delivery', function () {
 			await page.getByRole('switch', { name: 'Enable fixture' }).click();
 			const normalChecked = await waitForSwitchState(true);
 			assert.strictEqual(normalChecked.input.checked, true);
+			assert.strictEqual(normalChecked.input.opacity, '0');
 			assert.notStrictEqual(normalChecked.track.backgroundColor, normalUnchecked.track.backgroundColor);
 			assert.notStrictEqual(normalChecked.knob.transform, normalUnchecked.knob.transform);
 			assert.deepStrictEqual(await page.evaluate(() => (window as any).__voidSwitchFixture.changes), [true]);
 			await page.getByRole('switch', { name: 'Enable fixture' }).press('Space');
-			await waitForSwitchState(false);
+			const normalUncheckedAfterSpace = await waitForSwitchState(false);
+			assert.strictEqual(normalUncheckedAfterSpace.input.opacity, '0');
 			assert.deepStrictEqual(await page.evaluate(() => (window as any).__voidSwitchFixture.changes), [true, false]);
 
 			await page.locator('#settings-root').evaluate((rootNode) => rootNode.classList.add('void-dark'));
@@ -289,6 +307,7 @@ suite('Void Settings switch style delivery', function () {
 			assert.notStrictEqual(darkChecked.knob.transform, darkUnchecked.knob.transform);
 
 			await page.getByRole('switch', { name: 'Enable fixture' }).focus();
+			assert.strictEqual((await inspect()).input.opacity, '0');
 			const outlinedElements = await page.locator('#settings-root *').evaluateAll(elements => elements.filter(element => {
 				const style = getComputedStyle(element);
 				return style.outlineStyle !== 'none' && style.outlineWidth !== '0px';
@@ -318,6 +337,8 @@ suite('Void Settings switch style delivery', function () {
 				assert.ok(Number(visual.opacity) > 0);
 			}
 			await page.evaluate(() => (window as any).__voidSwitchFixture.dispose());
+			assert.deepStrictEqual(pageErrors, []);
+			assert.deepStrictEqual(consoleErrors, []);
 		} finally {
 			try {
 				await browser?.close();

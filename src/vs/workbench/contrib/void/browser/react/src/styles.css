@@ -57,6 +57,11 @@
 	outline-offset: 2px !important;
 }
 
+/* Keep the native interaction owner invisible when workbench focus rules target inputs. */
+.void-switch-input {
+	opacity: 0 !important;
+}
+
 .void-model-visibility-input:focus-visible + .void-model-visibility-track {
 	outline: 2px solid var(--void-ring-color) !important;
 	outline-offset: 2px !important;
