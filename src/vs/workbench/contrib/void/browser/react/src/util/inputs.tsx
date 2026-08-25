@@ -457,12 +457,12 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 	};
 
 
-	const onSelectOption = async () => {
+	const onSelectOption = async (explicitIndex?: number) => {
 
 		if (menuTriggerRef.current === 'dollar' && (!dollarSessionRef.current || optionText !== dollarSessionRef.current.query || !didLoadInitialOptions || !canSelectSkillPickerQuery(skillPickerQueryRef.current, dollarSessionRef.current.query))) return;
 		if (!options.length) { return; }
 
-		const option = options[optionIdx];
+		const option = options[explicitIndex ?? optionIdx];
 		if (!option || option.disabled) { return; }
 		const newPath = [...optionPath, option.fullName]
 		const isLastOption = !option.generateNextOptions && !option.nextOptions
@@ -938,7 +938,7 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 											px-3 py-1
 											${isDisabled ? 'cursor-default opacity-50 text-void-fg-3 pointer-events-none' : isSelected ? 'cursor-pointer bg-blue-500 text-white/80' : 'cursor-pointer bg-void-bg-2-alt text-void-fg-1'}
 										`}
-										onClick={isDisabled ? undefined : () => { onSelectOption(); }}
+										onClick={isDisabled ? undefined : () => { void onSelectOption(oIdx); }}
 										onMouseMove={isDisabled ? undefined : () => { setOptionIdx(oIdx) }}
 									>
 										{<o.iconInMenu size={12} />}

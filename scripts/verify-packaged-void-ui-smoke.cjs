@@ -274,10 +274,12 @@ async function assertFixedAgentOnlyComposer(luna) {
 async function selectFixtureAgent(page, chat) {
 	await chat.click(); await page.keyboard.type('@');
 	const agent = page.getByRole('option', { name: 'Agent', exact: true }); await waitVisible(agent, 'Agent picker option');
-	for (let index = 0; index < 3; index++) await page.keyboard.press('ArrowDown');
-	await page.keyboard.press('Enter');
+	if (await agent.getAttribute('aria-selected') !== 'false') throw new Error('Agent click regression did not begin on a non-highlighted option.');
+	await agent.click();
 	const fixtureRole = page.getByRole('option', { name: 'fixture-reader', exact: true }); await waitVisible(fixtureRole, 'fixture-reader picker option');
-	await page.keyboard.press('ArrowDown'); await page.keyboard.press('Enter');
+	if (await fixtureRole.getAttribute('aria-selected') !== 'false') throw new Error('Fixture role click regression did not begin on a non-highlighted option.');
+	await fixtureRole.click();
+	await fixtureRole.waitFor({ state: 'hidden', timeout: timeoutMs });
 }
 async function runFakeAcceptance(page, evidence, fakeServer) {
 	await assertNoOnboarding(page); evidence.assertions.push('fixed-start-without-onboarding');
