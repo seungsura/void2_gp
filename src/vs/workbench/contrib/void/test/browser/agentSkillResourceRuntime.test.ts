@@ -23,7 +23,7 @@ const fixture = (runtimeSnapshot = snapshot()) => {
 	const thread = { messages, state: {} };
 	const value: any = {
 		state: { allThreads: { parent: thread }, currentThreadId: 'parent' }, streamState: {},
-		_instructionTurnOfThread: new Map([['parent', runtimeSnapshot]]), _agentInstructionSessionOfThread: new Map(), _agentControlGeneration: new Map([['parent', 0]]), _parentRunTokenOfThread: new Map(), _agentDelegationAuthorityOfThread: new Map(),
+		_instructionTurnOfThread: new Map([['parent', runtimeSnapshot]]), _agentInstructionSessionOfThread: new Map(), _agentControlGeneration: new Map([['parent', 0]]), _parentRunTokenOfThread: new Map(), _agentDelegationAuthorityOfThread: new Map(), _cancellingToolReceiptsOfThread: new Map(),
 		_workspaceContextService: { getWorkspace: () => ({ folders: owner ? [{ uri: URI.parse(owner) }] : [] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => trusted },
 		_agentSkillsService: { readSkillResource: async (selection: unknown, resourcePath: string, options: unknown) => { serviceCalls.push({ selection, resourcePath, options }); return { body: 'RESOURCE\n' }; } },
 		_convertToLLMMessagesService: { prepareLLMChatMessages: async (options: unknown) => { conversionCalls.push(options); return { messages: [], separateSystemMessage: undefined }; } },
@@ -32,9 +32,12 @@ const fixture = (runtimeSnapshot = snapshot()) => {
 		_cancelChildToolApprovalsForParent() { },
 		_addMessageToThread(_threadId: string, message: any) { messages.push(message); },
 		_updateLatestTool(_threadId: string, message: any) { if (messages[messages.length - 1]?.role === 'tool') messages[messages.length - 1] = message; else messages.push(message); },
+		_editMessageInThread(_threadId: string, index: number, message: any) { messages[index] = message; },
 		_setStreamState(threadId: string, state: any) { value.streamState[threadId] = state; },
 		_purgeInstructionTurn(threadId: string) { purges++; value._instructionTurnOfThread.delete(threadId); },
+		toolErrMsgs: { rejected: 'Tool call was rejected by the user.', interrupted: 'Tool call was interrupted by the user.' },
 	};
+	Object.setPrototypeOf(value, ChatThreadService.prototype);
 	value._revokeAgentDelegation = (threadId: string, forget = false) => (ChatThreadService.prototype as any)._revokeAgentDelegation.call(value, threadId, forget);
 	return { value, messages, serviceCalls, conversionCalls, runtimeSnapshot, setTrusted: (next: boolean) => trusted = next, setOwner: (next: string) => owner = next, purges: () => purges };
 };
@@ -50,41 +53,44 @@ suite('Void selected Skill resource Chat runtime', () => {
 	});
 
 	test('rejects unavailable, malformed, outside, and unknown identities before service side effects', async () => {
-		for (const [raw, allowed, expected] of [
-			[{ skill: 'demo', resource_path: 'a' }, false, 'read_skill_resource_not_available'],
-			[{ skill: 'demo', resource_path: 'a', extra: true }, true, 'read_skill_resource_invalid_params'],
-			[{ skill: 'demo', resource_path: '../a' }, true, 'skill_resource_outside_root'],
-			[{ skill: 'missing', resource_path: 'a' }, true, 'skill_not_selected'],
+		for (const [raw, allowed, expected, expectedResult] of [
+			[{ skill: 'demo', resource_path: 'a' }, false, 'read_skill_resource_not_available', {}],
+			[{ skill: 'demo', resource_path: 'a', extra: true }, true, 'read_skill_resource_invalid_params', {}],
+			[{ skill: 'demo', resource_path: '../a' }, true, 'skill_resource_outside_root', {}],
+			[{ skill: 'missing', resource_path: 'a' }, true, 'skill_not_selected', { failure: 'skill_not_selected', validatedParams: { skill: 'missing', resourcePath: 'a' } }],
 		] as const) {
-			const f = fixture(); const result = await run(f.value, f.runtimeSnapshot, raw, allowed); assert.deepStrictEqual(result, {}); assert.strictEqual(f.serviceCalls.length, 0); assert.strictEqual(f.messages.length, 1); assert.ok(f.messages[0].content.includes(expected)); assert.strictEqual(f.messages[0].mcpServerName, undefined);
+			const f = fixture(); const result = await run(f.value, f.runtimeSnapshot, raw, allowed); assert.deepStrictEqual(result, expectedResult); assert.strictEqual(f.serviceCalls.length, 0); assert.strictEqual(f.messages.length, 1); assert.ok(f.messages[0].content.includes(expected)); assert.strictEqual(f.messages[0].mcpServerName, undefined);
 		}
 	});
 
 	test('turns every read diagnostic and oversize body into one failure while retaining the same turn', async () => {
+		const expectedParams = { skill: 'demo', resourcePath: 'references/a' };
 		for (const code of ['skill_resource_not_found', 'skill_stale', 'skill_resource_unreadable', 'skill_invalid_utf8']) {
 			const f = fixture(); f.value._agentSkillsService.readSkillResource = async () => { f.serviceCalls.push(code); return { diagnostic: { code } }; };
-			const result = await run(f.value, f.runtimeSnapshot, { skill: 'demo', resource_path: 'references/a' }); assert.deepStrictEqual(result, {}); assert.strictEqual(f.messages.length, 1); assert.strictEqual(f.messages[0].type, 'tool_error'); assert.ok(f.messages[0].content.includes(code)); assert.strictEqual(f.value._instructionTurnOfThread.get('parent'), f.runtimeSnapshot); assert.deepStrictEqual(f.runtimeSnapshot.selected.map(item => item.identity), ['demo', 'other']);
+			const result = await run(f.value, f.runtimeSnapshot, { skill: 'demo', resource_path: 'references/a' }); assert.deepStrictEqual(result, { failure: `error: ${code}`, validatedParams: expectedParams }); assert.strictEqual(f.messages.length, 1); assert.strictEqual(f.messages[0].type, 'tool_error'); assert.ok(f.messages[0].content.includes(code)); assert.strictEqual(f.value._instructionTurnOfThread.get('parent'), f.runtimeSnapshot); assert.deepStrictEqual(f.runtimeSnapshot.selected.map(item => item.identity), ['demo', 'other']);
 		}
-		const small = fixture(snapshot(1024)); small.value._agentSkillsService.readSkillResource = async () => ({ body: 'never-partially-returned' }); const result = await run(small.value, small.runtimeSnapshot, { skill: 'demo', resource_path: 'references/a' }); assert.deepStrictEqual(result, {}); assert.strictEqual(small.messages.length, 1); assert.strictEqual(small.messages[0].type, 'tool_error'); assert.ok(small.messages[0].content.includes('skill_resource_context_admission_failed')); assert.strictEqual(small.messages[0].content.includes('never-partially-returned'), false); assert.strictEqual(small.value._instructionTurnOfThread.get('parent'), small.runtimeSnapshot);
-		const conversion = fixture(); conversion.value._convertToLLMMessagesService.prepareLLMChatMessages = async () => { throw new Error('prospective history cannot fit'); }; await run(conversion.value, conversion.runtimeSnapshot, { skill: 'demo', resource_path: 'references/a' }); assert.strictEqual(conversion.messages.length, 1); assert.strictEqual(conversion.messages[0].type, 'tool_error'); assert.strictEqual(conversion.messages[0].content, 'skill_resource_context_admission_failed');
+		const small = fixture(snapshot(1024)); small.value._agentSkillsService.readSkillResource = async () => ({ body: 'never-partially-returned' }); const smallResult = await run(small.value, small.runtimeSnapshot, { skill: 'demo', resource_path: 'references/a' }); assert.deepStrictEqual(smallResult, { failure: 'skill_resource_context_admission_failed', validatedParams: expectedParams }); assert.strictEqual(small.messages.length, 1); assert.strictEqual(small.messages[0].type, 'tool_error'); assert.ok(small.messages[0].content.includes('skill_resource_context_admission_failed')); assert.strictEqual(small.messages[0].content.includes('never-partially-returned'), false); assert.strictEqual(small.value._instructionTurnOfThread.get('parent'), small.runtimeSnapshot);
+		const conversion = fixture(); conversion.value._convertToLLMMessagesService.prepareLLMChatMessages = async () => { throw new Error('prospective history cannot fit'); }; const conversionResult = await run(conversion.value, conversion.runtimeSnapshot, { skill: 'demo', resource_path: 'references/a' }); assert.deepStrictEqual(conversionResult, { failure: 'skill_resource_context_admission_failed', validatedParams: expectedParams }); assert.strictEqual(conversion.messages.length, 1); assert.strictEqual(conversion.messages[0].type, 'tool_error'); assert.strictEqual(conversion.messages[0].content, 'skill_resource_context_admission_failed');
 	});
 
 	test('captures the model/history budget before the asynchronous read and never recomputes it', async () => {
 		const f = fixture(snapshot(1100)); let release!: (value: { body: string }) => void; f.value._agentSkillsService.readSkillResource = () => new Promise(resolve => release = resolve);
 		const pending = run(f.value, f.runtimeSnapshot, { skill: 'demo', resource_path: 'references/a' }); await Promise.resolve();
+		const receiptId = f.messages[0]?.receiptId; const receipt = f.value._activeToolCardReceiptsOfThread?.get('parent')?.get(receiptId); assert.strictEqual(f.messages[0]?.type, 'running_now'); assert.strictEqual(typeof receiptId, 'string'); assert.deepStrictEqual({ toolId: receipt?.toolId, messageIndex: receipt?.messageIndex, interruptInstalled: receipt?.interruptInstalled, cancelling: receipt?.cancelling }, { toolId: 'provider-tool-id', messageIndex: 0, interruptInstalled: true, cancelling: false });
 		f.value.state.allThreads.parent.messages.push({ role: 'user', content: 'x'.repeat(20_000) }); release({ body: 'fits-in-captured-budget' });
-		assert.deepStrictEqual(await pending, {}); assert.strictEqual(f.messages[f.messages.length - 1].type, 'success');
+		assert.deepStrictEqual(await pending, {}); assert.strictEqual(f.messages[f.messages.length - 1].type, 'success'); assert.strictEqual(f.value._activeToolCardReceiptsOfThread?.get('parent'), undefined);
 	});
 
 	test('Stop settles the running tool once and drops the late resource completion', async () => {
 		const prompt = fixture(); let releasePrompt!: (value: { body: string }) => void; prompt.value._agentSkillsService.readSkillResource = () => new Promise(resolve => releasePrompt = resolve);
 		const promptlySettled = run(prompt.value, prompt.runtimeSnapshot, { skill: 'demo', resource_path: 'references/a' }); await Promise.resolve();
+		const promptReceiptId = prompt.messages[0]?.receiptId; assert.strictEqual(prompt.messages[0]?.type, 'running_now'); assert.strictEqual(typeof promptReceiptId, 'string'); assert.strictEqual(prompt.value._activeToolCardReceiptsOfThread?.get('parent')?.get(promptReceiptId)?.interruptInstalled, true);
 		await ChatThreadService.prototype.abortRunning.call(prompt.value, 'parent'); assert.deepStrictEqual(await promptlySettled, { interrupted: true }); releasePrompt({ body: 'IGNORED-AFTER-SETTLEMENT' }); await Promise.resolve();
-		assert.strictEqual(prompt.messages.length, 1); assert.strictEqual(prompt.messages[0].type, 'rejected');
+		assert.strictEqual(prompt.messages.length, 1); assert.strictEqual(prompt.messages[0].type, 'rejected'); assert.strictEqual(prompt.messages[0].content, 'Tool call was interrupted by the user.'); assert.strictEqual(prompt.value._activeToolCardReceiptsOfThread?.get('parent'), undefined); assert.strictEqual(prompt.value._cancellingToolReceiptsOfThread.get('parent'), undefined);
 		const f = fixture(); let release!: (value: { body: string }) => void; f.value._agentSkillsService.readSkillResource = () => new Promise(resolve => release = resolve);
 		const pending = run(f.value, f.runtimeSnapshot, { skill: 'demo', resource_path: 'references/a' }); await Promise.resolve();
 		const stopping = ChatThreadService.prototype.abortRunning.call(f.value, 'parent'); release({ body: 'LATE-SUCCESS' });
-		await stopping; assert.deepStrictEqual(await pending, { interrupted: true }); assert.strictEqual(f.messages.some(message => message.type === 'success' || message.content === 'LATE-SUCCESS'), false); assert.strictEqual(f.messages.length, 1); assert.strictEqual(f.messages[0].type, 'rejected');
+		await stopping; assert.deepStrictEqual(await pending, { interrupted: true }); assert.strictEqual(f.messages.some(message => message.type === 'success' || message.content === 'LATE-SUCCESS'), false); assert.strictEqual(f.messages.length, 1); assert.strictEqual(f.messages[0].type, 'rejected'); assert.strictEqual(f.value._activeToolCardReceiptsOfThread?.get('parent'), undefined); assert.strictEqual(f.value._cancellingToolReceiptsOfThread.get('parent'), undefined);
 	});
 
 	test('fails closed before and after the read when owner or trust drifts', async () => {
