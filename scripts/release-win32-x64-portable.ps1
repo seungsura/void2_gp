@@ -359,24 +359,25 @@ function Invoke-PackagedVoidUiSmoke {
     )
     foreach($phase in $phases){if(Test-Path -LiteralPath $phase.evidencePath){throw 'Packaged UI smoke evidence path already exists.'}}
     $records=@()
+    $result=[ordered]@{record=@();evidence=[ordered]@{};failure=$null;cleanup=$null}
     foreach($phase in $phases){
+        # Production can make one paid request, so validate fake evidence before launching it.
         $arguments=@($helper,'--mode',$phase.mode,'--exe',$exe,'--product-root',$Extract,'--smoke-root',$SmokeRoot,'--evidence',$phase.evidencePath)
         Assert-CanonicalCommandArguments $node $arguments
-        $records+=,(Invoke-ReleaseCommand -Stage $Stage -Name ("smoke-packaged-void-ui-"+$phase.mode) -FilePath $node -Arguments $arguments -LogDirectory (Join-Path $Stage 'logs') -Summary $Summary -SummaryPath $SummaryPath -AllowNonZero)
-    }
-    $result=[ordered]@{record=@($records);evidence=[ordered]@{};failure=$null;cleanup=$null}
-    try {
-        foreach($phase in $phases){
+        $record=Invoke-ReleaseCommand -Stage $Stage -Name ("smoke-packaged-void-ui-"+$phase.mode) -FilePath $node -Arguments $arguments -LogDirectory (Join-Path $Stage 'logs') -Summary $Summary -SummaryPath $SummaryPath -AllowNonZero
+        $records+=,$record
+        try {
             if(-not(Test-Path -LiteralPath $phase.evidencePath -PathType Leaf)){throw "Packaged UI $($phase.mode) smoke evidence is missing."}
             Assert-NotReparsePoint $phase.evidencePath|Out-Null
             $evidence=(Read-Utf8NoBomText $phase.evidencePath)|ConvertFrom-Json
             $result.evidence[$phase.mode]=$evidence
-            $record=@($records|Where-Object{$_.name -ceq ("smoke-packaged-void-ui-"+$phase.mode)})[0]
             Assert-PackagedVoidUiSmokeEvidence -Evidence $evidence -Record $record -Mode $phase.mode
+        } catch {
+            $result.failure='Packaged UI smoke evidence validation failed.'
+            break
         }
-    } catch {
-        $result.failure='Packaged UI smoke evidence validation failed.'
     }
+    $result.record=@($records)
     $drain=[DateTime]::UtcNow.AddSeconds(15)
     do{$owned=@(Get-VoidProcessesByExactPath $exe);if($owned.Count -eq 0){break};Start-Sleep -Milliseconds 250}while([DateTime]::UtcNow -lt $drain)
     $owned=@(Get-VoidProcessesByExactPath $exe)

@@ -117,8 +117,8 @@ function recordMainStderrLine(evidence, line) {
 	const dep0168 = /^\(node:\d+\) \[DEP0168\] DeprecationWarning: Uncaught N-API callback exception detected/;
 	const watcher = /^\[main .*UtilityProcess id: \d+, type: fileWatcher, pid: <none>\]: unable to kill the process$/;
 	const disposable = /^Error: Trying to add a disposable to a DisposableStore that has already been disposed of\./;
-	const developmentJumpList = evidence.launch.provenance === 'development-source-app fake-only' && /^\[\d+:\d+\/\d+\.\d+:ERROR:electron_api_app\.cc\(\d+\)\] Failed to begin Jump List transaction\.$/.test(message);
-	if (dep0168.test(message) || developmentJumpList || (evidence.close.attempted && (watcher.test(message) || disposable.test(message)))) return;
+	const isolatedPackagedSmokeJumpList = evidence.kind === 'void-packaged-ui-smoke' && evidence.launch.isolated === true && /^\[\d+:\d+\/\d+\.\d+:ERROR:electron_api_app\.cc\(\d+\)\] Failed to begin Jump List transaction\.$/.test(message);
+	if (dep0168.test(message) || isolatedPackagedSmokeJumpList || (evidence.close.attempted && (watcher.test(message) || disposable.test(message)))) return;
 	if (/\b(?:ReferenceError|TypeError|SyntaxError|Unhandled|uncaught|fatal|ERR_[A-Z_]+)\b|\bError:|\bunable to kill\b/i.test(message)) addError(evidence, 'main-stderr', message);
 }
 function createMainStderrRecorder(evidence) {
@@ -323,7 +323,7 @@ async function runProductionAcceptance(page, electronApp, evidence) {
 }
 async function launchAndExercise(mode, evidence, runRoot, exe, developmentAppRoot) {
 	const workspace = makeDirectory(runRoot, `${mode}-workspace`); const userData = makeDirectory(runRoot, `${mode}-user-data`); const extensions = makeDirectory(runRoot, `${mode}-extensions`); const logs = makeDirectory(runRoot, `${mode}-logs`); const crash = makeDirectory(runRoot, `${mode}-crash`); const home = makeDirectory(runRoot, `${mode}-home`);
-	if (developmentAppRoot) { const editorHome = makeDirectory(home, '.void-editor'); makeDirectory(editorHome, 'extensions'); }
+	if (mode === 'fake') { const editorHome = makeDirectory(home, '.void-editor'); makeDirectory(editorHome, 'extensions'); }
 	writeFixtureWorkspace(workspace, mode);
 	let fakeServer; let electronApp; let mainOutput = Promise.resolve(); const stderr = createMainStderrRecorder(evidence);
 	try {
