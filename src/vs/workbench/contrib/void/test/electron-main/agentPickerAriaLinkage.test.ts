@@ -122,6 +122,7 @@ suite('Void Agent and Skills picker ARIA linkage', function () {
 			const firstId = await picker.getAttribute('aria-activedescendant');
 			const listboxId = await picker.getAttribute('aria-controls');
 			assert.ok(firstId && listboxId);
+			assert.strictEqual(await picker.getAttribute('aria-expanded'), 'true');
 			assert.strictEqual(await listbox.getAttribute('id'), listboxId);
 			assert.strictEqual(await page.locator(`#${firstId}`).getAttribute('role'), 'option');
 			assert.strictEqual(await page.locator(`#${firstId}`).getAttribute('aria-disabled'), 'false');
@@ -152,6 +153,7 @@ suite('Void Agent and Skills picker ARIA linkage', function () {
 			const skillControls = await picker.getAttribute('aria-controls');
 			const skillActive = await picker.getAttribute('aria-activedescendant');
 			assert.ok(skillControls && skillActive);
+			assert.strictEqual(await picker.getAttribute('aria-expanded'), 'true');
 			assert.strictEqual(await page.locator(`#${skillControls}`).getAttribute('role'), 'listbox');
 			assert.strictEqual(await page.locator(`#${skillActive}`).getAttribute('aria-selected'), 'true');
 			await picker.press('Escape');
