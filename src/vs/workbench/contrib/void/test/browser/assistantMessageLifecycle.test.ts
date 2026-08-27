@@ -4,7 +4,7 @@
 
 import assert from 'assert';
 import { ChatThreadService } from '../../browser/chatThreadService.js';
-import { ConvertToLLMMessageService } from '../../browser/convertToLLMMessageService.js';
+import { closeNativeToolBatchForProspectiveAdmission, ConvertToLLMMessageService } from '../../browser/convertToLLMMessageService.js';
 import { projectAgentConfig, resolveAgentInstructions, stableAgentInstructionRevision } from '../../common/agentInstructions.js';
 import { createSkillCatalog } from '../../common/agentSkills.js';
 import { assistantMessagePresentation, INTERNAL_EMPTY_MESSAGE_SENTINEL, sanitizeAssistantDisplayContent } from '../../common/assistantMessagePresentation.js';
@@ -59,9 +59,9 @@ type TestRunChatOptions = {
 	modelSelection: { providerName: 'openAI' | 'openAICompatible'; modelName: string } | null;
 	modelSelectionOptions: unknown;
 	instructionSnapshot: ReturnType<typeof instructionSnapshot>;
-	callThisToolFirst?: { role: 'tool'; type: 'tool_request'; name: 'read_file'; id: string; params: Record<string, unknown>; rawParams: Record<string, unknown>; content: string; result: null; mcpServerName: undefined };
+	callThisToolFirst?: { role: 'tool'; type: 'tool_request'; name: 'read_file' | 'run_command'; id: string; params: Record<string, unknown>; rawParams: Record<string, unknown>; content: string; result: null; mcpServerName: undefined; batchId?: string; batchOrdinal?: number };
 };
-type TestToolCallResult = { awaitingUserApproval?: boolean; interrupted?: boolean; receiptCancelled?: boolean };
+type TestToolCallResult = { awaitingUserApproval?: boolean; interrupted?: boolean; receiptCancelled?: boolean; failure?: string; validatedParams?: Record<string, unknown> };
 interface ChatLifecycleTestAdapter {
 	_runChatAgent(this: unknown, options: TestRunChatOptions & { parentRun: TestParentRun }): Promise<void>;
 	_runToolCall(this: unknown, threadId: string, toolName: string, toolId: string, mcpServerName: string | undefined, options: { preapproved: true; unvalidatedToolParams: Record<string, unknown>; validatedParams: Record<string, unknown> }, snapshot: ReturnType<typeof instructionSnapshot>, authority: undefined, skillReadAllowed: boolean, generation: number, isActive: () => boolean, batchRef?: { batchId: string; batchOrdinal: number }): Promise<TestToolCallResult>;
@@ -494,6 +494,28 @@ suite('Assistant message lifecycle', () => {
 			assert.strictEqual(JSON.stringify(result.messages).includes(INTERNAL_EMPTY_MESSAGE_SENTINEL), false);
 		}
 		await assert.rejects(() => converter.prepareLLMChatMessages({ chatMessages: history.slice(0, -1), chatMode: 'agent', modelSelection: { providerName: 'openAI', modelName: 'gpt-4.1' }, instructionSnapshot: instructionSnapshot() as never }), /native_tool_batch_unclosed/);
+		const skipped = [...history.slice(0, 2), { role: 'tool', type: 'success', name: 'fixture_tool', params: { value: 'alpha' }, content: 'alpha', id: 'tool-1', rawParams: { value: 'alpha' }, result: 'alpha', mcpServerName: 'fixture-server', batchId: 'native-batch', batchOrdinal: 0 }, { role: 'tool', type: 'skipped', name: 'fixture_tool', content: 'cancelled before start', id: 'tool-2', rawParams: { malformed: true }, result: null, mcpServerName: 'fixture-server', batchId: 'native-batch', batchOrdinal: 1 }];
+		const skippedResult = await converter.prepareLLMChatMessages({ chatMessages: skipped, chatMode: 'agent', modelSelection: { providerName: 'openAI', modelName: 'gpt-4.1' }, instructionSnapshot: instructionSnapshot() as never }); assert.deepStrictEqual(skippedResult.messages.filter((message: any) => message.role === 'tool').map((message: any) => message.tool_call_id), ['tool-1', 'tool-2']);
+		const resourceBatch: any[] = [
+			{ role: 'user', content: 'admit a resource', displayContent: 'admit a resource' },
+			{ role: 'assistant', displayContent: '', reasoning: '', anthropicReasoning: null, toolBatch: { version: 1, batchId: 'resource-batch', calls: [{ id: 'resource-0', name: 'read_skill_resource', rawParams: { skill: 'demo', resource_path: 'guide.md' } }, { id: 'later-1', name: 'fixture_tool', rawParams: { value: 'later' } }] } },
+			{ role: 'tool', type: 'success', name: 'read_skill_resource', params: { skill: 'demo', resourcePath: 'guide.md' }, content: 'resource body', id: 'resource-0', rawParams: { skill: 'demo', resource_path: 'guide.md' }, result: 'resource body', mcpServerName: undefined, batchId: 'resource-batch', batchOrdinal: 0 },
+		];
+		const prospectiveResource = closeNativeToolBatchForProspectiveAdmission(resourceBatch, { batchId: 'resource-batch', batchOrdinal: 0 });
+		assert.deepStrictEqual(prospectiveResource.filter(message => message.role === 'tool').map((message: any) => [message.id, message.type, Object.prototype.hasOwnProperty.call(message, 'params')]), [['resource-0', 'success', true], ['later-1', 'skipped', false]]);
+		assert.strictEqual(resourceBatch.length, 3, 'prospective closure must not mutate live history');
+		const prospectiveResult = await converter.prepareLLMChatMessages({ chatMessages: prospectiveResource, chatMode: 'agent', modelSelection: { providerName: 'openAI', modelName: 'gpt-4.1' }, instructionSnapshot: instructionSnapshot() as never });
+		assert.deepStrictEqual(prospectiveResult.messages.filter((message: any) => message.role === 'tool').map((message: any) => message.tool_call_id), ['resource-0', 'later-1']);
+		for (const corrupt of [
+			[history[0], { ...history[1], toolBatch: { ...history[1].toolBatch, version: 2 } }, ...history.slice(2)],
+			[history[0], { ...history[1], toolBatch: { ...history[1].toolBatch, calls: [{ ...history[1].toolBatch.calls[0] }, { ...history[1].toolBatch.calls[0] }] } }, ...history.slice(2)],
+			[history[0], history[1], history[2], { ...history[3], batchOrdinal: 0 }],
+			[history[0], history[1], history[2], { ...history[3], name: 'other_tool' }],
+			[history[0], history[1], { ...history[2], batchId: undefined }, history[3]],
+			[history[0], history[1], history[2], { role: 'user', content: 'interleaved', displayContent: 'interleaved' }, history[3]],
+			[...history, { ...history[2], batchId: 'orphan', batchOrdinal: 0 }],
+			[...history, { ...history[1], displayContent: 'reused', toolBatch: { ...history[1].toolBatch, calls: [{ id: 'tool-3', name: 'fixture_tool', rawParams: { value: 'gamma' } }] } }, { ...history[2], id: 'tool-3', batchOrdinal: 0 }],
+		]) await assert.rejects(() => converter.prepareLLMChatMessages({ chatMessages: corrupt as any, chatMode: 'agent', modelSelection: { providerName: 'openAI', modelName: 'gpt-4.1' }, instructionSnapshot: instructionSnapshot() as never }), /native_tool_batch_(invalid_declaration|unclosed)/);
 	});
 
 	test('Anthropic, Gemini, and XML retain tool-only native blocks without fake text', async () => {
@@ -819,11 +841,84 @@ suite('Assistant message lifecycle', () => {
 			},
 			_mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } },
 			_setStreamState(threadId: string, value: any) { streamState[threadId] = value; },
-			_addMessageToThread() { },
+			_addMessageToThread() { }, _terminalizeBatchTailAfter(...args: any[]) { return (ChatThreadService.prototype as any)._terminalizeBatchTailAfter.call(this, ...args); },
 			_runToolCall: async () => { toolCalls++; return { receiptCancelled: true }; },
 		};
 		await runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot });
 		assert.deepStrictEqual({ sends, toolCalls, error: streamState.task.error }, { sends: 2, toolCalls: 1, error: undefined });
+
+		for (const cancelledAt of ['current', 'tail'] as const) {
+			const batchId = `restored-${cancelledAt}`;
+			const calls = [
+				{ name: 'run_command', id: `${cancelledAt}-0`, rawParams: { command: 'echo approved', terminalId: `${cancelledAt}-0` } },
+				{ name: 'run_command', id: `${cancelledAt}-1`, rawParams: { command: 'echo tail', terminalId: `${cancelledAt}-1` } },
+				{ name: 'write_file', id: `${cancelledAt}-2`, rawParams: { malformed: true } },
+			];
+			const params = { command: 'echo approved', terminalId: `${cancelledAt}-0` };
+			const messages: any[] = [
+				{ role: 'user', content: 'resume persisted batch', displayContent: 'resume persisted batch' },
+				{ role: 'assistant', displayContent: '', reasoning: '', anthropicReasoning: null, toolBatch: { version: 1, batchId, calls } },
+				{ role: 'tool', type: 'tool_request', name: 'run_command', params, content: '(Awaiting user permission...)', result: null, id: calls[0].id, rawParams: calls[0].rawParams, mcpServerName: undefined, batchId, batchOrdinal: 0 },
+			];
+			const resumedStream: any = {}; const executed: string[] = []; let resumedSends = 0;
+			const resumed: any = {
+				state: { allThreads: { task: { messages, state: {}, filesWithUserChanges: new Set<string>() } } }, streamState: resumedStream,
+				_agentControlGeneration: new Map([['task', 0]]), _parentRunTokenOfThread: new Map(), _agentDelegationAuthorityOfThread: new Map(),
+				_settingsService: { state: { globalSettings: { chatMode: 'agent' } } }, _convertToLLMMessagesService: { prepareLLMChatMessages: async () => ({ messages: [], separateSystemMessage: false }) },
+				_llmMessageService: { sendLLMMessage: (options: any) => { resumedSends++; queueMicrotask(() => void options.onFinalMessage({ fullText: 'continued once', fullReasoning: '', anthropicReasoning: null })); return 'continued-request'; }, abort() { } },
+				_mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } }, _computeMCPServerOfToolName: () => undefined,
+				_setStreamState(id: string, value: any) { resumedStream[id] = value; }, _addMessageToThread(_id: string, message: any) { messages.push(message); }, _editMessageInThread(_id: string, index: number, message: any) { messages[index] = message; },
+				_terminalizeBatchTailAfter(...args: any[]) { return (ChatThreadService.prototype as any)._terminalizeBatchTailAfter.call(this, ...args); },
+				_runToolCall: async (_id: string, name: string, toolId: string, _mcp: unknown, options: any, _snapshot: unknown, _authority: unknown, _skill: boolean, _generation: number, _current: () => boolean, batchRef: { batchId: string; batchOrdinal: number }) => {
+					executed.push(toolId);
+					const currentIndex = messages.findIndex(message => message.role === 'tool' && message.id === toolId && message.batchId === batchRef.batchId && message.batchOrdinal === batchRef.batchOrdinal);
+					const terminal = { role: 'tool', type: cancelledAt === 'tail' && batchRef.batchOrdinal === 0 ? 'success' : 'rejected', name, params: options.validatedParams ?? options.unvalidatedToolParams, content: cancelledAt === 'tail' && batchRef.batchOrdinal === 0 ? 'approved' : 'cancelled', result: cancelledAt === 'tail' && batchRef.batchOrdinal === 0 ? 'approved' : null, id: toolId, rawParams: options.unvalidatedToolParams, mcpServerName: undefined, ...batchRef };
+					if (currentIndex >= 0) messages[currentIndex] = terminal; else messages.push(terminal);
+					return cancelledAt === 'current' || batchRef.batchOrdinal === 1 ? { receiptCancelled: true } : {};
+				},
+			};
+			await runChatAgent(resumed, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot, callThisToolFirst: messages[2] });
+			assert.deepStrictEqual(executed, cancelledAt === 'current' ? [`${cancelledAt}-0`] : [`${cancelledAt}-0`, `${cancelledAt}-1`]);
+			assert.strictEqual(resumedSends, 1);
+			const rows = messages.filter(message => message.role === 'tool');
+			assert.deepStrictEqual(rows.map(message => [message.id, message.type, message.batchOrdinal]), cancelledAt === 'current'
+				? [['current-0', 'rejected', 0], ['current-1', 'skipped', 1], ['current-2', 'skipped', 2]]
+				: [['tail-0', 'success', 0], ['tail-1', 'rejected', 1], ['tail-2', 'skipped', 2]]);
+			assert.strictEqual(rows.filter(message => message.type === 'skipped').every(message => !Object.prototype.hasOwnProperty.call(message, 'params')), true);
+			assert.strictEqual(resumedStream.task.error, undefined);
+		}
+
+		const pausedMessages: any[] = [{ role: 'user', content: 'pause on the second native call', displayContent: 'pause on the second native call' }];
+		const pausedStream: any = {}; const pausedRuns: string[] = []; const completedRuns: string[] = []; let pausedSends = 0; let pausedConversions = 0;
+		const pausedCalls = [
+			{ name: 'run_command', id: 'pause-0', rawParams: { command: 'echo complete', terminalId: 'pause-0' } },
+			{ name: 'run_command', id: 'pause-1', rawParams: { command: 'echo approve', terminalId: 'pause-1' } },
+			{ name: 'run_command', id: 'pause-2', rawParams: { command: 'echo must-not-run', terminalId: 'pause-2' } },
+		];
+		const paused: any = {
+			state: { allThreads: { task: { messages: pausedMessages, state: {}, filesWithUserChanges: new Set<string>() } } }, streamState: pausedStream,
+			_agentControlGeneration: new Map([['task', 0]]), _parentRunTokenOfThread: new Map(), _agentDelegationAuthorityOfThread: new Map(),
+			_settingsService: { state: { globalSettings: { chatMode: 'agent' } } },
+			_convertToLLMMessagesService: { prepareLLMChatMessages: async () => { pausedConversions++; return { messages: [], separateSystemMessage: false }; } },
+			_llmMessageService: { sendLLMMessage: (options: any) => { const send = ++pausedSends; queueMicrotask(() => void options.onFinalMessage(send === 1 ? { fullText: '', fullReasoning: '', toolCalls: pausedCalls, anthropicReasoning: null } : { fullText: 'continued after approval', fullReasoning: '', anthropicReasoning: null })); return `pause-provider-${send}`; }, abort() { } },
+			_mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } },
+			_setStreamState(id: string, value: any) { pausedStream[id] = value; }, _addMessageToThread(_id: string, message: any) { pausedMessages.push(message); },
+			_runToolCall: async (_id: string, name: string, toolId: string, _mcp: unknown, options: any, _snapshot: unknown, _authority: unknown, _skill: boolean, _generation: number, _current: () => boolean, batchRef: { batchId: string; batchOrdinal: number }) => {
+				pausedRuns.push(toolId);
+				const awaiting = batchRef.batchOrdinal === 1 && !options.preapproved;
+				if (!awaiting) completedRuns.push(toolId);
+				const terminal = { role: 'tool', type: awaiting ? 'tool_request' : 'success', name, params: options.validatedParams ?? options.unvalidatedToolParams, content: awaiting ? '(Awaiting user permission...)' : 'completed', result: awaiting ? null : 'completed', id: toolId, rawParams: options.unvalidatedToolParams, mcpServerName: undefined, ...batchRef };
+				const existing = pausedMessages.findIndex(message => message.role === 'tool' && message.id === toolId && message.batchId === batchRef.batchId && message.batchOrdinal === batchRef.batchOrdinal);
+				if (existing >= 0) pausedMessages[existing] = terminal; else pausedMessages.push(terminal);
+				return awaiting ? { awaitingUserApproval: true } : {};
+			},
+		};
+		await runChatAgent(paused, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot });
+		assert.deepStrictEqual({ sends: pausedSends, conversions: pausedConversions, runs: pausedRuns, running: pausedStream.task.isRunning }, { sends: 1, conversions: 1, runs: ['pause-0', 'pause-1'], running: 'awaiting_user' });
+		assert.deepStrictEqual(pausedMessages.filter(message => message.role === 'tool').map(message => [message.id, message.type, message.batchOrdinal]), [['pause-0', 'success', 0], ['pause-1', 'tool_request', 1]]);
+		await runChatAgent(paused, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot, callThisToolFirst: pausedMessages.find(message => message.role === 'tool' && message.id === 'pause-1') });
+		assert.deepStrictEqual({ sends: pausedSends, conversions: pausedConversions, runs: pausedRuns, completedRuns }, { sends: 2, conversions: 2, runs: ['pause-0', 'pause-1', 'pause-1', 'pause-2'], completedRuns: ['pause-0', 'pause-1', 'pause-2'] });
+		assert.deepStrictEqual(pausedMessages.filter(message => message.role === 'tool').map(message => [message.id, message.type, message.batchOrdinal]), [['pause-0', 'success', 0], ['pause-1', 'success', 1], ['pause-2', 'success', 2]]);
 	});
 
 	test('stops the parent loop after three identical normalized tool failures without a fourth provider send', async () => {
@@ -838,6 +933,35 @@ suite('Assistant message lifecycle', () => {
 		};
 		await runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot });
 		assert.strictEqual(sends, 3); assert.strictEqual(toolRuns, 3); assert.strictEqual(streamState.task.error.message, 'The same tool failed three times. Change the request or recover the command before continuing.');
+
+		const batchId = 'resumed-identical-failures';
+		const calls = Array.from({ length: 4 }, (_, index) => ({ name: 'run_command', id: `resumed-failure-${index}`, rawParams: { command: 'false', cwd: null, terminalId: `raw-${index}` } }));
+		const resumedMessages: any[] = [
+			{ role: 'user', content: 'resume failures', displayContent: 'resume failures' },
+			{ role: 'assistant', displayContent: '', reasoning: '', anthropicReasoning: null, toolBatch: { version: 1, batchId, calls } },
+			{ role: 'tool', type: 'tool_request', name: 'run_command', params: { command: 'false', cwd: null, terminalId: 'validated-0' }, content: '(Awaiting user permission...)', result: null, id: calls[0].id, rawParams: calls[0].rawParams, mcpServerName: undefined, batchId, batchOrdinal: 0 },
+		];
+		const resumedState: any = {}; let resumedSends = 0; let resumedRuns = 0;
+		const resumed: any = {
+			state: { allThreads: { task: { messages: resumedMessages, state: {}, filesWithUserChanges: new Set<string>() } } }, streamState: resumedState,
+			_agentControlGeneration: new Map([['task', 0]]), _parentRunTokenOfThread: new Map(), _agentDelegationAuthorityOfThread: new Map(),
+			_settingsService: { state: { globalSettings: { chatMode: 'agent' } } }, _convertToLLMMessagesService: { prepareLLMChatMessages: async () => ({ messages: [], separateSystemMessage: false }) },
+			_llmMessageService: { sendLLMMessage: () => { resumedSends++; throw new Error('provider must not run after resumed identical-failure circuit'); }, abort() { } },
+			_mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } }, _computeMCPServerOfToolName: () => undefined,
+			_setStreamState(id: string, value: any) { resumedState[id] = value; }, _addMessageToThread(_id: string, message: any) { resumedMessages.push(message); }, _editMessageInThread(_id: string, index: number, message: any) { resumedMessages[index] = message; },
+			_terminalizeBatchTailAfter(...args: any[]) { return (ChatThreadService.prototype as any)._terminalizeBatchTailAfter.call(this, ...args); },
+			_runToolCall: async (_id: string, name: string, toolId: string, _mcp: unknown, options: any, _snapshot: unknown, _authority: unknown, _skill: boolean, _generation: number, _current: () => boolean, batchRef: { batchId: string; batchOrdinal: number }) => {
+				resumedRuns++; const validatedParams = { command: 'false', cwd: null, terminalId: `validated-${batchRef.batchOrdinal}` };
+				const terminal = { role: 'tool', type: 'tool_error', name, params: validatedParams, content: 'terminal failed', result: 'terminal failed', id: toolId, rawParams: options.unvalidatedToolParams, mcpServerName: undefined, ...batchRef };
+				const existing = resumedMessages.findIndex(message => message.role === 'tool' && message.id === toolId && message.batchId === batchRef.batchId && message.batchOrdinal === batchRef.batchOrdinal);
+				if (existing >= 0) resumedMessages[existing] = terminal; else resumedMessages.push(terminal);
+				return { failure: 'terminal_exit_1', validatedParams };
+			},
+		};
+		await runChatAgent(resumed, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot, callThisToolFirst: resumedMessages[2] });
+		assert.strictEqual(resumedRuns, 3); assert.strictEqual(resumedSends, 0); assert.strictEqual(resumedState.task.error.message, 'The same tool failed three times. Change the request or recover the command before continuing.');
+		assert.deepStrictEqual(resumedMessages.filter(message => message.role === 'tool').map(message => [message.id, message.type, message.batchOrdinal]), [['resumed-failure-0', 'tool_error', 0], ['resumed-failure-1', 'tool_error', 1], ['resumed-failure-2', 'tool_error', 2], ['resumed-failure-3', 'skipped', 3]]);
+		assert.strictEqual(Object.prototype.hasOwnProperty.call(resumedMessages.at(-1), 'params'), false);
 	});
 
 	test('different failures, different arguments, and successful calls do not trip the failure circuit', async () => {

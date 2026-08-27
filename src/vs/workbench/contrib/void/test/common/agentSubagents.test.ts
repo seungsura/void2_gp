@@ -7,10 +7,10 @@ import { LLMMessageService } from '../../common/sendLLMMessageService.js';
 
 suite('Void agent subagents', () => {
 	test('projects a bounded immutable child-tool approval with a collision-safe tuple key', () => {
-		const request: any = { parentId: 'a|b', generation: 2, childId: 'child-123456789', toolId: 'tool|id', snapshotRevision: 'rev', name: `remote-${'t'.repeat(200)}`, tool: { kind: 'mcp', mcpServerName: `server-${'s'.repeat(200)}`, approval: 'MCP tools' }, rawParams: Object.fromEntries(Array.from({ length: 20 }, (_, index) => [index === 0 ? 'a' : `z${index.toString().padStart(2, '0')}`, 'x'.repeat(10_000)])) };
+		const request: any = { parentId: 'a|b', generation: 2, childId: 'child-123456789', batchId: 'batch|id', batchOrdinal: 3, toolId: 'tool|id', snapshotRevision: 'rev', name: `remote-${'t'.repeat(200)}`, tool: { kind: 'mcp', mcpServerName: `server-${'s'.repeat(200)}`, approval: 'MCP tools' }, rawParams: Object.fromEntries(Array.from({ length: 20 }, (_, index) => [index === 0 ? 'a' : `z${index.toString().padStart(2, '0')}`, 'x'.repeat(10_000)])) };
 		const view = createChildToolApprovalView(request);
 		assert.strictEqual(view.structuralKey, childToolApprovalStructuralKey(view.key)); assert.strictEqual(view.childShortId, 'child-12'); assert.strictEqual(view.toolName.length, 128); assert.strictEqual(view.mcpServerName?.length, 128); assert.strictEqual(view.title, `MCP tool — ${view.mcpServerName} / ${view.toolName}`); assert.strictEqual(view.status, 'awaiting'); assert.strictEqual(view.parameters.length <= 4096, true); assert.strictEqual(JSON.parse(view.parameters).truncated, true); assert.ok(Object.isFrozen(view)); assert.ok(Object.isFrozen(view.key));
-		assert.notStrictEqual(childToolApprovalStructuralKey({ ...view.key, parentId: 'a', childId: 'b|child-123456789' }), view.structuralKey);
+		assert.notStrictEqual(childToolApprovalStructuralKey({ ...view.key, parentId: 'a', childId: 'b|child-123456789' }), view.structuralKey); assert.notStrictEqual(childToolApprovalStructuralKey({ ...view.key, batchOrdinal: 4 }), view.structuralKey);
 		const builtin = createChildToolApprovalView({ ...request, name: 'write_file', tool: { kind: 'builtin', approval: 'edits' }, rawParams: { z: 1, a: 2 } }); assert.strictEqual(builtin.title, 'Built-in tool — write_file'); assert.strictEqual(builtin.parameters, '{"a":2,"z":1}'); assert.throws(() => createChildToolApprovalView({ ...request, tool: { kind: 'skill_resource', approval: undefined } }));
 	});
 	test('uses an exact read-only profile and flat conservative control schemas', () => {

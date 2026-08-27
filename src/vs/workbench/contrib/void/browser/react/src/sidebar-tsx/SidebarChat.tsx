@@ -2459,6 +2459,17 @@ const LiveToolCard = ({ threadId, toolMessage }: { threadId: string; toolMessage
 	return <ToolHeaderWrapper title={title} desc1={desc1} elapsed={elapsed} rightAction={toolMessage.type === 'running_now' ? <ToolCardStop threadId={threadId} toolMessage={toolMessage} /> : undefined} isRejected={false} />
 }
 
+export function SkippedToolCard({ toolMessage }: { toolMessage: Extract<ToolMessage<ToolName>, { type: 'skipped' }> }) {
+	return <ToolHeaderWrapper title={toolMessage.name} desc1="Skipped" isRejected={true} />
+}
+
+/** Production-used early routing seam for terminal rows that intentionally have no
+ * validated params. Returning before the typed route prevents URI/command decoders
+ * from observing never-executed provider arguments. */
+export function renderEarlyToolCard(toolMessage: ToolMessage<ToolName>) {
+	return toolMessage.type === 'skipped' ? <SkippedToolCard toolMessage={toolMessage} /> : undefined
+}
+
 const _ChatBubble = ({ threadId, chatMessage, isCommitted, messageIdx, _scrollToBottom, editable }: ChatBubbleProps) => {
 	const role = chatMessage.role
 
@@ -2478,6 +2489,10 @@ const _ChatBubble = ({ threadId, chatMessage, isCommitted, messageIdx, _scrollTo
 		/>
 	}
 	else if (role === 'tool') {
+		// A skipped native-batch row was never validated or started. Route it before any
+		// tool-specific card so persisted malformed raw arguments cannot be inspected.
+		const earlyToolCard = renderEarlyToolCard(chatMessage)
+		if (earlyToolCard !== undefined) return earlyToolCard
 		const toolName = chatMessage.name
 		const isBuiltinTool = isABuiltinToolName(toolName)
 		const route = applicationToolRoute(toolName, isBuiltinTool)

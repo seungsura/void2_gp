@@ -62,7 +62,8 @@ export type ToolMessage<T extends ToolName> = {
 		| { type: 'tool_error', result: string, name: T, params: ToolCallParams<T>, } // error when tool was running
 		| { type: 'success', result: Awaited<ToolResult<T>>, name: T, params: ToolCallParams<T>, }
 		| { type: 'rejected', result: null, name: T, params: ToolCallParams<T> }
-	) // user rejected
+		| { type: 'skipped', result: null, name: T }
+) // user rejected
 
 export type DecorativeCanceledTool = {
 	role: 'interrupted_streaming_tool';

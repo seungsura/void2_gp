@@ -41,8 +41,8 @@ const fixture = (runtimeSnapshot = snapshot()) => {
 	value._revokeAgentDelegation = (threadId: string, forget = false) => (ChatThreadService.prototype as any)._revokeAgentDelegation.call(value, threadId, forget);
 	return { value, messages, serviceCalls, conversionCalls, runtimeSnapshot, setTrusted: (next: boolean) => trusted = next, setOwner: (next: string) => owner = next, purges: () => purges };
 };
-const run = (value: any, runtimeSnapshot: AgentRuntimeTurnSnapshot, raw: Record<string, unknown>, allowed = true) =>
-	(ChatThreadService.prototype as any)._runToolCall.call(value, 'parent', 'read_skill_resource', 'provider-tool-id', 'spoofed-mcp', { preapproved: false, unvalidatedToolParams: raw }, runtimeSnapshot, undefined, allowed, value._agentControlGeneration.get('parent') ?? 0, () => true);
+const run = (value: any, runtimeSnapshot: AgentRuntimeTurnSnapshot, raw: Record<string, unknown>, allowed = true, toolId = 'provider-tool-id', batchRef?: { batchId: string; batchOrdinal: number }) =>
+	(ChatThreadService.prototype as any)._runToolCall.call(value, 'parent', 'read_skill_resource', toolId, 'spoofed-mcp', { preapproved: false, unvalidatedToolParams: raw }, runtimeSnapshot, undefined, allowed, value._agentControlGeneration.get('parent') ?? 0, () => true, batchRef);
 
 suite('Void selected Skill resource Chat runtime', () => {
 	test('routes before builtin/MCP/approval and returns exact text from the captured selected descriptor', async () => {
@@ -50,6 +50,20 @@ suite('Void selected Skill resource Chat runtime', () => {
 		assert.deepStrictEqual(result, {}); assert.strictEqual(f.serviceCalls.length, 1); assert.strictEqual(f.serviceCalls[0].selection, f.runtimeSnapshot.selected[0]); assert.strictEqual(f.serviceCalls[0].resourcePath, 'references/guide.md');
 		assert.ok(f.serviceCalls[0].options.maxResourceBytes > 0); assert.strictEqual(f.serviceCalls[0].options.token.isCancellationRequested, false); assert.strictEqual(f.conversionCalls.length, 1);
 		assert.strictEqual(f.messages.length, 1); assert.strictEqual(f.messages[0].type, 'success'); assert.strictEqual(f.messages[0].content, 'RESOURCE\n'); assert.strictEqual(f.messages[0].result, 'RESOURCE\n'); assert.strictEqual(f.messages[0].id, 'provider-tool-id'); assert.strictEqual(f.messages[0].mcpServerName, undefined);
+
+		const batch = fixture(); const batchId = 'parent-resource-first'; const calls = [
+			{ id: 'resource-0', name: 'read_skill_resource', rawParams: { skill: 'demo', resource_path: 'first.md' } },
+			{ id: 'resource-1', name: 'read_skill_resource', rawParams: { skill: 'demo', resource_path: 'second.md' } },
+		];
+		batch.messages.push({ role: 'assistant', displayContent: '', reasoning: '', anthropicReasoning: null, toolBatch: { version: 1, batchId, calls } }, { role: 'tool', type: 'tool_request', name: 'read_skill_resource', params: { skill: 'demo', resourcePath: 'first.md' }, content: '(Awaiting user permission...)', result: null, id: calls[0].id, rawParams: calls[0].rawParams, mcpServerName: undefined, batchId, batchOrdinal: 0 });
+		assert.deepStrictEqual(await run(batch.value, batch.runtimeSnapshot, calls[0].rawParams, true, calls[0].id, { batchId, batchOrdinal: 0 }), {});
+		const firstProspective = batch.conversionCalls[0].chatMessages.filter((message: any) => message.role === 'tool');
+		assert.deepStrictEqual(firstProspective.map((message: any) => [message.id, message.type, Object.prototype.hasOwnProperty.call(message, 'params')]), [['resource-0', 'success', true], ['resource-1', 'skipped', false]]);
+		assert.deepStrictEqual(batch.messages.filter((message: any) => message.role === 'tool').map((message: any) => [message.id, message.type]), [['resource-0', 'success']], 'prospective skipped tail must not persist');
+		batch.messages.push({ role: 'tool', type: 'tool_request', name: 'read_skill_resource', params: { skill: 'demo', resourcePath: 'second.md' }, content: '(Awaiting user permission...)', result: null, id: calls[1].id, rawParams: calls[1].rawParams, mcpServerName: undefined, batchId, batchOrdinal: 1 });
+		assert.deepStrictEqual(await run(batch.value, batch.runtimeSnapshot, calls[1].rawParams, true, calls[1].id, { batchId, batchOrdinal: 1 }), {});
+		assert.deepStrictEqual(batch.messages.filter((message: any) => message.role === 'tool').map((message: any) => [message.id, message.type, message.batchOrdinal]), [['resource-0', 'success', 0], ['resource-1', 'success', 1]]);
+		assert.deepStrictEqual(batch.serviceCalls.map(call => call.resourcePath), ['first.md', 'second.md']);
 	});
 
 	test('rejects unavailable, malformed, outside, and unknown identities before service side effects', async () => {

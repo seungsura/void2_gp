@@ -28,13 +28,13 @@ export type AgentSubagentToolSnapshot = Readonly<{ revision: string; tools: read
  * cannot accidentally re-resolve a similarly named live tool. `cancel` is an
  * acknowledgement: it resolves only once the external operation is quiescent.
  */
-export type AgentSubagentToolBrokerRequest = Readonly<{ parentId: string; generation: number; childId: string; toolId: string; name: string; tool: AgentSubagentToolSnapshotEntry; rawParams: Readonly<Record<string, unknown>>; snapshotRevision: string; maxReadOutputTokens: number; cancellationToken: CancellationToken }>;
+export type AgentSubagentToolBrokerRequest = Readonly<{ parentId: string; generation: number; childId: string; batchId: string; batchOrdinal: number; toolId: string; name: string; tool: AgentSubagentToolSnapshotEntry; rawParams: Readonly<Record<string, unknown>>; snapshotRevision: string; maxReadOutputTokens: number; cancellationToken: CancellationToken }>;
 export type AgentSubagentToolBrokerResult = Readonly<{ ok: true; content: string; result?: unknown }> | Readonly<{ ok: false; error: string }>;
 /** This exact tuple is the only authority a child-tool approval can address. */
-export type ChildToolApprovalKey = Readonly<{ parentId: string; generation: number; childId: string; toolId: string; snapshotRevision: string }>;
+export type ChildToolApprovalKey = Readonly<{ parentId: string; generation: number; childId: string; batchId: string; batchOrdinal: number; toolId: string; snapshotRevision: string }>;
 export type ChildToolApprovalView = Readonly<{ key: ChildToolApprovalKey; structuralKey: string; childShortId: string; title: string; toolName: string; toolKind: 'builtin' | 'mcp'; mcpServerName?: string; category: 'edits' | 'terminal' | 'MCP tools'; parameters: string; status: 'awaiting' }>;
 /** JSON tuple avoids ambiguity inherent in delimiter-concatenated IDs. */
-export const childToolApprovalStructuralKey = (key: ChildToolApprovalKey): string => JSON.stringify([key.parentId, key.generation, key.childId, key.toolId, key.snapshotRevision]);
+export const childToolApprovalStructuralKey = (key: ChildToolApprovalKey): string => JSON.stringify([key.parentId, key.generation, key.childId, key.batchId, key.batchOrdinal, key.toolId, key.snapshotRevision]);
 const boundedApprovalValue = (value: unknown, depth = 0): unknown => {
 	if (depth > 3) return '[truncated]';
 	if (value === null || typeof value === 'boolean' || typeof value === 'number') return value;
@@ -52,7 +52,7 @@ const boundedApprovalParameters = (value: unknown): string => {
 };
 export const createChildToolApprovalView = (request: AgentSubagentToolBrokerRequest): ChildToolApprovalView => {
 	if ((request.tool.kind !== 'builtin' && request.tool.kind !== 'mcp') || !request.tool.approval || (request.tool.kind === 'mcp' && !request.tool.mcpServerName)) throw new Error('child_tool_approval_not_presentable');
-	const key = Object.freeze({ parentId: request.parentId, generation: request.generation, childId: request.childId, toolId: request.toolId, snapshotRevision: request.snapshotRevision });
+	const key = Object.freeze({ parentId: request.parentId, generation: request.generation, childId: request.childId, batchId: request.batchId, batchOrdinal: request.batchOrdinal, toolId: request.toolId, snapshotRevision: request.snapshotRevision });
 	const parameters = boundedApprovalParameters(request.rawParams);
 	const toolName = request.name.slice(0, 128); const mcpServerName = request.tool.mcpServerName?.slice(0, 128); const toolKind = request.tool.kind === 'mcp' ? 'mcp' as const : 'builtin' as const;
 	const title = toolKind === 'mcp' ? `MCP tool — ${mcpServerName} / ${toolName}` : `Built-in tool — ${toolName}`;

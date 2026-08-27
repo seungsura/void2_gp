@@ -10,6 +10,11 @@ import { chromium } from '@playwright/test';
 import { build } from 'tsup';
 
 const read = (filePath: string): string => fs.readFileSync(filePath, 'utf8');
+const between = (text: string, start: string, end: string): string => {
+	const startIndex = text.indexOf(start); const endIndex = text.indexOf(end, startIndex + start.length);
+	assert.ok(startIndex >= 0 && endIndex > startIndex, `Expected bounded source region: ${start}`);
+	return text.slice(startIndex, endIndex);
+};
 const findJavaScriptFiles = (directory: string): string[] => fs.readdirSync(directory, { withFileTypes: true }).flatMap(entry => entry.isDirectory() ? findJavaScriptFiles(path.join(directory, entry.name)) : entry.isFile() && entry.name.endsWith('.js') ? [path.join(directory, entry.name)] : []);
 
 const buildRuntime = async (servicesPath: string) => {
@@ -54,17 +59,54 @@ const buildRuntime = async (servicesPath: string) => {
 	} catch (error) { fs.rmSync(temporaryRoot, { recursive: true, force: true }); throw error; }
 };
 
+const buildSkippedToolCardRuntime = async (sidebarPath: string) => {
+	const sourceRoot = path.resolve(process.cwd());
+	const temporaryRoot = fs.mkdtempSync(path.join(sourceRoot, '.skipped-tool-card-'));
+	assert.ok(temporaryRoot.startsWith(`${sourceRoot}${path.sep}`));
+	const entry = path.join(temporaryRoot, 'entry.tsx'); const outDir = path.join(temporaryRoot, 'out');
+	const component = between(read(sidebarPath), 'export function SkippedToolCard', 'const _ChatBubble =');
+	assert.strictEqual(component.includes('.params'), false); assert.strictEqual(component.includes('rawParams'), false); assert.strictEqual(component.includes('applicationToolRoute'), false);
+	fs.writeFileSync(entry, `
+		import React from 'react';
+		import { createRoot } from 'react-dom/client';
+		import { flushSync } from 'react-dom';
+		type ToolName = string;
+		type ToolMessage<T extends ToolName> = { type: 'skipped'; name: T } | { type: 'other'; name: T; params: unknown };
+		const ToolHeaderWrapper = ({ title, desc1, isRejected }: { title: string; desc1: string; isRejected: boolean }) => <article data-tool-card="skipped" data-rejected={String(isRejected)}><strong>{title}</strong><span>{desc1}</span></article>;
+		${component}
+		const rows = [
+			{ role: 'tool', type: 'skipped', name: 'write_file', result: null, content: 'never executed', id: 'write-skipped', rawParams: { uri: { malformed: true }, edits: 'not-an-array' }, mcpServerName: undefined, batchId: 'safe-batch', batchOrdinal: 0 },
+			{ role: 'tool', type: 'skipped', name: 'run_command', result: null, content: 'never executed', id: 'command-skipped', rawParams: { command: { malformed: true }, terminalId: null }, mcpServerName: undefined, batchId: 'safe-batch', batchOrdinal: 1 },
+		] as const;
+		let root: ReturnType<typeof createRoot> | undefined;
+		const Harness = () => <>{rows.map(row => <React.Fragment key={row.id}>{renderEarlyToolCard(row as any) ?? <article data-tool-card="typed">typed route</article>}</React.Fragment>)}</>;
+		(window as any).__skippedToolCard = { mount(node: HTMLElement) { root = createRoot(node); flushSync(() => root!.render(<Harness />)); }, hasParams: () => rows.map(row => Object.prototype.hasOwnProperty.call(row, 'params')), rawParamKinds: () => rows.map(row => typeof row.rawParams), dispose() { flushSync(() => root?.unmount()); } };
+	`, 'utf8');
+	try {
+		await build({ entry: { runtime: entry }, outDir, format: ['iife'], globalName: 'SkippedToolCardRuntime', splitting: false, clean: true, platform: 'browser', target: 'es2022', silent: true, noExternal: [/^(?!\.).*$/], treeshake: true, esbuildOptions(options) { options.outbase = temporaryRoot; } });
+		const outputs = findJavaScriptFiles(outDir); assert.strictEqual(outputs.length, 1);
+		return { script: read(outputs[0]), dispose: () => fs.rmSync(temporaryRoot, { recursive: true, force: true }) };
+	} catch (error) { fs.rmSync(temporaryRoot, { recursive: true, force: true }); throw error; }
+};
+
 suite('Child Run live timing', function () {
 	this.timeout(20_000);
 	test('refreshes the three views together while active and clears its only timer', async () => {
 		const servicesPath = path.join(process.cwd(), 'src', 'vs', 'workbench', 'contrib', 'void', 'browser', 'react', 'src2', 'util', 'services.tsx');
-		for (const sidebarPath of [path.join(process.cwd(), 'src', 'vs', 'workbench', 'contrib', 'void', 'browser', 'react', 'src', 'sidebar-tsx', 'SidebarChat.tsx'), path.join(process.cwd(), 'src', 'vs', 'workbench', 'contrib', 'void', 'browser', 'react', 'src2', 'sidebar-tsx', 'SidebarChat.tsx')]) {
+		const sourceSidebarPath = path.join(process.cwd(), 'src', 'vs', 'workbench', 'contrib', 'void', 'browser', 'react', 'src', 'sidebar-tsx', 'SidebarChat.tsx'); const generatedSidebarPath = path.join(process.cwd(), 'src', 'vs', 'workbench', 'contrib', 'void', 'browser', 'react', 'src2', 'sidebar-tsx', 'SidebarChat.tsx');
+		for (const sidebarPath of [sourceSidebarPath, generatedSidebarPath]) {
 			const sidebar = read(sidebarPath); assert.ok(sidebar.includes('Provider requests:')); assert.ok(sidebar.includes('in flight (')); assert.ok(sidebar.includes('Result retention:'));
 			for (const stale of ['maxChildTurns', 'maxChildRunMs', 'deadlineMsRemaining', 'group deadline']) assert.strictEqual(sidebar.includes(stale), false, `${path.basename(sidebarPath)} retains ${stale}`);
+			const toolBranch = sidebar.indexOf("role === 'tool'"); const earlyRoute = sidebar.indexOf('renderEarlyToolCard(chatMessage)', toolBranch); const applicationRoute = sidebar.indexOf('applicationToolRoute(toolName', toolBranch);
+			assert.ok(toolBranch >= 0 && earlyRoute > toolBranch && applicationRoute > earlyRoute, `${path.basename(sidebarPath)} must route skipped rows before typed tool routing`);
 		}
-		const runtime = await buildRuntime(servicesPath); let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
+		const skippedRuntime = await buildSkippedToolCardRuntime(generatedSidebarPath); const runtime = await buildRuntime(servicesPath); let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
 		try {
-			browser = await chromium.launch({ headless: true }); const page = await browser.newPage(); const errors: string[] = []; page.on('pageerror', error => errors.push(error.message));
+			browser = await chromium.launch({ headless: true }); const page = await browser.newPage(); const errors: string[] = []; const consoleErrors: string[] = []; page.on('pageerror', error => errors.push(error.message)); page.on('console', message => { if (message.type() === 'error') consoleErrors.push(message.text()); });
+			await page.setContent('<!doctype html><div id="skipped-root"></div>'); await page.addScriptTag({ content: skippedRuntime.script }); await page.locator('#skipped-root').evaluate(node => (window as any).__skippedToolCard.mount(node));
+			assert.deepStrictEqual(await page.locator('[data-tool-card="skipped"]').evaluateAll(cards => cards.map(card => ({ text: card.textContent, rejected: card.getAttribute('data-rejected') }))), [{ text: 'write_fileSkipped', rejected: 'true' }, { text: 'run_commandSkipped', rejected: 'true' }]);
+			assert.strictEqual(await page.locator('[data-tool-card="typed"]').count(), 0);
+			assert.deepStrictEqual(await page.evaluate(() => (window as any).__skippedToolCard.hasParams()), [false, false]); assert.deepStrictEqual(await page.evaluate(() => (window as any).__skippedToolCard.rawParamKinds()), ['object', 'object']); await page.evaluate(() => (window as any).__skippedToolCard.dispose());
 			await page.setContent('<!doctype html><div id="root"></div>'); await page.addScriptTag({ content: runtime.script }); await page.locator('#root').evaluate(node => (window as any).__childRunTiming.mount(node));
 			const fixture = {
 				activeTimers: () => page.evaluate(() => (window as any).__childRunTiming.activeTimers()),
@@ -86,7 +128,7 @@ suite('Child Run live timing', function () {
 			await fixture.setThread('C'); assert.strictEqual(await page.locator('#snapshot').textContent(), 'C:undefined:undefined:0/64:3:2000'); assert.strictEqual(await fixture.activeTimers(), 0); assert.deepStrictEqual(await fixture.listenerCounts(), { run: 1, diagnostics: 1 });
 			await fixture.setThread('B'); assert.strictEqual(await page.locator('#snapshot').textContent(), 'B:queued:2000:0/64:3:2000'); assert.strictEqual(await fixture.activeTimers(), 1); assert.deepStrictEqual(await fixture.listenerCounts(), { run: 1, diagnostics: 1 });
 			const callsBeforeStaleEvent = await fixture.calls(); await fixture.emitDiagnostics('A'); assert.deepStrictEqual(await fixture.calls(), callsBeforeStaleEvent);
-			await fixture.dispose(); assert.strictEqual(await fixture.activeTimers(), 0); assert.deepStrictEqual(await fixture.listenerCounts(), { run: 0, diagnostics: 0 }); assert.ok((await fixture.cleared()).length >= 2); assert.deepStrictEqual(errors, []);
-		} finally { await browser?.close(); runtime.dispose(); }
+			await fixture.dispose(); assert.strictEqual(await fixture.activeTimers(), 0); assert.deepStrictEqual(await fixture.listenerCounts(), { run: 0, diagnostics: 0 }); assert.ok((await fixture.cleared()).length >= 2); assert.deepStrictEqual(errors, []); assert.deepStrictEqual(consoleErrors, []);
+		} finally { await browser?.close(); runtime.dispose(); skippedRuntime.dispose(); }
 	});
 });

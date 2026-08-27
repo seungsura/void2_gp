@@ -31,7 +31,7 @@ import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { getModelCapabilities, getReservedOutputTokenSpace } from '../common/modelCapabilities.js';
 import { AgentDelegationLimits, appendAgentInstructionDeveloperInstructions } from '../common/agentInstructions.js';
 import { computeMaxReadOutputTokens } from '../common/readFileReliability.js';
-import { estimateHistoryTokensForReadBudget, protectedSkillResourceHistoryLength } from './convertToLLMMessageService.js';
+import { closeNativeToolBatchForProspectiveAdmission, estimateHistoryTokensForReadBudget, protectedSkillResourceHistoryLength } from './convertToLLMMessageService.js';
 import { isABuiltinToolName } from '../common/prompt/prompts.js';
 import { sanitizeAssistantDisplayContent } from '../common/assistantMessagePresentation.js';
 
@@ -251,7 +251,8 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 						const content = admitSkillResourceContext(read.body, maxReadOutputTokens);
 						const success: ChatMessage & { role: 'tool' } = { role: 'tool', type: 'success', content, id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: undefined, name: response.tool.name, params: response.tool.rawParams, result: content as never, ...batchRef };
 						try {
-							await this.converter.prepareLLMChatMessages({ chatMessages: [...history, success], chatMode: 'agent', modelSelection, instructionSnapshot: run.snapshot, toolExecutionProfile: run.toolExecutionProfile, childRoot: owner.toString(), agentDelegationAllowed: run.remainingDepth > 0, frozenToolSnapshot: run.parentTools });
+							const prospective = closeNativeToolBatchForProspectiveAdmission([...history, success], batchRef);
+							await this.converter.prepareLLMChatMessages({ chatMessages: prospective, chatMode: 'agent', modelSelection, instructionSnapshot: run.snapshot, toolExecutionProfile: run.toolExecutionProfile, childRoot: owner.toString(), agentDelegationAllowed: run.remainingDepth > 0, frozenToolSnapshot: run.parentTools });
 						} catch { throw new Error('skill_resource_context_admission_failed'); }
 						if (!this.isCurrent(run)) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; }
 						history.push(success);
@@ -259,7 +260,7 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 					continue;
 				}
 				const maxReadOutputTokens = run.snapshot.model.hasModel ? computeMaxReadOutputTokens(run.snapshot.model.contextWindow, run.snapshot.model.reservedOutputTokens, estimateHistoryTokensForReadBudget(history)) : 0;
-				const request: AgentSubagentToolBrokerRequest = Object.freeze({ parentId: run.parentId, generation: run.generation, childId: run.id, toolId: response.tool.id, name: response.tool.name, tool: captured, rawParams: Object.freeze({ ...response.tool.rawParams }), snapshotRevision: run.parentTools!.revision, maxReadOutputTokens, cancellationToken: run.cancellation.token });
+				const request: AgentSubagentToolBrokerRequest = Object.freeze({ parentId: run.parentId, generation: run.generation, childId: run.id, batchId: batchRef.batchId, batchOrdinal: batchRef.batchOrdinal, toolId: response.tool.id, name: response.tool.name, tool: captured, rawParams: Object.freeze({ ...response.tool.rawParams }), snapshotRevision: run.parentTools!.revision, maxReadOutputTokens, cancellationToken: run.cancellation.token });
 				run.brokerRequest = request;
 				try {
 					const execute = run.broker.execute(request); run.brokerExecute = execute;

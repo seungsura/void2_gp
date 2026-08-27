@@ -17,7 +17,7 @@ import { generateUuid } from '../../../../base/common/uuid.js';
 import { FeatureName, ModelSelection, ModelSelectionOptions, SettingsOfProvider } from '../common/voidSettingsTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { getIsReasoningEnabledState, getModelCapabilities, getReservedOutputTokenSpace } from '../common/modelCapabilities.js';
-import { estimateHistoryTokensForReadBudget, protectedSkillResourceHistoryLength } from './convertToLLMMessageService.js';
+import { closeNativeToolBatchForProspectiveAdmission, estimateHistoryTokensForReadBudget, protectedSkillResourceHistoryLength } from './convertToLLMMessageService.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, BuiltinToolResultType, ToolCallParams, ToolName, ToolResult } from '../common/toolsServiceTypes.js';
 import { computeMaxReadOutputTokens, isBoundedReadHistory, isBoundedReadHistoryString } from '../common/readFileReliability.js';
 import { IToolsService } from './toolsServiceInterface.js';
@@ -501,7 +501,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	getChildToolApprovals(parentId: string): readonly ChildToolApprovalView[] { return Object.freeze([...this._childToolApprovals.values()].map(entry => entry.view).filter(view => view.key.parentId === parentId)); }
 	private _decideChildToolApproval(key: ChildToolApprovalKey, decision: 'approved' | 'rejected' | 'cancelled'): boolean {
 		const structuralKey = childToolApprovalStructuralKey(key); const record = this._childToolApprovals.get(structuralKey);
-		if (!record || record.view.key.parentId !== key.parentId || record.view.key.generation !== key.generation || record.view.key.childId !== key.childId || record.view.key.toolId !== key.toolId || record.view.key.snapshotRevision !== key.snapshotRevision) return false;
+		if (!record || record.view.key.parentId !== key.parentId || record.view.key.generation !== key.generation || record.view.key.childId !== key.childId || record.view.key.batchId !== key.batchId || record.view.key.batchOrdinal !== key.batchOrdinal || record.view.key.toolId !== key.toolId || record.view.key.snapshotRevision !== key.snapshotRevision) return false;
 		this._childToolApprovals.delete(structuralKey); record.resolve(decision); this._onDidChangeChildToolApprovals.fire(); return true;
 	}
 	approveChildToolApproval(key: ChildToolApprovalKey): boolean { return this._decideChildToolApproval(key, 'approved'); }
@@ -1127,10 +1127,11 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			const existing = (this.state.allThreads[threadId]?.messages ?? []).find(message => message.role === 'tool' && message.id === call.id && message.batchId === batchId && message.batchOrdinal === batchOrdinal)
 			if (existing?.role === 'tool' && existing.type !== 'running_now' && existing.type !== 'tool_request') continue
 			if (existing?.role === 'tool') {
+				if (!('params' in existing)) continue
 				const index = (this.state.allThreads[threadId]?.messages ?? []).indexOf(existing)
 				if (index >= 0) this._editMessageInThread(threadId, index, { role: 'tool', type: 'rejected', name: call.name, params: existing.params, content: reason, result: null, id: call.id, rawParams: call.rawParams, mcpServerName: existing.mcpServerName, batchId, batchOrdinal })
 			} else {
-				this._addMessageToThread(threadId, { role: 'tool', type: 'rejected', name: call.name, params: call.rawParams as ToolCallParams<ToolName>, content: reason, result: null, id: call.id, rawParams: call.rawParams, mcpServerName: this._computeMCPServerOfToolName(call.name), batchId, batchOrdinal })
+				this._addMessageToThread(threadId, { role: 'tool', type: 'skipped', name: call.name, content: reason, result: null, id: call.id, rawParams: call.rawParams, mcpServerName: this._computeMCPServerOfToolName(call.name), batchId, batchOrdinal })
 			}
 		}
 	}
@@ -1144,9 +1145,10 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			const existing = (this.state.allThreads[threadId]?.messages ?? []).find(message => message.role === 'tool' && message.id === call.id && message.batchId === batchRef.batchId && message.batchOrdinal === batchOrdinal)
 			if (existing?.role === 'tool' && existing.type !== 'running_now' && existing.type !== 'tool_request') continue
 			if (existing?.role === 'tool') {
+				if (!('params' in existing)) continue
 				const index = (this.state.allThreads[threadId]?.messages ?? []).indexOf(existing)
 				if (index >= 0) this._editMessageInThread(threadId, index, { role: 'tool', type: 'rejected', name: call.name, params: existing.params, content: reason, result: null, id: call.id, rawParams: call.rawParams, mcpServerName: existing.mcpServerName, batchId: batchRef.batchId, batchOrdinal })
-			} else this._addMessageToThread(threadId, { role: 'tool', type: 'rejected', name: call.name, params: call.rawParams as ToolCallParams<ToolName>, content: reason, result: null, id: call.id, rawParams: call.rawParams, mcpServerName: this._computeMCPServerOfToolName(call.name), batchId: batchRef.batchId, batchOrdinal })
+			} else this._addMessageToThread(threadId, { role: 'tool', type: 'skipped', name: call.name, content: reason, result: null, id: call.id, rawParams: call.rawParams, mcpServerName: this._computeMCPServerOfToolName(call.name), batchId: batchRef.batchId, batchOrdinal })
 		}
 	}
 
@@ -1202,7 +1204,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const lastMsg = thread.messages[thread.messages.length - 1]
 
 		let params: ToolCallParams<ToolName>
-		if (lastMsg.role === 'tool' && lastMsg.type !== 'invalid_params') {
+		if (lastMsg.role === 'tool' && lastMsg.type === 'tool_request') {
 			params = lastMsg.params
 		}
 		else { releaseAwaitingApproval.call(this, threadId); return }
@@ -1230,10 +1232,10 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	private _createAgentSubagentToolBroker(threadId: string, authority: AgentDelegationTurnAuthority): AgentSubagentToolBroker {
 		type BrokerRequestState = { cancelled: boolean; executing: boolean; settled: boolean; interrupt?: () => void; interruptIssued: boolean; pendingKey?: ChildToolApprovalKey; resolve: () => void; quiescent: Promise<void> };
 		const requests = new Map<string, BrokerRequestState>();
-		// A turn is bounded to eight accepted children and sixteen turns per child.
-		// Retaining 128 completed keys blocks replay without retaining an unbounded log.
+		// Retaining 128 completed exact batch-call tuples blocks replay without
+		// retaining an unbounded log; it does not impose a cumulative child-turn cap.
 		const completed = new Map<string, true>();
-		const approvalKeyOf = (request: AgentSubagentToolBrokerRequest): ChildToolApprovalKey => Object.freeze({ parentId: request.parentId, generation: request.generation, childId: request.childId, toolId: request.toolId, snapshotRevision: request.snapshotRevision });
+		const approvalKeyOf = (request: AgentSubagentToolBrokerRequest): ChildToolApprovalKey => Object.freeze({ parentId: request.parentId, generation: request.generation, childId: request.childId, batchId: request.batchId, batchOrdinal: request.batchOrdinal, toolId: request.toolId, snapshotRevision: request.snapshotRevision });
 		const keyOf = (request: AgentSubagentToolBrokerRequest) => childToolApprovalStructuralKey(approvalKeyOf(request));
 		const rememberCompleted = (key: string) => {
 			completed.delete(key);
@@ -1514,7 +1516,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				if (!isCurrentParentRun()) return cancellationOutcome();
 				try {
 					if (!instructionSnapshot.model.hasModel) throw new Error('skill_resource_context_admission_failed');
-					await this._convertToLLMMessagesService.prepareLLMChatMessages({ chatMessages: prospectiveMessages, chatMode: 'agent', modelSelection: { providerName: instructionSnapshot.model.providerName as ModelSelection['providerName'], modelName: instructionSnapshot.model.modelName }, instructionSnapshot, agentDelegationAllowed: !!agentDelegationAuthority?.allowed });
+					const prospectiveAdmissionMessages = closeNativeToolBatchForProspectiveAdmission(prospectiveMessages, batchRef);
+					await this._convertToLLMMessagesService.prepareLLMChatMessages({ chatMessages: prospectiveAdmissionMessages, chatMode: 'agent', modelSelection: { providerName: instructionSnapshot.model.providerName as ModelSelection['providerName'], modelName: instructionSnapshot.model.modelName }, instructionSnapshot, agentDelegationAllowed: !!agentDelegationAuthority?.allowed });
 				} catch { throw new Error('skill_resource_context_admission_failed'); }
 				if (interrupted || !isCurrentParentRun() || !sameGeneration()) return cancellationOutcome();
 				if (!sameResourceAuthority()) {
@@ -1806,21 +1809,33 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		// Parent-run local: successful calls, invalid requests and cancellations never
 		// enter it, and a new user turn gets a fresh map.
 		const identicalFailures = new Map<string, number>()
+		const accountIdenticalFailure = (toolName: ToolName, mcpServerName: string | undefined, failure: string | undefined, validatedParams: ToolCallParams<ToolName> | undefined, rawParams: RawToolParamsObj, batchRef: BatchCallRef | undefined): boolean => {
+			if (!failure) return false
+			const key = `${toolName.toLowerCase()}|${mcpServerName ?? ''}|${stableToolValue(semanticToolArgs(toolName, validatedParams ?? rawParams))}|${failure}`
+			const count = (identicalFailures.get(key) ?? 0) + 1
+			identicalFailures.set(key, count)
+			if (count < 3) return false
+			if (batchRef) this._terminalizeBatchTailAfter(threadId, batchRef, 'Native tool batch was closed after the identical-failure circuit opened.')
+			this._setStreamState(threadId, { isRunning: undefined, error: { message: 'The same tool failed three times. Change the request or recover the command before continuing.', fullError: null } })
+			return true
+		}
 
 		// before enter loop, call tool
 		if (callThisToolFirst) {
 			const callRef = callThisToolFirst.batchId === undefined || callThisToolFirst.batchOrdinal === undefined ? undefined : { batchId: callThisToolFirst.batchId, batchOrdinal: callThisToolFirst.batchOrdinal }
-			const { interrupted } = await this._runToolCall(threadId, callThisToolFirst.name, callThisToolFirst.id, callThisToolFirst.mcpServerName, { preapproved: true, unvalidatedToolParams: callThisToolFirst.rawParams, validatedParams: callThisToolFirst.params }, snapshot, agentDelegationAuthority, chatMode === 'agent', agentRunGeneration, isCurrentRun, callRef)
+			const current = await this._runToolCall(threadId, callThisToolFirst.name, callThisToolFirst.id, callThisToolFirst.mcpServerName, { preapproved: true, unvalidatedToolParams: callThisToolFirst.rawParams, validatedParams: callThisToolFirst.params }, snapshot, agentDelegationAuthority, chatMode === 'agent', agentRunGeneration, isCurrentRun, callRef)
 			if (!isCurrentRun()) return
-			if (interrupted) {
+			if (current.interrupted) {
 				this._setStreamState(threadId, undefined)
 				return
 			}
+			if (current.receiptCancelled && callRef) this._terminalizeBatchTailAfter(threadId, callRef, 'Native tool batch was cancelled before this call could start.')
+			if (accountIdenticalFailure(callThisToolFirst.name, callThisToolFirst.mcpServerName, current.failure, current.validatedParams, callThisToolFirst.rawParams, callRef)) return
 			// An approval is a pause inside a persisted native declaration, not the end
 			// of that declaration.  Reconstruct the remaining calls from the immutable
 			// assistant row so reload never needs a mutable cursor and cannot replay the
 			// already-approved call.
-			if (callThisToolFirst.batchId !== undefined && callThisToolFirst.batchOrdinal !== undefined) {
+			if (!current.receiptCancelled && callThisToolFirst.batchId !== undefined && callThisToolFirst.batchOrdinal !== undefined) {
 				const declaration = (this.state.allThreads[threadId]?.messages ?? []).find((message): message is Extract<ChatMessage, { role: 'assistant' }> => message.role === 'assistant' && message.toolBatch?.batchId === callThisToolFirst.batchId)?.toolBatch
 				if (!declaration || declaration.calls[callThisToolFirst.batchOrdinal]?.id !== callThisToolFirst.id) {
 					this._setStreamState(threadId, { isRunning: undefined, error: { message: 'The pending native tool batch no longer matches its declaration.', fullError: null } })
@@ -1830,12 +1845,16 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 					if (!isCurrentRun()) return
 					const toolCall = declaration.calls[batchOrdinal]
 					const mcpTool = isAgentSubagentControlName(toolCall.name) || isReadSkillResourceToolName(toolCall.name) ? undefined : this._mcpService.getMCPTools()?.find(tool => tool.name === toolCall.name)
-					const tail = await this._runToolCall(threadId, toolCall.name, toolCall.id, mcpTool?.mcpServerName, { preapproved: false, unvalidatedToolParams: toolCall.rawParams }, snapshot, agentDelegationAuthority, chatMode === 'agent', agentRunGeneration, isCurrentRun, { batchId: declaration.batchId, batchOrdinal })
-					if (tail.interrupted || tail.receiptCancelled) { this._setStreamState(threadId, undefined); return }
+					const tailRef = { batchId: declaration.batchId, batchOrdinal }
+					const tail = await this._runToolCall(threadId, toolCall.name, toolCall.id, mcpTool?.mcpServerName, { preapproved: false, unvalidatedToolParams: toolCall.rawParams }, snapshot, agentDelegationAuthority, chatMode === 'agent', agentRunGeneration, isCurrentRun, tailRef)
+					if (tail.interrupted) { this._setStreamState(threadId, undefined); return }
+					if (tail.receiptCancelled) { this._terminalizeBatchTailAfter(threadId, tailRef, 'Native tool batch was cancelled before this call could start.'); break }
 					if (tail.awaitingUserApproval) { this._setStreamState(threadId, { isRunning: 'awaiting_user' }); return }
+					if (accountIdenticalFailure(toolCall.name, mcpTool?.mcpServerName, tail.failure, tail.validatedParams, toolCall.rawParams, tailRef)) return
 				}
 			}
 		}
+		shouldSendAnotherMessage = true
 		this._setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' })  // just decorative, for clarity
 
 
@@ -1995,22 +2014,28 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 					for (const [batchOrdinal, toolCall] of toolCalls.entries()) {
 					const mcpTool = isAgentSubagentControlName(toolCall.name) || isReadSkillResourceToolName(toolCall.name) ? undefined : this._mcpService.getMCPTools()?.find(t => t.name === toolCall.name)
 
-					const { awaitingUserApproval, interrupted, failure, validatedParams } = await this._runToolCall(threadId, toolCall.name, toolCall.id, mcpTool?.mcpServerName, { preapproved: false, unvalidatedToolParams: toolCall.rawParams }, snapshot, agentDelegationAuthority, chatMode === 'agent', agentRunGeneration, isCurrentRun, { batchId: batchId!, batchOrdinal })
+					const batchRef = { batchId: batchId!, batchOrdinal }
+					const { awaitingUserApproval, interrupted, receiptCancelled, failure, validatedParams } = await this._runToolCall(threadId, toolCall.name, toolCall.id, mcpTool?.mcpServerName, { preapproved: false, unvalidatedToolParams: toolCall.rawParams }, snapshot, agentDelegationAuthority, chatMode === 'agent', agentRunGeneration, isCurrentRun, batchRef)
 					if (!isCurrentRun()) return
 					if (interrupted) {
 						this._setStreamState(threadId, undefined)
 						return
 					}
-					if (awaitingUserApproval) { isRunningWhenEnd = 'awaiting_user'; break }
+					if (receiptCancelled) {
+						this._terminalizeBatchTailAfter(threadId, batchRef, 'Native tool batch was cancelled before this call could start.')
+						shouldSendAnotherMessage = true
+						break
+					}
+					if (awaitingUserApproval) {
+						// An earlier call in the same provider batch may already have marked a
+						// continuation as necessary. Approval is a stronger boundary: keep the
+						// declaration open and do not assemble another provider request yet.
+						shouldSendAnotherMessage = false
+						isRunningWhenEnd = 'awaiting_user'
+						break
+					}
 					else if (failure) {
-						const key = `${toolCall.name.toLowerCase()}|${mcpTool?.mcpServerName ?? ''}|${stableToolValue(semanticToolArgs(toolCall.name, validatedParams ?? toolCall.rawParams))}|${failure}`
-						const count = (identicalFailures.get(key) ?? 0) + 1
-						identicalFailures.set(key, count)
-						if (count >= 3) {
-							this._terminalizeBatchTailAfter(threadId, { batchId: batchId!, batchOrdinal }, 'Native tool batch was closed after the identical-failure circuit opened.')
-							this._setStreamState(threadId, { isRunning: undefined, error: { message: 'The same tool failed three times. Change the request or recover the command before continuing.', fullError: null } })
-							return
-						}
+						if (accountIdenticalFailure(toolCall.name, mcpTool?.mcpServerName, failure, validatedParams, toolCall.rawParams, batchRef)) return
 						shouldSendAnotherMessage = true
 					}
 					else { shouldSendAnotherMessage = true }
