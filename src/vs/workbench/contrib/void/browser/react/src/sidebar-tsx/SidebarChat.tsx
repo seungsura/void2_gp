@@ -2892,7 +2892,7 @@ export const LandingSuggestedPrompts = ({ onSubmit, disabled }: { onSubmit: (tex
 			key={text}
 			type='button'
 			disabled={disabled}
-			className='w-full py-1 px-2 rounded text-left text-sm bg-zinc-700/5 hover:bg-zinc-700/10 dark:bg-zinc-300/5 dark:hover:bg-zinc-300/10 cursor-pointer opacity-80 hover:opacity-100 disabled:cursor-default disabled:opacity-50'
+			className='focus-ring w-full py-1 px-2 rounded text-left text-sm bg-zinc-700/5 hover:bg-zinc-700/10 dark:bg-zinc-300/5 dark:hover:bg-zinc-300/10 cursor-pointer opacity-80 hover:opacity-100 disabled:cursor-default disabled:opacity-50'
 			onClick={() => onSubmit(text)}
 		>
 			{text}

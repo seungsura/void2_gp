@@ -70,6 +70,7 @@ suite('Landing suggestion buttons', function () {
 		const root = process.cwd();
 		const sourceSidebarPath = path.join(root, 'src', 'vs', 'workbench', 'contrib', 'void', 'browser', 'react', 'src', 'sidebar-tsx', 'SidebarChat.tsx');
 		const generatedSidebarPath = path.join(root, 'src', 'vs', 'workbench', 'contrib', 'void', 'browser', 'react', 'src2', 'sidebar-tsx', 'SidebarChat.tsx');
+		const generatedStylesPath = path.join(root, 'src', 'vs', 'workbench', 'contrib', 'void', 'browser', 'react', 'src2', 'styles.css');
 		const source = read(sourceSidebarPath);
 		const sourceComponent = between(source, 'export const LandingSuggestedPrompts =', 'export const SidebarChat =');
 		const generatedComponent = between(read(generatedSidebarPath), 'export const LandingSuggestedPrompts =', 'export const SidebarChat =');
@@ -84,6 +85,8 @@ suite('Landing suggestion buttons', function () {
 			assert.strictEqual(occurrences(component, 'text-left'), 1);
 			assert.strictEqual(occurrences(component, 'w-full'), 2);
 		}
+		assert.strictEqual(occurrences(sourceComponent, 'focus-ring'), 1);
+		assert.strictEqual(occurrences(generatedComponent, 'void-focus-ring'), 1);
 		const sourceCallSite = between(source, 'const initiallySuggestedPromptsHTML =', 'const threadPageInput =');
 		assert.strictEqual(sourceCallSite.trim(), 'const initiallySuggestedPromptsHTML = <LandingSuggestedPrompts onSubmit={onSubmit} disabled={chatModelUnavailable} />');
 		assert.strictEqual(occurrences(sourceCallSite, 'currentStatusPresentation.sendDisabled'), 0);
@@ -97,7 +100,8 @@ suite('Landing suggestion buttons', function () {
 			const consoleErrors: string[] = [];
 			page.on('pageerror', error => pageErrors.push(error.message));
 			page.on('console', message => { if (message.type() === 'error') { consoleErrors.push(message.text()); } });
-			await page.setContent('<!doctype html><div id="root"></div>');
+			await page.setContent('<!doctype html><div class="void-scope" id="root" style="--void-ring-color:#1177cb"></div>');
+			await page.addStyleTag({ content: read(generatedStylesPath) });
 			await page.addScriptTag({ content: runtime.script });
 			await page.locator('#root').evaluate(node => (window as any).__landingSuggestionButton.mount(node));
 			const first = page.getByRole('button', { name: 'Summarize my codebase' });
@@ -109,6 +113,10 @@ suite('Landing suggestion buttons', function () {
 			]);
 			await page.keyboard.press('Tab');
 			assert.strictEqual(await first.evaluate(button => document.activeElement === button), true);
+			assert.deepStrictEqual(await first.evaluate(button => {
+				const style = getComputedStyle(button);
+				return { outlineStyle: style.outlineStyle, outlineWidth: style.outlineWidth, outlineOffset: style.outlineOffset, outlineColor: style.outlineColor };
+			}), { outlineStyle: 'solid', outlineWidth: '2px', outlineOffset: '2px', outlineColor: 'rgb(17, 119, 203)' });
 			await first.press('Enter');
 			assert.strictEqual(await page.evaluate(() => (window as any).__landingSuggestionButton.getFormSubmits()), 0);
 			await second.press('Space');
