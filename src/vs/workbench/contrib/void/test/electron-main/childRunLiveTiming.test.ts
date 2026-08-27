@@ -28,7 +28,7 @@ const buildRuntime = async (servicesPath: string) => {
 		const listen = (set: Set<any>, listener: any) => { set.add(listener); return { dispose: () => set.delete(listener) }; };
 		let now = 0; const states: Record<string, 'queued' | 'running' | 'completed'> = { A: 'running', B: 'queued' }; const calls = { runs: 0, budget: 0, diagnostics: 0 };
 		const child = {
-			getRunViews(id: string) { calls.runs++; return [{ id, status: states[id], totalMs: now, queuedMs: now, runningMs: now }]; },
+			getRunViews(id: string) { calls.runs++; return id === 'C' ? [] : [{ id, status: states[id], totalMs: now, queuedMs: now, runningMs: now }]; },
 			getBudgetView(id: string) { calls.budget++; return { parentId: id, deadlineMsRemaining: 10000 - now }; },
 			getDiagnosticsView(id: string) { calls.diagnostics++; return { parentId: id, elapsedMs: now }; },
 			onDidChangeRun(listener: any) { return listen(runListeners, listener); }, onDidChangeDiagnostics(listener: any) { return listen(diagnosticsListeners, listener); },
@@ -79,6 +79,7 @@ suite('Child Run live timing', function () {
 			await fixture.emitRun('B'); assert.deepStrictEqual(await fixture.calls(), { runs: 3, budget: 3, diagnostics: 3 });
 			await fixture.emitDiagnostics('A'); await fixture.emitRun('A'); assert.strictEqual(await fixture.activeTimers(), 1); assert.deepStrictEqual(await fixture.calls(), { runs: 5, budget: 5, diagnostics: 5 });
 			await fixture.completeA(); assert.strictEqual(await fixture.activeTimers(), 0); await fixture.advance(1_000); assert.strictEqual(await page.locator('#snapshot').textContent(), 'A:completed:1000:9000:1000');
+			await fixture.setThread('C'); assert.strictEqual(await page.locator('#snapshot').textContent(), 'C:undefined:undefined:8000:2000'); assert.strictEqual(await fixture.activeTimers(), 0); assert.deepStrictEqual(await fixture.listenerCounts(), { run: 1, diagnostics: 1 });
 			await fixture.setThread('B'); assert.strictEqual(await page.locator('#snapshot').textContent(), 'B:queued:2000:8000:2000'); assert.strictEqual(await fixture.activeTimers(), 1); assert.deepStrictEqual(await fixture.listenerCounts(), { run: 1, diagnostics: 1 });
 			const callsBeforeStaleEvent = await fixture.calls(); await fixture.emitDiagnostics('A'); assert.deepStrictEqual(await fixture.calls(), callsBeforeStaleEvent);
 			await fixture.dispose(); assert.strictEqual(await fixture.activeTimers(), 0); assert.deepStrictEqual(await fixture.listenerCounts(), { run: 0, diagnostics: 0 }); assert.ok((await fixture.cleared()).length >= 2); assert.deepStrictEqual(errors, []);
