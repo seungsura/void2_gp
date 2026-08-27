@@ -253,10 +253,11 @@ const SimpleModelSettingsDialog = ({
 	const { title: providerTitle } = displayInfoOfProviderName(providerName)
 	const accessor = useAccessor()
 	const settingsState = useSettingsState()
-	const mouseDownInsideModal = useRef(false); // Ref to track mousedown origin
+	const backdropPointerDownRef = useRef(false);
 	const closeButtonRef = useRef<HTMLButtonElement | null>(null);
 	const onCloseRef = useRef(onClose);
 	const isClosingRef = useRef(false);
+	const saveInFlightRef = useRef(false);
 	const headingId = useId();
 	const settingsStateService = accessor.get('IVoidSettingsService')
 	onCloseRef.current = onClose;
@@ -305,12 +306,29 @@ const SimpleModelSettingsDialog = ({
 		};
 	}, [closeOnce, openerRef]);
 
+	useEffect(() => {
+		saveInFlightRef.current = false;
+		return () => {
+			saveInFlightRef.current = false;
+		};
+	}, []);
+
+	const saveAndClose = async (overrides: Partial<ModelOverrides> | undefined) => {
+		if (saveInFlightRef.current) return;
+		saveInFlightRef.current = true;
+		try {
+			await settingsStateService.setOverridesOfModel(providerName, modelName, overrides);
+		} catch (error) {
+			saveInFlightRef.current = false;
+			throw error;
+		}
+		closeOnce();
+	};
+
 	const onSave = async () => {
 		// if disabled override, reset overrides
 		if (!overrideEnabled) {
-			await settingsStateService.setOverridesOfModel(providerName, modelName, undefined);
-			closeOnce();
-			return;
+			return saveAndClose(undefined);
 		}
 
 		// enabled overrides
@@ -340,8 +358,7 @@ const SimpleModelSettingsDialog = ({
 				cleaned[k] = parsedInput[k] as any;
 			}
 		}
-		await settingsStateService.setOverridesOfModel(providerName, modelName, cleaned);
-		closeOnce();
+		return saveAndClose(cleaned);
 	};
 
 	const sourcecodeOverridesLink = `https://github.com/voideditor/void/blob/2e5ecb291d33afbe4565921664fb7e183189c1c5/src/vs/workbench/contrib/void/common/modelCapabilities.ts#L146-L172`
@@ -349,14 +366,15 @@ const SimpleModelSettingsDialog = ({
 	return (
 		<div // Backdrop
 			className="fixed inset-0 bg-black/50 flex items-center justify-center z-[9999999]"
-			onMouseDown={() => {
-				mouseDownInsideModal.current = false;
+			onMouseDown={(event) => {
+				backdropPointerDownRef.current = event.target === event.currentTarget;
 			}}
-			onMouseUp={() => {
-				if (!mouseDownInsideModal.current) {
+			onMouseUp={(event) => {
+				const shouldClose = backdropPointerDownRef.current && event.target === event.currentTarget;
+				backdropPointerDownRef.current = false;
+				if (shouldClose) {
 					closeOnce();
 				}
-				mouseDownInsideModal.current = false;
 			}}
 		>
 			{/* MODAL */}
@@ -367,7 +385,6 @@ const SimpleModelSettingsDialog = ({
 				className="bg-void-bg-1 rounded-md p-4 max-w-xl w-full shadow-xl overflow-y-auto max-h-[90vh]"
 				onClick={(e) => e.stopPropagation()} // Keep stopping propagation for normal clicks inside
 				onMouseDown={(e) => {
-					mouseDownInsideModal.current = true;
 					e.stopPropagation();
 				}}
 			>

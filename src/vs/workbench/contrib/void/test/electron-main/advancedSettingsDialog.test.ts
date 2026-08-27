@@ -41,7 +41,7 @@ const buildRuntime = async (generatedSettingsPath: string) => {
 			return <><button type="button" onClick={event => { openerRef.current = event.currentTarget; setOpen(true); }}>Open fixture advanced settings</button>{open ? <SimpleModelSettingsDialog isOpen={true} onClose={() => { closeCount += 1; setOpen(false); }} modelInfo={{ modelName: 'gpt-5.6-luna', providerName: 'openAICompatible' as any, type: 'default' }} openerRef={openerRef} /> : null}</>;
 		};
 		(window as any).__advancedSettingsDialog = {
-			persisted: advancedSettingsDialogFixture.persisted, getCloseCount: () => closeCount,
+			persisted: advancedSettingsDialogFixture.persisted, persistenceCalls: advancedSettingsDialogFixture.persistenceCalls, deferNextPersistence: advancedSettingsDialogFixture.deferNextPersistence, resolveDeferredPersistence: advancedSettingsDialogFixture.resolveDeferredPersistence, getCloseCount: () => closeCount,
 			mount(node: HTMLElement) { mountedRoot = createRoot(node); flushSync(() => mountedRoot!.render(<Harness />)); },
 			dispose() { flushSync(() => mountedRoot?.unmount()); },
 		};
@@ -61,8 +61,19 @@ const buildRuntime = async (generatedSettingsPath: string) => {
 							const displayInfoOfProviderName = (_providerName: string) => ({ title: 'OpenAI Compatible' });
 							const getModelCapabilities = () => ({ contextWindow: 128, temperature: 1, recognizedModelName: 'Fixture model', isUnrecognizedModel: false });
 							const persisted: unknown[] = [];
+							const persistenceCalls: unknown[] = [];
+							let deferNextPersistence = false;
+							let resolveDeferredPersistence: (() => void) | undefined;
 							const settingsState = { overridesOfModel: {} };
-							const settingsStateService = { setOverridesOfModel: async (_providerName: string, _modelName: string, overrides: unknown) => { persisted.push(overrides); } };
+							const settingsStateService = { setOverridesOfModel: (_providerName: string, _modelName: string, overrides: unknown) => {
+								persistenceCalls.push(overrides);
+								if (deferNextPersistence) {
+									deferNextPersistence = false;
+									return new Promise<void>(resolve => { resolveDeferredPersistence = () => { persisted.push(overrides); resolve(); }; });
+								}
+								persisted.push(overrides);
+								return Promise.resolve();
+							} };
 							const useAccessor = () => ({ get: (_service: string) => settingsStateService });
 							const useSettingsState = () => settingsState;
 							const VoidSwitch = ({ ariaLabel, value, onChange }: any) => <button type="button" role="switch" aria-label={ariaLabel} aria-checked={value} onClick={() => onChange(!value)} style={{ width: 16, height: 16 }} />;
@@ -71,7 +82,7 @@ const buildRuntime = async (generatedSettingsPath: string) => {
 							const X = () => <span aria-hidden="true">×</span>;
 							${component}
 							export { SimpleModelSettingsDialog };
-							export const advancedSettingsDialogFixture = { persisted };
+							export const advancedSettingsDialogFixture = { persisted, persistenceCalls, deferNextPersistence: () => { deferNextPersistence = true; }, resolveDeferredPersistence: () => resolveDeferredPersistence?.() };
 						`, loader: 'tsx', resolveDir: path.dirname(args.path) };
 					});
 				},
@@ -173,6 +184,17 @@ suite('Advanced Settings dialog', function () {
 			await reopen();
 			await closeWithoutPersistence(() => page.getByRole('button', { name: 'Cancel' }).click());
 			await reopen();
+			const beforeBackdropDragClose = await page.evaluate(() => (window as any).__advancedSettingsDialog.getCloseCount());
+			const beforeBackdropDragPersisted = await page.evaluate(() => (window as any).__advancedSettingsDialog.persisted.length);
+			const dialogBounds = await dialog.boundingBox();
+			assert.ok(dialogBounds);
+			await page.mouse.move(1, 1);
+			await page.mouse.down();
+			await page.mouse.move(dialogBounds.x + 8, dialogBounds.y + 8);
+			await page.mouse.up();
+			assert.strictEqual(await dialog.count(), 1);
+			assert.strictEqual(await page.evaluate(() => (window as any).__advancedSettingsDialog.getCloseCount()), beforeBackdropDragClose);
+			assert.strictEqual(await page.evaluate(() => (window as any).__advancedSettingsDialog.persisted.length), beforeBackdropDragPersisted);
 			await closeWithoutPersistence(async () => { await page.mouse.click(1, 1); });
 			await reopen();
 			await closeWithoutPersistence(() => page.keyboard.press('Escape'));
@@ -216,6 +238,27 @@ suite('Advanced Settings dialog', function () {
 			assert.strictEqual(await page.evaluate(() => (window as any).__advancedSettingsDialog.persisted.length), beforeValid + 1);
 			assert.deepStrictEqual(await page.evaluate(() => (window as any).__advancedSettingsDialog.persisted.at(-1)), { contextWindow: 200 });
 			assert.strictEqual(await page.evaluate(() => (window as any).__advancedSettingsDialog.getCloseCount()), beforeValidClose + 1);
+
+			await reopen();
+			await page.getByRole('switch', { name: 'Override model defaults for OpenAI Compatible / gpt-5.6-luna' }).click();
+			await page.locator('textarea').fill('{"contextWindow": 300}');
+			const beforeDeferredCalls = await page.evaluate(() => (window as any).__advancedSettingsDialog.persistenceCalls.length);
+			const beforeDeferredPersisted = await page.evaluate(() => (window as any).__advancedSettingsDialog.persisted.length);
+			const beforeDeferredClose = await page.evaluate(() => (window as any).__advancedSettingsDialog.getCloseCount());
+			await page.evaluate(() => (window as any).__advancedSettingsDialog.deferNextPersistence());
+			const saveButton = page.getByRole('button', { name: 'Save' });
+			await saveButton.click();
+			await saveButton.click();
+			assert.strictEqual(await page.evaluate(() => (window as any).__advancedSettingsDialog.persistenceCalls.length), beforeDeferredCalls + 1);
+			assert.strictEqual(await page.evaluate(() => (window as any).__advancedSettingsDialog.persisted.length), beforeDeferredPersisted);
+			assert.strictEqual(await dialog.count(), 1);
+			assert.strictEqual(await page.evaluate(() => (window as any).__advancedSettingsDialog.getCloseCount()), beforeDeferredClose);
+			await page.evaluate(() => (window as any).__advancedSettingsDialog.resolveDeferredPersistence());
+			await dialog.waitFor({ state: 'detached' });
+			await assertReturnedToOpener();
+			assert.strictEqual(await page.evaluate(() => (window as any).__advancedSettingsDialog.persisted.length), beforeDeferredPersisted + 1);
+			assert.deepStrictEqual(await page.evaluate(() => (window as any).__advancedSettingsDialog.persisted.at(-1)), { contextWindow: 300 });
+			assert.strictEqual(await page.evaluate(() => (window as any).__advancedSettingsDialog.getCloseCount()), beforeDeferredClose + 1);
 
 			await page.evaluate(() => (window as any).__advancedSettingsDialog.dispose());
 			assert.deepStrictEqual(pageErrors, []);
