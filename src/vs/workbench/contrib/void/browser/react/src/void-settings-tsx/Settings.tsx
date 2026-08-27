@@ -3,7 +3,7 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import React, { useCallback, useEffect, useMemo, useState, useRef } from 'react'; // Added useRef import just in case it was missed, though likely already present
+import React, { useCallback, useEffect, useId, useMemo, useState, useRef } from 'react'; // Added useRef import just in case it was missed, though likely already present
 import { ProviderName, SettingName, displayInfoOfSettingName, providerNames, VoidStatefulModelInfo, customSettingNamesOfProvider, RefreshableProviderName, refreshableProviderNames, displayInfoOfProviderName, nonlocalProviderNames, localProviderNames, GlobalSettingName, featureNames, displayInfoOfFeatureName, isProviderNameDisabled, FeatureName, hasDownloadButtonsOnModelsProviderNames, subTextMdOfProviderName } from '../../../../common/voidSettingsTypes.js'
 import ErrorBoundary from '../sidebar-tsx/ErrorBoundary.js'
 import { VoidButtonBgDarken, VoidCustomDropdownBox, VoidInputBox2, VoidSimpleInputBox, VoidSwitch } from '../util/inputs.js'
@@ -240,10 +240,12 @@ const SimpleModelSettingsDialog = ({
 	isOpen,
 	onClose,
 	modelInfo,
+	openerRef,
 }: {
 	isOpen: boolean;
 	onClose: () => void;
 	modelInfo: { modelName: string; providerName: ProviderName; type: 'autodetected' | 'custom' | 'default' } | null;
+	openerRef: React.MutableRefObject<HTMLButtonElement | null>;
 }) => {
 	if (!isOpen || !modelInfo) return null;
 
@@ -252,7 +254,18 @@ const SimpleModelSettingsDialog = ({
 	const accessor = useAccessor()
 	const settingsState = useSettingsState()
 	const mouseDownInsideModal = useRef(false); // Ref to track mousedown origin
+	const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+	const onCloseRef = useRef(onClose);
+	const isClosingRef = useRef(false);
+	const headingId = useId();
 	const settingsStateService = accessor.get('IVoidSettingsService')
+	onCloseRef.current = onClose;
+
+	const closeOnce = useCallback(() => {
+		if (isClosingRef.current) return;
+		isClosingRef.current = true;
+		onCloseRef.current();
+	}, []);
 
 	// current overrides and defaults
 	const defaultModelCapabilities = getModelCapabilities(providerName, modelName, undefined);
@@ -278,11 +291,25 @@ const SimpleModelSettingsDialog = ({
 		setErrorMsg(null);
 	}, [isOpen, providerName, modelName, settingsState.overridesOfModel, placeholder]);
 
+	useEffect(() => {
+		closeButtonRef.current?.focus();
+		const onKeyDown = (event: KeyboardEvent) => {
+			if (event.key !== 'Escape') return;
+			event.preventDefault();
+			closeOnce();
+		};
+		window.addEventListener('keydown', onKeyDown);
+		return () => {
+			window.removeEventListener('keydown', onKeyDown);
+			if (openerRef.current?.isConnected) openerRef.current.focus();
+		};
+	}, [closeOnce, openerRef]);
+
 	const onSave = async () => {
 		// if disabled override, reset overrides
 		if (!overrideEnabled) {
 			await settingsStateService.setOverridesOfModel(providerName, modelName, undefined);
-			onClose();
+			closeOnce();
 			return;
 		}
 
@@ -295,10 +322,12 @@ const SimpleModelSettingsDialog = ({
 				parsedInput = JSON.parse(textAreaRef.current.value);
 			} catch (e) {
 				setErrorMsg('Invalid JSON');
+				textAreaRef.current?.focus();
 				return;
 			}
 		} else {
 			setErrorMsg('Invalid JSON');
+			textAreaRef.current?.focus();
 			return;
 		}
 
@@ -312,7 +341,7 @@ const SimpleModelSettingsDialog = ({
 			}
 		}
 		await settingsStateService.setOverridesOfModel(providerName, modelName, cleaned);
-		onClose();
+		closeOnce();
 	};
 
 	const sourcecodeOverridesLink = `https://github.com/voideditor/void/blob/2e5ecb291d33afbe4565921664fb7e183189c1c5/src/vs/workbench/contrib/void/common/modelCapabilities.ts#L146-L172`
@@ -325,13 +354,16 @@ const SimpleModelSettingsDialog = ({
 			}}
 			onMouseUp={() => {
 				if (!mouseDownInsideModal.current) {
-					onClose();
+					closeOnce();
 				}
 				mouseDownInsideModal.current = false;
 			}}
 		>
 			{/* MODAL */}
 			<div
+				role="dialog"
+				aria-modal="true"
+				aria-labelledby={headingId}
 				className="bg-void-bg-1 rounded-md p-4 max-w-xl w-full shadow-xl overflow-y-auto max-h-[90vh]"
 				onClick={(e) => e.stopPropagation()} // Keep stopping propagation for normal clicks inside
 				onMouseDown={(e) => {
@@ -340,12 +372,16 @@ const SimpleModelSettingsDialog = ({
 				}}
 			>
 				<div className="flex justify-between items-center mb-4">
-					<h3 className="text-lg font-medium">
+					<h3 id={headingId} className="text-lg font-medium">
 						Change Defaults for {modelName} ({displayInfoOfProviderName(providerName).title})
 					</h3>
 					<button
-						onClick={onClose}
-						className="text-void-fg-3 hover:text-void-fg-1"
+						ref={closeButtonRef}
+						type="button"
+						onClick={closeOnce}
+						aria-label={`Close advanced settings for ${providerTitle} / ${modelName}`}
+						title={`Close advanced settings for ${providerTitle} / ${modelName}`}
+						className="text-void-fg-3 hover:text-void-fg-1 focus-ring"
 					>
 						<X className="size-5" />
 					</button>
@@ -385,7 +421,7 @@ const SimpleModelSettingsDialog = ({
 
 
 				<div className="flex justify-end gap-2 mt-4">
-					<VoidButtonBgDarken onClick={onClose} className="px-3 py-1">
+					<VoidButtonBgDarken onClick={closeOnce} className="px-3 py-1">
 						Cancel
 					</VoidButtonBgDarken>
 					<VoidButtonBgDarken
@@ -414,6 +450,7 @@ export const ModelDump = ({ filteredProviders }: { filteredProviders?: ProviderN
 		providerName: ProviderName,
 		type: 'autodetected' | 'custom' | 'default'
 	} | null>(null);
+	const advancedSettingsOpenerRef = useRef<HTMLButtonElement | null>(null);
 
 	// States for add model functionality
 	const [isAddModelOpen, setIsAddModelOpen] = useState(false);
@@ -511,7 +548,7 @@ export const ModelDump = ({ filteredProviders }: { filteredProviders?: ProviderN
 						<div className="w-5 flex items-center justify-center">
 							<button
 								type='button'
-								onClick={() => { setOpenSettingsModel({ modelName, providerName, type }) }}
+								onClick={(event) => { advancedSettingsOpenerRef.current = event.currentTarget; setOpenSettingsModel({ modelName, providerName, type }) }}
 								aria-label={`Open advanced settings for ${providerTitle} / ${modelName}`}
 								title={`Open advanced settings for ${providerTitle} / ${modelName}`}
 								data-tooltip-id='void-tooltip'
@@ -650,6 +687,7 @@ export const ModelDump = ({ filteredProviders }: { filteredProviders?: ProviderN
 				isOpen={true}
 				onClose={() => setOpenSettingsModel(null)}
 				modelInfo={openSettingsModel}
+				openerRef={advancedSettingsOpenerRef}
 			/>
 		) : null}
 	</div>
