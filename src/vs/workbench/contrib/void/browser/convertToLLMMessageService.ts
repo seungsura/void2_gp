@@ -118,6 +118,56 @@ const parseNativeToolBatch = (value: unknown): NativeToolBatch | undefined => {
 
 type NativeToolBatchDeclaration = Readonly<{ declaration: Extract<ChatMessage, { role: 'assistant' }>; declarationIndex: number; batch: NativeToolBatch }>
 
+/** A native approval may resume only when every persisted declaration is strict,
+ * every unrelated batch is closed, and the current declaration has contiguous
+ * terminal predecessors plus one exact pending row. Later calls are deliberately
+ * absent: resume reconstructs them only after the approval settles. */
+export const hasSafeNativeToolBatchApprovalHistory = (messages: readonly ChatMessage[], pending: unknown): boolean => {
+	if (!isRecord(pending) || pending.role !== 'tool' || pending.type !== 'tool_request' || typeof pending.batchId !== 'string' || typeof pending.batchOrdinal !== 'number' || !Number.isInteger(pending.batchOrdinal) || pending.batchOrdinal < 0) return false
+	const batchIds = new Set<string>()
+	const declarations = new Map<string, Readonly<{ index: number; batch: NativeToolBatch }>>()
+	for (let index = 0; index < messages.length; index++) {
+		const candidate = messages[index]
+		const message = candidate as unknown
+		if (!isRecord(message) || message.role !== 'assistant' || !hasOwn(message, 'toolBatch')) continue
+		const batch = parseNativeToolBatch(message.toolBatch)
+		if (!batch || batchIds.has(batch.batchId)) return false
+		batchIds.add(batch.batchId)
+		declarations.set(batch.batchId, { index, batch })
+	}
+	const matchesCall = (row: unknown, batchId: string, batchOrdinal: number, call: NativeToolBatchCall): boolean => {
+		if (!isRecord(row) || row.role !== 'tool' || row.batchId !== batchId || row.batchOrdinal !== batchOrdinal || row.id !== call.id || row.name !== call.name) return false
+		try { return canonicalNativeToolRawParams(row.rawParams as RawToolParamsObj) === canonicalNativeToolRawParams(call.rawParams) } catch { return false }
+	}
+	try {
+		for (const [batchId, declaration] of declarations) {
+			for (let batchOrdinal = 0; batchOrdinal < declaration.batch.calls.length; batchOrdinal++) {
+				const row = messages[declaration.index + 1 + batchOrdinal] as unknown
+				const call = declaration.batch.calls[batchOrdinal]
+				if (batchId === pending.batchId && batchOrdinal > pending.batchOrdinal) {
+					if (row !== undefined) return false
+					continue
+				}
+				if (!matchesCall(row, batchId, batchOrdinal, call)) return false
+				if (row === pending) {
+					if (batchId !== pending.batchId || batchOrdinal !== pending.batchOrdinal) return false
+				} else if (!terminalNativeToolRowTypes.has((row as Record<string, unknown>).type as string)) return false
+			}
+		}
+		for (const candidate of messages) {
+			const message = candidate as unknown
+			if (!isRecord(message) || message.role !== 'tool' || (message.batchId === undefined && message.batchOrdinal === undefined)) continue
+			const rawBatchOrdinal = message.batchOrdinal
+			if (typeof message.batchId !== 'string' || typeof rawBatchOrdinal !== 'number' || !Number.isInteger(rawBatchOrdinal) || rawBatchOrdinal < 0) return false
+			const declaration = declarations.get(message.batchId)
+			if (!declaration || messages[declaration.index + 1 + rawBatchOrdinal] !== message) return false
+		}
+	} catch {
+		return false
+	}
+	return true
+}
+
 /** Resolve one persisted declaration without assuming that stored messages still
  * satisfy TypeScript's in-memory shape. An invalid or ambiguous declaration has no
  * usable batch, so callers must settle conservatively instead of guessing a tail. */

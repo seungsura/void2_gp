@@ -17,7 +17,7 @@ import { generateUuid } from '../../../../base/common/uuid.js';
 import { FeatureName, ModelSelection, ModelSelectionOptions, SettingsOfProvider } from '../common/voidSettingsTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { getIsReasoningEnabledState, getModelCapabilities, getReservedOutputTokenSpace } from '../common/modelCapabilities.js';
-import { closeNativeToolBatchForProspectiveAdmission, estimateHistoryTokensForReadBudget, protectedSkillResourceHistoryLength, requiresNativeToolBatchRowIdentity, resolveNativeToolBatchDeclaration, validateNativeToolBatchRowIdentity } from './convertToLLMMessageService.js';
+import { closeNativeToolBatchForProspectiveAdmission, estimateHistoryTokensForReadBudget, hasSafeNativeToolBatchApprovalHistory, protectedSkillResourceHistoryLength, requiresNativeToolBatchRowIdentity, resolveNativeToolBatchDeclaration, validateNativeToolBatchRowIdentity } from './convertToLLMMessageService.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, BuiltinToolResultType, ToolCallParams, ToolName, ToolResult } from '../common/toolsServiceTypes.js';
 import { computeMaxReadOutputTokens, isBoundedReadHistory, isBoundedReadHistoryString } from '../common/readFileReliability.js';
 import { IToolsService } from './toolsServiceInterface.js';
@@ -961,7 +961,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				const requiresNativeIdentity = requiresNativeToolBatchRowIdentity(messages, message)
 				if (!requiresNativeIdentity) { pendingApproval = message; continue }
 				const identity = validateNativeToolBatchRowIdentity(messages, message)
-				const valid = !!identity && identity.rowIndex === messages.length - 1
+				const valid = !!identity && identity.rowIndex === messages.length - 1 && hasSafeNativeToolBatchApprovalHistory(messages, message)
 				if (valid && !pendingApproval) pendingApproval = message
 				else {
 					const reason = 'Native tool batch could not be resumed after restart.'
@@ -1847,8 +1847,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				: undefined
 			const requiresNativeIdentity = requiresNativeToolBatchRowIdentity(persistedMessages, callThisToolFirst)
 			const persistedIdentity = requiresNativeIdentity ? validateNativeToolBatchRowIdentity(persistedMessages, callThisToolFirst) : undefined
+			const hasSafeApprovalHistory = !requiresNativeIdentity || hasSafeNativeToolBatchApprovalHistory(persistedMessages, callThisToolFirst)
 			const invalidPendingBatch = 'The pending native tool batch no longer matches its declaration.'
-			if (requiresNativeIdentity && (!persistedIdentity || persistedIdentity.rowIndex !== persistedMessages.length - 1)) {
+			if (requiresNativeIdentity && (!hasSafeApprovalHistory || !persistedIdentity || persistedIdentity.rowIndex !== persistedMessages.length - 1)) {
 				const index = persistedMessages.indexOf(callThisToolFirst)
 				if (index >= 0 && persistedMessages[index] === callThisToolFirst) this._editMessageInThread(threadId, index, skippedPendingToolRow(callThisToolFirst, invalidPendingBatch))
 				if (suppliedCallRef) this._terminalizeBatchTailAfter(threadId, suppliedCallRef, invalidPendingBatch)
