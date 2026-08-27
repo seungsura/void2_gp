@@ -23,10 +23,14 @@ suite('Void agent subagents', () => {
 		});
 	});
 
-	test('derives exact child and parent registries from production availableTools', () => {
+	test('keeps child orchestration controls exact and excludes Plan-like tool surfaces', () => {
+		const delegationControls = ['spawn_agent', 'wait_agent', 'interrupt_agent'];
+		assert.deepStrictEqual(Object.keys(agentSubagentToolSchemas), delegationControls);
 		const fakeMcp = [{ name: 'remote_mutation', description: 'no', params: {}, mcpServerName: 'remote' }, ...(['spawn_agent', 'wait_agent', 'interrupt_agent'] as const).map(name => ({ name, description: 'colliding MCP tool', params: {}, mcpServerName: 'remote' }))];
-		assert.deepStrictEqual(availableTools('agent', fakeMcp, 'read-only-child')?.map(tool => tool.name), [...readOnlyChildToolNames]);
-		assert.deepStrictEqual(availableTools('agent', fakeMcp, 'read-only-child', true)?.map(tool => tool.name), [...readOnlyChildToolNames, 'spawn_agent', 'wait_agent', 'interrupt_agent']);
+		const childRegistry = availableTools('agent', fakeMcp, 'read-only-child')!.map(tool => tool.name);
+		const delegatedChildRegistry = availableTools('agent', fakeMcp, 'read-only-child', true)!.map(tool => tool.name);
+		assert.deepStrictEqual(childRegistry, [...readOnlyChildToolNames]);
+		assert.deepStrictEqual(delegatedChildRegistry, [...readOnlyChildToolNames, ...delegationControls]);
 		const controlText = availableTools('agent', fakeMcp, 'read-only-child', true)!.filter(tool => ['spawn_agent', 'wait_agent'].includes(tool.name)).map(tool => `${tool.description}\n${JSON.stringify(tool.params)}`).join('\n');
 		assert.strictEqual(/four|two|one to eight/i.test(controlText), false);
 		const unselectedParent = availableTools('agent', fakeMcp)!.map(tool => tool.name);
@@ -34,7 +38,7 @@ suite('Void agent subagents', () => {
 		assert.ok(unselectedParent.includes('remote_mutation'));
 		const parent = availableTools('agent', fakeMcp, 'default-parent', true)!.map(tool => tool.name);
 		for (const name of ['spawn_agent', 'wait_agent', 'interrupt_agent', 'remote_mutation']) assert.ok(parent.includes(name));
-		for (const name of ['spawn_agent', 'wait_agent', 'interrupt_agent']) assert.strictEqual(parent.filter(candidate => candidate === name).length, 1);
+		for (const name of delegationControls) assert.strictEqual(parent.filter(candidate => candidate === name).length, 1);
 
 		const calls: Array<{ command: string; params: any }> = []; let mcpReads = 0; let allowMcpRead = false;
 		const channel = { listen: () => () => ({ dispose() { } }), call: (command: string, params: any) => { calls.push({ command, params }); return Promise.resolve(); } };
@@ -71,10 +75,11 @@ suite('Void agent subagents', () => {
 		const roots = [URI.file('C:\\workspace').toString(), URI.parse('vscode-remote://ssh-remote+example/workspace').toString()];
 		for (const root of roots) {
 			const xml = chat_systemMessage({ workspaceFolders: [root], openedURIs: [], activeURI: undefined, persistentTerminalIDs: [], directoryStr: `Root hint: ${root} (use read tools; no recursive overview was injected).`, chatMode: 'agent', mcpTools: [{ name: 'remote_mutation', description: 'no', params: {} }], includeXMLToolDefinitions: true, toolExecutionProfile: 'read-only-child' });
-			assert.ok(/Void application-level read-only — terminal disabled, no OS sandbox/.test(xml)); assert.strictEqual(xml.includes(root), true); assert.strictEqual(xml.includes('C:\\workspace'), false); for (const name of readOnlyChildToolNames) assert.ok(new RegExp(`<${name}>`).test(xml)); for (const forbidden of ['run_command', 'write_file', 'remote_mutation', 'spawn_agent', 'get_dir_tree', 'read_lint_errors']) assert.strictEqual(xml.includes(`<${forbidden}>`), false);
+			assert.ok(/Void application-level read-only — terminal disabled, no OS sandbox/.test(xml)); assert.strictEqual(xml.includes(root), true); assert.strictEqual(xml.includes('C:\\workspace'), false); for (const name of readOnlyChildToolNames) assert.ok(new RegExp(`<${name}>`).test(xml)); for (const forbidden of ['run_command', 'write_file', 'remote_mutation', 'spawn_agent', 'get_dir_tree', 'read_lint_errors', 'plan', 'update_plan', 'todowrite']) assert.strictEqual(xml.includes(`<${forbidden}>`), false);
 		}
 		const delegatedChild = chat_systemMessage({ workspaceFolders: ['C:\\workspace'], openedURIs: [], activeURI: undefined, persistentTerminalIDs: [], directoryStr: '', chatMode: 'agent', mcpTools: [], includeXMLToolDefinitions: true, toolExecutionProfile: 'read-only-child', agentDelegationAllowed: true });
 		for (const name of ['spawn_agent', 'wait_agent', 'interrupt_agent']) assert.ok(delegatedChild.includes(`<${name}>`));
+		for (const name of ['plan', 'update_plan', 'todowrite']) assert.strictEqual(delegatedChild.includes(`<${name}>`), false);
 		const unselectedParent = chat_systemMessage({ workspaceFolders: ['C:\\workspace'], openedURIs: [], activeURI: undefined, persistentTerminalIDs: [], directoryStr: '', chatMode: 'agent', mcpTools: [], includeXMLToolDefinitions: true });
 		assert.strictEqual(unselectedParent.includes('<spawn_agent>'), false);
 		const selectedParent = chat_systemMessage({ workspaceFolders: ['C:\\workspace'], openedURIs: [], activeURI: undefined, persistentTerminalIDs: [], directoryStr: '', chatMode: 'agent', mcpTools: [], includeXMLToolDefinitions: true, agentDelegationAllowed: true });
