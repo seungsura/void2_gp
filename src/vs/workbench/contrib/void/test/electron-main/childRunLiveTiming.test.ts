@@ -29,7 +29,7 @@ const buildRuntime = async (servicesPath: string) => {
 		let now = 0; const states: Record<string, 'queued' | 'running' | 'completed'> = { A: 'running', B: 'queued' }; const calls = { runs: 0, budget: 0, diagnostics: 0 };
 		const child = {
 			getRunViews(id: string) { calls.runs++; return id === 'C' ? [] : [{ id, status: states[id], totalMs: now, queuedMs: now, runningMs: now }]; },
-			getBudgetView(id: string) { calls.budget++; return { parentId: id, deadlineMsRemaining: 10000 - now }; },
+			getBudgetView(id: string) { calls.budget++; return { parentId: id, activeProviderSends: id === 'A' ? 1 : 0, maxProviderSends: 64, providerSends: id === 'A' ? 2 : 3 }; },
 			getDiagnosticsView(id: string) { calls.diagnostics++; return { parentId: id, elapsedMs: now }; },
 			onDidChangeRun(listener: any) { return listen(runListeners, listener); }, onDidChangeDiagnostics(listener: any) { return listen(diagnosticsListeners, listener); },
 		};
@@ -39,7 +39,7 @@ const buildRuntime = async (servicesPath: string) => {
 		window.setInterval = ((callback: TimerHandler) => { const id = nextTimer++; timers.set(id, callback as () => void); return id; }) as typeof window.setInterval;
 		window.clearInterval = ((id: number) => { cleared.push(id); timers.delete(id); }) as typeof window.clearInterval;
 		let updateThread!: (id: string) => void; let root: ReturnType<typeof createRoot> | undefined;
-		const Harness = () => { const [threadId, setThreadId] = useState('A'); updateThread = setThreadId; const value = useAgentSubagentLiveSnapshot(threadId); const run = value.runs[0]; return <output id="snapshot">{threadId + ':' + run?.status + ':' + run?.totalMs + ':' + value.budget?.deadlineMsRemaining + ':' + value.diagnostics?.elapsedMs}</output>; };
+		const Harness = () => { const [threadId, setThreadId] = useState('A'); updateThread = setThreadId; const value = useAgentSubagentLiveSnapshot(threadId); const run = value.runs[0]; return <output id="snapshot">{threadId + ':' + run?.status + ':' + run?.totalMs + ':' + value.budget?.activeProviderSends + '/' + value.budget?.maxProviderSends + ':' + value.budget?.providerSends + ':' + value.diagnostics?.elapsedMs}</output>; };
 		(window as any).__childRunTiming = {
 			calls, cleared, mount(node: HTMLElement) { root = createRoot(node); flushSync(() => root!.render(<Harness />)); },
 			advance(ms: number) { now += ms; for (const callback of [...timers.values()]) callback(); },
@@ -58,6 +58,10 @@ suite('Child Run live timing', function () {
 	this.timeout(20_000);
 	test('refreshes the three views together while active and clears its only timer', async () => {
 		const servicesPath = path.join(process.cwd(), 'src', 'vs', 'workbench', 'contrib', 'void', 'browser', 'react', 'src2', 'util', 'services.tsx');
+		for (const sidebarPath of [path.join(process.cwd(), 'src', 'vs', 'workbench', 'contrib', 'void', 'browser', 'react', 'src', 'sidebar-tsx', 'SidebarChat.tsx'), path.join(process.cwd(), 'src', 'vs', 'workbench', 'contrib', 'void', 'browser', 'react', 'src2', 'sidebar-tsx', 'SidebarChat.tsx')]) {
+			const sidebar = read(sidebarPath); assert.ok(sidebar.includes('Provider requests:')); assert.ok(sidebar.includes('in flight (')); assert.ok(sidebar.includes('Result retention:'));
+			for (const stale of ['maxChildTurns', 'maxChildRunMs', 'deadlineMsRemaining', 'group deadline']) assert.strictEqual(sidebar.includes(stale), false, `${path.basename(sidebarPath)} retains ${stale}`);
+		}
 		const runtime = await buildRuntime(servicesPath); let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
 		try {
 			browser = await chromium.launch({ headless: true }); const page = await browser.newPage(); const errors: string[] = []; page.on('pageerror', error => errors.push(error.message));
@@ -74,13 +78,13 @@ suite('Child Run live timing', function () {
 				setThread: (threadId: string) => page.evaluate(threadId => (window as any).__childRunTiming.setThread(threadId), threadId),
 				dispose: () => page.evaluate(() => (window as any).__childRunTiming.dispose()),
 			};
-			assert.strictEqual(await fixture.activeTimers(), 1); assert.deepStrictEqual(await fixture.listenerCounts(), { run: 1, diagnostics: 1 }); assert.strictEqual(await page.locator('#snapshot').textContent(), 'A:running:0:10000:0'); assert.deepStrictEqual(await fixture.calls(), { runs: 2, budget: 2, diagnostics: 2 });
-			await fixture.advance(1_000); assert.strictEqual(await page.locator('#snapshot').textContent(), 'A:running:1000:9000:1000'); assert.deepStrictEqual(await fixture.calls(), { runs: 3, budget: 3, diagnostics: 3 });
+			assert.strictEqual(await fixture.activeTimers(), 1); assert.deepStrictEqual(await fixture.listenerCounts(), { run: 1, diagnostics: 1 }); assert.strictEqual(await page.locator('#snapshot').textContent(), 'A:running:0:1/64:2:0'); assert.deepStrictEqual(await fixture.calls(), { runs: 2, budget: 2, diagnostics: 2 });
+			await fixture.advance(1_000); assert.strictEqual(await page.locator('#snapshot').textContent(), 'A:running:1000:1/64:2:1000'); assert.deepStrictEqual(await fixture.calls(), { runs: 3, budget: 3, diagnostics: 3 });
 			await fixture.emitRun('B'); assert.deepStrictEqual(await fixture.calls(), { runs: 3, budget: 3, diagnostics: 3 });
 			await fixture.emitDiagnostics('A'); await fixture.emitRun('A'); assert.strictEqual(await fixture.activeTimers(), 1); assert.deepStrictEqual(await fixture.calls(), { runs: 5, budget: 5, diagnostics: 5 });
-			await fixture.completeA(); assert.strictEqual(await fixture.activeTimers(), 0); await fixture.advance(1_000); assert.strictEqual(await page.locator('#snapshot').textContent(), 'A:completed:1000:9000:1000');
-			await fixture.setThread('C'); assert.strictEqual(await page.locator('#snapshot').textContent(), 'C:undefined:undefined:8000:2000'); assert.strictEqual(await fixture.activeTimers(), 0); assert.deepStrictEqual(await fixture.listenerCounts(), { run: 1, diagnostics: 1 });
-			await fixture.setThread('B'); assert.strictEqual(await page.locator('#snapshot').textContent(), 'B:queued:2000:8000:2000'); assert.strictEqual(await fixture.activeTimers(), 1); assert.deepStrictEqual(await fixture.listenerCounts(), { run: 1, diagnostics: 1 });
+			await fixture.completeA(); assert.strictEqual(await fixture.activeTimers(), 0); await fixture.advance(1_000); assert.strictEqual(await page.locator('#snapshot').textContent(), 'A:completed:1000:1/64:2:1000');
+			await fixture.setThread('C'); assert.strictEqual(await page.locator('#snapshot').textContent(), 'C:undefined:undefined:0/64:3:2000'); assert.strictEqual(await fixture.activeTimers(), 0); assert.deepStrictEqual(await fixture.listenerCounts(), { run: 1, diagnostics: 1 });
+			await fixture.setThread('B'); assert.strictEqual(await page.locator('#snapshot').textContent(), 'B:queued:2000:0/64:3:2000'); assert.strictEqual(await fixture.activeTimers(), 1); assert.deepStrictEqual(await fixture.listenerCounts(), { run: 1, diagnostics: 1 });
 			const callsBeforeStaleEvent = await fixture.calls(); await fixture.emitDiagnostics('A'); assert.deepStrictEqual(await fixture.calls(), callsBeforeStaleEvent);
 			await fixture.dispose(); assert.strictEqual(await fixture.activeTimers(), 0); assert.deepStrictEqual(await fixture.listenerCounts(), { run: 0, diagnostics: 0 }); assert.ok((await fixture.cleared()).length >= 2); assert.deepStrictEqual(errors, []);
 		} finally { await browser?.close(); runtime.dispose(); }

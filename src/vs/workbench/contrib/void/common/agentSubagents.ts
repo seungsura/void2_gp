@@ -107,12 +107,12 @@ export const assertCanonicalReadOnlyChildRawPaths = (name: string, raw: Record<s
 };
 
 export type AgentSubagentStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
-export type AgentSubagentBudgetView = Readonly<{ accepted: number; running: number; queued: number; maxAccepted: number; maxConcurrent: number; providerSends: number; activeProviderSends: number; maxProviderSends: number; resultChars: number; retainedResultChars: number; maxResultChars: number; truncatedResultCount: number; maxChildTurns: number; maxChildRunMs: number; maxChildSummaryChars: number; deadlineMsRemaining: number; usage: null }>;
+export type AgentSubagentBudgetView = Readonly<{ accepted: number; running: number; queued: number; maxAccepted: number; maxConcurrent: number; providerSends: number; activeProviderSends: number; maxProviderSends: number; resultChars: number; retainedResultChars: number; maxResultChars: number; truncatedResultCount: number; maxChildSummaryChars: number; usage: null }>;
 /** Scheduler state is intentionally separate from terminal status: a timed-out wait may be ready to resume but still queued behind another lease. */
 export type AgentSubagentRunView = Readonly<{ id: string; parentRunId?: string; depth: number; remainingDepth: number; status: AgentSubagentStatus; schedulerActivity: 'active' | 'waiting_children' | 'ready_to_resume' | 'quiescing'; summary?: string; resultTruncated?: true; roleName?: string; roleDescription?: string; capabilityProfile?: 'read_only' | 'inherit_parent_write'; toolPresentation?: Readonly<{ toolNames: readonly string[]; approvals: readonly string[]; undoAvailable: boolean; applicationBoundary: 'no_os_sandbox' }>; queuedMs: number; runningMs: number; totalMs: number; authority: Readonly<{ runtimeRevision: string; instructionsRevision: string; catalogRevision: string; modelFingerprint?: string; roleRevision?: string; selectedSkills: readonly Readonly<{ identity: string; bodyRevision: string }>[] }>; usage: null }>;
 export type AgentSubagentTraceKind = 'group_created' | 'admission_started' | 'admission_failed' | 'child_queued' | 'child_running' | 'provider_send' | 'child_completed' | 'child_failed' | 'child_cancelled' | 'receipt_delivered' | 'group_cancelled';
 export type AgentSubagentTraceEvent = Readonly<{ sequence: number; parentId: string; generation: number; childId?: string; kind: AgentSubagentTraceKind; timestamp: number; elapsedMs: number; status?: Exclude<AgentSubagentStatus, 'queued' | 'running'>; diagnostic?: AgentSubagentTraceDiagnostic; budget: Readonly<{ accepted: number; running: number; queued: number; providerSends: number; resultChars: number }> }>;
-export type AgentSubagentTraceDiagnostic = 'cancelled' | 'model_missing' | 'provider_invalid' | 'owner_changed' | 'role_not_found' | 'role_stale' | 'skill_unavailable' | 'budget_exhausted' | 'provider_error' | 'result_retention_truncated' | 'timeout' | 'turn_limit' | 'unknown';
+export type AgentSubagentTraceDiagnostic = 'cancelled' | 'model_missing' | 'provider_invalid' | 'owner_changed' | 'role_not_found' | 'role_stale' | 'skill_unavailable' | 'budget_exhausted' | 'provider_error' | 'result_retention_truncated' | 'timeout' | 'unknown';
 export type AgentSubagentDiagnosticsView = Readonly<{ parentId: string; generation: number; elapsedMs: number; events: readonly AgentSubagentTraceEvent[]; droppedEvents: number; completed: number; failed: number; cancelled: number; usage: null }>;
 export const isActiveChildRun = <T extends { readonly status: AgentSubagentStatus }>(view: T | undefined): boolean => view?.status === 'queued' || view?.status === 'running';
 export const agentSubagentStatusLabel = (status: AgentSubagentStatus): string => ({ queued: 'Queued', running: 'Running', completed: 'Completed', failed: 'Failed', cancelled: 'Cancelled' })[status];
@@ -127,7 +127,6 @@ export const AGENT_SUBAGENT_MAX_ACCEPTED = 4;
 /** Protocol ceiling; a turn's configured accepted-child limit can be lower. */
 export const AGENT_SUBAGENT_MAX_WAIT_TARGETS = 8;
 export const AGENT_SUBAGENT_MAX_GROUP_PROVIDER_SENDS = 64;
-export const AGENT_SUBAGENT_MAX_GROUP_RUN_MS = 240_000;
 export const AGENT_SUBAGENT_MAX_AGGREGATE_RESULT_CHARS = 32_000;
 /** UI-only transient trace; it is intentionally absent from model-facing wait receipts. */
 export const AGENT_SUBAGENT_MAX_TRACE_EVENTS = 128;

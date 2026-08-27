@@ -15,7 +15,7 @@ import { IFileService } from '../../../../platform/files/common/files.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
 import { IWorkspaceTrustManagementService } from '../../../../platform/workspace/common/workspaceTrust.js';
 import { AgentRuntimeTurnSnapshot, admitProtectedAgentAuthority, admitSkillResourceContext, assembleProtectedAgentAuthority, createAgentRuntimeTurnSnapshot, isReadSkillResourceToolName, selectExplicitSkills, skillAdvertisement, validateReadSkillResourceToolParams } from '../common/agentSkills.js';
-import { AGENT_SUBAGENT_MAX_MESSAGE_CHARS, AGENT_SUBAGENT_MAX_RESULTS, AGENT_SUBAGENT_MAX_TRACE_EVENTS, AGENT_SUBAGENT_MAX_WAIT_TARGETS, AgentSubagentBudgetView, AgentSubagentDiagnosticsView, AgentSubagentLifecycle, AgentSubagentReceipt, AgentSubagentRunView, AgentSubagentStatus, AgentSubagentToolBroker, AgentSubagentToolBrokerRequest, AgentSubagentToolSnapshot, AgentSubagentTraceDiagnostic, AgentSubagentTraceEvent, AgentSubagentTraceKind, ToolExecutionProfile, isAgentSubagentControlName, isMutationCapableSnapshot, validateAgentSubagentControlParams } from '../common/agentSubagents.js';
+import { AGENT_SUBAGENT_MAX_GROUP_PROVIDER_SENDS, AGENT_SUBAGENT_MAX_MESSAGE_CHARS, AGENT_SUBAGENT_MAX_RESULTS, AGENT_SUBAGENT_MAX_TRACE_EVENTS, AGENT_SUBAGENT_MAX_WAIT_TARGETS, AgentSubagentBudgetView, AgentSubagentDiagnosticsView, AgentSubagentLifecycle, AgentSubagentReceipt, AgentSubagentRunView, AgentSubagentStatus, AgentSubagentToolBroker, AgentSubagentToolBrokerRequest, AgentSubagentToolSnapshot, AgentSubagentTraceDiagnostic, AgentSubagentTraceEvent, AgentSubagentTraceKind, ToolExecutionProfile, isAgentSubagentControlName, isMutationCapableSnapshot, validateAgentSubagentControlParams } from '../common/agentSubagents.js';
 import { ILLMMessageService } from '../common/sendLLMMessageService.js';
 import { assertCanonicalAgentChildRawUri, assertCanonicalAgentChildUriPath, assertCanonicalReadOnlyChildRawPaths, assertExactReadOnlyChildRawKeys, canonicalAgentChildUri, readOnlyChildToolNames } from '../common/agentSubagents.js';
 import { IToolsService } from './toolsServiceInterface.js';
@@ -36,14 +36,12 @@ import { isABuiltinToolName } from '../common/prompt/prompts.js';
 import { sanitizeAssistantDisplayContent } from '../common/assistantMessagePresentation.js';
 
 const DEFAULT_CHILD_SUMMARY_CHARS = 8_000;
-const DEFAULT_CHILD_RUN_MS = 120_000;
-const MAX_TIMEOUT_DELAY = 0x7fffffff;
 const safeProduct = (value: number, factor: number) => value > Math.floor(Number.MAX_SAFE_INTEGER / factor) ? Number.MAX_SAFE_INTEGER : value * factor;
-const budgetFor = (limits: AgentDelegationLimits) => { const scale = Math.max(1, Math.ceil(limits.maxAcceptedChildren / 4)); return Object.freeze({ maxProviderSends: Math.min(Number.MAX_SAFE_INTEGER, safeProduct(64, scale)), maxResultChars: Math.min(Number.MAX_SAFE_INTEGER, safeProduct(32_000, scale)), deadlineMs: Math.min(MAX_TIMEOUT_DELAY, safeProduct(240_000, scale)), maxChildTurns: Math.min(Number.MAX_SAFE_INTEGER, safeProduct(16, scale)), maxChildRunMs: Math.min(MAX_TIMEOUT_DELAY, safeProduct(DEFAULT_CHILD_RUN_MS, scale)), maxChildSummaryChars: Math.min(32_000, safeProduct(DEFAULT_CHILD_SUMMARY_CHARS, scale)) }); };
+const budgetFor = (limits: AgentDelegationLimits) => { const scale = Math.max(1, Math.ceil(limits.maxAcceptedChildren / 4)); return Object.freeze({ maxProviderSends: Math.min(Number.MAX_SAFE_INTEGER, safeProduct(AGENT_SUBAGENT_MAX_GROUP_PROVIDER_SENDS, scale)), maxResultChars: Math.min(Number.MAX_SAFE_INTEGER, safeProduct(32_000, scale)), maxChildSummaryChars: Math.min(32_000, safeProduct(DEFAULT_CHILD_SUMMARY_CHARS, scale)) }); };
 
 type ChildSchedulerActivity = 'active' | 'waiting_children' | 'ready_to_resume' | 'quiescing';
-type ChildRun = { readonly id: string; readonly parentId: string; readonly generation: number; readonly parentRunId: string | undefined; readonly depth: number; readonly remainingDepth: number; readonly budgetLimits: ReturnType<typeof budgetFor>; readonly message: string; readonly snapshot: AgentRuntimeTurnSnapshot; readonly lifecycle: AgentSubagentLifecycle; readonly cancellation: CancellationTokenSource; readonly settingsOfProvider: SettingsOfProvider; readonly admittedRoles: CustomAgentCatalog | undefined; readonly admittedSettingsState: IVoidSettingsService['state']; readonly toolExecutionProfile: ToolExecutionProfile; readonly parentTools?: AgentSubagentToolSnapshot; readonly broker?: AgentSubagentToolBroker; readonly mutationCapable: boolean; brokerRequest?: AgentSubagentToolBrokerRequest; brokerExecute?: Promise<unknown>; brokerCancelPromise?: Promise<void>; brokerCancelled: boolean; released: boolean; capacityReleased: boolean; providerSends: number; readonly acceptedAt: number; startedAt?: number; settledAt?: number; readonly role?: { name: string; description: string; revision: string; capabilityProfile: 'read_only' | 'inherit_parent_write' }; requestId?: string; timeoutHandle?: ReturnType<typeof setTimeout>; summary: string; resultTruncated: boolean; terminalView?: AgentSubagentRunView; schedulerActive: boolean; schedulerActivity: ChildSchedulerActivity; yielded: boolean; resume?: () => void; runPromise?: Promise<void> };
-type ChildGroup = { readonly parentId: string; readonly generation: number; readonly createdAt: number; readonly limits: AgentDelegationLimits; readonly budgetLimits: ReturnType<typeof budgetFor>; readonly runs: ChildRun[]; readonly admissions: Map<CancellationTokenSource, string | undefined>; readonly deadlineAt: number; cancellation: boolean; accepted: number; providerSends: number; activeProviderSends: number; resultChars: number; retainedResultChars: number; truncatedResultCount: number; traceSequence: number; readonly traceEvents: AgentSubagentTraceEvent[]; droppedTraceEvents: number; admissionChain: Promise<void>; deadline?: ReturnType<typeof setTimeout> };
+type ChildRun = { readonly id: string; readonly parentId: string; readonly generation: number; readonly parentRunId: string | undefined; readonly depth: number; readonly remainingDepth: number; readonly budgetLimits: ReturnType<typeof budgetFor>; readonly message: string; readonly snapshot: AgentRuntimeTurnSnapshot; readonly lifecycle: AgentSubagentLifecycle; readonly cancellation: CancellationTokenSource; readonly settingsOfProvider: SettingsOfProvider; readonly admittedRoles: CustomAgentCatalog | undefined; readonly admittedSettingsState: IVoidSettingsService['state']; readonly toolExecutionProfile: ToolExecutionProfile; readonly parentTools?: AgentSubagentToolSnapshot; readonly broker?: AgentSubagentToolBroker; readonly mutationCapable: boolean; brokerRequest?: AgentSubagentToolBrokerRequest; brokerExecute?: Promise<unknown>; brokerCancelPromise?: Promise<void>; brokerCancelled: boolean; released: boolean; capacityReleased: boolean; providerLeaseRelease?: () => void; providerResponseFinish?: () => void; readonly acceptedAt: number; startedAt?: number; settledAt?: number; readonly role?: { name: string; description: string; revision: string; capabilityProfile: 'read_only' | 'inherit_parent_write' }; requestId?: string; summary: string; resultTruncated: boolean; terminalView?: AgentSubagentRunView; schedulerActive: boolean; schedulerActivity: ChildSchedulerActivity; yielded: boolean; resume?: () => void; runPromise?: Promise<void> };
+type ChildGroup = { readonly parentId: string; readonly generation: number; readonly createdAt: number; readonly limits: AgentDelegationLimits; readonly budgetLimits: ReturnType<typeof budgetFor>; readonly runs: ChildRun[]; readonly admissions: Map<CancellationTokenSource, string | undefined>; cancellation: boolean; accepted: number; providerSends: number; activeProviderSends: number; resultChars: number; retainedResultChars: number; truncatedResultCount: number; traceSequence: number; readonly traceEvents: AgentSubagentTraceEvent[]; droppedTraceEvents: number; admissionChain: Promise<void> };
 export const IAgentSubagentService = createDecorator<IAgentSubagentService>('voidAgentSubagentService');
 export type AgentSubagentRunChangeEvent = Readonly<
 	{ parentId: string; id: string; status: AgentSubagentStatus; removed?: false }
@@ -88,7 +86,7 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 		if (parent.instructions.config.agentDelegationLimits.maxConcurrentThreadsPerSession > parent.instructions.config.agentDelegationLimits.maxAcceptedChildren) throw new Error('agent_child_concurrency_exceeds_capacity');
 		let group = this.groups.get(parentId);
 		if (group && group.generation !== generation) { this.forgetParent(parentId); group = undefined; }
-		if (!group) { if (parentRun) throw new Error('agent_child_group_missing'); const createdAt = Date.now(); const limits = Object.freeze({ ...parent.instructions.config.agentDelegationLimits }); const budgetLimits = budgetFor(limits); group = { parentId, generation, createdAt, limits, budgetLimits, runs: [], admissions: new Map(), deadlineAt: Math.min(Number.MAX_SAFE_INTEGER, createdAt + budgetLimits.deadlineMs), cancellation: false, accepted: 0, providerSends: 0, activeProviderSends: 0, resultChars: 0, retainedResultChars: 0, truncatedResultCount: 0, traceSequence: 0, traceEvents: [], droppedTraceEvents: 0, admissionChain: Promise.resolve() }; this.groups.set(parentId, group); this.trace(group, 'group_created'); group.deadline = setTimeout(() => this.cancelGroup(group!, 'Child group exceeded its configured safety duration.'), budgetLimits.deadlineMs); }
+		if (!group) { if (parentRun) throw new Error('agent_child_group_missing'); const createdAt = Date.now(); const limits = Object.freeze({ ...parent.instructions.config.agentDelegationLimits }); const budgetLimits = budgetFor(limits); group = { parentId, generation, createdAt, limits, budgetLimits, runs: [], admissions: new Map(), cancellation: false, accepted: 0, providerSends: 0, activeProviderSends: 0, resultChars: 0, retainedResultChars: 0, truncatedResultCount: 0, traceSequence: 0, traceEvents: [], droppedTraceEvents: 0, admissionChain: Promise.resolve() }; this.groups.set(parentId, group); this.trace(group, 'group_created'); }
 		if (group.cancellation) throw new Error('agent_child_cancelled');
 		if (parentRun && (parentRun.parentId !== parentId || parentRun.generation !== generation || parentRun.lifecycle.status !== 'running' || parentRun.remainingDepth <= 0 || !group.runs.includes(parentRun))) throw new Error('agent_child_depth_exhausted');
 		if (group.accepted + group.admissions.size >= group.limits.maxAcceptedChildren) throw new Error('agent_child_limit_reached');
@@ -127,7 +125,7 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 			// manifest and the protected-context admission calculation in lockstep with
 			// the model-facing profile: a read-only child must neither see nor reserve it.
 			admitProtectedAgentAuthority(snapshot, toolExecutionProfile === 'inherited-parent-write-child');
-			const run: ChildRun = { id: generateUuid(), parentId, generation, parentRunId: parentRun?.id, depth: parentRun ? parentRun.depth + 1 : 1, remainingDepth: parentRun ? parentRun.remainingDepth - 1 : admittedGroup.limits.maxDepth - 1, budgetLimits: admittedGroup.budgetLimits, message, snapshot, lifecycle: new AgentSubagentLifecycle(), cancellation: new CancellationTokenSource(), settingsOfProvider, admittedRoles, admittedSettingsState: capturedState, toolExecutionProfile, ...(effectiveParentTools ? { parentTools: effectiveParentTools } : {}), ...(effectiveBroker ? { broker: effectiveBroker } : {}), mutationCapable: toolExecutionProfile === 'inherited-parent-write-child' && isMutationCapableSnapshot(effectiveParentTools), brokerCancelled: false, released: false, capacityReleased: false, providerSends: 0, acceptedAt: Date.now(), ...(role ? { role: { name: role.name, description: role.description, revision: role.revision, capabilityProfile: role.capabilityProfile } } : {}), summary: '', resultTruncated: false, schedulerActive: false, schedulerActivity: 'ready_to_resume', yielded: false };
+			const run: ChildRun = { id: generateUuid(), parentId, generation, parentRunId: parentRun?.id, depth: parentRun ? parentRun.depth + 1 : 1, remainingDepth: parentRun ? parentRun.remainingDepth - 1 : admittedGroup.limits.maxDepth - 1, budgetLimits: admittedGroup.budgetLimits, message, snapshot, lifecycle: new AgentSubagentLifecycle(), cancellation: new CancellationTokenSource(), settingsOfProvider, admittedRoles, admittedSettingsState: capturedState, toolExecutionProfile, ...(effectiveParentTools ? { parentTools: effectiveParentTools } : {}), ...(effectiveBroker ? { broker: effectiveBroker } : {}), mutationCapable: toolExecutionProfile === 'inherited-parent-write-child' && isMutationCapableSnapshot(effectiveParentTools), brokerCancelled: false, released: false, capacityReleased: false, acceptedAt: Date.now(), ...(role ? { role: { name: role.name, description: role.description, revision: role.revision, capabilityProfile: role.capabilityProfile } } : {}), summary: '', resultTruncated: false, schedulerActive: false, schedulerActivity: 'ready_to_resume', yielded: false };
 			admittedGroup.runs.push(run); admittedGroup.accepted++; admittedGroup.admissions.delete(admission); admission.dispose();
 			this.trace(admittedGroup, 'child_queued', run);
 			this._onDidChangeRun.fire({ parentId, id: run.id, status: run.lifecycle.status });
@@ -164,7 +162,6 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 		try {
 			if (!run.lifecycle.start()) return;
 			run.startedAt = Date.now(); const groupAtStart = this.groups.get(run.parentId); if (groupAtStart?.generation === run.generation) this.trace(groupAtStart, 'child_running', run);
-			run.timeoutHandle = setTimeout(() => this.cancelRun(run, 'Child exceeded its configured safety duration.', 'failed'), this.groupBudget(run).maxChildRunMs);
 			this._onDidChangeRun.fire({ parentId: run.parentId, id: run.id, status: run.lifecycle.status });
 			const model = run.snapshot.model;
 			if (!model.hasModel) { this.settle(run, 'failed', 'Child model is unavailable.'); return; }
@@ -173,18 +170,23 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 			if (!run.snapshot.ownerProjectRoot || !run.snapshot.runCwd || run.snapshot.ownerProjectRoot !== run.snapshot.runCwd) { this.settle(run, 'failed', 'Child owner is unavailable.'); return; }
 			const owner = URI.parse(run.snapshot.ownerProjectRoot);
 			const history: ChatMessage[] = [{ role: 'user', content: message, displayContent: message, selections: [], state: { stagingSelections: [], isBeingEdited: false } }];
-			for (let turn = 0; turn < this.groupBudget(run).maxChildTurns && !run.cancellation.token.isCancellationRequested; turn++) {
+			for (let turn = 0; !run.cancellation.token.isCancellationRequested; turn++) {
 			const prepared = await this.converter.prepareLLMChatMessages({ chatMessages: history, chatMode: 'agent', modelSelection, instructionSnapshot: run.snapshot, toolExecutionProfile: run.toolExecutionProfile, childRoot: owner.toString(), agentDelegationAllowed: run.remainingDepth > 0, frozenToolSnapshot: run.parentTools });
 			if (!this.isCurrent(run) || !run.schedulerActive || (run.mutationCapable && this.mutationOwners.get(run.parentId) !== run.id)) { this.settle(run, 'cancelled', 'Child owner or scheduler changed.'); return; }
-			const group = this.groups.get(run.parentId); if (!group || group.generation !== run.generation || group.activeProviderSends >= group.budgetLimits.maxProviderSends) { this.settle(run, 'failed', 'Child group provider-send budget exceeded.'); return; } group.providerSends++; group.activeProviderSends++; run.providerSends++; this.trace(group, 'provider_send', run);
-			const response = await new Promise<{ text?: string; tool?: { id: string; name: string; rawParams: Record<string, unknown> }; error?: string }>(resolve => {
+			const group = this.groups.get(run.parentId); if (!group || group.generation !== run.generation) { this.settle(run, 'cancelled', 'Child group changed.'); return; }
+			const releaseProviderSend = this.acquireProviderSend(run, group); if (!releaseProviderSend) { this.settle(run, 'failed', 'Child group provider-send capacity is full.'); return; }
+			let response: { text?: string; tool?: { id: string; name: string; rawParams: Record<string, unknown> }; error?: string };
+			try { response = await new Promise<{ text?: string; tool?: { id: string; name: string; rawParams: Record<string, unknown> }; error?: string }>(resolve => {
 				let resolved = false;
-				const finish = (value: { text?: string; tool?: { id: string; name: string; rawParams: Record<string, unknown> }; error?: string }) => { if (!resolved) { resolved = true; resolve(value); } };
-				const requestId = this.llm.sendLLMMessage({ messagesType: 'chatMessages', messages: prepared.messages, separateSystemMessage: prepared.separateSystemMessage, chatMode: 'agent', toolExecutionProfile: run.toolExecutionProfile, frozenToolSnapshot: run.parentTools, agentDelegationAllowed: run.remainingDepth > 0, settingsOfProviderOverride: run.settingsOfProvider, modelSelection, modelSelectionOptions: model.modelSelectionOptions as never, overridesOfModel: { [modelSelection.providerName]: { [model.modelName]: model.selectedModelOverrides } } as never, logging: { loggingName: 'Agent child', loggingExtras: { childId: run.id, turn, depth: run.depth } }, onText: () => {}, onFinalMessage: ({ fullText, toolCall }) => finish(toolCall ? { text: fullText, tool: { id: toolCall.id, name: toolCall.name, rawParams: toolCall.rawParams } } : { text: fullText }), onError: ({ message: error }) => finish({ error }), onAbort: () => finish({ error: 'Child cancelled.' }) });
-				run.requestId = requestId ?? undefined;
-				if (!requestId) finish({ error: 'Child provider request was not started.' });
-			});
-			run.requestId = undefined; // cancellation must never keep a completed provider request as an active lease.
+				const finish = (value: { text?: string; tool?: { id: string; name: string; rawParams: Record<string, unknown> }; error?: string }) => { if (!resolved) { resolved = true; releaseProviderSend(); resolve(value); } };
+				run.providerResponseFinish = () => finish({ error: 'Child cancelled.' });
+				try {
+					const requestId = this.llm.sendLLMMessage({ messagesType: 'chatMessages', messages: prepared.messages, separateSystemMessage: prepared.separateSystemMessage, chatMode: 'agent', toolExecutionProfile: run.toolExecutionProfile, frozenToolSnapshot: run.parentTools, agentDelegationAllowed: run.remainingDepth > 0, settingsOfProviderOverride: run.settingsOfProvider, modelSelection, modelSelectionOptions: model.modelSelectionOptions as never, overridesOfModel: { [modelSelection.providerName]: { [model.modelName]: model.selectedModelOverrides } } as never, logging: { loggingName: 'Agent child', loggingExtras: { childId: run.id, turn, depth: run.depth } }, onText: () => {}, onFinalMessage: ({ fullText, toolCall }) => finish(toolCall ? { text: fullText, tool: { id: toolCall.id, name: toolCall.name, rawParams: toolCall.rawParams } } : { text: fullText }), onError: ({ message: error }) => finish({ error }), onAbort: () => finish({ error: 'Child cancelled.' }) });
+					run.requestId = requestId ?? undefined;
+					if (!requestId) finish({ error: 'Child provider request was not started.' });
+					else if (run.cancellation.token.isCancellationRequested) { this.llm.abort(requestId); finish({ error: 'Child cancelled.' }); }
+				} catch (error) { finish({ error: error instanceof Error ? error.message : String(error) }); }
+			}); } finally { run.requestId = undefined; run.providerResponseFinish = undefined; releaseProviderSend(); }
 			if (!this.isCurrent(run)) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; }
 			if (response.error) { this.settle(run, run.cancellation.token.isCancellationRequested ? 'cancelled' : 'failed', response.error); return; }
 			const responseText = sanitizeAssistantDisplayContent(response.text ?? '');
@@ -285,7 +287,7 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 				history.push({ role: 'tool', type: 'success', content: printable, id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: undefined, name: response.tool.name, params: params as never, result: result as never });
 			} catch (error) { if (!this.isCurrent(run)) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; } const content = `The read-only tool call failed: ${error instanceof Error ? error.message : String(error)}`; history.push({ role: 'tool', type: 'tool_error', content, id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: undefined, name: response.tool.name, params: response.tool.rawParams, result: content }); }
 			}
-			this.settle(run, run.cancellation.token.isCancellationRequested ? 'cancelled' : 'failed', run.cancellation.token.isCancellationRequested ? 'Child cancelled.' : 'Child exceeded its bounded tool turn limit.');
+			if (run.cancellation.token.isCancellationRequested) this.settle(run, 'cancelled', 'Child cancelled.');
 		} catch (error) {
 			this.settleRunFailure(run, error);
 		} finally {
@@ -366,6 +368,23 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 			}, () => { /* fail closed: retain the mutation tombstone */ return new Promise<void>(() => { }); });
 		} catch { run.brokerCancelPromise = new Promise<void>(() => { }); }
 	}
+	/** One provider request owns one lease. Terminal child capacity is separate from this live occupancy. */
+	private acquireProviderSend(run: ChildRun, group: ChildGroup): (() => void) | undefined {
+		if (group.activeProviderSends >= group.budgetLimits.maxProviderSends) return undefined;
+		let released = false;
+		group.providerSends++;
+		group.activeProviderSends++;
+		this.trace(group, 'provider_send', run);
+		const release = () => {
+			if (released) return;
+			released = true;
+			if (run.providerLeaseRelease === release) run.providerLeaseRelease = undefined;
+			group.activeProviderSends = Math.max(0, group.activeProviderSends - 1);
+			this._onDidChangeDiagnostics.fire({ parentId: group.parentId, generation: group.generation });
+		};
+		run.providerLeaseRelease = release;
+		return release;
+	}
 	private groupBudget(run: ChildRun) { return this.groups.get(run.parentId)?.budgetLimits ?? run.budgetLimits; }
 	private settle(run: ChildRun, status: Exclude<AgentSubagentStatus, 'queued' | 'running'>, summary: string): boolean {
 		const group = this.groups.get(run.parentId);
@@ -394,11 +413,9 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 			if (!run.capacityReleased) {
 				run.capacityReleased = true;
 				group.accepted = Math.max(0, group.accepted - 1);
-				group.activeProviderSends = Math.max(0, group.activeProviderSends - run.providerSends);
 			}
 			this.trace(group, status === 'completed' ? 'child_completed' : status === 'failed' ? 'child_failed' : 'child_cancelled', run, status, this.terminalDiagnostic(status, summary, resultTruncated));
 		}
-		if (run.timeoutHandle !== undefined) { clearTimeout(run.timeoutHandle); run.timeoutHandle = undefined; }
 		run.summary = retainedSummary;
 		run.resultTruncated = resultTruncated;
 		run.terminalView = this.createRunView(run);
@@ -415,7 +432,7 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 	}
 	private traceBudget(group: ChildGroup) { return { accepted: group.accepted, running: this.activeCount(group), queued: group.runs.filter(run => run.lifecycle.status === 'queued').length, providerSends: group.providerSends, resultChars: group.resultChars }; }
 	private diagnostic(error: unknown): AgentSubagentTraceDiagnostic { const code = error instanceof Error ? error.message : ''; if (code.includes('cancel')) return 'cancelled'; if (code.includes('model_missing')) return 'model_missing'; if (code.includes('provider_invalid')) return 'provider_invalid'; if (code.includes('owner') || code.includes('trust')) return 'owner_changed'; if (code.includes('role') || code.includes('custom_agent')) return code.includes('stale') ? 'role_stale' : 'role_not_found'; if (code.includes('skill')) return 'skill_unavailable'; if (code.includes('budget') || code.includes('limit')) return 'budget_exhausted'; if (code.includes('provider')) return 'provider_error'; return 'unknown'; }
-	private terminalDiagnostic(status: Exclude<AgentSubagentStatus, 'queued' | 'running'>, summary: string, resultTruncated = false): AgentSubagentTraceDiagnostic | undefined { if (status === 'cancelled') return 'cancelled'; if (resultTruncated) return 'result_retention_truncated'; if (status === 'completed') return undefined; if (summary.includes('provider-send budget')) return 'budget_exhausted'; if (summary.includes('exceeded') || summary.includes('limit')) return summary.includes('turn') ? 'turn_limit' : 'timeout'; if (summary.includes('provider')) return 'provider_error'; return 'unknown'; }
+	private terminalDiagnostic(status: Exclude<AgentSubagentStatus, 'queued' | 'running'>, summary: string, resultTruncated = false): AgentSubagentTraceDiagnostic | undefined { if (status === 'cancelled') return 'cancelled'; if (resultTruncated) return 'result_retention_truncated'; if (status === 'completed') return undefined; if (summary.includes('provider-send capacity')) return 'budget_exhausted'; if (summary.includes('timeout')) return 'timeout'; if (summary.includes('provider')) return 'provider_error'; return 'unknown'; }
 	private async assertContainedRead(params: Record<string, unknown>, owner: URI): Promise<void> {
 		const raw = params.uri ?? params.searchInFolder;
 		if (!raw) return;
@@ -503,7 +520,7 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 	}
 	getRunViews(parentId: string): readonly AgentSubagentRunView[] { return Object.freeze((this.groups.get(parentId)?.runs ?? []).map(run => this.view(run))); }
 	getRunView(parentId: string): AgentSubagentRunView | undefined { return this.getRunViews(parentId)[0]; }
-	private budget(group: ChildGroup): AgentSubagentBudgetView { return Object.freeze({ accepted: group.accepted, running: this.activeCount(group), queued: group.runs.filter(run => run.lifecycle.status === 'queued').length, maxAccepted: group.limits.maxAcceptedChildren, maxConcurrent: group.limits.maxConcurrentThreadsPerSession, providerSends: group.providerSends, activeProviderSends: group.activeProviderSends, maxProviderSends: group.budgetLimits.maxProviderSends, resultChars: group.resultChars, retainedResultChars: group.retainedResultChars, maxResultChars: group.budgetLimits.maxResultChars, truncatedResultCount: group.truncatedResultCount, maxChildTurns: group.budgetLimits.maxChildTurns, maxChildRunMs: group.budgetLimits.maxChildRunMs, maxChildSummaryChars: group.budgetLimits.maxChildSummaryChars, deadlineMsRemaining: Math.max(0, group.deadlineAt - Date.now()), usage: null }); }
+	private budget(group: ChildGroup): AgentSubagentBudgetView { return Object.freeze({ accepted: group.accepted, running: this.activeCount(group), queued: group.runs.filter(run => run.lifecycle.status === 'queued').length, maxAccepted: group.limits.maxAcceptedChildren, maxConcurrent: group.limits.maxConcurrentThreadsPerSession, providerSends: group.providerSends, activeProviderSends: group.activeProviderSends, maxProviderSends: group.budgetLimits.maxProviderSends, resultChars: group.resultChars, retainedResultChars: group.retainedResultChars, maxResultChars: group.budgetLimits.maxResultChars, truncatedResultCount: group.truncatedResultCount, maxChildSummaryChars: group.budgetLimits.maxChildSummaryChars, usage: null }); }
 	getBudgetView(parentId: string): AgentSubagentBudgetView | undefined { const group = this.groups.get(parentId); return group && this.budget(group); }
 	getDiagnosticsView(parentId: string): AgentSubagentDiagnosticsView | undefined { const group = this.groups.get(parentId); if (!group) return undefined; const counts = { completed: 0, failed: 0, cancelled: 0 }; for (const run of group.runs) if (run.lifecycle.status === 'completed') counts.completed++; else if (run.lifecycle.status === 'failed') counts.failed++; else if (run.lifecycle.status === 'cancelled') counts.cancelled++; return Object.freeze({ parentId: group.parentId, generation: group.generation, elapsedMs: Math.max(0, Date.now() - group.createdAt), events: Object.freeze([...group.traceEvents]), droppedEvents: group.droppedTraceEvents, ...counts, usage: null }); }
 	interrupt(parentId: string, target: string, generation = 0) { return this.interruptFor(parentId, undefined, target, generation); }
@@ -513,12 +530,14 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 		if (run.lifecycle.status !== 'queued' && run.lifecycle.status !== 'running') return;
 		// Fence first; abort/provider cancellation and broker cancellation happen before any lease is released.
 		run.cancellation.cancel();
-		const requestId = run.requestId; if (requestId) this.llm.abort(requestId);
+		const requestId = run.requestId; if (requestId) { try { this.llm.abort(requestId); } catch { /* cancellation is already fenced; continue local settlement */ } }
+		run.providerResponseFinish?.();
+		run.providerLeaseRelease?.();
 		this.cancelBroker(run);
 		this.settle(run, status, summary);
 		if (!run.runPromise) this.releaseExecution(run); // queued/yielded children have no in-flight provider or broker promise.
 	}
-	private cancelGroup(group: ChildGroup, summary: string): void { if (group.cancellation) return; group.cancellation = true; this.trace(group, 'group_cancelled', undefined, undefined, summary.includes('exceeded') ? 'timeout' : 'cancelled'); if (group.deadline) clearTimeout(group.deadline); for (const admission of group.admissions.keys()) { admission.cancel(); admission.dispose(); } group.admissions.clear(); for (const run of group.runs) this.cancelRun(run, summary); }
+	private cancelGroup(group: ChildGroup, summary: string): void { if (group.cancellation) return; group.cancellation = true; this.trace(group, 'group_cancelled', undefined, undefined, 'cancelled'); for (const admission of group.admissions.keys()) { admission.cancel(); admission.dispose(); } group.admissions.clear(); for (const run of group.runs) this.cancelRun(run, summary); }
 	cancelParent(parentId: string) { const group = this.groups.get(parentId); if (group) this.cancelGroup(group, 'Child cancelled by parent.'); }
 	forgetParent(parentId: string) { const group = this.groups.get(parentId); if (!group) return; this.cancelGroup(group, 'Child cancelled by parent.'); this.groups.delete(parentId); this._onDidChangeDiagnostics.fire({ parentId, generation: group.generation }); for (const run of group.runs) this._onDidChangeRun.fire({ parentId, id: run.id, removed: true }); }
 	override dispose(): void { for (const parentId of [...this.groups.keys()]) this.forgetParent(parentId); this.groups.clear(); super.dispose(); }

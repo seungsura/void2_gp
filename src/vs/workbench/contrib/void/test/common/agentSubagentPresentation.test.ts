@@ -6,7 +6,7 @@
 import * as assert from 'assert';
 import { getAgentSubagentPresentation, selectThreadScopedValue } from '../../common/agentSubagentPresentation.js';
 
-const budget = (overrides: Record<string, unknown> = {}) => ({ accepted: 0, running: 0, queued: 0, maxAccepted: 4, maxConcurrent: 2, providerSends: 0, maxProviderSends: 64, resultChars: 0, maxResultChars: 32_000, deadlineMsRemaining: 240_000, usage: null, ...overrides }) as any;
+const budget = (overrides: Record<string, unknown> = {}) => ({ accepted: 0, running: 0, queued: 0, maxAccepted: 4, maxConcurrent: 2, providerSends: 0, activeProviderSends: 0, maxProviderSends: 64, resultChars: 0, retainedResultChars: 0, maxResultChars: 32_000, truncatedResultCount: 0, maxChildSummaryChars: 8_000, usage: null, ...overrides }) as any;
 const run = (status: string, id = 'child-abcdefgh') => ({ id, status, queuedMs: 1, runningMs: 2, totalMs: 3, authority: { runtimeRevision: 'runtime', instructionsRevision: 'instructions', catalogRevision: 'catalog', selectedSkills: [] }, usage: null }) as any;
 const diagnostics = (events: any[] = []) => ({ parentId: 'parent', generation: 1, elapsedMs: 4, events, droppedEvents: 0, completed: 0, failed: 0, cancelled: 0, usage: null }) as any;
 const event = (kind: string) => ({ sequence: 1, parentId: 'parent', generation: 1, kind, timestamp: 1, elapsedMs: 0, budget: { accepted: 0, running: 0, queued: 0, providerSends: 0, resultChars: 0 } });
