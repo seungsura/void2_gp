@@ -384,6 +384,9 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 
 	const textAreaRef = useRef<HTMLTextAreaElement | null>(null)
 	const selectedOptionRef = useRef<HTMLDivElement>(null);
+	// Keep the ID namespace local to this picker instance. Option IDs use their
+	// rendered index so catalog labels never become DOM identifiers.
+	const pickerListboxId = useId();
 	const adjustHeight = useCallback(() => {
 		const r = textAreaRef.current
 		if (!r) return
@@ -782,6 +785,12 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 
 
 	const [isEnabled, setEnabled] = useState(true)
+	// Disabling an open composer does not change the existing popup lifecycle, but
+	// it must immediately detach the textarea from that inactive popup.
+	const pickerLinkageOpen = enableAtToMention === true && isEnabled && isMenuOpen;
+	const activePickerOptionId = pickerLinkageOpen && options[optionIdx] && options[optionIdx].disabled !== true
+		? `${pickerListboxId}-option-${optionIdx}`
+		: undefined;
 
 	const fns: TextAreaFns = useMemo(() => ({
 		setValue: (val) => {
@@ -810,6 +819,13 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 			autoFocus={false}
 			aria-label={ariaLabel}
 			aria-describedby={ariaDescribedBy}
+			{...(enableAtToMention ? {
+				role: 'combobox',
+				'aria-autocomplete': 'list' as const,
+				'aria-expanded': pickerLinkageOpen,
+				...(pickerLinkageOpen ? { 'aria-controls': pickerListboxId } : {}),
+				...(activePickerOptionId ? { 'aria-activedescendant': activePickerOptionId } : {}),
+			} : {})}
 			ref={useCallback((r: HTMLTextAreaElement | null) => {
 				if (fnsRef)
 					fnsRef.current = fns
@@ -917,7 +933,7 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 
 
 				{/* Options list */}
-				<div className='max-h-[400px] w-full max-w-full overflow-y-auto overflow-x-auto' role="listbox">
+				<div id={pickerListboxId} role="listbox" className='max-h-[400px] w-full max-w-full overflow-y-auto overflow-x-auto'>
 					<div className="w-max min-w-full flex flex-col gap-0 text-nowrap flex-nowrap">
 						{options.length === 0 ?
 							<div className="text-void-fg-3 px-3 py-0.5">No results found</div>
@@ -930,6 +946,7 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 									<div
 										ref={isSelected ? selectedOptionRef : null}
 										key={o.fullName}
+										id={`${pickerListboxId}-option-${oIdx}`}
 										role="option"
 										aria-disabled={isDisabled}
 										aria-selected={isSelected}
