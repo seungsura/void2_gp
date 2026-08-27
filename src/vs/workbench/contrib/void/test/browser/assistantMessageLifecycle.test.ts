@@ -1014,7 +1014,14 @@ suite('Assistant message lifecycle', () => {
 		await runChatAgent(unclosedReceiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot, callThisToolFirst: unclosedBeforeTarget.at(-1) });
 		assert.deepStrictEqual({ unclosedRuns, unclosedConversions, unclosedSends, target: unclosedBeforeTarget.at(-1).type, hasParams: Object.prototype.hasOwnProperty.call(unclosedBeforeTarget.at(-1), 'params') }, { unclosedRuns: 0, unclosedConversions: 0, unclosedSends: 0, target: 'skipped', hasParams: false });
 
-		const pausedMessages: any[] = [{ role: 'user', content: 'pause on the second native call', displayContent: 'pause on the second native call' }];
+		const pausedMessages: any[] = [
+			{ role: 'user', content: 'two closed native batches before approval', displayContent: 'two closed native batches before approval' },
+			{ role: 'assistant', displayContent: '', reasoning: '', anthropicReasoning: null, toolBatch: { version: 1, batchId: 'closed-one', calls: [{ id: 'closed-one-0', name: 'run_command', rawParams: { command: 'echo one', terminalId: 'closed-one-0' } }] } },
+			{ role: 'tool', type: 'success', name: 'run_command', params: { command: 'echo one', terminalId: 'closed-one-0' }, content: 'one', result: 'one', id: 'closed-one-0', rawParams: { command: 'echo one', terminalId: 'closed-one-0' }, mcpServerName: undefined, batchId: 'closed-one', batchOrdinal: 0 },
+			{ role: 'assistant', displayContent: '', reasoning: '', anthropicReasoning: null, toolBatch: { version: 1, batchId: 'closed-two', calls: [{ id: 'closed-two-0', name: 'run_command', rawParams: { command: 'echo two', terminalId: 'closed-two-0' } }] } },
+			{ role: 'tool', type: 'success', name: 'run_command', params: { command: 'echo two', terminalId: 'closed-two-0' }, content: 'two', result: 'two', id: 'closed-two-0', rawParams: { command: 'echo two', terminalId: 'closed-two-0' }, mcpServerName: undefined, batchId: 'closed-two', batchOrdinal: 0 },
+			{ role: 'user', content: 'pause on the second native call', displayContent: 'pause on the second native call' },
+		];
 		const pausedStream: any = {}; const pausedRuns: string[] = []; const completedRuns: string[] = []; const approvedParams: any[] = []; let pausedSends = 0; let pausedConversions = 0;
 		const pausedCalls = [
 			{ name: 'run_command', id: 'pause-0', rawParams: { command: 'echo complete', terminalId: 'pause-0' } },
@@ -1043,14 +1050,14 @@ suite('Assistant message lifecycle', () => {
 		};
 		await runChatAgent(paused, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot });
 		assert.deepStrictEqual({ sends: pausedSends, conversions: pausedConversions, runs: pausedRuns, running: pausedStream.task.isRunning }, { sends: 1, conversions: 1, runs: ['pause-0', 'pause-1'], running: 'awaiting_user' });
-		assert.deepStrictEqual(pausedMessages.filter(message => message.role === 'tool').map(message => [message.id, message.type, message.batchOrdinal]), [['pause-0', 'success', 0], ['pause-1', 'tool_request', 1]]);
+		assert.deepStrictEqual(pausedMessages.filter(message => message.role === 'tool' && message.id.startsWith('pause-')).map(message => [message.id, message.type, message.batchOrdinal]), [['pause-0', 'success', 0], ['pause-1', 'tool_request', 1]]);
 		const pausedApproval = pausedMessages.find(message => message.role === 'tool' && message.id === 'pause-1');
 		pausedApproval.rawParams = { terminalId: 'pause-1', command: 'echo approve' };
 		pausedApproval.params = { terminalId: 'poisoned', command: 'echo must-not-run' };
 		await runChatAgent(paused, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot, callThisToolFirst: pausedApproval });
 		assert.deepStrictEqual({ sends: pausedSends, conversions: pausedConversions, runs: pausedRuns, completedRuns }, { sends: 2, conversions: 2, runs: ['pause-0', 'pause-1', 'pause-1', 'pause-2'], completedRuns: ['pause-0', 'pause-1', 'pause-2'] });
 		assert.deepStrictEqual(approvedParams, [{ command: 'echo approve', terminalId: 'pause-1' }], 'resume must revalidate declaration-bound raw arguments instead of trusting persisted params');
-		assert.deepStrictEqual(pausedMessages.filter(message => message.role === 'tool').map(message => [message.id, message.type, message.batchOrdinal]), [['pause-0', 'success', 0], ['pause-1', 'success', 1], ['pause-2', 'success', 2]]);
+		assert.deepStrictEqual(pausedMessages.filter(message => message.role === 'tool' && message.id.startsWith('pause-')).map(message => [message.id, message.type, message.batchOrdinal]), [['pause-0', 'success', 0], ['pause-1', 'success', 1], ['pause-2', 'success', 2]]);
 	});
 
 	test('stops the parent loop after three identical normalized tool failures without a fourth provider send', async () => {
