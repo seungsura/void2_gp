@@ -6,7 +6,7 @@
 import React, { ButtonHTMLAttributes, FormEvent, FormHTMLAttributes, Fragment, KeyboardEvent, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 
 
-import { useAccessor, useAgentSubagentBudget, useAgentSubagentDiagnostics, useAgentSubagentRuns, useChatThreadsState, useChatThreadsStreamState, usePendingChatInputs, usePendingChatSubmission, useSettingsState, useActiveURI, useChildToolApprovals, useCommandBarState } from '../util/services.js';
+import { useAccessor, useAgentSubagentLiveSnapshot, useChatThreadsState, useChatThreadsStreamState, usePendingChatInputs, usePendingChatSubmission, useSettingsState, useActiveURI, useChildToolApprovals, useCommandBarState } from '../util/services.js';
 import { ScrollType } from '../../../../../../../editor/common/editorCommon.js';
 
 import { ChatMarkdownRender, ChatMessageLocation, getApplyBoxId } from '../markdown/ChatMarkdownRender.js';
@@ -2909,9 +2909,7 @@ export const SidebarChat = () => {
 	const pendingSubmission = usePendingChatSubmission(threadId)
 	const pendingInputs = usePendingChatInputs(threadId)
 	const isRunning = currThreadStreamState?.isRunning
-	const childRuns = useAgentSubagentRuns(currentThread.id)
-	const childBudget = useAgentSubagentBudget(currentThread.id)
-	const childDiagnostics = useAgentSubagentDiagnostics(currentThread.id)
+	const { runs: childRuns, budget: childBudget, diagnostics: childDiagnostics } = useAgentSubagentLiveSnapshot(currentThread.id)
 	const childToolApprovals = useChildToolApprovals(currentThread.id)
 	const childPresentation = getAgentSubagentPresentation(childBudget, childRuns, childDiagnostics)
 	const childIsActive = childRuns.some(isActiveChildRun)

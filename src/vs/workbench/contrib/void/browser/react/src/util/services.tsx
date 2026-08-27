@@ -56,7 +56,7 @@ import { IStorageService, StorageScope } from '../../../../../../../platform/sto
 import { OPT_OUT_KEY } from '../../../../common/storageKeys.js'
 import { IAgentSubagentService } from '../../../agentSubagentService.js'
 import { IAgentInstructionsService } from '../../../agentInstructionsService.js'
-import { AgentSubagentBudgetView, AgentSubagentDiagnosticsView, AgentSubagentRunView, ChildToolApprovalView } from '../../../../common/agentSubagents.js'
+import { AgentSubagentBudgetView, AgentSubagentDiagnosticsView, AgentSubagentRunView, ChildToolApprovalView, isActiveChildRun } from '../../../../common/agentSubagents.js'
 import { hasActionRequiredChild } from '../../../../common/chatHistoryPresentation.js'
 import { selectThreadScopedValue } from '../../../../common/agentSubagentPresentation.js'
 
@@ -348,17 +348,48 @@ export const useAgentSubagentRuns = (threadId: string): readonly AgentSubagentRu
 	useEffect(() => { const refresh = () => setState({ threadId, value: service.getRunViews(threadId) }); refresh(); const disposable = service.onDidChangeRun(event => { if (event.parentId === threadId) refresh() }); return () => disposable.dispose() }, [service, threadId])
 	return selectThreadScopedValue(state, threadId, () => service.getRunViews(threadId))
 }
-export const useAgentSubagentBudget = (threadId: string): AgentSubagentBudgetView | undefined => {
+
+export type AgentSubagentLiveSnapshot = Readonly<{
+	runs: readonly AgentSubagentRunView[];
+	budget: AgentSubagentBudgetView | undefined;
+	diagnostics: AgentSubagentDiagnosticsView | undefined;
+}>;
+
+/**
+ * Child timing is calculated by the service when a view is read. Keep the three
+ * related views on one renderer-local cadence so an idle child does not freeze
+ * between service events. Admission-only groups intentionally have no timer.
+ */
+export const useAgentSubagentLiveSnapshot = (threadId: string): AgentSubagentLiveSnapshot => {
 	const service = useAccessor().get('IAgentSubagentService')
-	const [state, setState] = useState(() => ({ threadId, value: service.getBudgetView(threadId) }))
-	useEffect(() => { const refresh = () => setState({ threadId, value: service.getBudgetView(threadId) }); refresh(); const disposable = service.onDidChangeRun(event => { if (event.parentId === threadId) refresh() }); return () => disposable.dispose() }, [service, threadId])
-	return selectThreadScopedValue(state, threadId, () => service.getBudgetView(threadId))
-}
-export const useAgentSubagentDiagnostics = (threadId: string): AgentSubagentDiagnosticsView | undefined => {
-	const service = useAccessor().get('IAgentSubagentService')
-	const [state, setState] = useState(() => ({ threadId, value: service.getDiagnosticsView(threadId) }))
-	useEffect(() => { const refresh = () => setState({ threadId, value: service.getDiagnosticsView(threadId) }); refresh(); const disposable = service.onDidChangeDiagnostics(event => { if (event.parentId === threadId) refresh() }); return () => disposable.dispose() }, [service, threadId])
-	return selectThreadScopedValue(state, threadId, () => service.getDiagnosticsView(threadId))
+	const readSnapshot = (): AgentSubagentLiveSnapshot => Object.freeze({
+		runs: service.getRunViews(threadId),
+		budget: service.getBudgetView(threadId),
+		diagnostics: service.getDiagnosticsView(threadId),
+	})
+	const [state, setState] = useState(() => ({ threadId, value: readSnapshot() }))
+	useEffect(() => {
+		let interval: number | undefined
+		const refresh = () => {
+			const value = readSnapshot()
+			setState({ threadId, value })
+			if (value.runs.some(isActiveChildRun)) {
+				if (interval === undefined) interval = window.setInterval(refresh, 1_000)
+			} else if (interval !== undefined) {
+				window.clearInterval(interval)
+				interval = undefined
+			}
+		}
+		refresh()
+		const runChange = service.onDidChangeRun(event => { if (event.parentId === threadId) refresh() })
+		const diagnosticsChange = service.onDidChangeDiagnostics(event => { if (event.parentId === threadId) refresh() })
+		return () => {
+			runChange.dispose()
+			diagnosticsChange.dispose()
+			if (interval !== undefined) window.clearInterval(interval)
+		}
+	}, [service, threadId])
+	return selectThreadScopedValue(state, threadId, readSnapshot)
 }
 
 export const useChildToolApprovals = (threadId: string): readonly ChildToolApprovalView[] => {
