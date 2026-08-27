@@ -251,6 +251,53 @@ function Get-VoidProcessesByExactPath {
     )
 }
 function Get-AllVoidProcesses { @((Get-CimInstance Win32_Process | Where-Object { $_.Name -ceq 'Void.exe' } | ForEach-Object {[pscustomobject]@{pid=[int]$_.ProcessId;parent=[int]$_.ParentProcessId;cmd=[string]$_.CommandLine;path=[string]$_.ExecutablePath}})) }
+function Test-ExactStageReferencePath {
+    param([string]$Stage,[string]$Path)
+    if([string]::IsNullOrWhiteSpace($Path)){return $false}
+    $normalizedStage=[IO.Path]::GetFullPath($Stage).TrimEnd([char[]]@($DirectorySeparatorChar,[IO.Path]::AltDirectorySeparatorChar))
+    try {$normalizedPath=[IO.Path]::GetFullPath($Path)}catch{return $false}
+    $normalizedPath.StartsWith($normalizedStage+$DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)
+}
+function Test-ExactStageReferenceCommandLine {
+    param([string]$Stage,[string]$CommandLine)
+    if([string]::IsNullOrWhiteSpace($CommandLine)){return $false}
+    $normalizedStage=[IO.Path]::GetFullPath($Stage).TrimEnd([char[]]@($DirectorySeparatorChar,[IO.Path]::AltDirectorySeparatorChar)).Replace([char]'/',[char]$DirectorySeparatorChar)
+    $normalizedCommand=$CommandLine.Replace([char]'/',[char]$DirectorySeparatorChar)
+    $pattern='(?i)(?:^|[\s\"''=])'+[regex]::Escape($normalizedStage)+'(?=$|[\s\"''\\])'
+    [regex]::IsMatch($normalizedCommand,$pattern)
+}
+function Test-ProcessReferencesExactStage {
+    param([string]$Stage,$Process)
+    (Test-ExactStageReferencePath $Stage ([string]$Process.path)) -or (Test-ExactStageReferenceCommandLine $Stage ([string]$Process.cmd))
+}
+function Get-ExactStageReferenceProcesses {
+    param([string]$Stage,[scriptblock]$GetProcessSnapshot)
+    $snapshot=if($null -ne $GetProcessSnapshot){& $GetProcessSnapshot}else{Get-CimInstance Win32_Process|ForEach-Object{[pscustomobject]@{pid=[int]$_.ProcessId;parent=[int]$_.ParentProcessId;cmd=[string]$_.CommandLine;path=[string]$_.ExecutablePath}}}
+    @($snapshot|Where-Object{Test-ProcessReferencesExactStage $Stage $_}|ForEach-Object{[pscustomobject]@{pid=[int]$_.pid;parent=[int]$_.parent;cmd=[string]$_.cmd;path=[string]$_.path}})
+}
+function Get-ExactStageReferenceProcessByPid {
+    param([string]$Stage,[int]$ProcessId,[scriptblock]$GetProcessSnapshot)
+    @(Get-ExactStageReferenceProcesses $Stage $GetProcessSnapshot|Where-Object{$_.pid -eq $ProcessId})
+}
+function Request-ExactStageProcessGracefulStop {
+    param([int]$ProcessId)
+    try {$process=Get-Process -Id $ProcessId -ErrorAction Stop;if($process.MainWindowHandle -ne 0){$null=$process.CloseMainWindow()}}catch{}
+}
+function Invoke-ExactStageReferenceProcessSettlement {
+    param([string]$Stage,[scriptblock]$GetProcessSnapshot,[scriptblock]$RequestGracefulStop,[scriptblock]$ForceStop,[int]$GracefulWaitMilliseconds=2500,[int]$PollIntervalMilliseconds=250)
+    $initial=@(Get-ExactStageReferenceProcesses $Stage $GetProcessSnapshot)
+    $graceful=$RequestGracefulStop;if($null -eq $graceful){$graceful={param([int]$ProcessId) Request-ExactStageProcessGracefulStop $ProcessId}}
+    $force=$ForceStop;if($null -eq $force){$force={param([int]$ProcessId) Stop-Process -Id $ProcessId -Force -ErrorAction Stop}}
+    foreach($record in $initial){$matching=@(Get-ExactStageReferenceProcessByPid -Stage $Stage -ProcessId ([int]$record.pid) -GetProcessSnapshot $GetProcessSnapshot);if($matching.Count -gt 0){& $graceful ([int]$record.pid)}}
+    if($initial.Count -gt 0 -and $GracefulWaitMilliseconds -gt 0){$deadline=[DateTime]::UtcNow.AddMilliseconds($GracefulWaitMilliseconds);do{$remaining=@(Get-ExactStageReferenceProcesses $Stage $GetProcessSnapshot);if($remaining.Count -eq 0 -or [DateTime]::UtcNow -ge $deadline){break};$delay=[Math]::Min($PollIntervalMilliseconds,[Math]::Max(1,[int]($deadline-[DateTime]::UtcNow).TotalMilliseconds));Start-Sleep -Milliseconds $delay}while($true)}
+    $forceAttempted=New-Object Collections.ArrayList
+    foreach($record in @(Get-ExactStageReferenceProcesses $Stage $GetProcessSnapshot)){
+        $matching=@(Get-ExactStageReferenceProcessByPid -Stage $Stage -ProcessId ([int]$record.pid) -GetProcessSnapshot $GetProcessSnapshot);if($matching.Count -gt 0){try{& $force ([int]$record.pid);[void]$forceAttempted.Add([int]$record.pid)}catch{}}
+    }
+    $survivors=@(Get-ExactStageReferenceProcesses $Stage $GetProcessSnapshot)
+    if($survivors.Count -gt 0){throw "Exact release-stage process settlement left survivors: $($survivors.pid -join ', ')"}
+    [pscustomobject]@{initialPids=@($initial|ForEach-Object{[int]$_.pid});forceAttemptedPids=@($forceAttempted|ForEach-Object{[int]$_});survivorPids=@()}
+}
 function Get-FileEvidence { param([string]$Path) if(Test-Path -LiteralPath $Path -PathType Leaf){Get-ExistingFileMetadata $Path}else{$null} }
 function Get-SmokeLogCounters {
     param([string]$Text)
@@ -462,6 +509,7 @@ function Get-CanonicalBuildAndTestCommands {
     [void]$commands.Add([pscustomobject]@{name='postinstall';file='npm';args=@('run','postinstall');allowNonZero=$false;expectedPreHelper=$false})
     [void]$commands.Add([pscustomobject]@{name='focused-release-content-manifest';file='powershell.exe';args=@('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $PSScriptRoot 'test-release-content-manifest.ps1'));allowNonZero=$false;expectedPreHelper=$false})
 	[void]$commands.Add([pscustomobject]@{name='focused-release-pass-count-map';file='powershell.exe';args=@('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $PSScriptRoot 'test-release-focused-pass-counts.ps1'));allowNonZero=$false;expectedPreHelper=$false})
+    [void]$commands.Add([pscustomobject]@{name='focused-release-stage-process-settlement';file='powershell.exe';args=@('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $PSScriptRoot 'test-release-stage-process-settlement.ps1'));allowNonZero=$false;expectedPreHelper=$false})
     [void]$commands.Add([pscustomobject]@{name='pre-runtime-validation';file='powershell.exe';args=@('-NoProfile','-ExecutionPolicy','Bypass','-File',$nativeScript,'-ValidateOnly');allowNonZero=$true;expectedPreHelper=$true})
     [void]$commands.Add([pscustomobject]@{name='native-runtime';file='powershell.exe';args=@('-NoProfile','-ExecutionPolicy','Bypass','-File',$nativeScript);allowNonZero=$false;expectedPreHelper=$false})
     [void]$commands.Add([pscustomobject]@{name='post-runtime-validation';file='powershell.exe';args=@('-NoProfile','-ExecutionPolicy','Bypass','-File',$nativeScript,'-ValidateOnly');allowNonZero=$false;expectedPreHelper=$false})
@@ -715,7 +763,7 @@ function Invoke-CanonicalRelease {
     try {
         $context=New-CanonicalReleaseContext;$null=Invoke-CanonicalBuildAndTestGates $context;$candidate=Invoke-CanonicalCandidateAndSmoke $context;$finalSummaryPath=Get-CanonicalReleaseSummaryPath $context $candidate;$published=Invoke-CanonicalPublishAndVerify $context $candidate
         $context.summary.status='publication-committed-cleanup-pending';$context.summary.error=$null;$context.summary.cleanup=[pscustomobject]@{state='pending';stage=$context.stage;stageRemoved=$false;residue=$null};$context.summary.finalMetadata=$context.summary.publication.final;Save-ReleaseSummary $context.summary $context.summaryPath;$firstSummary=Publish-ReleaseSummaryTransaction $context.summary $finalSummaryPath
-        try {Assert-NotReparsePoint $context.stage|Out-Null;Remove-ExactPathWithRetry $context.stage $PackageRoot;if(Test-Path -LiteralPath $context.stage){throw 'Current release stage remained after cleanup.'};$final=Assert-CanonicalPackageFiles $candidate.portable $candidate.outer $null;$source=Assert-CommittedCleanHead;if($source.head -cne $context.head.head -or $source.branch -cne $context.head.branch -or $source.status.Count -ne 0){throw 'Source changed after stage cleanup.'};$global=@(Get-AllVoidProcesses);if($global.Count -ne 0){throw 'Global Void process audit was not empty after stage cleanup.'};$context.summary.cleanup=[pscustomobject]@{state='passed';stage=$context.stage;stageRemoved=$true;residue=0;globalVoidProcesses=0};$context.summary.finalMetadata=[pscustomobject]@{portable=[pscustomobject]@{path=$final.portable.Path;size=$final.portable.Size;sha256=$final.portable.Sha256;entries=$final.portable.Entries;version=$final.portable.Version;docsContract=$final.portable.DocsContract;docsLayout=$final.portable.DocsLayout;docsCount=$final.portable.DocsCount;docs=@($final.portable.Docs)};outer=[pscustomobject]@{path=$final.outer.Path;size=$final.outer.Size;sha256=$final.outer.Sha256;entries=$final.outer.Entries;version=$final.outer.Version;docsLayout=$final.outer.DocsLayout;innerName=$final.outer.InnerName;innerSize=$final.outer.InnerSize;innerSha256=$final.outer.InnerSha256;sharedDocsCount=$final.outer.SharedDocsCount}};$context.summary.status='passed';$finalSummary=Publish-ReleaseSummaryTransaction $context.summary $finalSummaryPath;Assert-NoCanonicalPackageResidue $null;Write-Host "Canonical release passed: $($final.portable.Sha256) / $($final.outer.Sha256)";[pscustomobject]@{status='passed';portable=$final.portable;outer=$final.outer;summary=$finalSummary;stageRemoved=$true}}
+        try {Assert-NotReparsePoint $context.stage|Out-Null;$stageProcessSettlement=Invoke-ExactStageReferenceProcessSettlement $context.stage;Remove-ExactPathWithRetry $context.stage $PackageRoot;if(Test-Path -LiteralPath $context.stage){throw 'Current release stage remained after cleanup.'};$final=Assert-CanonicalPackageFiles $candidate.portable $candidate.outer $null;$source=Assert-CommittedCleanHead;if($source.head -cne $context.head.head -or $source.branch -cne $context.head.branch -or $source.status.Count -ne 0){throw 'Source changed after stage cleanup.'};$global=@(Get-AllVoidProcesses);if($global.Count -ne 0){throw 'Global Void process audit was not empty after stage cleanup.'};$context.summary.cleanup=[pscustomobject]@{state='passed';stage=$context.stage;stageRemoved=$true;residue=0;globalVoidProcesses=0;stageReferenceInitialPids=@($stageProcessSettlement.initialPids);stageReferenceForceAttemptedPids=@($stageProcessSettlement.forceAttemptedPids);stageReferenceSurvivorPids=@($stageProcessSettlement.survivorPids)};$context.summary.finalMetadata=[pscustomobject]@{portable=[pscustomobject]@{path=$final.portable.Path;size=$final.portable.Size;sha256=$final.portable.Sha256;entries=$final.portable.Entries;version=$final.portable.Version;docsContract=$final.portable.DocsContract;docsLayout=$final.portable.DocsLayout;docsCount=$final.portable.DocsCount;docs=@($final.portable.Docs)};outer=[pscustomobject]@{path=$final.outer.Path;size=$final.outer.Size;sha256=$final.outer.Sha256;entries=$final.outer.Entries;version=$final.outer.Version;docsLayout=$final.outer.DocsLayout;innerName=$final.outer.InnerName;innerSize=$final.outer.InnerSize;innerSha256=$final.outer.InnerSha256;sharedDocsCount=$final.outer.SharedDocsCount}};$context.summary.status='passed';$finalSummary=Publish-ReleaseSummaryTransaction $context.summary $finalSummaryPath;Assert-NoCanonicalPackageResidue $null;Write-Host "Canonical release passed: $($final.portable.Sha256) / $($final.outer.Sha256)";[pscustomobject]@{status='passed';portable=$final.portable;outer=$final.outer;summary=$finalSummary;stageRemoved=$true}}
         catch {$postException=$_.Exception;$context.summary.status='failed-after-publication';$context.summary.error=$postException.ToString();$context.summary.cleanup=[pscustomobject]@{state='failed';stage=$context.stage;stageRemoved=(-not(Test-Path -LiteralPath $context.stage));error=$postException.ToString()};if(Test-Path -LiteralPath $context.summaryPath -PathType Leaf){try{Save-ReleaseSummary $context.summary $context.summaryPath}catch{}};$summaryFailure=$null;try{$null=Publish-ReleaseSummaryTransaction $context.summary $finalSummaryPath}catch{$summaryFailure=$_.Exception};Write-Host "Release failed after publication; valid product was preserved: $($postException.Message)" -ForegroundColor Red;$postPublicationHandled=$true;if($null -ne $summaryFailure){throw [InvalidOperationException]::new(("Release failed after publication: $($postException.Message); final summary failed: $($summaryFailure.Message)"),$postException)};throw $postException}
     } catch {
         $releaseException=$_.Exception;if($null -eq $context){throw};if($null -eq $finalSummaryPath){$finalSummaryPath=Get-CanonicalReleaseSummaryPath $context $candidate};if($context.summary.publicationCommitted){if($postPublicationHandled){throw};$context.summary.status='failed-after-publication';$context.summary.error=$releaseException.ToString();$context.summary.cleanup=[pscustomobject]@{state='retained-after-publication-failure';stage=$context.stage;stageRemoved=(-not(Test-Path -LiteralPath $context.stage));error=$releaseException.ToString()};if(Test-Path -LiteralPath $context.summaryPath -PathType Leaf){try{Save-ReleaseSummary $context.summary $context.summaryPath}catch{}};$summaryFailure=$null;if($null -ne $finalSummaryPath){try{$null=Publish-ReleaseSummaryTransaction $context.summary $finalSummaryPath}catch{$summaryFailure=$_.Exception}};Write-Host "Release failed after publication; valid product was preserved: $($releaseException.Message)" -ForegroundColor Red;if($null -ne $summaryFailure){throw [InvalidOperationException]::new(("Release failed after publication: $($releaseException.Message); final summary failed: $($summaryFailure.Message)"),$releaseException)};throw $releaseException}
