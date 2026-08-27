@@ -26,6 +26,9 @@ type SimpleLLMMessage = {
 	id: string;
 	name: ToolName;
 	rawParams: RawToolParamsObj;
+	/** Durable native batch identity used only to group provider result blocks. */
+	batchId?: string;
+	batchOrdinal?: number;
 	/** Exact selected-Skill resource evidence; generic history trimming must not alter it. */
 	protectedSkillResource?: boolean;
 } | {
@@ -35,6 +38,7 @@ type SimpleLLMMessage = {
 	role: 'assistant';
 	content: string;
 	anthropicReasoning: AnthropicReasoning[] | null;
+	toolBatch?: { version: 1; batchId: string; calls: readonly { id: string; name: ToolName; rawParams: RawToolParamsObj }[] };
 }
 
 
@@ -46,6 +50,23 @@ const TRIM_TO_LEN = 120
 // It is state-free so tool execution can derive a bound without serializing or mutating history.
 export const estimateHistoryTokensForReadBudget = (history: readonly unknown[]) => Math.ceil(JSON.stringify(history).length / CHARS_PER_TOKEN)
 export const protectedSkillResourceHistoryLength = (history: readonly ChatMessage[]) => history.reduce((total, message) => total + (message.role === 'tool' && message.type === 'success' && isReadSkillResourceToolName(message.name) ? message.content.length : 0), 0)
+
+/** A native assistant declaration must be complete before a later provider turn can
+ * serialize it. This keeps a cancelled/reloaded/approval-paused batch from becoming
+ * an invalid provider transcript. Batch bookkeeping itself never crosses the wire. */
+const assertClosedNativeToolBatches = (messages: readonly ChatMessage[]): void => {
+	for (const message of messages) {
+		if (message.role !== 'assistant' || !message.toolBatch) continue
+		const { batchId, calls } = message.toolBatch
+		if (!batchId || calls.length === 0 || calls.some(call => !call.id || !call.name) || new Set(calls.map(call => call.id)).size !== calls.length) throw new Error('native_tool_batch_invalid_declaration')
+		const rows = messages.filter((candidate): candidate is Extract<ChatMessage, { role: 'tool' }> => candidate.role === 'tool' && candidate.batchId === batchId)
+		if (rows.length !== calls.length) throw new Error('native_tool_batch_unclosed')
+		for (const [batchOrdinal, call] of calls.entries()) {
+			const matching = rows.filter(row => row.batchOrdinal === batchOrdinal && row.id === call.id)
+			if (matching.length !== 1 || !['success', 'tool_error', 'rejected', 'invalid_params'].includes(matching[0].type)) throw new Error('native_tool_batch_unclosed')
+		}
+	}
+}
 
 
 
@@ -80,6 +101,10 @@ const prepareMessages_openai_tools = (messages: SimpleLLMMessage[]): AnthropicOr
 	for (let i = 0; i < messages.length; i += 1) {
 		const currMsg = messages[i]
 
+		if (currMsg.role === 'assistant') {
+			newMessages.push({ role: 'assistant', content: currMsg.content, ...(currMsg.toolBatch ? { tool_calls: currMsg.toolBatch.calls.map(call => ({ type: 'function' as const, id: call.id, function: { name: call.name, arguments: JSON.stringify(call.rawParams) } })) } : {}) })
+			continue
+		}
 		if (currMsg.role !== 'tool') {
 			newMessages.push(currMsg)
 			continue
@@ -87,7 +112,7 @@ const prepareMessages_openai_tools = (messages: SimpleLLMMessage[]): AnthropicOr
 
 		// edit previous assistant message to have called the tool
 		const prevMsg = 0 <= i - 1 && i - 1 <= newMessages.length ? newMessages[i - 1] : undefined
-		if (prevMsg?.role === 'assistant') {
+		if (prevMsg?.role === 'assistant' && !prevMsg.tool_calls?.length) {
 			prevMsg.tool_calls = [{
 				type: 'function',
 				id: currMsg.id,
@@ -143,7 +168,7 @@ user: ...content, result(id, content)
 type AnthropicOrOpenAILLMMessage = AnthropicLLMChatMessage | OpenAILLMChatMessage
 
 const prepareMessages_anthropic_tools = (messages: SimpleLLMMessage[], supportsAnthropicReasoning: boolean): AnthropicOrOpenAILLMMessage[] => {
-	const newMessages: (AnthropicLLMChatMessage | (SimpleLLMMessage & { role: 'tool' }))[] = messages;
+	const newMessages: AnthropicLLMChatMessage[] = [];
 
 	for (let i = 0; i < messages.length; i += 1) {
 		const currMsg = messages[i]
@@ -152,44 +177,54 @@ const prepareMessages_anthropic_tools = (messages: SimpleLLMMessage[], supportsA
 		if (currMsg.role === 'assistant') {
 			if (currMsg.anthropicReasoning && supportsAnthropicReasoning) {
 				const content = currMsg.content
-				newMessages[i] = {
+				newMessages.push({
 					role: 'assistant',
-					content: content ? [...currMsg.anthropicReasoning, { type: 'text' as const, text: content }] : currMsg.anthropicReasoning
-				}
+					content: [...(content ? [...currMsg.anthropicReasoning, { type: 'text' as const, text: content }] : currMsg.anthropicReasoning), ...(currMsg.toolBatch?.calls.map(call => ({ type: 'tool_use' as const, id: call.id, name: call.name, input: call.rawParams })) ?? [])]
+				})
 			}
 			else {
-				newMessages[i] = {
+				newMessages.push({
 					role: 'assistant',
-					content: currMsg.content,
+					content: currMsg.toolBatch ? [...(currMsg.content ? [{ type: 'text' as const, text: currMsg.content }] : []), ...currMsg.toolBatch.calls.map(call => ({ type: 'tool_use' as const, id: call.id, name: call.name, input: call.rawParams }))] : currMsg.content,
 					// strip away anthropicReasoning
-				}
+				})
 			}
 			continue
 		}
 
 		if (currMsg.role === 'user') {
-			newMessages[i] = {
+			newMessages.push({
 				role: 'user',
 				content: currMsg.content,
-			}
+			})
 			continue
 		}
 
 		if (currMsg.role === 'tool') {
 			// add anthropic tools
-			const prevMsg = 0 <= i - 1 && i - 1 <= newMessages.length ? newMessages[i - 1] : undefined
+			const toolRows: Extract<SimpleLLMMessage, { role: 'tool' }>[] = [currMsg]
+			if (currMsg.batchId !== undefined) {
+				while (i + 1 < messages.length) {
+					const next = messages[i + 1]
+					if (next.role !== 'tool' || next.batchId !== currMsg.batchId) break
+					i += 1
+					toolRows.push(next)
+				}
+			}
+			const prevMsg = newMessages.at(-1)
 
 			// make it so the assistant called the tool
-			if (prevMsg?.role === 'assistant') {
+			if (prevMsg?.role === 'assistant' && !(Array.isArray(prevMsg.content) && prevMsg.content.some(part => part.type === 'tool_use'))) {
 				if (typeof prevMsg.content === 'string') prevMsg.content = prevMsg.content ? [{ type: 'text', text: prevMsg.content }] : []
-				prevMsg.content.push({ type: 'tool_use', id: currMsg.id, name: currMsg.name, input: currMsg.rawParams })
+				for (const tool of toolRows) prevMsg.content.push({ type: 'tool_use', id: tool.id, name: tool.name, input: tool.rawParams })
 			}
 
-			// turn each tool into a user message with tool results at the end
-			newMessages[i] = {
+			// Native batches require one ordered user result block. Legacy singleton rows
+			// retain their existing one-result message shape.
+			newMessages.push({
 				role: 'user',
-				content: [{ type: 'tool_result', tool_use_id: currMsg.id, content: currMsg.content }]
-			}
+				content: toolRows.map(tool => ({ type: 'tool_result' as const, tool_use_id: tool.id, content: tool.content }))
+			})
 			continue
 		}
 
@@ -452,7 +487,7 @@ const prepareOpenAIOrAnthropicMessages = ({
 type GeminiUserPart = (GeminiLLMChatMessage & { role: 'user' })['parts'][0]
 type GeminiModelPart = (GeminiLLMChatMessage & { role: 'model' })['parts'][0]
 const prepareGeminiMessages = (messages: AnthropicLLMChatMessage[]) => {
-	let latestToolName: ToolName | undefined = undefined
+	const toolNames = new Map<string, ToolName>()
 	const messages2: GeminiLLMChatMessage[] = messages.map((m): GeminiLLMChatMessage | null => {
 		if (m.role === 'assistant') {
 			if (typeof m.content === 'string') {
@@ -464,7 +499,7 @@ const prepareGeminiMessages = (messages: AnthropicLLMChatMessage[]) => {
 						return { text: c.text }
 					}
 					else if (c.type === 'tool_use') {
-						latestToolName = c.name
+						toolNames.set(c.id, c.name)
 						return { functionCall: { id: c.id, name: c.name, args: c.input } }
 					}
 					else return null
@@ -482,8 +517,9 @@ const prepareGeminiMessages = (messages: AnthropicLLMChatMessage[]) => {
 						return { text: c.text }
 					}
 					else if (c.type === 'tool_result') {
-						if (!latestToolName) return null
-						return { functionResponse: { id: c.tool_use_id, name: latestToolName, response: { output: c.content } } }
+						const name = toolNames.get(c.tool_use_id)
+						if (!name) return null
+						return { functionResponse: { id: c.tool_use_id, name, response: { output: c.content } } }
 					}
 					else return null
 				}).filter(m => !!m)
@@ -590,6 +626,7 @@ export class ConvertToLLMMessageService extends Disposable implements IConvertTo
 					role: m.role,
 					content: sanitizeAssistantDisplayContent(m.displayContent),
 					anthropicReasoning: m.anthropicReasoning,
+					toolBatch: m.toolBatch,
 				})
 			}
 			else if (m.role === 'tool') {
@@ -599,6 +636,8 @@ export class ConvertToLLMMessageService extends Disposable implements IConvertTo
 					name: m.name,
 					id: m.id,
 					rawParams: m.rawParams,
+					batchId: m.batchId,
+					batchOrdinal: m.batchOrdinal,
 					protectedSkillResource: m.type === 'success' && isReadSkillResourceToolName(m.name),
 				})
 			}
@@ -665,6 +704,7 @@ export class ConvertToLLMMessageService extends Disposable implements IConvertTo
 		const isReasoningEnabled = getIsReasoningEnabledState('Chat', providerName, modelName, modelSelectionOptions, overridesOfModel)
 		const contextWindow = runtime?.model.hasModel ? runtime.model.contextWindow : liveContextWindow
 		const reservedOutputTokenSpace = runtime?.model.hasModel ? runtime.model.reservedOutputTokens : getReservedOutputTokenSpace(providerName, modelName, { isReasoningEnabled, overridesOfModel })
+		assertClosedNativeToolBatches(chatMessages)
 		const llmMessages = this._chatMessagesToSimpleMessages(chatMessages)
 
 		const { messages, separateSystemMessage } = prepareMessages({

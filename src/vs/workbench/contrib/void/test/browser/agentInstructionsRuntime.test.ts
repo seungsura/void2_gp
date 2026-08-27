@@ -301,13 +301,13 @@ suite('AGENTS instruction runtime paths', () => {
 				},
 			},
 			_llmMessageService: {
-				sendLLMMessage: (options: { messages: unknown; onError: (error: { message: string; fullError: Error | null }) => Promise<void>; onFinalMessage: (result: { fullText: string; fullReasoning: string; toolCall?: unknown; anthropicReasoning: null }) => Promise<void> }) => {
+				sendLLMMessage: (options: { messages: unknown; onError: (error: { message: string; fullError: Error | null }) => Promise<void>; onFinalMessage: (result: { fullText: string; fullReasoning: string; toolCalls?: readonly unknown[]; anthropicReasoning: null }) => Promise<void> }) => {
 					sentMessages.push(options.messages);
 					sends++;
 					if (sends === 1) {
 						void options.onError({ message: 'transient', fullError: null });
 					} else if (sends === 2) {
-						void options.onFinalMessage({ fullText: 'tool', fullReasoning: '', toolCall: { name: 'read_file', id: 'tool-1', rawParams: {} }, anthropicReasoning: null });
+						void options.onFinalMessage({ fullText: 'tool', fullReasoning: '', toolCalls: [{ name: 'read_file', id: 'tool-1', rawParams: {} }], anthropicReasoning: null });
 					} else {
 						void options.onFinalMessage({ fullText: 'done', fullReasoning: '', anthropicReasoning: null });
 					}

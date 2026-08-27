@@ -2932,10 +2932,11 @@ export const SidebarChat = () => {
 	const childIsActive = childRuns.some(isActiveChildRun)
 	const isAnyRunning = !!isRunning || childIsActive || !!pendingSubmission
 	const latestError = currThreadStreamState?.error
-	const { displayContentSoFar, toolCallSoFar, reasoningSoFar } = currThreadStreamState?.llmInfo ?? {}
+	const { displayContentSoFar, toolCallSoFar, toolCallsSoFar, reasoningSoFar } = currThreadStreamState?.llmInfo ?? {}
 
 	// this is just if it's currently being generated, NOT if it's currently running
-	const toolIsGenerating = toolCallSoFar && !toolCallSoFar.isDone // show loading for slow tools (right now just edit)
+	const generatingToolCalls = toolCallsSoFar ?? (toolCallSoFar ? [toolCallSoFar] : [])
+	const toolIsGenerating = generatingToolCalls.some(tool => !tool.isDone) // show loading for slow tools (right now just edit)
 
 	// ----- SIDEBAR CHAT state (local) -----
 
@@ -3069,10 +3070,7 @@ export const SidebarChat = () => {
 
 
 	// the tool currently being generated
-	const generatingTool = toolIsGenerating ?
-		toolCallSoFar.name === 'write_file' ? <SimplifiedToolHeader key={'curr-streaming-tool'} title='Writing file' />
-			: null
-		: null
+	const generatingTool = toolIsGenerating ? generatingToolCalls.filter(tool => !tool.isDone).map((tool, ordinal) => <SimplifiedToolHeader key={`curr-streaming-tool-${tool.id || ordinal}`} title={tool.name === 'write_file' ? 'Writing file' : tool.name} />) : null
 	const transientControl = currThreadStreamState?.isRunning === 'idle' && currThreadStreamState.toolInfo?.transient ?
 		<LiveToolCard key={`control-${currThreadStreamState.toolInfo.receiptId}`} threadId={threadId} toolMessage={{ role: 'tool', type: 'running_now', name: currThreadStreamState.toolInfo.toolName, params: currThreadStreamState.toolInfo.toolParams, content: currThreadStreamState.toolInfo.content, result: null, id: currThreadStreamState.toolInfo.id, rawParams: currThreadStreamState.toolInfo.rawParams, mcpServerName: currThreadStreamState.toolInfo.mcpServerName, receiptId: currThreadStreamState.toolInfo.receiptId, lifecycle: currThreadStreamState.toolInfo.lifecycle, startedAt: currThreadStreamState.toolInfo.startedAt, cardStopAvailable: false, cardStopUnavailableReason: currThreadStreamState.toolInfo.cardStopUnavailableReason } as any} /> : null
 

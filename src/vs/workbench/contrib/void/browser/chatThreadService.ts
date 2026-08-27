@@ -75,10 +75,14 @@ const semanticToolArgs = (toolName: ToolName, params: ToolCallParams<ToolName>):
 }
 type AgentDelegationTurnAuthority = Readonly<{ allowed: boolean; generation: number; limits: AgentDelegationLimits; runtimeSnapshot: AgentRuntimeTurnSnapshot; parentTools: AgentSubagentToolSnapshot; autoApprove: Readonly<{ edits: boolean; terminal: boolean; mcp: boolean }>; roles?: CustomAgentCatalog; settingsState?: IVoidSettingsService['state']; settingsOfProvider?: SettingsOfProvider }>
 type ParentRunOwnership = Readonly<{ token: symbol; runId: string; generation: number; isLatest: () => boolean; isActive: () => boolean; deactivate: () => void; releaseLatest: () => void }>
+/** Durable identity of a call within one native provider declaration. Provider ids are
+ * only unique inside that declaration, so they are never sufficient row identity. */
+type BatchCallRef = Readonly<{ batchId: string; batchOrdinal: number }>;
 /** Ephemeral authority for a single live card. The provider tool id is not unique across
  * parent runs, so only this generated receipt may stop the operation. */
 type ActiveToolCardReceipt = {
 	toolId: string;
+	batchRef?: BatchCallRef;
 	messageIndex: number;
 	cancel: () => void;
 	isCurrent: () => boolean;
@@ -277,6 +281,9 @@ export type ThreadStreamState = {
 			displayContentSoFar: string;
 			reasoningSoFar: string;
 			toolCallSoFar: RawToolCallObj | null;
+			/** Ordered native calls are retained for the streaming preview; the singular
+			 * field remains the first call for existing interruption presentation. */
+			toolCallsSoFar?: readonly RawToolCallObj[];
 		};
 		toolInfo?: undefined;
 		interrupt: Promise<() => void>; // calling this should have no effect on state - would be too confusing. it just cancels the tool
@@ -486,7 +493,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	/** Cancellation is retained separately from the persisted tool message until the
 	 * underlying operation settles. This lets the card truthfully remain Cancelling
 	 * while generation fences keep a late result from replacing it. */
-	private readonly _cancellingToolReceiptsOfThread = new Map<string, Map<string, { toolId: string; messageIndex: number }>>();
+	private readonly _cancellingToolReceiptsOfThread = new Map<string, Map<string, { toolId: string; batchRef?: BatchCallRef; messageIndex: number }>>();
 	/** Live-only receipt registry. It is never translated to model history. */
 	private readonly _activeToolCardReceiptsOfThread = new Map<string, Map<string, ActiveToolCardReceipt>>();
 	private readonly _agentDelegationAuthorityOfThread = new Map<string, AgentDelegationTurnAuthority>();
@@ -926,17 +933,26 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		if (streamState?.isRunning === undefined && !streamState?.error) {
 
 			// set streamState
-			const messages = newState.allThreads[threadId]?.messages
-			const lastMessage = messages && messages[messages.length - 1]
-			// if awaiting user but stream state doesn't indicate it (happens if restart Void)
-			if (lastMessage && lastMessage.role === 'tool' && lastMessage.type === 'tool_request')
-				this._setStreamState(threadId, { isRunning: 'awaiting_user', })
-
-			// if running now but stream state doesn't indicate it (happens if restart Void), cancel that last tool
-			if (lastMessage && lastMessage.role === 'tool' && lastMessage.type === 'running_now') {
-
-				this._updateLatestTool(threadId, { role: 'tool', type: 'rejected', content: lastMessage.content, id: lastMessage.id, rawParams: lastMessage.rawParams, result: null, name: lastMessage.name, params: lastMessage.params, mcpServerName: lastMessage.mcpServerName })
+			const messages = newState.allThreads[threadId]?.messages ?? []
+			let pendingApproval: Extract<ChatMessage, { role: 'tool' }> | undefined
+			for (const message of messages) {
+				if (message.role !== 'tool') continue
+				const ref = message.batchId === undefined || message.batchOrdinal === undefined ? undefined : { batchId: message.batchId, batchOrdinal: message.batchOrdinal }
+				if (message.type === 'running_now') {
+					// A reload has no physical receipt to resume. Close its later ordinals and
+					// settle this exact persisted row once; it must never be replayed.
+					if (ref) this._terminalizeBatchTailAfter(threadId, ref, 'Native tool batch was interrupted by restart before this call could finish.')
+					this._updateLatestTool(threadId, { role: 'tool', type: 'rejected', content: message.content, id: message.id, rawParams: message.rawParams, result: null, name: message.name, params: message.params, mcpServerName: message.mcpServerName, ...ref })
+					continue
+				}
+				if (message.type !== 'tool_request') continue
+				if (!ref) { pendingApproval = message; continue }
+				const declaration = messages.find((candidate): candidate is Extract<ChatMessage, { role: 'assistant' }> => candidate.role === 'assistant' && candidate.toolBatch?.batchId === ref.batchId)?.toolBatch
+				const valid = !!declaration && declaration.calls[ref.batchOrdinal]?.id === message.id && declaration.calls.slice(0, ref.batchOrdinal).every((call, ordinal) => messages.some(row => row.role === 'tool' && row.id === call.id && row.batchId === ref.batchId && row.batchOrdinal === ordinal && row.type !== 'running_now' && row.type !== 'tool_request'))
+				if (valid && !pendingApproval) pendingApproval = message
+				else this._terminalizeBatchTail(threadId, ref.batchId, 'Native tool batch could not be resumed after restart.')
 			}
+			if (pendingApproval) this._setStreamState(threadId, { isRunning: 'awaiting_user' })
 
 		}
 
@@ -982,19 +998,23 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		return receipts
 	}
 
-	private _expectedLiveToolMessageIndex(threadId: string): number {
+	private _expectedLiveToolMessageIndex(threadId: string, toolId: string, batchRef?: BatchCallRef): number {
 		const messages = this.state.allThreads[threadId]?.messages ?? []
-		const last = messages[messages.length - 1]
-		return last?.role === 'tool' && last.type !== 'invalid_params' ? messages.length - 1 : messages.length
+		for (let index = messages.length - 1; index >= 0; index--) {
+			const message = messages[index]
+			if (message.role === 'tool' && message.id === toolId && message.batchId === batchRef?.batchId && message.batchOrdinal === batchRef?.batchOrdinal && (message.type === 'running_now' || message.type === 'tool_request')) return index
+		}
+		return messages.length
 	}
 
 	/** Register before the visible row is published. `_updateLatestTool` fires state
 	 * listeners synchronously, so publishing first would leave a re-entrant card Stop
 	 * with no exact receipt to validate. */
-	private _registerActiveToolCardReceipt(threadId: string, receiptId: string, toolId: string, cancel: () => void, isCurrent: () => boolean, interruptInstalled: boolean): void {
+	private _registerActiveToolCardReceipt(threadId: string, receiptId: string, toolId: string, batchRef: BatchCallRef | undefined, cancel: () => void, isCurrent: () => boolean, interruptInstalled: boolean): void {
 		this._activeToolCardReceipts(threadId, true)!.set(receiptId, {
 			toolId,
-			messageIndex: this._expectedLiveToolMessageIndex(threadId),
+			batchRef,
+			messageIndex: this._expectedLiveToolMessageIndex(threadId, toolId, batchRef),
 			cancel,
 			isCurrent,
 			interruptInstalled,
@@ -1015,7 +1035,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	private _replaceExactLiveToolCard(threadId: string, receipt: ActiveToolCardReceipt, receiptId: string, update: (message: ToolMessage<ToolName> & { type: 'running_now' }) => ToolMessage<ToolName> & { type: 'running_now' }): boolean {
 		const messages = this.state.allThreads[threadId]?.messages
 		const message = messages?.[receipt.messageIndex]
-		if (!message || message.role !== 'tool' || message.type !== 'running_now' || message.lifecycle === 'cancelling' || message.id !== receipt.toolId || message.receiptId !== receiptId) return false
+		if (!message || message.role !== 'tool' || message.type !== 'running_now' || message.lifecycle === 'cancelling' || message.id !== receipt.toolId || message.batchId !== receipt.batchRef?.batchId || message.batchOrdinal !== receipt.batchRef?.batchOrdinal || message.receiptId !== receiptId) return false
 		const next = update(message)
 		const receiver = this as unknown as { _storeAllThreads?: unknown; _editMessageInThread?: (threadId: string, index: number, nextMessage: ChatMessage) => void }
 		if (typeof receiver._storeAllThreads === 'function') this._editMessageInThread(threadId, receipt.messageIndex, next)
@@ -1043,9 +1063,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		// Own cancellation before emitting the visible state change. An event listener
 		// may immediately click the same card again or settle the operation.
 		receipt.cancelling = true
-		const cancelling = this._cancellingToolReceiptsOfThread.get(threadId) ?? new Map<string, { toolId: string; messageIndex: number }>()
+		const cancelling = this._cancellingToolReceiptsOfThread.get(threadId) ?? new Map<string, { toolId: string; batchRef?: BatchCallRef; messageIndex: number }>()
 		const previousCancellation = cancelling.get(receiptId)
-		cancelling.set(receiptId, { toolId, messageIndex: receipt.messageIndex })
+		cancelling.set(receiptId, { toolId, batchRef: receipt.batchRef, messageIndex: receipt.messageIndex })
 		this._cancellingToolReceiptsOfThread.set(threadId, cancelling)
 		if (!this._replaceExactLiveToolCard(threadId, receipt, receiptId, message => ({ ...message, lifecycle: 'cancelling', cardStopAvailable: false, cardStopUnavailableReason: 'Waiting for this tool to stop.' }))) {
 			receipt.cancelling = false
@@ -1078,12 +1098,15 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	private _swapOutLatestStreamingToolWithResult = (threadId: string, tool: ChatMessage & { role: 'tool' }) => {
 		const messages = this.state.allThreads[threadId]?.messages
 		if (!messages) return false
-		const lastMsg = messages[messages.length - 1]
-		if (!lastMsg) return false
-
-		if (lastMsg.role === 'tool' && lastMsg.type !== 'invalid_params') {
-			this._editMessageInThread(threadId, messages.length - 1, tool)
-			return true
+		for (let index = messages.length - 1; index >= 0; index--) {
+			const message = messages[index]
+			if (message.role === 'tool' && message.id === tool.id && message.batchId === tool.batchId && message.batchOrdinal === tool.batchOrdinal && (message.type === 'running_now' || message.type === 'tool_request')) {
+				// A restored approval row already owns the durable batch identity.  Tool
+				// execution deliberately creates fresh terminal objects, so carry that
+				// immutable identity forward instead of relying on a live id lookup.
+				this._editMessageInThread(threadId, index, tool.batchId === undefined && message.batchId !== undefined ? { ...tool, batchId: message.batchId, batchOrdinal: message.batchOrdinal } : tool)
+				return true
+			}
 		}
 		return false
 	}
@@ -1091,6 +1114,40 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const swapped = this._swapOutLatestStreamingToolWithResult(threadId, tool)
 		if (swapped) return
 		this._addMessageToThread(threadId, tool)
+	}
+
+	/** Close every unresolved declaration deterministically before history can be sent
+	 * back to a native provider. This is derived only from durable rows/declaration;
+	 * there is deliberately no in-memory batch cursor to revive after reload. */
+	private _terminalizeBatchTail(threadId: string, batchId: string, reason: string): void {
+		const messages = this.state.allThreads[threadId]?.messages ?? []
+		const declaration = messages.find((message): message is Extract<ChatMessage, { role: 'assistant' }> => message.role === 'assistant' && message.toolBatch?.batchId === batchId)?.toolBatch
+		if (!declaration) return
+		for (const [batchOrdinal, call] of declaration.calls.entries()) {
+			const existing = (this.state.allThreads[threadId]?.messages ?? []).find(message => message.role === 'tool' && message.id === call.id && message.batchId === batchId && message.batchOrdinal === batchOrdinal)
+			if (existing?.role === 'tool' && existing.type !== 'running_now' && existing.type !== 'tool_request') continue
+			if (existing?.role === 'tool') {
+				const index = (this.state.allThreads[threadId]?.messages ?? []).indexOf(existing)
+				if (index >= 0) this._editMessageInThread(threadId, index, { role: 'tool', type: 'rejected', name: call.name, params: existing.params, content: reason, result: null, id: call.id, rawParams: call.rawParams, mcpServerName: existing.mcpServerName, batchId, batchOrdinal })
+			} else {
+				this._addMessageToThread(threadId, { role: 'tool', type: 'rejected', name: call.name, params: call.rawParams as ToolCallParams<ToolName>, content: reason, result: null, id: call.id, rawParams: call.rawParams, mcpServerName: this._computeMCPServerOfToolName(call.name), batchId, batchOrdinal })
+			}
+		}
+	}
+
+	private _terminalizeBatchTailAfter(threadId: string, batchRef: BatchCallRef, reason: string): void {
+		const messages = this.state.allThreads[threadId]?.messages ?? []
+		const declaration = messages.find((message): message is Extract<ChatMessage, { role: 'assistant' }> => message.role === 'assistant' && message.toolBatch?.batchId === batchRef.batchId)?.toolBatch
+		if (!declaration) return
+		for (let batchOrdinal = batchRef.batchOrdinal + 1; batchOrdinal < declaration.calls.length; batchOrdinal++) {
+			const call = declaration.calls[batchOrdinal]
+			const existing = (this.state.allThreads[threadId]?.messages ?? []).find(message => message.role === 'tool' && message.id === call.id && message.batchId === batchRef.batchId && message.batchOrdinal === batchOrdinal)
+			if (existing?.role === 'tool' && existing.type !== 'running_now' && existing.type !== 'tool_request') continue
+			if (existing?.role === 'tool') {
+				const index = (this.state.allThreads[threadId]?.messages ?? []).indexOf(existing)
+				if (index >= 0) this._editMessageInThread(threadId, index, { role: 'tool', type: 'rejected', name: call.name, params: existing.params, content: reason, result: null, id: call.id, rawParams: call.rawParams, mcpServerName: existing.mcpServerName, batchId: batchRef.batchId, batchOrdinal })
+			} else this._addMessageToThread(threadId, { role: 'tool', type: 'rejected', name: call.name, params: call.rawParams as ToolCallParams<ToolName>, content: reason, result: null, id: call.id, rawParams: call.rawParams, mcpServerName: this._computeMCPServerOfToolName(call.name), batchId: batchRef.batchId, batchOrdinal })
+		}
 	}
 
 	approveLatestToolRequest(threadId: string) {
@@ -1107,7 +1164,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		if (!snapshot || snapshot.ownerProjectRoot !== currentOwner || snapshot.runCwd !== currentOwner || snapshot.workspaceTrustedAtAdmission !== this._workspaceTrustManagementService.isWorkspaceTrusted()) {
 			this._purgeInstructionTurn(threadId)
 			const content = 'This tool request cannot resume because the current workspace or trust context no longer matches its instruction snapshot. Send a new message in a new task to continue.'
-			this._updateLatestTool(threadId, { role: 'tool', type: 'rejected', params: lastMsg.params, name: lastMsg.name, content, result: null, id: lastMsg.id, rawParams: lastMsg.rawParams, mcpServerName: lastMsg.mcpServerName })
+			this._updateLatestTool(threadId, { role: 'tool', type: 'rejected', params: lastMsg.params, name: lastMsg.name, content, result: null, id: lastMsg.id, rawParams: lastMsg.rawParams, mcpServerName: lastMsg.mcpServerName, ...(lastMsg.batchId === undefined || lastMsg.batchOrdinal === undefined ? {} : { batchId: lastMsg.batchId, batchOrdinal: lastMsg.batchOrdinal }) })
+			if (lastMsg.batchId) this._terminalizeBatchTail(threadId, lastMsg.batchId, content)
 			this._setStreamState(threadId, undefined)
 			releaseAwaitingApproval.call(this, threadId)
 			return
@@ -1119,7 +1177,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const currentOverride = selectedModel ? this._settingsService.state.overridesOfModel[selectedModel.providerName]?.[selectedModel.modelName] ?? {} : {};
 		if (!admittedModel.hasModel || !selectedModel || selectedModel.providerName !== admittedModel.providerName || selectedModel.modelName !== admittedModel.modelName || runtimeModelFingerprint({ providerName: selectedModel.providerName, modelName: selectedModel.modelName, contextWindow: currentContext, reservedOutputTokens: currentReserve, modelSelectionOptions: currentProps.modelSelectionOptions ?? {}, selectedModelOverrides: currentOverride as never }) !== admittedModel.fingerprint) {
 			this._purgeInstructionTurn(threadId)
-			this._updateLatestTool(threadId, { role: 'tool', type: 'rejected', params: lastMsg.params, name: lastMsg.name, content: 'This tool request cannot resume because its admitted model changed. Send a new message.', result: null, id: lastMsg.id, rawParams: lastMsg.rawParams, mcpServerName: lastMsg.mcpServerName })
+			this._updateLatestTool(threadId, { role: 'tool', type: 'rejected', params: lastMsg.params, name: lastMsg.name, content: 'This tool request cannot resume because its admitted model changed. Send a new message.', result: null, id: lastMsg.id, rawParams: lastMsg.rawParams, mcpServerName: lastMsg.mcpServerName, ...(lastMsg.batchId === undefined || lastMsg.batchOrdinal === undefined ? {} : { batchId: lastMsg.batchId, batchOrdinal: lastMsg.batchOrdinal }) })
+			if (lastMsg.batchId) this._terminalizeBatchTail(threadId, lastMsg.batchId, 'This tool request cannot resume because its admitted model changed. Send a new message.')
 			this._setStreamState(threadId, undefined)
 			releaseAwaitingApproval.call(this, threadId)
 			return
@@ -1151,7 +1210,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const { name, id, rawParams, mcpServerName } = lastMsg
 
 		const errorMessage = this.toolErrMsgs.rejected
-		this._updateLatestTool(threadId, { role: 'tool', type: 'rejected', params: params, name: name, content: errorMessage, result: null, id, rawParams, mcpServerName })
+		this._updateLatestTool(threadId, { role: 'tool', type: 'rejected', params: params, name: name, content: errorMessage, result: null, id, rawParams, mcpServerName, ...(lastMsg.batchId === undefined || lastMsg.batchOrdinal === undefined ? {} : { batchId: lastMsg.batchId, batchOrdinal: lastMsg.batchOrdinal }) })
+		if (lastMsg.batchId) this._terminalizeBatchTail(threadId, lastMsg.batchId, errorMessage)
 		this._setStreamState(threadId, undefined)
 		releaseAwaitingApproval.call(this, threadId)
 		// Restored approval rows deliberately have no live quiescence lease. Once
@@ -1291,8 +1351,10 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			const messages = this.state.allThreads[threadId]?.messages ?? []
 			const messageIndex = messages.length - 1
 			const latest = messages[messageIndex]
-			if (receiptId && messageIndex >= 0 && latest?.role === 'tool' && latest.id === id && latest.type === 'running_now') { const receipts = this._cancellingToolReceiptsOfThread.get(threadId) ?? new Map(); receipts.set(receiptId, { toolId: id, messageIndex }); this._cancellingToolReceiptsOfThread.set(threadId, receipts) }
-			this._updateLatestTool(threadId, { role: 'tool', name: toolName, params: toolParams, id, content, rawParams, type: 'running_now', result: null, mcpServerName, receiptId, startedAt: latest?.role === 'tool' ? latest.startedAt : undefined, lifecycle: 'cancelling', cardStopAvailable: false, cardStopUnavailableReason: 'Waiting for this tool to stop.' })
+			const latestBatchRef = latest?.role === 'tool' && latest.batchId !== undefined && latest.batchOrdinal !== undefined ? { batchId: latest.batchId, batchOrdinal: latest.batchOrdinal } : undefined
+			if (latestBatchRef) this._terminalizeBatchTailAfter(threadId, latestBatchRef, 'Native tool batch was interrupted before this call could start.')
+			if (receiptId && messageIndex >= 0 && latest?.role === 'tool' && latest.id === id && latest.type === 'running_now') { const receipts = this._cancellingToolReceiptsOfThread.get(threadId) ?? new Map(); receipts.set(receiptId, { toolId: id, batchRef: latestBatchRef, messageIndex }); this._cancellingToolReceiptsOfThread.set(threadId, receipts) }
+			this._updateLatestTool(threadId, { role: 'tool', name: toolName, params: toolParams, id, content, rawParams, type: 'running_now', result: null, mcpServerName, receiptId, startedAt: latest?.role === 'tool' ? latest.startedAt : undefined, lifecycle: 'cancelling', cardStopAvailable: false, cardStopUnavailableReason: 'Waiting for this tool to stop.', ...latestBatchRef })
 		}
 		// reject the tool for the user if relevant
 		else if (this.streamState[threadId]?.isRunning === 'awaiting_user') {
@@ -1311,16 +1373,16 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		if (!transientControl) this._setStreamState(threadId, undefined)
 	}
 
-	private _settleCancelledTool(threadId: string, receiptId: string, toolId: string, toolName: ToolName, toolParams: ToolCallParams<ToolName>, rawParams: RawToolParamsObj, mcpServerName: string | undefined): void {
+	private _settleCancelledTool(threadId: string, receiptId: string, toolId: string, toolName: ToolName, toolParams: ToolCallParams<ToolName>, rawParams: RawToolParamsObj, mcpServerName: string | undefined, batchRef?: BatchCallRef): void {
 		const receipts = this._cancellingToolReceiptsOfThread?.get(threadId); const receipt = receipts?.get(receiptId)
-		if (!receipt || receipt.toolId !== toolId) return
+		if (!receipt || receipt.toolId !== toolId || receipt.batchRef?.batchId !== batchRef?.batchId || receipt.batchRef?.batchOrdinal !== batchRef?.batchOrdinal) return
 		receipts!.delete(receiptId); if (receipts!.size === 0) this._cancellingToolReceiptsOfThread?.delete(threadId)
 		const messages = this.state.allThreads[threadId]?.messages
 		const index = receipt.messageIndex
 		// Replace exactly the cancelling receipt, rather than the latest row: old A
 		// settles without touching a newer B and does not strand A as Cancelling.
-		if (index < 0 || messages?.[index]?.role !== 'tool' || messages[index].id !== toolId || messages[index].receiptId !== receiptId || messages[index].type !== 'running_now' || messages[index].lifecycle !== 'cancelling') return
-		this._editMessageInThread(threadId, index, { role: 'tool', name: toolName, params: toolParams, id: toolId, content: this.toolErrMsgs.interrupted, rawParams, type: 'rejected', result: null, mcpServerName })
+		if (index < 0 || messages?.[index]?.role !== 'tool' || messages[index].id !== toolId || messages[index].batchId !== batchRef?.batchId || messages[index].batchOrdinal !== batchRef?.batchOrdinal || messages[index].receiptId !== receiptId || messages[index].type !== 'running_now' || messages[index].lifecycle !== 'cancelling') return
+		this._editMessageInThread(threadId, index, { role: 'tool', name: toolName, params: toolParams, id: toolId, content: this.toolErrMsgs.interrupted, rawParams, type: 'rejected', result: null, mcpServerName, ...batchRef })
 	}
 
 
@@ -1347,13 +1409,14 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		agentSkillResourceReadAllowed: boolean,
 		agentRunGeneration: number | undefined,
 		isCurrentParentRun: () => boolean,
+		batchRef?: BatchCallRef,
 	): Promise<{ awaitingUserApproval?: boolean, interrupted?: boolean, receiptCancelled?: boolean, failure?: string, validatedParams?: ToolCallParams<ToolName> }> {
 		if (!isCurrentParentRun()) return { interrupted: true }
 		// A few focused production fixtures bind this method to a narrow receiver rather
 		// than construct the whole workbench service. Resolve live-card helpers through
 		// the prototype without weakening the real service's exact receipt checks.
 		const cardReceiver = this as unknown as {
-			_registerActiveToolCardReceipt?: (threadId: string, receiptId: string, toolId: string, cancel: () => void, isCurrent: () => boolean, interruptInstalled: boolean) => void;
+			_registerActiveToolCardReceipt?: (threadId: string, receiptId: string, toolId: string, batchRef: BatchCallRef | undefined, cancel: () => void, isCurrent: () => boolean, interruptInstalled: boolean) => void;
 			_markToolCardInterruptInstalled?: (threadId: string, receiptId: string) => void;
 			_retireActiveToolCardReceipt?: (threadId: string, receiptId: string) => void;
 		};
@@ -1371,7 +1434,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		if (toolName === 'edit_file' || toolName === 'rewrite_file') {
 			if (!isCurrentParentRun()) return { interrupted: true }
 			const message = `${toolName} is no longer supported; use write_file with native structured arguments.`
-			this._addMessageToThread(threadId, { role: 'tool', type: 'invalid_params', rawParams: opts.unvalidatedToolParams, result: null, name: toolName, content: message, id: toolId, mcpServerName })
+			this._addMessageToThread(threadId, { role: 'tool', type: 'invalid_params', rawParams: opts.unvalidatedToolParams, result: null, name: toolName, content: message, id: toolId, mcpServerName, ...batchRef })
 			return {}
 		}
 		// This application read is deliberately not a builtin or MCP call. It is
@@ -1387,8 +1450,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			const sameRememberedSnapshot = () => this._instructionTurnOfThread.get(threadId) === instructionSnapshot;
 			const sameResourceAuthority = () => isCurrentParentRun() && sameGeneration() && sameRememberedSnapshot() && currentOwnerAndTrustMatch();
 			const addFailure = (type: 'invalid_params' | 'tool_error', content: string) => {
-				if (type === 'invalid_params') this._addMessageToThread(threadId, { role: 'tool', type, rawParams: opts.unvalidatedToolParams, result: null, name: toolName, content, id: toolId, mcpServerName: undefined });
-				else this._addMessageToThread(threadId, { role: 'tool', type, rawParams: opts.unvalidatedToolParams, params: opts.unvalidatedToolParams, result: content, name: toolName, content, id: toolId, mcpServerName: undefined });
+				if (type === 'invalid_params') this._addMessageToThread(threadId, { role: 'tool', type, rawParams: opts.unvalidatedToolParams, result: null, name: toolName, content, id: toolId, mcpServerName: undefined, ...batchRef });
+				else this._addMessageToThread(threadId, { role: 'tool', type, rawParams: opts.unvalidatedToolParams, params: opts.unvalidatedToolParams, result: content, name: toolName, content, id: toolId, mcpServerName: undefined, ...batchRef });
 			};
 			if (!isCurrentParentRun()) return { interrupted: true };
 			if (!sameResourceAuthority()) {
@@ -1413,7 +1476,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			const applicationParams = opts.unvalidatedToolParams;
 			if (!isCurrentParentRun() || !sameResourceAuthority()) return { interrupted: true };
 			const receiptId = generateUuid();
-			const settleCancelled = () => this._settleCancelledTool?.(threadId, receiptId, toolId, toolName, applicationParams, applicationParams, undefined);
+			const settleCancelled = () => this._settleCancelledTool?.(threadId, receiptId, toolId, toolName, applicationParams, applicationParams, undefined, batchRef);
 			let interrupted = false;
 			let cancelledByCard = false;
 			const readCancellation = new CancellationTokenSource();
@@ -1421,13 +1484,13 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			const cardInterruptor = () => { cancelledByCard = true; interruptor(); };
 			const cancellationOutcome = () => cancelledByCard && isCurrentParentRun() && sameGeneration() ? { receiptCancelled: true } : { interrupted: true };
 			const interruptorPromise = Promise.resolve(interruptor);
-			registerActiveToolCardReceipt.call(this, threadId, receiptId, toolId, cardInterruptor, () => isCurrentParentRun() && sameGeneration(), true);
+			registerActiveToolCardReceipt.call(this, threadId, receiptId, toolId, batchRef, cardInterruptor, () => isCurrentParentRun() && sameGeneration(), true);
 			// Establish global-Stop authority before publishing the live card. `_updateLatestTool`
 			// notifies synchronously, so an observer can otherwise revoke this parent while
 			// it still looks idle and leave the just-published row without a settlement path.
 			this._setStreamState(threadId, { isRunning: 'tool', interrupt: interruptorPromise, toolInfo: { toolName, toolParams: applicationParams, id: toolId, content: 'interrupted...', rawParams: applicationParams, mcpServerName: undefined, receiptId } });
 			if (!isCurrentParentRun()) { retireActiveToolCardReceipt.call(this, threadId, receiptId); return { interrupted: true }; }
-			this._updateLatestTool(threadId, { role: 'tool', type: 'running_now', name: toolName, params: applicationParams, content: '(value not received yet...)', result: null, id: toolId, rawParams: applicationParams, mcpServerName: undefined, startedAt: Date.now(), receiptId, cardStopAvailable: true });
+			this._updateLatestTool(threadId, { role: 'tool', type: 'running_now', name: toolName, params: applicationParams, content: '(value not received yet...)', result: null, id: toolId, rawParams: applicationParams, mcpServerName: undefined, startedAt: Date.now(), receiptId, cardStopAvailable: true, ...batchRef });
 			if (!isCurrentParentRun()) { settleCancelled(); retireActiveToolCardReceipt.call(this, threadId, receiptId); return { interrupted: true }; }
 			try {
 				const cancelled = Object.freeze({ cancelled: true as const });
@@ -1437,13 +1500,13 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				if (!sameResourceAuthority()) {
 					if (sameRememberedSnapshot()) {
 						this._purgeInstructionTurn(threadId);
-						this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: applicationParams, result: 'skill_owner_or_trust_changed', name: toolName, content: 'skill_owner_or_trust_changed', id: toolId, rawParams: applicationParams, mcpServerName: undefined });
+						this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: applicationParams, result: 'skill_owner_or_trust_changed', name: toolName, content: 'skill_owner_or_trust_changed', id: toolId, rawParams: applicationParams, mcpServerName: undefined, ...batchRef });
 					}
 					return { interrupted: true };
 				}
 				if (read.body === undefined) throw new Error(read.diagnostic?.code ?? 'skill_resource_unreadable');
 				const resource = admitSkillResourceContext(read.body, maxReadOutputTokens);
-				const successMessage: ChatMessage & { role: 'tool' } = { role: 'tool', type: 'success', params: applicationParams, result: resource as never, name: toolName, content: resource, id: toolId, rawParams: applicationParams, mcpServerName: undefined };
+			const successMessage: ChatMessage & { role: 'tool' } = { role: 'tool', type: 'success', params: applicationParams, result: resource as never, name: toolName, content: resource, id: toolId, rawParams: applicationParams, mcpServerName: undefined, ...batchRef };
 				const currentMessages = this.state.allThreads[threadId]?.messages ?? [];
 				const prospectiveMessages = [...currentMessages];
 				if (prospectiveMessages[prospectiveMessages.length - 1]?.role === 'tool' && (prospectiveMessages[prospectiveMessages.length - 1] as ToolMessage<ToolName>).id === toolId) prospectiveMessages[prospectiveMessages.length - 1] = successMessage;
@@ -1457,7 +1520,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				if (!sameResourceAuthority()) {
 					if (sameRememberedSnapshot()) {
 						this._purgeInstructionTurn(threadId);
-						this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: applicationParams, result: 'skill_owner_or_trust_changed', name: toolName, content: 'skill_owner_or_trust_changed', id: toolId, rawParams: applicationParams, mcpServerName: undefined });
+						this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: applicationParams, result: 'skill_owner_or_trust_changed', name: toolName, content: 'skill_owner_or_trust_changed', id: toolId, rawParams: applicationParams, mcpServerName: undefined, ...batchRef });
 					}
 					return { interrupted: true };
 				}
@@ -1468,13 +1531,13 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				if (!sameResourceAuthority()) {
 					if (sameRememberedSnapshot()) {
 						this._purgeInstructionTurn(threadId);
-						this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: applicationParams, result: 'skill_owner_or_trust_changed', name: toolName, content: 'skill_owner_or_trust_changed', id: toolId, rawParams: applicationParams, mcpServerName: undefined });
+						this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: applicationParams, result: 'skill_owner_or_trust_changed', name: toolName, content: 'skill_owner_or_trust_changed', id: toolId, rawParams: applicationParams, mcpServerName: undefined, ...batchRef });
 					}
 					return { interrupted: true };
 				}
 				const errorMessage = getErrorMessage(error);
 				const content = errorMessage.includes('skill_resource_context_admission_failed') ? 'skill_resource_context_admission_failed' : errorMessage;
-				this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: applicationParams, result: content, name: toolName, content, id: toolId, rawParams: applicationParams, mcpServerName: undefined });
+				this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: applicationParams, result: content, name: toolName, content, id: toolId, rawParams: applicationParams, mcpServerName: undefined, ...batchRef });
 				return { failure: content.trim().replace(/\s+/g, ' ').toLowerCase(), validatedParams: params };
 			} finally {
 				if (interrupted || !isCurrentParentRun() || !sameGeneration()) settleCancelled();
@@ -1491,7 +1554,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			const currentGeneration = this._agentControlGeneration.get(threadId) ?? 0
 			if (!agentDelegationAuthority?.allowed || currentAuthority !== agentDelegationAuthority || agentDelegationAuthority.generation !== currentGeneration) {
 				const content = 'agent_delegation_not_authorized: native Agent delegation must be active in the current top-level turn before using child controls.';
-				this._addMessageToThread(threadId, { role: 'tool', type: 'invalid_params', rawParams: opts.unvalidatedToolParams, result: null, name: toolName, content, id: toolId, mcpServerName: undefined });
+				this._addMessageToThread(threadId, { role: 'tool', type: 'invalid_params', rawParams: opts.unvalidatedToolParams, result: null, name: toolName, content, id: toolId, mcpServerName: undefined, ...batchRef });
 				return {};
 			}
 			const controlGeneration = agentDelegationAuthority.generation;
@@ -1501,7 +1564,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				control = validateAgentSubagentControlParams(toolName, opts.unvalidatedToolParams);
 			} catch (error) {
 				const content = getErrorMessage(error);
-				this._addMessageToThread(threadId, { role: 'tool', type: 'invalid_params', rawParams: opts.unvalidatedToolParams, result: null, name: toolName, content, id: toolId, mcpServerName: undefined });
+				this._addMessageToThread(threadId, { role: 'tool', type: 'invalid_params', rawParams: opts.unvalidatedToolParams, result: null, name: toolName, content, id: toolId, mcpServerName: undefined, ...batchRef });
 				return {};
 			}
 			if (!isControlCurrent()) return { interrupted: true };
@@ -1522,12 +1585,12 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				clearTransient();
 				const content = JSON.stringify(result);
 				if (!isControlCurrent()) return { interrupted: true };
-				this._addMessageToThread(threadId, { role: 'tool', type: 'success', rawParams: opts.unvalidatedToolParams, result: result as never, name: toolName, params: validatedParams as never, content, id: toolId, mcpServerName: undefined });
+				this._addMessageToThread(threadId, { role: 'tool', type: 'success', rawParams: opts.unvalidatedToolParams, result: result as never, name: toolName, params: validatedParams as never, content, id: toolId, mcpServerName: undefined, ...batchRef });
 				return {};
 			} catch (error) {
 				if (!isControlCurrent()) return { interrupted: true };
 				const content = getErrorMessage(error);
-				this._addMessageToThread(threadId, { role: 'tool', type: 'tool_error', rawParams: opts.unvalidatedToolParams, result: content, name: toolName, params: validatedParams as never, content, id: toolId, mcpServerName: undefined });
+				this._addMessageToThread(threadId, { role: 'tool', type: 'tool_error', rawParams: opts.unvalidatedToolParams, result: content, name: toolName, params: validatedParams as never, content, id: toolId, mcpServerName: undefined, ...batchRef });
 				return { failure: content.trim().replace(/\s+/g, ' ').toLowerCase(), validatedParams };
 			} finally {
 				clearTransient();
@@ -1550,7 +1613,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			catch (error) {
 				if (!isCurrentParentRun()) return { interrupted: true }
 				const errorMessage = getErrorMessage(error)
-				this._addMessageToThread(threadId, { role: 'tool', type: 'invalid_params', rawParams: opts.unvalidatedToolParams, result: null, name: toolName, content: errorMessage, id: toolId, mcpServerName })
+				this._addMessageToThread(threadId, { role: 'tool', type: 'invalid_params', rawParams: opts.unvalidatedToolParams, result: null, name: toolName, content: errorMessage, id: toolId, mcpServerName, ...batchRef })
 				return {}
 			}
 			// 2. if tool requires approval, break from the loop, awaiting approval
@@ -1560,7 +1623,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				if (!isCurrentParentRun()) return { interrupted: true }
 				const autoApprove = this._settingsService.state.globalSettings.autoApprove[approvalType]
 				// add a tool_request because we use it for UI if a tool is loading (this should be improved in the future)
-				this._addMessageToThread(threadId, { role: 'tool', type: 'tool_request', content: '(Awaiting user permission...)', result: null, name: toolName, params: toolParams, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName })
+				this._addMessageToThread(threadId, { role: 'tool', type: 'tool_request', content: '(Awaiting user permission...)', result: null, name: toolName, params: toolParams, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName, ...batchRef })
 				if (!autoApprove) {
 					return { awaitingUserApproval: true }
 				}
@@ -1581,7 +1644,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		// cancellation authority exists.
 		if (!isCurrentParentRun()) return { interrupted: true }
 		const receiptId = generateUuid()
-		const settleCancelled = () => this._settleCancelledTool?.(threadId, receiptId, toolId, toolName, toolParams, opts.unvalidatedToolParams, mcpServerName)
+		const settleCancelled = () => this._settleCancelledTool?.(threadId, receiptId, toolId, toolName, toolParams, opts.unvalidatedToolParams, mcpServerName, batchRef)
 		let interrupted = false
 		let cancelledByCard = false
 		let interruptTool: (() => void) | undefined
@@ -1590,11 +1653,11 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const cancellationOutcome = () => cancelledByCard && isCurrentParentRun() ? { receiptCancelled: true } : { interrupted: true }
 		const runningTool = {
 			role: 'tool', type: 'running_now', name: toolName, params: toolParams, content: '(value not received yet...)', result: null,
-			id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName, startedAt: Date.now(), receiptId,
+			id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName, startedAt: Date.now(), receiptId, ...batchRef,
 			cardStopUnavailableReason: isBuiltInTool ? 'Stop becomes available once this tool provides its cancellation handle.' : 'This MCP tool does not expose an independent cancellation handle.',
 		} as const
 		const interruptorPromise = Promise.resolve(interruptor)
-		registerActiveToolCardReceipt.call(this, threadId, receiptId, toolId, cardInterruptor, isCurrentParentRun, false)
+		registerActiveToolCardReceipt.call(this, threadId, receiptId, toolId, batchRef, cardInterruptor, isCurrentParentRun, false)
 		// The global Stop path needs this stream before a synchronous live-row listener
 		// can observe the card. If it revokes during the stream event, publish nothing.
 		this._setStreamState(threadId, { isRunning: 'tool', interrupt: interruptorPromise, toolInfo: { toolName, toolParams, id: toolId, content: 'interrupted...', rawParams: opts.unvalidatedToolParams, mcpServerName, receiptId } })
@@ -1652,7 +1715,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 					toolName: toolName,
 					params: toolParams
 				})).result
-				if (!isCurrentParentRun()) return { interrupted: true }
+				if (!isCurrentParentRun()) { settleCancelled(); return cancellationOutcome() }
 			}
 
 			if (interrupted || !isCurrentParentRun()) { settleCancelled(); return cancellationOutcome() }
@@ -1662,7 +1725,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			if (interrupted) { settleCancelled(); return cancellationOutcome() }
 
 			const errorMessage = getErrorMessage(error)
-			this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: toolParams, result: errorMessage, name: toolName, content: errorMessage, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName })
+			this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: toolParams, result: errorMessage, name: toolName, content: errorMessage, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName, ...batchRef })
 			return { failure: errorMessage.trim().replace(/\s+/g, ' ').toLowerCase(), validatedParams: toolParams }
 		}
 
@@ -1673,7 +1736,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			const terminalResult = toolResult as { resolveReason?: { type?: string; exitCode?: number }; result?: string }
 			if (isTerminalCommand && terminalResult.resolveReason?.type === 'done' && terminalResult.resolveReason.exitCode !== 0) {
 				const content = `${terminalResult.result ?? ''}\n(exit code ${terminalResult.resolveReason.exitCode})`
-				this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: toolParams, result: content, name: toolName, content, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName })
+				this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: toolParams, result: content, name: toolName, content, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName, ...batchRef })
 				return { failure: `terminal_exit_${terminalResult.resolveReason.exitCode}`, validatedParams: toolParams }
 			}
 			if (isBuiltInTool) toolResultStr = this._toolsService.stringOfResult[toolName](toolParams as any, toolResult as any)
@@ -1681,7 +1744,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		} catch (error) {
 			if (!isCurrentParentRun()) return { interrupted: true }
 			const errorMessage = this.toolErrMsgs.errWhenStringifying(error)
-			this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: toolParams, result: errorMessage, name: toolName, content: errorMessage, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName })
+			this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: toolParams, result: errorMessage, name: toolName, content: errorMessage, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName, ...batchRef })
 			return { failure: errorMessage.trim().replace(/\s+/g, ' ').toLowerCase(), validatedParams: toolParams }
 		}
 
@@ -1690,11 +1753,11 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		if (toolName === 'read_file' && (!isBoundedReadHistory(toolResult as BuiltinToolResultType['read_file'], this._settingsService.state.globalSettings.readFileLimits) || !isBoundedReadHistoryString(toolResultStr, this._settingsService.state.globalSettings.readFileLimits))) {
 			if (!isCurrentParentRun()) return { interrupted: true }
 			const errorMessage = 'read_file rejected: bounded history validation failed; re-read a smaller continuation.'
-			this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: toolParams, result: errorMessage, name: toolName, content: errorMessage, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName })
+			this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: toolParams, result: errorMessage, name: toolName, content: errorMessage, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName, ...batchRef })
 			return { failure: errorMessage.trim().replace(/\s+/g, ' ').toLowerCase(), validatedParams: toolParams }
 		}
 		if (!isCurrentParentRun()) return { interrupted: true }
-		this._updateLatestTool(threadId, { role: 'tool', type: 'success', params: toolParams, result: toolResult, name: toolName, content: toolResultStr, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName })
+		this._updateLatestTool(threadId, { role: 'tool', type: 'success', params: toolParams, result: toolResult, name: toolName, content: toolResultStr, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName, ...batchRef })
 		return {}
 		} finally {
 			// The terminal history row carries no live receipt after settlement; only an
@@ -1746,11 +1809,31 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 		// before enter loop, call tool
 		if (callThisToolFirst) {
-			const { interrupted } = await this._runToolCall(threadId, callThisToolFirst.name, callThisToolFirst.id, callThisToolFirst.mcpServerName, { preapproved: true, unvalidatedToolParams: callThisToolFirst.rawParams, validatedParams: callThisToolFirst.params }, snapshot, agentDelegationAuthority, chatMode === 'agent', agentRunGeneration, isCurrentRun)
+			const callRef = callThisToolFirst.batchId === undefined || callThisToolFirst.batchOrdinal === undefined ? undefined : { batchId: callThisToolFirst.batchId, batchOrdinal: callThisToolFirst.batchOrdinal }
+			const { interrupted } = await this._runToolCall(threadId, callThisToolFirst.name, callThisToolFirst.id, callThisToolFirst.mcpServerName, { preapproved: true, unvalidatedToolParams: callThisToolFirst.rawParams, validatedParams: callThisToolFirst.params }, snapshot, agentDelegationAuthority, chatMode === 'agent', agentRunGeneration, isCurrentRun, callRef)
 			if (!isCurrentRun()) return
 			if (interrupted) {
 				this._setStreamState(threadId, undefined)
 				return
+			}
+			// An approval is a pause inside a persisted native declaration, not the end
+			// of that declaration.  Reconstruct the remaining calls from the immutable
+			// assistant row so reload never needs a mutable cursor and cannot replay the
+			// already-approved call.
+			if (callThisToolFirst.batchId !== undefined && callThisToolFirst.batchOrdinal !== undefined) {
+				const declaration = (this.state.allThreads[threadId]?.messages ?? []).find((message): message is Extract<ChatMessage, { role: 'assistant' }> => message.role === 'assistant' && message.toolBatch?.batchId === callThisToolFirst.batchId)?.toolBatch
+				if (!declaration || declaration.calls[callThisToolFirst.batchOrdinal]?.id !== callThisToolFirst.id) {
+					this._setStreamState(threadId, { isRunning: undefined, error: { message: 'The pending native tool batch no longer matches its declaration.', fullError: null } })
+					return
+				}
+				for (let batchOrdinal = callThisToolFirst.batchOrdinal + 1; batchOrdinal < declaration.calls.length; batchOrdinal++) {
+					if (!isCurrentRun()) return
+					const toolCall = declaration.calls[batchOrdinal]
+					const mcpTool = isAgentSubagentControlName(toolCall.name) || isReadSkillResourceToolName(toolCall.name) ? undefined : this._mcpService.getMCPTools()?.find(tool => tool.name === toolCall.name)
+					const tail = await this._runToolCall(threadId, toolCall.name, toolCall.id, mcpTool?.mcpServerName, { preapproved: false, unvalidatedToolParams: toolCall.rawParams }, snapshot, agentDelegationAuthority, chatMode === 'agent', agentRunGeneration, isCurrentRun, { batchId: declaration.batchId, batchOrdinal })
+					if (tail.interrupted || tail.receiptCancelled) { this._setStreamState(threadId, undefined); return }
+					if (tail.awaitingUserApproval) { this._setStreamState(threadId, { isRunning: 'awaiting_user' }); return }
+				}
 			}
 		}
 		this._setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' })  // just decorative, for clarity
@@ -1795,7 +1878,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				nAttempts += 1
 
 				type ResTypes =
-					| { type: 'llmDone', toolCall?: RawToolCallObj, info: { fullText: string, fullReasoning: string, anthropicReasoning: AnthropicReasoning[] | null } }
+					| { type: 'llmDone', toolCalls: readonly RawToolCallObj[], info: { fullText: string, fullReasoning: string, anthropicReasoning: AnthropicReasoning[] | null } }
 					| { type: 'llmError', error?: { message: string; fullError: Error | null; } }
 					| { type: 'llmAborted' }
 
@@ -1821,14 +1904,14 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 					agentDelegationAllowed: isDelegationAuthorityCurrent(),
 					logging: { loggingName: `Chat - ${chatMode}`, loggingExtras: { threadId, nMessagesSent, chatMode } },
 					separateSystemMessage: separateSystemMessage,
-					onText: ({ fullText, fullReasoning, toolCall }) => {
+					onText: ({ fullText, fullReasoning, toolCalls }) => {
 						if (providerSettled || !isCurrentRun()) return
-						this._setStreamState(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: sanitizeAssistantDisplayContent(fullText, true), reasoningSoFar: fullReasoning, toolCallSoFar: toolCall ?? null }, interrupt: Promise.resolve(() => { if (llmCancelToken) this._llmMessageService.abort(llmCancelToken) }) })
+						this._setStreamState(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: sanitizeAssistantDisplayContent(fullText, true), reasoningSoFar: fullReasoning, toolCallSoFar: toolCalls?.[0] ?? null, toolCallsSoFar: toolCalls ?? [] }, interrupt: Promise.resolve(() => { if (llmCancelToken) this._llmMessageService.abort(llmCancelToken) }) })
 					},
-					onFinalMessage: async ({ fullText, fullReasoning, toolCall, anthropicReasoning, }) => {
+					onFinalMessage: async ({ fullText, fullReasoning, toolCalls, anthropicReasoning, }) => {
 						if (providerSettled) return
 						if (!isCurrentRun()) { settleProvider({ type: 'llmAborted' }); return }
-						settleProvider({ type: 'llmDone', toolCall, info: { fullText, fullReasoning, anthropicReasoning } }) // resolve with tool calls
+						settleProvider({ type: 'llmDone', toolCalls: toolCalls ?? [], info: { fullText, fullReasoning, anthropicReasoning } }) // resolve with tool calls
 					},
 					onError: async (error) => {
 						if (providerSettled) return
@@ -1898,34 +1981,40 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				}
 
 				// llm res success
-				const { toolCall, info } = llmRes
-
-				this._addMessageToThread(threadId, { role: 'assistant', displayContent: info.fullText, reasoning: info.fullReasoning, anthropicReasoning: info.anthropicReasoning })
+				const { toolCalls, info } = llmRes
+				const validBatch = toolCalls.length === 0 || (toolCalls.every(call => !!call.id && !!call.name) && new Set(toolCalls.map(call => call.id)).size === toolCalls.length)
+				if (!validBatch) { this._setStreamState(threadId, { isRunning: undefined, error: { message: 'The provider returned an invalid or duplicate tool-call batch.', fullError: null } }); return }
+				const batchId = toolCalls.length ? generateUuid() : undefined
+				this._addMessageToThread(threadId, { role: 'assistant', displayContent: info.fullText, reasoning: info.fullReasoning, anthropicReasoning: info.anthropicReasoning, ...(batchId ? { toolBatch: { version: 1 as const, batchId, calls: toolCalls } } : {}) })
 
 				this._setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' }) // just decorative for clarity
 
-				// call tool if there is one
-				if (toolCall) {
+				// Native batches deliberately execute in provider order in 8A. The next provider
+				// request is assembled only after every declared call settles or one pauses.
+				if (toolCalls.length) {
+					for (const [batchOrdinal, toolCall] of toolCalls.entries()) {
 					const mcpTool = isAgentSubagentControlName(toolCall.name) || isReadSkillResourceToolName(toolCall.name) ? undefined : this._mcpService.getMCPTools()?.find(t => t.name === toolCall.name)
 
-					const { awaitingUserApproval, interrupted, failure, validatedParams } = await this._runToolCall(threadId, toolCall.name, toolCall.id, mcpTool?.mcpServerName, { preapproved: false, unvalidatedToolParams: toolCall.rawParams }, snapshot, agentDelegationAuthority, chatMode === 'agent', agentRunGeneration, isCurrentRun)
+					const { awaitingUserApproval, interrupted, failure, validatedParams } = await this._runToolCall(threadId, toolCall.name, toolCall.id, mcpTool?.mcpServerName, { preapproved: false, unvalidatedToolParams: toolCall.rawParams }, snapshot, agentDelegationAuthority, chatMode === 'agent', agentRunGeneration, isCurrentRun, { batchId: batchId!, batchOrdinal })
 					if (!isCurrentRun()) return
 					if (interrupted) {
 						this._setStreamState(threadId, undefined)
 						return
 					}
-					if (awaitingUserApproval) { isRunningWhenEnd = 'awaiting_user' }
+					if (awaitingUserApproval) { isRunningWhenEnd = 'awaiting_user'; break }
 					else if (failure) {
 						const key = `${toolCall.name.toLowerCase()}|${mcpTool?.mcpServerName ?? ''}|${stableToolValue(semanticToolArgs(toolCall.name, validatedParams ?? toolCall.rawParams))}|${failure}`
 						const count = (identicalFailures.get(key) ?? 0) + 1
 						identicalFailures.set(key, count)
 						if (count >= 3) {
+							this._terminalizeBatchTailAfter(threadId, { batchId: batchId!, batchOrdinal }, 'Native tool batch was closed after the identical-failure circuit opened.')
 							this._setStreamState(threadId, { isRunning: undefined, error: { message: 'The same tool failed three times. Change the request or recover the command before continuing.', fullError: null } })
 							return
 						}
 						shouldSendAnotherMessage = true
 					}
 					else { shouldSendAnotherMessage = true }
+					}
 
 					this._setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' }) // just decorative, for clarity
 				}

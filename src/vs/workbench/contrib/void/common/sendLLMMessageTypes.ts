@@ -88,10 +88,14 @@ export type RawToolCallObj = {
 	isDone: boolean;
 };
 
+/** A native provider response can declare several calls.  The order is the provider
+ * declaration order and is intentionally preserved through persistence and replay. */
+export type RawToolCallBatch = readonly RawToolCallObj[];
+
 export type AnthropicReasoning = ({ type: 'thinking'; thinking: any; signature: string; } | { type: 'redacted_thinking', data: any })
 
-export type OnText = (p: { fullText: string; fullReasoning: string; toolCall?: RawToolCallObj }) => void
-export type OnFinalMessage = (p: { fullText: string; fullReasoning: string; toolCall?: RawToolCallObj; anthropicReasoning: AnthropicReasoning[] | null }) => void // id is tool_use_id
+export type OnText = (p: { fullText: string; fullReasoning: string; toolCalls?: RawToolCallBatch }) => void
+export type OnFinalMessage = (p: { fullText: string; fullReasoning: string; toolCalls?: RawToolCallBatch; anthropicReasoning: AnthropicReasoning[] | null }) => void // ids are tool_use_ids
 export type OnError = (p: { message: string; fullError: Error | null }) => void
 export type OnAbort = () => void
 export type AbortRef = { current: (() => void) | null }

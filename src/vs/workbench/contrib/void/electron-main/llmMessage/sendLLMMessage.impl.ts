@@ -24,6 +24,7 @@ import { availableTools, InternalToolInfo } from '../../common/prompt/prompts.js
 import { AgentSubagentToolSnapshot, ToolExecutionProfile } from '../../common/agentSubagents.js';
 import { classifyOpenAICompatibleToolSchemaDialect, formatPrematureStreamCloseMessage, isPrematureStreamClose, OpenAICompatibleStreamDiagnostics, redactOpenAICompatibleEndpoint } from './openAICompatibleDiagnostics.js';
 import { generateUuid } from '../../../../../base/common/uuid.js';
+import { ToolName } from '../../common/toolsServiceTypes.js';
 
 const getGoogleApiKey = async () => {
 	// module‑level singleton
@@ -423,9 +424,8 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 	let fullReasoningSoFar = ''
 	let fullTextSoFar = ''
 
-	let toolName = ''
-	let toolId = ''
-	let toolParamsStr = ''
+	const streamedTools = new Map<number, { name: string; id: string; params: string; idConflict: boolean }>()
+	let sawInvalidToolIndex = false
 	const requestController = new AbortController()
 	_setAborter(() => requestController.abort())
 
@@ -444,11 +444,15 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 				// tool call
 				for (const tool of chunk.choices[0]?.delta?.tool_calls ?? []) {
 					const index = tool.index
-					if (index !== 0) continue
-
-					toolName += tool.function?.name ?? ''
-					toolParamsStr += tool.function?.arguments ?? '';
-					toolId += tool.id ?? ''
+					if (!Number.isInteger(index) || index < 0) { sawInvalidToolIndex = true; continue }
+					const current = streamedTools.get(index) ?? { name: '', id: '', params: '', idConflict: false }
+					current.name += tool.function?.name ?? ''
+					current.params += tool.function?.arguments ?? ''
+					if (tool.id) {
+						if (!current.id) current.id = tool.id
+						else if (current.id !== tool.id) current.idConflict = true
+					}
+					streamedTools.set(index, current)
 				}
 
 
@@ -464,19 +468,21 @@ const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onE
 				onText({
 					fullText: fullTextSoFar,
 					fullReasoning: fullReasoningSoFar,
-					toolCall: !toolName ? undefined : { name: toolName, rawParams: {}, isDone: false, doneParams: [], id: toolId },
+					toolCalls: [...streamedTools.entries()].sort(([a], [b]) => a - b).filter(([, tool]) => !!tool.name).map(([, tool]) => ({ name: tool.name as ToolName, rawParams: {}, isDone: false, doneParams: [], id: tool.id })),
 				})
 
 			}
 			// on final
-			if (!fullTextSoFar && !fullReasoningSoFar && !toolName) {
+			if (!fullTextSoFar && !fullReasoningSoFar && streamedTools.size === 0) {
 				onError({ message: 'Void: Response from model was empty.', fullError: null })
 				return false
 			}
 			else {
-				const toolCall = rawToolCallObjOfParamsStr(toolName, toolParamsStr, toolId)
-				const toolCallObj = toolCall ? { toolCall } : {}
-				onFinalMessage({ fullText: fullTextSoFar, fullReasoning: fullReasoningSoFar, anthropicReasoning: null, ...toolCallObj });
+				const toolCalls = [...streamedTools.entries()].sort(([a], [b]) => a - b).map(([, tool]) => rawToolCallObjOfParamsStr(tool.name, tool.params, tool.id)).filter((tool): tool is RawToolCallObj => !!tool)
+				const indexes = [...streamedTools.keys()].sort((a, b) => a - b)
+				const contiguous = indexes.every((index, ordinal) => index === ordinal)
+				if (sawInvalidToolIndex || !contiguous || [...streamedTools.values()].some(tool => tool.idConflict) || toolCalls.length !== streamedTools.size || new Set(toolCalls.map(tool => tool.id)).size !== toolCalls.length || toolCalls.some(tool => !tool.id)) { onError({ message: 'Void: provider returned an invalid, gapped, duplicate, or conflicting tool-call batch.', fullError: null }); return false }
+				onFinalMessage({ fullText: fullTextSoFar, fullReasoning: fullReasoningSoFar, anthropicReasoning: null, toolCalls });
 				return true
 			}
 	}
@@ -599,6 +605,56 @@ export const anthropicTools = (chatMode: ChatMode | null, mcpTools: InternalTool
 
 
 // ------------ ANTHROPIC ------------
+type AnthropicToolPreview = { name: ToolName; id: string; partialJson: string };
+
+/**
+ * The streamed Anthropic preview is deliberately separate from final-message
+ * parsing.  A provider can interleave JSON deltas for several `tool_use`
+ * blocks, so a single accumulated name/JSON string would silently turn two
+ * calls into one misleading preview.
+ */
+export const createAnthropicToolPreviewAccumulator = () => {
+	const callsByContentIndex = new Map<number, AnthropicToolPreview>();
+	const contentIndexById = new Map<string, number>();
+	let malformed = false;
+
+	const start = (contentIndex: unknown, block: { type?: unknown; name?: unknown; id?: unknown }): boolean => {
+		if (!Number.isInteger(contentIndex) || (contentIndex as number) < 0 || block.type !== 'tool_use' || typeof block.name !== 'string' || !block.name || typeof block.id !== 'string' || !block.id) {
+			malformed = true;
+			return false;
+		}
+		const index = contentIndex as number;
+		if (callsByContentIndex.has(index) || contentIndexById.has(block.id)) {
+			malformed = true;
+			return false;
+		}
+		callsByContentIndex.set(index, { name: block.name as ToolName, id: block.id, partialJson: '' });
+		contentIndexById.set(block.id, index);
+		return true;
+	};
+
+	const appendJson = (contentIndex: unknown, partialJson: unknown): boolean => {
+		if (malformed || !Number.isInteger(contentIndex) || (contentIndex as number) < 0 || typeof partialJson !== 'string') {
+			malformed = true;
+			return false;
+		}
+		const call = callsByContentIndex.get(contentIndex as number);
+		if (!call) {
+			malformed = true;
+			return false;
+		}
+		call.partialJson += partialJson;
+		return true;
+	};
+
+	return {
+		start,
+		appendJson,
+		get malformed() { return malformed; },
+		preview: (): AnthropicToolPreview[] => [...callsByContentIndex.entries()].sort(([left], [right]) => left - right).map(([, call]) => ({ ...call })),
+	};
+};
+
 const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions, overridesOfModel, modelName: modelName_, _setAborter, separateSystemMessage, chatMode, mcpTools, toolExecutionProfile, frozenToolSnapshot, agentDelegationAllowed }: SendChatParams_Internal) => {
 	const {
 		modelName,
@@ -653,15 +709,20 @@ const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessag
 	let fullText = ''
 	let fullReasoning = ''
 
-	let fullToolName = ''
-	let fullToolParams = ''
-
+	const toolPreview = createAnthropicToolPreviewAccumulator()
+	let malformedToolPreviewReported = false
+	const rejectMalformedToolPreview = () => {
+		if (malformedToolPreviewReported) return
+		malformedToolPreviewReported = true
+		onError({ message: 'Void: provider returned an invalid or duplicate streamed tool-call batch.', fullError: null })
+	}
 
 	const runOnText = () => {
+		if (toolPreview.malformed) return
 		onText({
 			fullText,
 			fullReasoning,
-			toolCall: !fullToolName ? undefined : { name: fullToolName, rawParams: {}, isDone: false, doneParams: [], id: 'dummy' },
+			toolCalls: toolPreview.preview().map(tool => ({ name: tool.name, rawParams: {}, isDone: false, doneParams: [], id: tool.id })),
 		})
 	}
 	// there are no events for tool_use, it comes in at the end
@@ -685,8 +746,8 @@ const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessag
 				runOnText()
 			}
 			else if (e.content_block.type === 'tool_use') {
-				fullToolName += e.content_block.name ?? '' // anthropic gives us the tool name in the start block
-				runOnText()
+				if (toolPreview.start(e.index, e.content_block)) runOnText()
+				else rejectMalformedToolPreview()
 			}
 		}
 
@@ -701,22 +762,22 @@ const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessag
 				runOnText()
 			}
 			else if (e.delta.type === 'input_json_delta') { // tool use
-				fullToolParams += e.delta.partial_json ?? '' // anthropic gives us the partial delta (string) here - https://docs.anthropic.com/en/api/messages-streaming
-				runOnText()
+				if (toolPreview.appendJson(e.index, e.delta.partial_json)) runOnText()
+				else rejectMalformedToolPreview()
 			}
 		}
 	})
 
 	// on done - (or when error/fail) - this is called AFTER last streamEvent
 	stream.on('finalMessage', (response) => {
+		if (toolPreview.malformed) { rejectMalformedToolPreview(); return }
 		const anthropicReasoning = response.content.filter(c => c.type === 'thinking' || c.type === 'redacted_thinking')
 		const tools = response.content.filter(c => c.type === 'tool_use')
 		// console.log('TOOLS!!!!!!', JSON.stringify(tools, null, 2))
 		// console.log('TOOLS!!!!!!', JSON.stringify(response, null, 2))
-		const toolCall = tools[0] && rawToolCallObjOfAnthropicParams(tools[0])
-		const toolCallObj = toolCall ? { toolCall } : {}
-
-		onFinalMessage({ fullText, fullReasoning, anthropicReasoning, ...toolCallObj })
+		const toolCalls = tools.map(rawToolCallObjOfAnthropicParams).filter((tool): tool is RawToolCallObj => !!tool)
+		if (toolCalls.length !== tools.length || new Set(toolCalls.map(tool => tool.id)).size !== toolCalls.length || toolCalls.some(tool => !tool.id)) { onError({ message: 'Void: provider returned an invalid or duplicate tool-call batch.', fullError: null }); return }
+		onFinalMessage({ fullText, fullReasoning, anthropicReasoning, toolCalls })
 	})
 	// on error
 	stream.on('error', (error) => {
@@ -878,6 +939,57 @@ export const geminiTools = (chatMode: ChatMode | null, mcpTools: InternalToolInf
 
 
 // Implementation for Gemini using Google's native API
+type GeminiToolPreview = { name: string; params: string; id: string };
+
+/**
+ * Gemini does not consistently supply function-call IDs.  An ID-bearing call
+ * can be retransmitted verbatim in a later chunk, but an id-less call in any
+ * later nonempty chunk cannot be distinguished from a second declaration.
+ */
+export const createGeminiToolCallAccumulator = () => {
+	const calls: GeminiToolPreview[] = [];
+	const callsByProviderId = new Map<string, GeminiToolPreview>();
+	let sawNonemptyChunk = false;
+	let malformed = false;
+
+	const consumeChunk = (functionCalls: readonly { id?: unknown; name?: unknown; args?: unknown }[] | undefined): boolean => {
+		if (malformed || !functionCalls?.length) return !malformed;
+		const isLaterNonemptyChunk = sawNonemptyChunk;
+		sawNonemptyChunk = true;
+		const idsInThisChunk = new Set<string>();
+		for (const functionCall of functionCalls) {
+			if (typeof functionCall.name !== 'string' || !functionCall.name) { malformed = true; return false; }
+			let params: string;
+			try { params = JSON.stringify(functionCall.args ?? {}); }
+			catch { malformed = true; return false; }
+			if (typeof params !== 'string') { malformed = true; return false; }
+			if (typeof functionCall.id === 'string' && functionCall.id) {
+				if (idsInThisChunk.has(functionCall.id)) { malformed = true; return false; }
+				idsInThisChunk.add(functionCall.id);
+				const previous = callsByProviderId.get(functionCall.id);
+				if (previous) {
+					if (previous.name !== functionCall.name || previous.params !== params) { malformed = true; return false; }
+					continue; // demonstrable retransmission
+				}
+				const call = { name: functionCall.name, params, id: functionCall.id };
+				callsByProviderId.set(functionCall.id, call);
+				calls.push(call);
+			}
+			else {
+				if (isLaterNonemptyChunk) { malformed = true; return false; }
+				calls.push({ name: functionCall.name, params, id: generateUuid() });
+			}
+		}
+		return true;
+	};
+
+	return {
+		consumeChunk,
+		get malformed() { return malformed; },
+		calls: (): GeminiToolPreview[] => calls.map(call => ({ ...call })),
+	};
+};
+
 const sendGeminiChat = async ({
 	messages,
 	separateSystemMessage,
@@ -944,9 +1056,7 @@ const sendGeminiChat = async ({
 	let fullReasoningSoFar = ''
 	let fullTextSoFar = ''
 
-	let toolName = ''
-	let toolParamsStr = ''
-	let toolId = ''
+	const streamedCalls = createGeminiToolCallAccumulator()
 
 
 	genAI.models.generateContentStream({
@@ -968,13 +1078,7 @@ const sendGeminiChat = async ({
 				fullTextSoFar += newText
 
 				// tool call
-				const functionCalls = chunk.functionCalls
-				if (functionCalls && functionCalls.length > 0) {
-					const functionCall = functionCalls[0] // Get the first function call
-					toolName = functionCall.name ?? ''
-					toolParamsStr = JSON.stringify(functionCall.args ?? {})
-					toolId = functionCall.id ?? ''
-				}
+				streamedCalls.consumeChunk(chunk.functionCalls)
 
 				// (do not handle reasoning yet)
 
@@ -982,18 +1086,18 @@ const sendGeminiChat = async ({
 				onText({
 					fullText: fullTextSoFar,
 					fullReasoning: fullReasoningSoFar,
-					toolCall: !toolName ? undefined : { name: toolName, rawParams: {}, isDone: false, doneParams: [], id: toolId },
+					toolCalls: streamedCalls.calls().map(tool => ({ name: tool.name as ToolName, rawParams: {}, isDone: false, doneParams: [], id: tool.id })),
 				})
 			}
 
 			// on final
-			if (!fullTextSoFar && !fullReasoningSoFar && !toolName) {
+			if (!fullTextSoFar && !fullReasoningSoFar && streamedCalls.calls().length === 0) {
 				onError({ message: 'Void: Response from model was empty.', fullError: null })
 			} else {
-				if (!toolId) toolId = generateUuid() // ids are empty, but other providers might expect an id
-				const toolCall = rawToolCallObjOfParamsStr(toolName, toolParamsStr, toolId)
-				const toolCallObj = toolCall ? { toolCall } : {}
-				onFinalMessage({ fullText: fullTextSoFar, fullReasoning: fullReasoningSoFar, anthropicReasoning: null, ...toolCallObj });
+				const calls = streamedCalls.calls()
+				const toolCalls = calls.map(tool => rawToolCallObjOfParamsStr(tool.name, tool.params, tool.id)).filter((tool): tool is RawToolCallObj => !!tool)
+				if (streamedCalls.malformed || toolCalls.length !== calls.length || new Set(toolCalls.map(tool => tool.id)).size !== toolCalls.length || toolCalls.some(tool => !tool.id)) { onError({ message: 'Void: provider returned an invalid, duplicate, or ambiguous id-less tool-call batch.', fullError: null }); return }
+				onFinalMessage({ fullText: fullTextSoFar, fullReasoning: fullReasoningSoFar, anthropicReasoning: null, toolCalls });
 			}
 		})
 		.catch(error => {

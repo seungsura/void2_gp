@@ -351,7 +351,7 @@ export const extractXMLToolsWrapper = (
 		onText({
 			...params,
 			fullText,
-			toolCall: latestToolCall,
+			toolCalls: latestToolCall ? [latestToolCall] : [],
 		});
 	};
 
@@ -361,14 +361,14 @@ export const extractXMLToolsWrapper = (
 		newOnText({ ...params })
 
 		fullText = fullText.trimEnd()
-		const toolCall = latestToolCall
+		const toolCalls = latestToolCall ? [latestToolCall] : []
 
 		// console.log('final message!!!', trueFullText)
 		// console.log('----- returning ----\n', fullText)
 		// console.log('----- tools ----\n', JSON.stringify(firstToolCallRef.current, null, 2))
 		// console.log('----- toolCall ----\n', JSON.stringify(toolCall, null, 2))
 
-		onFinalMessage({ ...params, fullText, toolCall: toolCall })
+		onFinalMessage({ ...params, fullText, toolCalls })
 	}
 	return { newOnText, newOnFinalMessage };
 }

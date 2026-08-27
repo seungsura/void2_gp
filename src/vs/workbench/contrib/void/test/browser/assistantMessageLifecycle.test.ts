@@ -47,8 +47,8 @@ type TestLLMInfo = { displayContentSoFar: string; reasoningSoFar: string; toolCa
 type TestStream = { isRunning?: string; llmInfo?: TestLLMInfo; toolInfo?: { toolName: string; toolParams: unknown; id: string; content: string; rawParams: unknown; mcpServerName?: string }; interrupt?: Promise<() => void> | 'not_needed'; error?: unknown };
 type TestStreamRecord = Record<string, TestStream | undefined>;
 type TestProviderCallbacks = {
-	onText(value: { fullText: string; fullReasoning: string; toolCall?: unknown }): void;
-	onFinalMessage(value: { fullText: string; fullReasoning: string; toolCall?: { name: string; id: string; rawParams: Record<string, unknown> }; anthropicReasoning: null }): Promise<void>;
+	onText(value: { fullText: string; fullReasoning: string; toolCalls?: readonly unknown[] }): void;
+	onFinalMessage(value: { fullText: string; fullReasoning: string; toolCalls?: readonly { name: string; id: string; rawParams: Record<string, unknown> }[]; anthropicReasoning: null }): Promise<void>;
 	onError(error: { message: string; fullError: Error | null }): Promise<void>;
 	onAbort(): void;
 };
@@ -64,7 +64,7 @@ type TestRunChatOptions = {
 type TestToolCallResult = { awaitingUserApproval?: boolean; interrupted?: boolean; receiptCancelled?: boolean };
 interface ChatLifecycleTestAdapter {
 	_runChatAgent(this: unknown, options: TestRunChatOptions & { parentRun: TestParentRun }): Promise<void>;
-	_runToolCall(this: unknown, threadId: string, toolName: string, toolId: string, mcpServerName: string | undefined, options: { preapproved: true; unvalidatedToolParams: Record<string, unknown>; validatedParams: Record<string, unknown> }, snapshot: ReturnType<typeof instructionSnapshot>, authority: undefined, skillReadAllowed: boolean, generation: number, isActive: () => boolean): Promise<TestToolCallResult>;
+	_runToolCall(this: unknown, threadId: string, toolName: string, toolId: string, mcpServerName: string | undefined, options: { preapproved: true; unvalidatedToolParams: Record<string, unknown>; validatedParams: Record<string, unknown> }, snapshot: ReturnType<typeof instructionSnapshot>, authority: undefined, skillReadAllowed: boolean, generation: number, isActive: () => boolean, batchRef?: { batchId: string; batchOrdinal: number }): Promise<TestToolCallResult>;
 	_wrapRunAgentToNotify(this: unknown, promise: Promise<void>, threadId: string, parentRun: TestParentRun): Promise<void>;
 	_revokeAgentDelegation(this: unknown, threadId: string, forget?: boolean): void;
 	abortRunning(this: unknown, threadId: string): Promise<void>;
@@ -179,12 +179,12 @@ suite('Assistant message lifecycle', () => {
 		const runB = run();
 		await Promise.resolve();
 		assert.strictEqual(callbacks.length, 2);
-		callbacks[1].onText({ fullText: 'B partial', fullReasoning: 'B reasoning', toolCall: undefined });
+		callbacks[1].onText({ fullText: 'B partial', fullReasoning: 'B reasoning', toolCalls: undefined });
 		assert.strictEqual(llmInfoOf(streamState.task).displayContentSoFar, 'B partial');
-		callbacks[0].onText({ fullText: 'A stale partial', fullReasoning: 'A reasoning', toolCall: undefined });
+		callbacks[0].onText({ fullText: 'A stale partial', fullReasoning: 'A reasoning', toolCalls: undefined });
 		await callbacks[0].onFinalMessage({ fullText: 'A stale result', fullReasoning: '', anthropicReasoning: null });
 		await runA;
-		assert.deepStrictEqual(llmInfoOf(streamState.task), { displayContentSoFar: 'B partial', reasoningSoFar: 'B reasoning', toolCallSoFar: null });
+		assert.deepStrictEqual(llmInfoOf(streamState.task), { displayContentSoFar: 'B partial', reasoningSoFar: 'B reasoning', toolCallSoFar: null, toolCallsSoFar: [] });
 		assert.strictEqual(messages.length, 0);
 		await callbacks[1].onFinalMessage({ fullText: 'B result', fullReasoning: '', anthropicReasoning: null });
 		await runB;
@@ -192,21 +192,26 @@ suite('Assistant message lifecycle', () => {
 	});
 
 	test('a same-generation approval continuation owns a new parent-run token', async () => {
-		const snapshot = instructionSnapshot(); const callbacks: TestProviderCallbacks[] = []; const messages: TestMessage[] = []; const streamState: TestStreamRecord = {};
+		const snapshot = instructionSnapshot(); const callbacks: TestProviderCallbacks[] = []; const messages: any[] = []; const streamState: TestStreamRecord = {}; const firstTool = deferred<void>(); const executionOrder: string[] = [];
 		const receiver = {
 			state: { allThreads: { task: { messages, state: {}, filesWithUserChanges: new Set<string>() } }, currentThreadId: 'task' }, streamState,
 			_agentControlGeneration: new Map([['task', 4]]), _parentRunTokenOfThread: new Map<string, symbol>(), _agentDelegationAuthorityOfThread: new Map(),
 			_settingsService: { state: { globalSettings: { chatMode: 'agent' } } }, _convertToLLMMessagesService: { prepareLLMChatMessages: async () => ({ messages: [], separateSystemMessage: false }) },
 			_llmMessageService: { sendLLMMessage: (options: TestProviderCallbacks) => { callbacks.push(options); return `request-${callbacks.length}`; }, abort() { } }, _mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } },
 			_setStreamState(threadId: string, value: TestStream | undefined) { streamState[threadId] = value; }, _addMessageToThread(_threadId: string, message: TestMessage) { messages.push(message); },
+			_runToolCall: async (_threadId: string, _name: string, id: string, _mcp: unknown, _options: unknown, _snapshot: unknown, _authority: unknown, _skill: boolean, _generation: number, _current: () => boolean, batchRef: { batchId: string; batchOrdinal: number }) => { executionOrder.push(id); if (id === 'batch-a') await firstTool.promise; messages.push({ role: 'tool', type: 'success', id, name: 'read_file', params: {}, rawParams: {}, content: id, result: id, ...batchRef }); return { interrupted: false }; },
 		};
 		const run = () => runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot });
 		const runA = run(); await Promise.resolve(); const runB = run(); await Promise.resolve(); assert.strictEqual(callbacks.length, 2);
-		callbacks[1].onText({ fullText: 'continuation partial', fullReasoning: '', toolCall: undefined }); callbacks[0].onText({ fullText: 'stale A', fullReasoning: '', toolCall: undefined });
+		callbacks[1].onText({ fullText: 'continuation partial', fullReasoning: '', toolCalls: undefined }); callbacks[0].onText({ fullText: 'stale A', fullReasoning: '', toolCalls: undefined });
 		await callbacks[0].onFinalMessage({ fullText: 'stale A', fullReasoning: '', anthropicReasoning: null }); await runA;
 		assert.strictEqual(llmInfoOf(streamState.task).displayContentSoFar, 'continuation partial'); assert.strictEqual(messages.length, 0);
-		await callbacks[1].onFinalMessage({ fullText: 'continuation complete', fullReasoning: '', anthropicReasoning: null }); await runB;
-		assert.deepStrictEqual(messages.map(message => message.displayContent), ['continuation complete']);
+		const final = callbacks[1].onFinalMessage({ fullText: 'continuation complete', fullReasoning: '', toolCalls: [{ name: 'read_file', id: 'batch-a', rawParams: {} }, { name: 'read_file', id: 'batch-b', rawParams: {} }], anthropicReasoning: null });
+		await flushMicrotasks(); assert.deepStrictEqual(executionOrder, ['batch-a']); assert.strictEqual(callbacks.length, 2);
+		firstTool.resolve(); await final; await flushMicrotasks(); assert.deepStrictEqual(executionOrder, ['batch-a', 'batch-b']); assert.strictEqual(callbacks.length, 3);
+		await callbacks[2].onFinalMessage({ fullText: 'continuation after batch', fullReasoning: '', anthropicReasoning: null }); await runB;
+		const declaration = messages.find(message => message.role === 'assistant' && message.toolBatch);
+		assert.deepStrictEqual({ calls: declaration.toolBatch.calls.map((call: any) => call.id), rows: messages.filter(message => message.role === 'tool').map(message => [message.id, message.batchId === declaration.toolBatch.batchId, message.batchOrdinal]) }, { calls: ['batch-a', 'batch-b'], rows: [['batch-a', true, 0], ['batch-b', true, 1]] });
 	});
 
 	test('a stale preapproved-tool continuation cannot clear its replacement run', async () => {
@@ -220,7 +225,7 @@ suite('Assistant message lifecycle', () => {
 		};
 		const runA = runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot, callThisToolFirst: { role: 'tool', type: 'tool_request', name: 'read_file', id: 'tool-a', params: {}, rawParams: {}, content: '', result: null, mcpServerName: undefined } });
 		await Promise.resolve(); const runB = runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot });
-		await Promise.resolve(); callbacks[0].onText({ fullText: 'B partial', fullReasoning: '', toolCall: undefined }); releaseTool(); await runA;
+		await Promise.resolve(); callbacks[0].onText({ fullText: 'B partial', fullReasoning: '', toolCalls: undefined }); releaseTool(); await runA;
 		assert.strictEqual(llmInfoOf(streamState.task).displayContentSoFar, 'B partial'); await callbacks[0].onFinalMessage({ fullText: 'B final', fullReasoning: '', anthropicReasoning: null }); await runB;
 	});
 
@@ -363,9 +368,9 @@ suite('Assistant message lifecycle', () => {
 		const parentRun = beginTestParentRun(receiver, 'task');
 		const running = chatLifecycle._runChatAgent.call(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot, parentRun });
 		const wrapped = chatLifecycle._wrapRunAgentToNotify.call(receiver, running, 'task', parentRun);
-		await Promise.resolve(); assert.strictEqual(callbacks.length, 1); callbacks[0].onText({ fullText: 'current partial', fullReasoning: 'current reasoning', toolCall: undefined }); await callbacks[0].onFinalMessage({ fullText: 'current final', fullReasoning: 'current reasoning', anthropicReasoning: null }); await wrapped;
+		await Promise.resolve(); assert.strictEqual(callbacks.length, 1); callbacks[0].onText({ fullText: 'current partial', fullReasoning: 'current reasoning', toolCalls: undefined }); await callbacks[0].onFinalMessage({ fullText: 'current final', fullReasoning: 'current reasoning', anthropicReasoning: null }); await wrapped;
 		const finalStream = streamState.task; const finalHistory = JSON.stringify(messages); const finalMetrics = [...metrics];
-		callbacks[0].onText({ fullText: 'late text', fullReasoning: 'late reasoning', toolCall: undefined }); await callbacks[0].onFinalMessage({ fullText: 'duplicate final', fullReasoning: '', anthropicReasoning: null }); await callbacks[0].onError({ message: 'duplicate error', fullError: null }); callbacks[0].onAbort(); await Promise.resolve();
+		callbacks[0].onText({ fullText: 'late text', fullReasoning: 'late reasoning', toolCalls: undefined }); await callbacks[0].onFinalMessage({ fullText: 'duplicate final', fullReasoning: '', anthropicReasoning: null }); await callbacks[0].onError({ message: 'duplicate error', fullError: null }); callbacks[0].onAbort(); await Promise.resolve();
 		assert.strictEqual(streamState.task, finalStream); assert.strictEqual(JSON.stringify(messages), finalHistory); assert.deepStrictEqual(metrics, finalMetrics); assert.deepStrictEqual(metrics, ['Agent Loop Done']); assert.deepStrictEqual(invalidations, ['task']); assert.strictEqual(notifications.length, 1); assert.strictEqual(notifications[0].severity, Severity.Info); assert.strictEqual(receiver._parentRunTokenOfThread.has('task'), false);
 	});
 
@@ -413,7 +418,7 @@ suite('Assistant message lifecycle', () => {
 					requestContent = toolAssistant?.content;
 					echoedFullText = requestContent;
 					queueMicrotask(() => {
-						options.onText({ fullText: echoedFullText, fullReasoning: 'local provider reasoning', toolCall: undefined });
+						options.onText({ fullText: echoedFullText, fullReasoning: 'local provider reasoning', toolCalls: undefined });
 						void options.onFinalMessage({ fullText: echoedFullText, fullReasoning: 'local provider reasoning', anthropicReasoning: null });
 					});
 					return 'local-echo-request';
@@ -475,16 +480,20 @@ suite('Assistant message lifecycle', () => {
 		(converter as any)._generateChatMessagesSystemMessage = async () => 'matrix system';
 		const history: any[] = [
 			{ role: 'user', content: 'use a tool', displayContent: 'use a tool' },
-			{ role: 'assistant', displayContent: '', reasoning: 'reasoning before tool', anthropicReasoning: null },
-			{ role: 'tool', type: 'success', name: 'fixture_tool', params: { value: 'alpha' }, content: 'alpha', id: 'tool-1', rawParams: { value: 'alpha' }, result: 'alpha', mcpServerName: 'fixture-server' },
+			{ role: 'assistant', displayContent: '', reasoning: 'reasoning before tool', anthropicReasoning: null, toolBatch: { version: 1, batchId: 'native-batch', calls: [{ id: 'tool-1', name: 'fixture_tool', rawParams: { value: 'alpha' } }, { id: 'tool-2', name: 'fixture_tool', rawParams: { value: 'beta' } }] } },
+			{ role: 'tool', type: 'success', name: 'fixture_tool', params: { value: 'alpha' }, content: 'alpha', id: 'tool-1', rawParams: { value: 'alpha' }, result: 'alpha', mcpServerName: 'fixture-server', batchId: 'native-batch', batchOrdinal: 0 },
+			{ role: 'tool', type: 'success', name: 'fixture_tool', params: { value: 'beta' }, content: 'beta', id: 'tool-2', rawParams: { value: 'beta' }, result: 'beta', mcpServerName: 'fixture-server', batchId: 'native-batch', batchOrdinal: 1 },
 		];
 		for (const providerName of ['openAI', 'openAICompatible'] as const) {
 			const result = await converter.prepareLLMChatMessages({ chatMessages: history, chatMode: 'agent', modelSelection: { providerName, modelName: 'gpt-4.1' }, instructionSnapshot: instructionSnapshot() as never });
 			const assistant: any = result.messages.find((message: any) => message.role === 'assistant');
 			assert.strictEqual(assistant.content, '');
-			assert.deepStrictEqual(assistant.tool_calls, [{ type: 'function', id: 'tool-1', function: { name: 'fixture_tool', arguments: '{"value":"alpha"}' } }]);
+			assert.deepStrictEqual(assistant.tool_calls, [{ type: 'function', id: 'tool-1', function: { name: 'fixture_tool', arguments: '{"value":"alpha"}' } }, { type: 'function', id: 'tool-2', function: { name: 'fixture_tool', arguments: '{"value":"beta"}' } }]);
+			assert.deepStrictEqual(result.messages.filter((message: any) => message.role === 'tool').map((message: any) => message.tool_call_id), ['tool-1', 'tool-2']);
+			for (const internal of ['toolBatch', 'batchId', 'batchOrdinal', 'native-batch']) assert.strictEqual(JSON.stringify(result.messages).includes(internal), false);
 			assert.strictEqual(JSON.stringify(result.messages).includes(INTERNAL_EMPTY_MESSAGE_SENTINEL), false);
 		}
+		await assert.rejects(() => converter.prepareLLMChatMessages({ chatMessages: history.slice(0, -1), chatMode: 'agent', modelSelection: { providerName: 'openAI', modelName: 'gpt-4.1' }, instructionSnapshot: instructionSnapshot() as never }), /native_tool_batch_unclosed/);
 	});
 
 	test('Anthropic, Gemini, and XML retain tool-only native blocks without fake text', async () => {
@@ -500,23 +509,31 @@ suite('Assistant message lifecycle', () => {
 		(converter as any)._generateChatMessagesSystemMessage = async () => 'matrix system';
 		const history: any[] = [
 			{ role: 'user', content: 'use a tool', displayContent: 'use a tool' },
-			{ role: 'assistant', displayContent: '', reasoning: 'reasoning before tool', anthropicReasoning: null },
-			{ role: 'tool', type: 'success', name: 'fixture_tool', params: { value: 'alpha' }, content: 'alpha', id: 'tool-1', rawParams: { value: 'alpha' }, result: 'alpha', mcpServerName: 'fixture-server' },
+			{ role: 'assistant', displayContent: '', reasoning: 'reasoning before tool', anthropicReasoning: null, toolBatch: { version: 1, batchId: 'native-batch', calls: [{ id: 'tool-1', name: 'fixture_tool', rawParams: { value: 'alpha' } }, { id: 'tool-2', name: 'fixture_tool', rawParams: { value: 'beta' } }] } },
+			{ role: 'tool', type: 'success', name: 'fixture_tool', params: { value: 'alpha' }, content: 'alpha', id: 'tool-1', rawParams: { value: 'alpha' }, result: 'alpha', mcpServerName: 'fixture-server', batchId: 'native-batch', batchOrdinal: 0 },
+			{ role: 'tool', type: 'success', name: 'fixture_tool', params: { value: 'beta' }, content: 'beta', id: 'tool-2', rawParams: { value: 'beta' }, result: 'beta', mcpServerName: 'fixture-server', batchId: 'native-batch', batchOrdinal: 1 },
 		];
 		const anthropic = await converter.prepareLLMChatMessages({ chatMessages: history, chatMode: 'agent', modelSelection: { providerName: 'anthropic', modelName: 'claude-sonnet-4-0' }, instructionSnapshot: instructionSnapshot() as never });
 		const anthropicAssistant: any = anthropic.messages.find((message: any) => message.role === 'assistant');
-		assert.deepStrictEqual(anthropicAssistant.content, [{ type: 'tool_use', id: 'tool-1', name: 'fixture_tool', input: { value: 'alpha' } }]);
+		assert.deepStrictEqual(anthropicAssistant.content, [{ type: 'tool_use', id: 'tool-1', name: 'fixture_tool', input: { value: 'alpha' } }, { type: 'tool_use', id: 'tool-2', name: 'fixture_tool', input: { value: 'beta' } }]);
+		const anthropicResults: any = anthropic.messages.filter((message: any) => message.role === 'user').at(-1);
+		assert.deepStrictEqual(anthropicResults?.content, [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'alpha' }, { type: 'tool_result', tool_use_id: 'tool-2', content: 'beta' }]);
 
 		const gemini = await converter.prepareLLMChatMessages({ chatMessages: history, chatMode: 'agent', modelSelection: { providerName: 'gemini', modelName: 'gemini-2.0-flash' }, instructionSnapshot: instructionSnapshot() as never });
 		const geminiAssistant: any = gemini.messages.find((message: any) => message.role === 'model');
-		assert.deepStrictEqual(geminiAssistant.parts, [{ functionCall: { id: 'tool-1', name: 'fixture_tool', args: { value: 'alpha' } } }]);
+		assert.deepStrictEqual(geminiAssistant.parts, [{ functionCall: { id: 'tool-1', name: 'fixture_tool', args: { value: 'alpha' } } }, { functionCall: { id: 'tool-2', name: 'fixture_tool', args: { value: 'beta' } } }]);
+		const geminiResults: any = gemini.messages.filter((message: any) => message.role === 'user').at(-1);
+		assert.deepStrictEqual(geminiResults?.parts, [{ functionResponse: { id: 'tool-1', name: 'fixture_tool', response: { output: 'alpha' } } }, { functionResponse: { id: 'tool-2', name: 'fixture_tool', response: { output: 'beta' } } }]);
 
 		const xml = await converter.prepareLLMChatMessages({ chatMessages: history, chatMode: 'agent', modelSelection: { providerName: 'openAICompatible', modelName: 'fixture-xml-model' }, instructionSnapshot: instructionSnapshot() as never });
 		const xmlAssistant: any = xml.messages.find((message: any) => message.role === 'assistant');
 		assert.strictEqual(typeof xmlAssistant.content, 'string');
-		assert.strictEqual(/<fixture_tool>/.test(xmlAssistant.content), true);
+		assert.strictEqual((xmlAssistant.content.match(/<fixture_tool>/g) ?? []).length, 1);
 		assert.strictEqual(/<value>alpha<\/value>/.test(xmlAssistant.content), true);
-		for (const result of [anthropic, gemini, xml]) assert.strictEqual(JSON.stringify(result.messages).includes(INTERNAL_EMPTY_MESSAGE_SENTINEL), false);
+		for (const result of [anthropic, gemini, xml]) {
+			assert.strictEqual(JSON.stringify(result.messages).includes(INTERNAL_EMPTY_MESSAGE_SENTINEL), false);
+			for (const internal of ['toolBatch', 'batchId', 'batchOrdinal', 'native-batch']) assert.strictEqual(JSON.stringify(result.messages).includes(internal), false);
+		}
 	});
 
 	test('general reasoning-only history stays empty across every provider dialect', async () => {
@@ -659,6 +676,20 @@ suite('Assistant message lifecycle', () => {
 		second.resolve({ result: '', resolveReason: { type: 'cancelled' } }); await runB;
 		assert.strictEqual(messages.at(-1).type, 'rejected');
 		assert.strictEqual(interrupts, 2);
+
+		const mcpPending = deferred<{ result: { late: true } }>(); const mcpMessages: any[] = []; const mcpStream: any = {}; let mcpCurrent = true;
+		const mcpReceiver: any = {
+			state: { allThreads: { task: { messages: mcpMessages, state: {}, filesWithUserChanges: new Set<string>() } } }, streamState: mcpStream,
+			_activeToolCardReceiptsOfThread: new Map(), _cancellingToolReceiptsOfThread: new Map(), toolErrMsgs: { interrupted: 'Tool call was interrupted by the user.' },
+			_revokeAgentDelegation() { mcpCurrent = false; }, _toolsService: { callTool: {}, stringOfResult: {} },
+			_mcpService: { getMCPTools: () => [{ name: 'fixture_mcp', mcpServerName: 'fixture' }], callMCPTool: () => mcpPending.promise, stringifyResult: () => { throw new Error('a stopped MCP result must not stringify'); } },
+			_updateLatestTool(_threadId: string, message: any) { if (mcpMessages.length) mcpMessages[mcpMessages.length - 1] = message; else mcpMessages.push(message); },
+			_editMessageInThread(_threadId: string, index: number, message: any) { mcpMessages[index] = message; }, _setStreamState(threadId: string, value: any) { mcpStream[threadId] = value; },
+		}; Object.setPrototypeOf(mcpReceiver, ChatThreadService.prototype);
+		const mcpRun = chatLifecycle._runToolCall.call(mcpReceiver, 'task', 'fixture_mcp', 'same', 'fixture', { preapproved: true, unvalidatedToolParams: {}, validatedParams: {} }, instructionSnapshot(), undefined, false, 0, () => mcpCurrent, { batchId: 'mcp-batch', batchOrdinal: 0 });
+		await flushMicrotasks(); await chatLifecycle.abortRunning.call(mcpReceiver, 'task'); assert.deepStrictEqual({ type: mcpMessages[0].type, lifecycle: mcpMessages[0].lifecycle }, { type: 'running_now', lifecycle: 'cancelling' });
+		mcpPending.resolve({ result: { late: true } }); assert.deepStrictEqual(await mcpRun, { interrupted: true });
+		assert.deepStrictEqual({ type: mcpMessages[0].type, batchId: mcpMessages[0].batchId, batchOrdinal: mcpMessages[0].batchOrdinal }, { type: 'rejected', batchId: 'mcp-batch', batchOrdinal: 0 });
 	});
 
 	test('card Stop owns one exact live receipt without revoking a parent or sibling', async () => {
@@ -689,8 +720,8 @@ suite('Assistant message lifecycle', () => {
 			},
 			_updateLatestTool(threadId: string, message: any) {
 				const target = threadId === 'task' ? messages : otherMessages;
-				const last = target.at(-1);
-				if (last?.role === 'tool' && last.type !== 'invalid_params') target[target.length - 1] = message;
+				let liveIndex = -1; for (let index = target.length - 1; index >= 0; index--) { const candidate = target[index]; if (candidate.role === 'tool' && candidate.id === message.id && candidate.batchId === message.batchId && candidate.batchOrdinal === message.batchOrdinal && (candidate.type === 'running_now' || candidate.type === 'tool_request')) { liveIndex = index; break; } }
+				if (liveIndex >= 0) target[liveIndex] = message;
 				else target.push(message);
 			},
 			_editMessageInThread(threadId: string, index: number, message: any) {
@@ -718,14 +749,14 @@ suite('Assistant message lifecycle', () => {
 		assert.deepStrictEqual({ type: messages[0].type, result: messages[0].result, stringifyCalls }, { type: 'rejected', result: null, stringifyCalls: 0 });
 
 		const runReplacement = start('task', 'replacement'); await flushMicrotasks();
-		const replacementReceipt = messages[0].receiptId as string;
+		const replacementReceipt = messages.at(-1).receiptId as string;
 		assert.notStrictEqual(replacementReceipt, firstReceipt);
 		assert.strictEqual(chatLifecycle.cancelToolReceipt.call(receiver, 'task', firstReceipt, 'same-provider-id'), false);
 		assert.strictEqual(interrupts.replacement, 0);
 		assert.strictEqual(chatLifecycle.cancelToolReceipt.call(receiver, 'task', replacementReceipt, 'same-provider-id'), true);
 		replacement.resolve({ result: '', resolveReason: { type: 'cancelled' } });
 		assert.deepStrictEqual(await runReplacement, { receiptCancelled: true });
-		assert.strictEqual(messages[0].type, 'rejected');
+		assert.strictEqual(messages.at(-1).type, 'rejected');
 
 		sibling.resolve({ result: 'unrelated finished', resolveReason: { type: 'done', exitCode: 0 } });
 		await runSibling;
@@ -783,7 +814,7 @@ suite('Assistant message lifecycle', () => {
 			_settingsService: { state: { globalSettings: { chatMode: 'agent' } } },
 			_convertToLLMMessagesService: { prepareLLMChatMessages: async () => ({ messages: [], separateSystemMessage: false }) },
 			_llmMessageService: {
-				sendLLMMessage: (options: any) => { const call = ++sends; queueMicrotask(() => void options.onFinalMessage({ fullText: call === 1 ? '' : 'continued', fullReasoning: '', toolCall: call === 1 ? { name: 'run_command', id: 'same', rawParams: { command: 'cancelled', terminalId: 'terminal' } } : undefined, anthropicReasoning: null })); return `provider-${call}`; },
+				sendLLMMessage: (options: any) => { const call = ++sends; queueMicrotask(() => void options.onFinalMessage({ fullText: call === 1 ? '' : 'continued', fullReasoning: '', toolCalls: call === 1  ? [{ name: 'run_command', id: 'same', rawParams: { command: 'cancelled', terminalId: 'terminal' } }] : undefined, anthropicReasoning: null })); return `provider-${call}`; },
 				abort() { },
 			},
 			_mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } },
@@ -801,8 +832,8 @@ suite('Assistant message lifecycle', () => {
 			state: { allThreads: { task: { messages, state: {}, filesWithUserChanges: new Set<string>() } } }, streamState,
 			_agentControlGeneration: new Map([['task', 0]]), _parentRunTokenOfThread: new Map(), _agentDelegationAuthorityOfThread: new Map(),
 			_settingsService: { state: { globalSettings: { chatMode: 'agent' } } }, _convertToLLMMessagesService: { prepareLLMChatMessages: async () => ({ messages: [], separateSystemMessage: false }) },
-			_llmMessageService: { sendLLMMessage: (options: any) => { const n = ++sends; queueMicrotask(() => void options.onFinalMessage({ fullText: '', fullReasoning: '', toolCall: { name: 'run_command', id: `provider-${n}`, rawParams: n % 2 ? { command: 'false', terminalId: `generated-${n}`, cwd: null } : { cwd: null, terminalId: `generated-${n}`, command: 'false' } }, anthropicReasoning: null })); return `request-${n}`; }, abort() { } },
-			_mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } }, _setStreamState(threadId: string, value: any) { streamState[threadId] = value; }, _addMessageToThread(_threadId: string, message: any) { messages.push(message); },
+			_llmMessageService: { sendLLMMessage: (options: any) => { const n = ++sends; queueMicrotask(() => void options.onFinalMessage({ fullText: '', fullReasoning: '', toolCalls: [{ name: 'run_command', id: `provider-${n}`, rawParams: n % 2 ? { command: 'false', terminalId: `generated-${n}`, cwd: null } : { cwd: null, terminalId: `generated-${n}`, command: 'false' } }], anthropicReasoning: null })); return `request-${n}`; }, abort() { } },
+			_mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } }, _setStreamState(threadId: string, value: any) { streamState[threadId] = value; }, _addMessageToThread(_threadId: string, message: any) { messages.push(message); }, _terminalizeBatchTailAfter(...args: any[]) { return (ChatThreadService.prototype as any)._terminalizeBatchTailAfter.call(this, ...args); },
 			_runToolCall: async () => ({ failure: 'terminal_exit_1', validatedParams: { command: 'false', cwd: null, terminalId: `validated-${++toolRuns}` }, interrupted: false }),
 		};
 		await runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot });
@@ -817,7 +848,7 @@ suite('Assistant message lifecycle', () => {
 			['successful calls', [{ params: { command: 'false', cwd: null, terminalId: 'a' } }, { params: { command: 'false', cwd: null, terminalId: 'b' } }, { params: { command: 'false', cwd: null, terminalId: 'c' } }]],
 		] as const) {
 			const streamState: any = {}; let sends = 0; let runs = 0;
-			const receiver: any = { state: { allThreads: { task: { messages: [{ role: 'user', content: label }], state: {}, filesWithUserChanges: new Set<string>() } } }, streamState, _agentControlGeneration: new Map([['task', 0]]), _parentRunTokenOfThread: new Map(), _agentDelegationAuthorityOfThread: new Map(), _settingsService: { state: { globalSettings: { chatMode: 'agent' } } }, _convertToLLMMessagesService: { prepareLLMChatMessages: async () => ({ messages: [], separateSystemMessage: false }) }, _llmMessageService: { sendLLMMessage: (options: any) => { const n = ++sends; queueMicrotask(() => void options.onFinalMessage({ fullText: '', fullReasoning: '', toolCall: n <= 3 ? { name: 'run_command', id: `${label}-${n}`, rawParams: outcomes[n - 1].params } : undefined, anthropicReasoning: null })); return `request-${n}`; }, abort() { } }, _mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } }, _setStreamState(id: string, value: any) { streamState[id] = value; }, _addMessageToThread() { }, _runToolCall: async () => { const outcome = outcomes[runs++]; return { interrupted: false, ...(outcome.failure ? { failure: outcome.failure } : {}), validatedParams: outcome.params }; } };
+			const receiver: any = { state: { allThreads: { task: { messages: [{ role: 'user', content: label }], state: {}, filesWithUserChanges: new Set<string>() } } }, streamState, _agentControlGeneration: new Map([['task', 0]]), _parentRunTokenOfThread: new Map(), _agentDelegationAuthorityOfThread: new Map(), _settingsService: { state: { globalSettings: { chatMode: 'agent' } } }, _convertToLLMMessagesService: { prepareLLMChatMessages: async () => ({ messages: [], separateSystemMessage: false }) }, _llmMessageService: { sendLLMMessage: (options: any) => { const n = ++sends; queueMicrotask(() => void options.onFinalMessage({ fullText: '', fullReasoning: '', toolCalls: n <= 3 ? [{ name: 'run_command', id: `${label}-${n}`, rawParams: outcomes[n - 1].params }] : undefined, anthropicReasoning: null })); return `request-${n}`; }, abort() { } }, _mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } }, _setStreamState(id: string, value: any) { streamState[id] = value; }, _addMessageToThread() { }, _runToolCall: async () => { const outcome = outcomes[runs++]; return { interrupted: false, ...(outcome.failure ? { failure: outcome.failure } : {}), validatedParams: outcome.params }; } };
 			await runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot });
 			assert.strictEqual(sends, 4, label); assert.strictEqual(runs, 3, label); assert.strictEqual(streamState.task.error, undefined, label);
 		}
@@ -1080,7 +1111,7 @@ suite('Assistant message lifecycle', () => {
 		const attached = receiver.submitPendingInput({ threadId: 'task', text: 'queue attachment safely', mode: 'steer', selections: [{ type: 'File', uri: URI.parse('file:///workspace/attached.ts'), language: 'typescript', state: { wasAddedAsCurrentFile: false } }] });
 		assert.strictEqual(plain.phase, 'steering');
 		assert.strictEqual(attached.phase, 'steering');
-		await callbacks[0].onFinalMessage({ fullText: '', fullReasoning: '', toolCall: { name: 'read_file', id: 'tool-a', rawParams: {} }, anthropicReasoning: null });
+		await callbacks[0].onFinalMessage({ fullText: '', fullReasoning: '', toolCalls: [{ name: 'read_file', id: 'tool-a', rawParams: {} }], anthropicReasoning: null });
 		await toolEntered.promise;
 		assert.strictEqual(messages.filter(message => message.role === 'user').length, 0);
 		toolSettled.resolve(undefined);

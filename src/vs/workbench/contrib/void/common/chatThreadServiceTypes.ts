@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------*/
 
 import { URI } from '../../../../base/common/uri.js';
-import { AnthropicReasoning, RawToolParamsObj } from './sendLLMMessageTypes.js';
+import { AnthropicReasoning, RawToolCallObj, RawToolParamsObj } from './sendLLMMessageTypes.js';
 import { ToolCallParams, ToolName, ToolResult } from './toolsServiceTypes.js';
 
 /**
@@ -48,6 +48,9 @@ export type ToolMessage<T extends ToolName> = {
 	cardStopAvailable?: boolean;
 	/** A truthful explanation when an independently cancellable receipt does not exist. */
 	cardStopUnavailableReason?: string;
+	/** Immutable identity inside a native provider multi-call declaration. */
+	batchId?: string;
+	batchOrdinal?: number;
 } & (
 		// in order of events:
 		| { type: 'invalid_params', result: null, name: T, }
@@ -85,6 +88,8 @@ export type ChatMessage =
 		reasoning: string; // reasoning from the LLM, used for step-by-step thinking
 
 		anthropicReasoning: AnthropicReasoning[] | null; // anthropic reasoning
+		/** Persisted once before any call in the native declaration executes. */
+		toolBatch?: { version: 1; batchId: string; calls: readonly RawToolCallObj[] };
 	}
 	| ToolMessage<ToolName>
 	| DecorativeCanceledTool

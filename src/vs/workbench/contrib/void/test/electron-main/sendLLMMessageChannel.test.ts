@@ -222,6 +222,7 @@ suite('Void LLM message channel lifecycle', () => {
 
 	test('OpenAI-Compatible loopback preserves native empty assistant tool-call content and reasoning-only response', async () => {
 		let requestBody: any;
+		let requestCount = 0;
 		const server = createServer((request, response) => {
 			const chunks: Buffer[] = [];
 			request.on('data', chunk => chunks.push(Buffer.from(chunk)));
@@ -229,8 +230,22 @@ suite('Void LLM message channel lifecycle', () => {
 				requestBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
 				const assistant = requestBody.messages.find((message: any) => message.role === 'assistant' && message.tool_calls?.length === 1);
 				response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'x-request-id': 'empty-tool-loopback' });
-				response.write(`data: ${JSON.stringify({ id: 'chatcmpl-empty-tool', object: 'chat.completion.chunk', created: 0, model: 'gpt-4.1', choices: [{ index: 0, delta: { role: 'assistant', content: assistant.content, reasoning_content: 'loopback reasoning' }, finish_reason: null }] })}\n\n`);
-				response.write(`data: ${JSON.stringify({ id: 'chatcmpl-empty-tool', object: 'chat.completion.chunk', created: 0, model: 'gpt-4.1', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
+				const write = (delta: any, finish_reason: string | null = null) => response.write(`data: ${JSON.stringify({ id: 'chatcmpl-empty-tool', object: 'chat.completion.chunk', created: 0, model: 'gpt-4.1', choices: [{ index: 0, delta, finish_reason }] })}\n\n`);
+				requestCount++;
+				if (requestCount === 1) {
+					write({ role: 'assistant', content: assistant.content, reasoning_content: 'loopback reasoning' });
+					write({}, 'stop');
+				}
+				else if (requestCount === 2) {
+					write({ tool_calls: [{ index: 1, id: 'tool-b', function: { name: 'tool_b', arguments: '{"b":' } }] });
+					write({ tool_calls: [{ index: 0, id: 'tool-a', function: { name: 'tool_a', arguments: '{"a":' } }] });
+					write({ tool_calls: [{ index: 1, id: 'tool-b', function: { arguments: '2}' } }] });
+					write({ tool_calls: [{ index: 0, id: 'tool-a', function: { arguments: '1}' } }] }, 'tool_calls');
+				}
+				else {
+					write({ tool_calls: [{ index: 0, id: 'first', function: { name: 'tool_a', arguments: '{}' } }] });
+					write({ tool_calls: [{ index: 0, id: 'conflict', function: { arguments: '' } }] }, 'tool_calls');
+				}
 				response.end('data: [DONE]\n\n');
 			});
 		});
@@ -257,6 +272,30 @@ suite('Void LLM message channel lifecycle', () => {
 			assert.strictEqual(finalText, '');
 			assert.strictEqual(finalReasoning, 'loopback reasoning');
 			assert.strictEqual((channel as any)._infoOfRunningRequest['empty-tool-loopback'], undefined);
+			const successChannel = new LLMMessageChannel(metrics);
+			const successfulTools = await new Promise<any[]>((resolve, reject) => {
+				const timer = setTimeout(() => reject(new Error('interleaved tool loopback timed out')), 2_000);
+				successChannel.listen(undefined, 'onFinalMessage_sendLLMMessage')(event => {
+					if (event.requestId !== 'interleaved-tools') return;
+					clearTimeout(timer); resolve(event.toolCalls);
+				});
+				successChannel.listen(undefined, 'onError_sendLLMMessage')(event => event.requestId === 'interleaved-tools' && reject(new Error(event.message)));
+				(successChannel as any)._callSendLLMMessage(emptyToolParams('interleaved-tools', `http://127.0.0.1:${address.port}/v1`));
+			});
+			assert.deepStrictEqual(successfulTools.map(tool => [tool.id, tool.name, tool.rawParams]), [['tool-a', 'tool_a', { a: 1 }], ['tool-b', 'tool_b', { b: 2 }]]);
+			const conflictChannel = new LLMMessageChannel(metrics);
+			let conflictFinals = 0;
+			const conflictMessage = await new Promise<string>((resolve, reject) => {
+				const timer = setTimeout(() => reject(new Error('conflicting tool loopback timed out')), 2_000);
+				conflictChannel.listen(undefined, 'onFinalMessage_sendLLMMessage')(event => { if (event.requestId === 'conflicting-tools') conflictFinals++; });
+				conflictChannel.listen(undefined, 'onError_sendLLMMessage')(event => {
+					if (event.requestId !== 'conflicting-tools') return;
+					clearTimeout(timer); resolve(event.message);
+				});
+				(conflictChannel as any)._callSendLLMMessage(emptyToolParams('conflicting-tools', `http://127.0.0.1:${address.port}/v1`));
+			});
+			assert.match(conflictMessage, /conflicting tool-call batch/);
+			assert.strictEqual(conflictFinals, 0);
 		}
 		finally {
 			server.closeAllConnections?.();
