@@ -8,7 +8,7 @@ import { IEditorService } from '../../../services/editor/common/editorService.js
 import { ChatMessage } from '../common/chatThreadServiceTypes.js';
 import { getIsReasoningEnabledState, getReservedOutputTokenSpace, getModelCapabilities } from '../common/modelCapabilities.js';
 import { reParsedToolXMLString, chat_systemMessage } from '../common/prompt/prompts.js';
-import { AnthropicLLMChatMessage, AnthropicReasoning, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, OpenAILLMChatMessage, RawToolParamsObj } from '../common/sendLLMMessageTypes.js';
+import { AnthropicLLMChatMessage, AnthropicReasoning, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, OpenAILLMChatMessage, RawToolCallObj, RawToolParamsObj } from '../common/sendLLMMessageTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { ChatMode, FeatureName, ModelSelection, ProviderName } from '../common/voidSettingsTypes.js';
 import { IDirectoryStrService } from '../common/directoryStrService.js';
@@ -51,6 +51,96 @@ const TRIM_TO_LEN = 120
 export const estimateHistoryTokensForReadBudget = (history: readonly unknown[]) => Math.ceil(JSON.stringify(history).length / CHARS_PER_TOKEN)
 export const protectedSkillResourceHistoryLength = (history: readonly ChatMessage[]) => history.reduce((total, message) => total + (message.role === 'tool' && message.type === 'success' && isReadSkillResourceToolName(message.name) ? message.content.length : 0), 0)
 
+const canonicalNativeToolValue = (value: unknown, ancestors: Set<object>): string => {
+	if (value === null) return 'null'
+	if (typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value)
+	if (typeof value === 'number') {
+		if (!Number.isFinite(value)) throw new Error('native_tool_batch_invalid_raw_params')
+		return JSON.stringify(value)
+	}
+	if (typeof value !== 'object') throw new Error('native_tool_batch_invalid_raw_params')
+	if (ancestors.has(value)) throw new Error('native_tool_batch_invalid_raw_params')
+	ancestors.add(value)
+	try {
+		if (Array.isArray(value)) {
+			const items: string[] = []
+			for (let index = 0; index < value.length; index++) {
+				if (!Object.prototype.hasOwnProperty.call(value, index)) throw new Error('native_tool_batch_invalid_raw_params')
+				items.push(canonicalNativeToolValue(value[index], ancestors))
+			}
+			return `[${items.join(',')}]`
+		}
+		const prototype = Object.getPrototypeOf(value)
+		if ((prototype !== Object.prototype && prototype !== null) || Object.getOwnPropertySymbols(value).length) throw new Error('native_tool_batch_invalid_raw_params')
+		const record = value as Record<string, unknown>
+		return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${canonicalNativeToolValue(record[key], ancestors)}`).join(',')}}`
+	} finally {
+		ancestors.delete(value)
+	}
+}
+
+/** Canonical JSON-object identity for provider-declared raw arguments. Object key
+ * order is irrelevant; non-JSON, cyclic and non-object roots fail closed. */
+export const canonicalNativeToolRawParams = (value: RawToolParamsObj): string => {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('native_tool_batch_invalid_raw_params')
+	return canonicalNativeToolValue(value, new Set())
+}
+
+const terminalNativeToolRowTypes = new Set(['success', 'tool_error', 'rejected', 'invalid_params', 'skipped'])
+
+/** Bind one durable row to exactly one native declaration. Earlier ordinals must be
+ * contiguous terminal rows with the same declared id/name/raw arguments. Callers add
+ * their own current-row state requirement (approval or terminal). */
+export const validateNativeToolBatchRowIdentity = (
+	messages: readonly ChatMessage[],
+	row: Extract<ChatMessage, { role: 'tool' }>,
+): Readonly<{ declaration: Extract<ChatMessage, { role: 'assistant' }>; declarationIndex: number; call: RawToolCallObj; rowIndex: number }> | undefined => {
+	if (!row.batchId || !Number.isInteger(row.batchOrdinal) || row.batchOrdinal! < 0) return undefined
+	const declarations = messages.map((message, index) => ({ message, index })).filter(({ message }) => message.role === 'assistant' && message.toolBatch?.batchId === row.batchId)
+	if (declarations.length !== 1) return undefined
+	const { message: declaration, index: declarationIndex } = declarations[0]
+	if (declaration.role !== 'assistant' || !declaration.toolBatch) return undefined
+	const { version, batchId, calls } = declaration.toolBatch
+	if (version !== 1 || !batchId || calls.length === 0 || calls.some(call => !call.id || !call.name) || new Set(calls.map(call => call.id)).size !== calls.length) return undefined
+	try { for (const call of calls) canonicalNativeToolRawParams(call.rawParams) } catch { return undefined }
+	const batchOrdinal = row.batchOrdinal!
+	const call = calls[batchOrdinal]
+	const rowIndex = declarationIndex + 1 + batchOrdinal
+	if (!call || messages[rowIndex] !== row || call.id !== row.id || call.name !== row.name) return undefined
+	try { if (canonicalNativeToolRawParams(call.rawParams) !== canonicalNativeToolRawParams(row.rawParams)) return undefined } catch { return undefined }
+	for (let ordinal = 0; ordinal < batchOrdinal; ordinal++) {
+		const priorCall = calls[ordinal]
+		const prior = messages[declarationIndex + 1 + ordinal]
+		if (!prior || prior.role !== 'tool' || !terminalNativeToolRowTypes.has(prior.type) || prior.batchId !== batchId || prior.batchOrdinal !== ordinal || prior.id !== priorCall.id || prior.name !== priorCall.name) return undefined
+		try { if (canonicalNativeToolRawParams(priorCall.rawParams) !== canonicalNativeToolRawParams(prior.rawParams)) return undefined } catch { return undefined }
+	}
+	return { declaration, declarationIndex, call, rowIndex }
+}
+
+/** A pending approval without batch fields is legacy only when every native batch
+ * already present in the same history is independently closed and valid. This keeps
+ * partially erased/corrupted native identities from falling through to legacy replay. */
+export const requiresNativeToolBatchRowIdentity = (
+	messages: readonly ChatMessage[],
+	row: Extract<ChatMessage, { role: 'tool' }>,
+): boolean => {
+	if (row.batchId !== undefined || row.batchOrdinal !== undefined) return true
+	if (!messages.includes(row)) return false
+	for (const message of messages) {
+		if (message.role === 'assistant' && message.toolBatch) {
+			const { version, batchId, calls } = message.toolBatch
+			if (version !== 1 || !batchId || calls.length === 0 || calls.some(call => !call.id || !call.name) || new Set(calls.map(call => call.id)).size !== calls.length) return true
+			for (const [batchOrdinal] of calls.entries()) {
+				const candidate = messages[messages.indexOf(message) + 1 + batchOrdinal]
+				if (candidate === row) return true
+				if (!candidate || candidate.role !== 'tool' || !terminalNativeToolRowTypes.has(candidate.type) || !validateNativeToolBatchRowIdentity(messages, candidate)) return true
+			}
+		}
+		if (message !== row && message.role === 'tool' && (message.batchId !== undefined || message.batchOrdinal !== undefined) && !validateNativeToolBatchRowIdentity(messages, message)) return true
+	}
+	return false
+}
+
 /** Build a conversion-only closed copy for selected-Skill resource admission. The
  * provider declared the whole native batch before any call ran, while admission must
  * size the resource immediately after its own success. Later calls therefore receive
@@ -62,16 +152,12 @@ export const closeNativeToolBatchForProspectiveAdmission = (
 ): ChatMessage[] => {
 	const prospective = [...messages]
 	if (!batchRef) return prospective
-	const declarations = prospective.map((message, index) => ({ message, index })).filter(({ message }) => message.role === 'assistant' && message.toolBatch?.batchId === batchRef.batchId)
-	if (declarations.length !== 1) throw new Error('native_tool_batch_unclosed')
-	const { message: declaration, index: declarationIndex } = declarations[0]
-	if (declaration.role !== 'assistant' || !declaration.toolBatch) throw new Error('native_tool_batch_unclosed')
-	const currentCall = declaration.toolBatch.calls[batchRef.batchOrdinal]
-	const currentIndex = declarationIndex + 1 + batchRef.batchOrdinal
-	const current = prospective[currentIndex]
-	if (!currentCall || currentIndex !== prospective.length - 1 || !current || current.role !== 'tool' || current.type !== 'success' || !isReadSkillResourceToolName(current.name) || current.batchId !== batchRef.batchId || current.batchOrdinal !== batchRef.batchOrdinal || current.id !== currentCall.id || current.name !== currentCall.name) throw new Error('native_tool_batch_unclosed')
-	for (let batchOrdinal = batchRef.batchOrdinal + 1; batchOrdinal < declaration.toolBatch.calls.length; batchOrdinal++) {
-		const call = declaration.toolBatch.calls[batchOrdinal]
+	const current = prospective.at(-1)
+	if (!current || current.role !== 'tool' || current.type !== 'success' || !isReadSkillResourceToolName(current.name) || current.batchId !== batchRef.batchId || current.batchOrdinal !== batchRef.batchOrdinal) throw new Error('native_tool_batch_unclosed')
+	const identity = validateNativeToolBatchRowIdentity(prospective, current)
+	if (!identity || identity.rowIndex !== prospective.length - 1 || !identity.declaration.toolBatch) throw new Error('native_tool_batch_unclosed')
+	for (let batchOrdinal = batchRef.batchOrdinal + 1; batchOrdinal < identity.declaration.toolBatch.calls.length; batchOrdinal++) {
+		const call = identity.declaration.toolBatch.calls[batchOrdinal]
 		prospective.push({ role: 'tool', type: 'skipped', content: 'Prospective resource admission placeholder; not persisted.', id: call.id, rawParams: call.rawParams, mcpServerName: undefined, name: call.name, result: null, batchId: batchRef.batchId, batchOrdinal })
 	}
 	return prospective
@@ -91,7 +177,7 @@ const assertClosedNativeToolBatches = (messages: readonly ChatMessage[]): void =
 		declared.add(batchId);
 		for (const [batchOrdinal, call] of calls.entries()) {
 			const row = messages[++index];
-			if (!row || row.role !== 'tool' || row.batchId !== batchId || row.batchOrdinal !== batchOrdinal || row.id !== call.id || row.name !== call.name || !['success', 'tool_error', 'rejected', 'invalid_params', 'skipped'].includes(row.type)) throw new Error('native_tool_batch_unclosed');
+			if (!row || row.role !== 'tool' || !terminalNativeToolRowTypes.has(row.type) || !validateNativeToolBatchRowIdentity(messages, row) || row.batchId !== batchId || row.batchOrdinal !== batchOrdinal || row.id !== call.id || row.name !== call.name) throw new Error('native_tool_batch_unclosed');
 		}
 	}
 }

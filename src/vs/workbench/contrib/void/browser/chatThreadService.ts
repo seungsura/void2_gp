@@ -17,7 +17,7 @@ import { generateUuid } from '../../../../base/common/uuid.js';
 import { FeatureName, ModelSelection, ModelSelectionOptions, SettingsOfProvider } from '../common/voidSettingsTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { getIsReasoningEnabledState, getModelCapabilities, getReservedOutputTokenSpace } from '../common/modelCapabilities.js';
-import { closeNativeToolBatchForProspectiveAdmission, estimateHistoryTokensForReadBudget, protectedSkillResourceHistoryLength } from './convertToLLMMessageService.js';
+import { closeNativeToolBatchForProspectiveAdmission, estimateHistoryTokensForReadBudget, protectedSkillResourceHistoryLength, requiresNativeToolBatchRowIdentity, validateNativeToolBatchRowIdentity } from './convertToLLMMessageService.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, BuiltinToolResultType, ToolCallParams, ToolName, ToolResult } from '../common/toolsServiceTypes.js';
 import { computeMaxReadOutputTokens, isBoundedReadHistory, isBoundedReadHistoryString } from '../common/readFileReliability.js';
 import { IToolsService } from './toolsServiceInterface.js';
@@ -78,6 +78,18 @@ type ParentRunOwnership = Readonly<{ token: symbol; runId: string; generation: n
 /** Durable identity of a call within one native provider declaration. Provider ids are
  * only unique inside that declaration, so they are never sufficient row identity. */
 type BatchCallRef = Readonly<{ batchId: string; batchOrdinal: number }>;
+const skippedPendingToolRow = (message: ToolMessage<ToolName> & { type: 'tool_request' }, content: string): ToolMessage<ToolName> => ({
+	role: 'tool',
+	type: 'skipped',
+	name: message.name,
+	content,
+	result: null,
+	id: message.id,
+	rawParams: message.rawParams,
+	mcpServerName: message.mcpServerName,
+	...(message.batchId === undefined ? {} : { batchId: message.batchId }),
+	...(message.batchOrdinal === undefined ? {} : { batchOrdinal: message.batchOrdinal }),
+})
 /** Ephemeral authority for a single live card. The provider tool id is not unique across
  * parent runs, so only this generated receipt may stop the operation. */
 type ActiveToolCardReceipt = {
@@ -946,11 +958,17 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 					continue
 				}
 				if (message.type !== 'tool_request') continue
-				if (!ref) { pendingApproval = message; continue }
-				const declaration = messages.find((candidate): candidate is Extract<ChatMessage, { role: 'assistant' }> => candidate.role === 'assistant' && candidate.toolBatch?.batchId === ref.batchId)?.toolBatch
-				const valid = !!declaration && declaration.calls[ref.batchOrdinal]?.id === message.id && declaration.calls.slice(0, ref.batchOrdinal).every((call, ordinal) => messages.some(row => row.role === 'tool' && row.id === call.id && row.batchId === ref.batchId && row.batchOrdinal === ordinal && row.type !== 'running_now' && row.type !== 'tool_request'))
+				const requiresNativeIdentity = requiresNativeToolBatchRowIdentity(messages, message)
+				if (!requiresNativeIdentity) { pendingApproval = message; continue }
+				const identity = validateNativeToolBatchRowIdentity(messages, message)
+				const valid = !!identity && identity.rowIndex === messages.length - 1
 				if (valid && !pendingApproval) pendingApproval = message
-				else this._terminalizeBatchTail(threadId, ref.batchId, 'Native tool batch could not be resumed after restart.')
+				else {
+					const reason = 'Native tool batch could not be resumed after restart.'
+					const index = messages.indexOf(message)
+					if (index >= 0 && messages[index] === message) this._editMessageInThread(threadId, index, skippedPendingToolRow(message, reason))
+					if (ref) this._terminalizeBatchTail(threadId, ref.batchId, reason)
+				}
 			}
 			if (pendingApproval) this._setStreamState(threadId, { isRunning: 'awaiting_user' })
 
@@ -1822,8 +1840,37 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 		// before enter loop, call tool
 		if (callThisToolFirst) {
-			const callRef = callThisToolFirst.batchId === undefined || callThisToolFirst.batchOrdinal === undefined ? undefined : { batchId: callThisToolFirst.batchId, batchOrdinal: callThisToolFirst.batchOrdinal }
-			const current = await this._runToolCall(threadId, callThisToolFirst.name, callThisToolFirst.id, callThisToolFirst.mcpServerName, { preapproved: true, unvalidatedToolParams: callThisToolFirst.rawParams, validatedParams: callThisToolFirst.params }, snapshot, agentDelegationAuthority, chatMode === 'agent', agentRunGeneration, isCurrentRun, callRef)
+			const persistedMessages = this.state.allThreads[threadId]?.messages ?? []
+			const suppliedCallRef = typeof callThisToolFirst.batchId === 'string' && callThisToolFirst.batchId.length > 0 && Number.isInteger(callThisToolFirst.batchOrdinal) && callThisToolFirst.batchOrdinal! >= 0
+				? { batchId: callThisToolFirst.batchId, batchOrdinal: callThisToolFirst.batchOrdinal! }
+				: undefined
+			const requiresNativeIdentity = requiresNativeToolBatchRowIdentity(persistedMessages, callThisToolFirst)
+			const persistedIdentity = requiresNativeIdentity ? validateNativeToolBatchRowIdentity(persistedMessages, callThisToolFirst) : undefined
+			const invalidPendingBatch = 'The pending native tool batch no longer matches its declaration.'
+			if (requiresNativeIdentity && (!persistedIdentity || persistedIdentity.rowIndex !== persistedMessages.length - 1)) {
+				const index = persistedMessages.indexOf(callThisToolFirst)
+				if (index >= 0 && persistedMessages[index] === callThisToolFirst) this._editMessageInThread(threadId, index, skippedPendingToolRow(callThisToolFirst, invalidPendingBatch))
+				if (suppliedCallRef) this._terminalizeBatchTailAfter(threadId, suppliedCallRef, invalidPendingBatch)
+				this._setStreamState(threadId, { isRunning: undefined, error: { message: invalidPendingBatch, fullError: null } })
+				return
+			}
+			const callRef = persistedIdentity ? { batchId: persistedIdentity.declaration.toolBatch!.batchId, batchOrdinal: callThisToolFirst.batchOrdinal! } : undefined
+			const authoritativeRawParams = persistedIdentity?.call.rawParams ?? callThisToolFirst.rawParams
+			let authoritativeValidatedParams = callThisToolFirst.params
+			if (persistedIdentity) {
+				try {
+					authoritativeValidatedParams = isABuiltinToolName(callThisToolFirst.name)
+						? this._toolsService.validateParams[callThisToolFirst.name](authoritativeRawParams)
+						: authoritativeRawParams as ToolCallParams<ToolName>
+				} catch {
+					const index = persistedMessages.indexOf(callThisToolFirst)
+					if (index >= 0 && persistedMessages[index] === callThisToolFirst) this._editMessageInThread(threadId, index, skippedPendingToolRow(callThisToolFirst, invalidPendingBatch))
+					if (callRef) this._terminalizeBatchTailAfter(threadId, callRef, invalidPendingBatch)
+					this._setStreamState(threadId, { isRunning: undefined, error: { message: invalidPendingBatch, fullError: null } })
+					return
+				}
+			}
+			const current = await this._runToolCall(threadId, callThisToolFirst.name, callThisToolFirst.id, callThisToolFirst.mcpServerName, { preapproved: true, unvalidatedToolParams: authoritativeRawParams, validatedParams: authoritativeValidatedParams }, snapshot, agentDelegationAuthority, chatMode === 'agent', agentRunGeneration, isCurrentRun, callRef)
 			if (!isCurrentRun()) return
 			if (current.interrupted) {
 				this._setStreamState(threadId, undefined)
@@ -1836,7 +1883,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			// assistant row so reload never needs a mutable cursor and cannot replay the
 			// already-approved call.
 			if (!current.receiptCancelled && callThisToolFirst.batchId !== undefined && callThisToolFirst.batchOrdinal !== undefined) {
-				const declaration = (this.state.allThreads[threadId]?.messages ?? []).find((message): message is Extract<ChatMessage, { role: 'assistant' }> => message.role === 'assistant' && message.toolBatch?.batchId === callThisToolFirst.batchId)?.toolBatch
+				const declaration = persistedIdentity?.declaration.toolBatch
 				if (!declaration || declaration.calls[callThisToolFirst.batchOrdinal]?.id !== callThisToolFirst.id) {
 					this._setStreamState(threadId, { isRunning: undefined, error: { message: 'The pending native tool batch no longer matches its declaration.', fullError: null } })
 					return

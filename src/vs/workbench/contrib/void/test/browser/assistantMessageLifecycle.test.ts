@@ -494,12 +494,12 @@ suite('Assistant message lifecycle', () => {
 			assert.strictEqual(JSON.stringify(result.messages).includes(INTERNAL_EMPTY_MESSAGE_SENTINEL), false);
 		}
 		await assert.rejects(() => converter.prepareLLMChatMessages({ chatMessages: history.slice(0, -1), chatMode: 'agent', modelSelection: { providerName: 'openAI', modelName: 'gpt-4.1' }, instructionSnapshot: instructionSnapshot() as never }), /native_tool_batch_unclosed/);
-		const skipped = [...history.slice(0, 2), { role: 'tool', type: 'success', name: 'fixture_tool', params: { value: 'alpha' }, content: 'alpha', id: 'tool-1', rawParams: { value: 'alpha' }, result: 'alpha', mcpServerName: 'fixture-server', batchId: 'native-batch', batchOrdinal: 0 }, { role: 'tool', type: 'skipped', name: 'fixture_tool', content: 'cancelled before start', id: 'tool-2', rawParams: { malformed: true }, result: null, mcpServerName: 'fixture-server', batchId: 'native-batch', batchOrdinal: 1 }];
+		const skipped = [...history.slice(0, 2), { role: 'tool', type: 'success', name: 'fixture_tool', params: { value: 'alpha' }, content: 'alpha', id: 'tool-1', rawParams: { value: 'alpha' }, result: 'alpha', mcpServerName: 'fixture-server', batchId: 'native-batch', batchOrdinal: 0 }, { role: 'tool', type: 'skipped', name: 'fixture_tool', content: 'cancelled before start', id: 'tool-2', rawParams: { value: 'beta' }, result: null, mcpServerName: 'fixture-server', batchId: 'native-batch', batchOrdinal: 1 }];
 		const skippedResult = await converter.prepareLLMChatMessages({ chatMessages: skipped, chatMode: 'agent', modelSelection: { providerName: 'openAI', modelName: 'gpt-4.1' }, instructionSnapshot: instructionSnapshot() as never }); assert.deepStrictEqual(skippedResult.messages.filter((message: any) => message.role === 'tool').map((message: any) => message.tool_call_id), ['tool-1', 'tool-2']);
 		const resourceBatch: any[] = [
 			{ role: 'user', content: 'admit a resource', displayContent: 'admit a resource' },
 			{ role: 'assistant', displayContent: '', reasoning: '', anthropicReasoning: null, toolBatch: { version: 1, batchId: 'resource-batch', calls: [{ id: 'resource-0', name: 'read_skill_resource', rawParams: { skill: 'demo', resource_path: 'guide.md' } }, { id: 'later-1', name: 'fixture_tool', rawParams: { value: 'later' } }] } },
-			{ role: 'tool', type: 'success', name: 'read_skill_resource', params: { skill: 'demo', resourcePath: 'guide.md' }, content: 'resource body', id: 'resource-0', rawParams: { skill: 'demo', resource_path: 'guide.md' }, result: 'resource body', mcpServerName: undefined, batchId: 'resource-batch', batchOrdinal: 0 },
+			{ role: 'tool', type: 'success', name: 'read_skill_resource', params: { skill: 'demo', resourcePath: 'guide.md' }, content: 'resource body', id: 'resource-0', rawParams: { resource_path: 'guide.md', skill: 'demo' }, result: 'resource body', mcpServerName: undefined, batchId: 'resource-batch', batchOrdinal: 0 },
 		];
 		const prospectiveResource = closeNativeToolBatchForProspectiveAdmission(resourceBatch, { batchId: 'resource-batch', batchOrdinal: 0 });
 		assert.deepStrictEqual(prospectiveResource.filter(message => message.role === 'tool').map((message: any) => [message.id, message.type, Object.prototype.hasOwnProperty.call(message, 'params')]), [['resource-0', 'success', true], ['later-1', 'skipped', false]]);
@@ -511,6 +511,8 @@ suite('Assistant message lifecycle', () => {
 			[history[0], { ...history[1], toolBatch: { ...history[1].toolBatch, calls: [{ ...history[1].toolBatch.calls[0] }, { ...history[1].toolBatch.calls[0] }] } }, ...history.slice(2)],
 			[history[0], history[1], history[2], { ...history[3], batchOrdinal: 0 }],
 			[history[0], history[1], history[2], { ...history[3], name: 'other_tool' }],
+			[history[0], history[1], history[2], { ...history[3], rawParams: { value: 'different' } }],
+			[history[0], { ...history[1], toolBatch: { ...history[1].toolBatch, calls: [{ ...history[1].toolBatch.calls[0], rawParams: { value: Number.POSITIVE_INFINITY } }, history[1].toolBatch.calls[1]] } }, ...history.slice(2)],
 			[history[0], history[1], { ...history[2], batchId: undefined }, history[3]],
 			[history[0], history[1], history[2], { role: 'user', content: 'interleaved', displayContent: 'interleaved' }, history[3]],
 			[...history, { ...history[2], batchId: 'orphan', batchOrdinal: 0 }],
@@ -865,6 +867,7 @@ suite('Assistant message lifecycle', () => {
 				state: { allThreads: { task: { messages, state: {}, filesWithUserChanges: new Set<string>() } } }, streamState: resumedStream,
 				_agentControlGeneration: new Map([['task', 0]]), _parentRunTokenOfThread: new Map(), _agentDelegationAuthorityOfThread: new Map(),
 				_settingsService: { state: { globalSettings: { chatMode: 'agent' } } }, _convertToLLMMessagesService: { prepareLLMChatMessages: async () => ({ messages: [], separateSystemMessage: false }) },
+				_toolsService: { validateParams: { run_command: (raw: any) => ({ command: raw.command, terminalId: raw.terminalId }) } },
 				_llmMessageService: { sendLLMMessage: (options: any) => { resumedSends++; queueMicrotask(() => void options.onFinalMessage({ fullText: 'continued once', fullReasoning: '', anthropicReasoning: null })); return 'continued-request'; }, abort() { } },
 				_mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } }, _computeMCPServerOfToolName: () => undefined,
 				_setStreamState(id: string, value: any) { resumedStream[id] = value; }, _addMessageToThread(_id: string, message: any) { messages.push(message); }, _editMessageInThread(_id: string, index: number, message: any) { messages[index] = message; },
@@ -888,8 +891,66 @@ suite('Assistant message lifecycle', () => {
 			assert.strictEqual(resumedStream.task.error, undefined);
 		}
 
+		const corruptDeclaration = { role: 'assistant', displayContent: '', reasoning: '', anthropicReasoning: null, toolBatch: { version: 1, batchId: 'corrupt-batch', calls: [
+			{ name: 'run_command', id: 'corrupt-0', rawParams: { command: 'echo prior', terminalId: 'corrupt-0' } },
+			{ name: 'run_command', id: 'corrupt-1', rawParams: { command: 'echo approved', terminalId: 'corrupt-1' } },
+			{ name: 'run_command', id: 'corrupt-2', rawParams: { command: 'echo tail', terminalId: 'corrupt-2' } },
+		] } };
+		const corruptPrior = { role: 'tool', type: 'success', name: 'run_command', params: { command: 'echo prior', terminalId: 'corrupt-0' }, content: 'prior', result: 'prior', id: 'corrupt-0', rawParams: { command: 'echo prior', terminalId: 'corrupt-0' }, mcpServerName: undefined, batchId: 'corrupt-batch', batchOrdinal: 0 };
+		const corruptPending = { role: 'tool', type: 'tool_request', name: 'run_command', params: { command: 'echo approved', terminalId: 'corrupt-1' }, content: '(Awaiting user permission...)', result: null, id: 'corrupt-1', rawParams: { command: 'echo approved', terminalId: 'corrupt-1' }, mcpServerName: undefined, batchId: 'corrupt-batch', batchOrdinal: 1 };
+		const corruptHistories: Array<{ label: string; messages: any[] }> = [
+			{ label: 'duplicate declaration', messages: [{ role: 'user', content: 'corrupt', displayContent: 'corrupt' }, corruptDeclaration, corruptPrior, { ...corruptDeclaration }, { ...corruptPending }] },
+			{ label: 'wrong call name', messages: [{ role: 'user', content: 'corrupt', displayContent: 'corrupt' }, corruptDeclaration, corruptPrior, { ...corruptPending, name: 'write_file' }] },
+			{ label: 'raw argument mismatch', messages: [{ role: 'user', content: 'corrupt', displayContent: 'corrupt' }, corruptDeclaration, corruptPrior, { ...corruptPending, rawParams: { command: 'echo changed', terminalId: 'corrupt-1' } }] },
+			{ label: 'missing prior row', messages: [{ role: 'user', content: 'corrupt', displayContent: 'corrupt' }, corruptDeclaration, { ...corruptPending }] },
+			{ label: 'interleaved prior rows', messages: [{ role: 'user', content: 'corrupt', displayContent: 'corrupt' }, corruptDeclaration, corruptPrior, { role: 'user', content: 'interleaved', displayContent: 'interleaved' }, { ...corruptPending }] },
+			{ label: 'partial batch identity', messages: [{ role: 'user', content: 'corrupt', displayContent: 'corrupt' }, corruptDeclaration, corruptPrior, { ...corruptPending, batchOrdinal: undefined }] },
+			{ label: 'erased batch identity', messages: [{ role: 'user', content: 'corrupt', displayContent: 'corrupt' }, corruptDeclaration, corruptPrior, { ...corruptPending, batchId: undefined, batchOrdinal: undefined }] },
+			{ label: 'legacy approval after unrelated corrupt native history', messages: [{ role: 'user', content: 'corrupt', displayContent: 'corrupt' }, corruptDeclaration, { role: 'user', content: 'legacy follows corruption', displayContent: 'legacy follows corruption' }, { ...corruptPending, id: 'legacy-pending', batchId: undefined, batchOrdinal: undefined }] },
+		];
+		for (const { label, messages } of corruptHistories) {
+			const rejectedStream: any = {}; let rejectedRuns = 0; let rejectedConversions = 0; let rejectedSends = 0;
+			const rejected: any = {
+				state: { allThreads: { task: { messages, state: {}, filesWithUserChanges: new Set<string>() } } }, streamState: rejectedStream,
+				_agentControlGeneration: new Map([['task', 0]]), _parentRunTokenOfThread: new Map(), _agentDelegationAuthorityOfThread: new Map(),
+				_settingsService: { state: { globalSettings: { chatMode: 'agent' } } },
+				_convertToLLMMessagesService: { prepareLLMChatMessages: async () => { rejectedConversions++; return { messages: [], separateSystemMessage: false }; } },
+				_llmMessageService: { sendLLMMessage: () => { rejectedSends++; throw new Error('corrupt approval must not send'); }, abort() { } },
+				_mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } }, _computeMCPServerOfToolName: () => undefined,
+				_setStreamState(id: string, value: any) { rejectedStream[id] = value; }, _editMessageInThread(_id: string, index: number, message: any) { messages[index] = message; }, _addMessageToThread(_id: string, message: any) { messages.push(message); },
+				_terminalizeBatchTailAfter(...args: any[]) { return (ChatThreadService.prototype as any)._terminalizeBatchTailAfter.call(this, ...args); },
+				_runToolCall: async () => { rejectedRuns++; return {}; },
+			};
+			const pending = messages.at(-1);
+			await runChatAgent(rejected, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot, callThisToolFirst: pending });
+			const settled = messages.find(message => message.id === pending.id);
+			const shouldCloseTail = pending.batchId !== undefined && pending.batchOrdinal !== undefined;
+			assert.deepStrictEqual({ label, rejectedRuns, rejectedConversions, rejectedSends, type: settled.type, hasParams: Object.prototype.hasOwnProperty.call(settled, 'params'), tail: messages.find(message => message.id === 'corrupt-2')?.type, error: rejectedStream.task.error.message }, { label, rejectedRuns: 0, rejectedConversions: 0, rejectedSends: 0, type: 'skipped', hasParams: false, tail: shouldCloseTail ? 'skipped' : undefined, error: 'The pending native tool batch no longer matches its declaration.' });
+		}
+
+		const restoreState = (messages: any[]) => {
+			const streamState: any = {};
+			const receiver: any = {
+				state: { allThreads: { task: { id: 'task', messages, state: {}, filesWithUserChanges: new Set<string>() } }, currentThreadId: 'task' }, streamState,
+				_onDidChangeCurrentThread: { fire() { } },
+				_setStreamState(id: string, value: any) { streamState[id] = value; }, _editMessageInThread(_id: string, index: number, message: any) { messages[index] = message; }, _addMessageToThread(_id: string, message: any) { messages.push(message); },
+				_computeMCPServerOfToolName: () => undefined,
+				_terminalizeBatchTail(...args: any[]) { return (ChatThreadService.prototype as any)._terminalizeBatchTail.call(this, ...args); },
+			};
+			(ChatThreadService.prototype as any)._setState.call(receiver, { allThreads: receiver.state.allThreads, currentThreadId: 'task' }, true);
+			return streamState;
+		};
+		const restoredCorrupt: any[] = [{ role: 'user', content: 'restore corrupt', displayContent: 'restore corrupt' }, corruptDeclaration, corruptPrior, { ...corruptPending, rawParams: { command: 'echo changed', terminalId: 'corrupt-1' } }];
+		const restoredCorruptStream = restoreState(restoredCorrupt);
+		assert.deepStrictEqual({ rows: restoredCorrupt.filter(message => message.role === 'tool').map(message => [message.id, message.type, Object.prototype.hasOwnProperty.call(message, 'params')]), stream: restoredCorruptStream.task }, { rows: [['corrupt-0', 'success', true], ['corrupt-1', 'skipped', false], ['corrupt-2', 'skipped', false]], stream: undefined });
+		const validLegacyPending = { role: 'tool', type: 'tool_request', name: 'run_command', params: { command: 'echo legacy', terminalId: 'legacy' }, content: '(Awaiting user permission...)', result: null, id: 'legacy', rawParams: { command: 'echo legacy', terminalId: 'legacy' }, mcpServerName: undefined };
+		const healthyClosedBatch = { role: 'assistant', displayContent: '', reasoning: '', anthropicReasoning: null, toolBatch: { version: 1, batchId: 'closed-before-legacy', calls: [{ name: 'run_command', id: 'closed-0', rawParams: { command: 'echo closed', terminalId: 'closed-0' } }] } };
+		const restoredLegacy: any[] = [{ role: 'user', content: 'closed then legacy', displayContent: 'closed then legacy' }, healthyClosedBatch, { role: 'tool', type: 'success', name: 'run_command', params: { command: 'echo closed', terminalId: 'closed-0' }, content: 'closed', result: 'closed', id: 'closed-0', rawParams: { command: 'echo closed', terminalId: 'closed-0' }, mcpServerName: undefined, batchId: 'closed-before-legacy', batchOrdinal: 0 }, validLegacyPending];
+		const restoredLegacyStream = restoreState(restoredLegacy);
+		assert.deepStrictEqual({ type: restoredLegacy.at(-1).type, stream: restoredLegacyStream.task }, { type: 'tool_request', stream: { isRunning: 'awaiting_user' } }, 'a healthy closed native batch must not poison a later legacy approval');
+
 		const pausedMessages: any[] = [{ role: 'user', content: 'pause on the second native call', displayContent: 'pause on the second native call' }];
-		const pausedStream: any = {}; const pausedRuns: string[] = []; const completedRuns: string[] = []; let pausedSends = 0; let pausedConversions = 0;
+		const pausedStream: any = {}; const pausedRuns: string[] = []; const completedRuns: string[] = []; const approvedParams: any[] = []; let pausedSends = 0; let pausedConversions = 0;
 		const pausedCalls = [
 			{ name: 'run_command', id: 'pause-0', rawParams: { command: 'echo complete', terminalId: 'pause-0' } },
 			{ name: 'run_command', id: 'pause-1', rawParams: { command: 'echo approve', terminalId: 'pause-1' } },
@@ -899,12 +960,14 @@ suite('Assistant message lifecycle', () => {
 			state: { allThreads: { task: { messages: pausedMessages, state: {}, filesWithUserChanges: new Set<string>() } } }, streamState: pausedStream,
 			_agentControlGeneration: new Map([['task', 0]]), _parentRunTokenOfThread: new Map(), _agentDelegationAuthorityOfThread: new Map(),
 			_settingsService: { state: { globalSettings: { chatMode: 'agent' } } },
+			_toolsService: { validateParams: { run_command: (raw: any) => ({ command: raw.command, terminalId: raw.terminalId }) } },
 			_convertToLLMMessagesService: { prepareLLMChatMessages: async () => { pausedConversions++; return { messages: [], separateSystemMessage: false }; } },
 			_llmMessageService: { sendLLMMessage: (options: any) => { const send = ++pausedSends; queueMicrotask(() => void options.onFinalMessage(send === 1 ? { fullText: '', fullReasoning: '', toolCalls: pausedCalls, anthropicReasoning: null } : { fullText: 'continued after approval', fullReasoning: '', anthropicReasoning: null })); return `pause-provider-${send}`; }, abort() { } },
 			_mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } },
 			_setStreamState(id: string, value: any) { pausedStream[id] = value; }, _addMessageToThread(_id: string, message: any) { pausedMessages.push(message); },
 			_runToolCall: async (_id: string, name: string, toolId: string, _mcp: unknown, options: any, _snapshot: unknown, _authority: unknown, _skill: boolean, _generation: number, _current: () => boolean, batchRef: { batchId: string; batchOrdinal: number }) => {
 				pausedRuns.push(toolId);
+				if (options.preapproved) approvedParams.push(options.validatedParams);
 				const awaiting = batchRef.batchOrdinal === 1 && !options.preapproved;
 				if (!awaiting) completedRuns.push(toolId);
 				const terminal = { role: 'tool', type: awaiting ? 'tool_request' : 'success', name, params: options.validatedParams ?? options.unvalidatedToolParams, content: awaiting ? '(Awaiting user permission...)' : 'completed', result: awaiting ? null : 'completed', id: toolId, rawParams: options.unvalidatedToolParams, mcpServerName: undefined, ...batchRef };
@@ -916,8 +979,12 @@ suite('Assistant message lifecycle', () => {
 		await runChatAgent(paused, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot });
 		assert.deepStrictEqual({ sends: pausedSends, conversions: pausedConversions, runs: pausedRuns, running: pausedStream.task.isRunning }, { sends: 1, conversions: 1, runs: ['pause-0', 'pause-1'], running: 'awaiting_user' });
 		assert.deepStrictEqual(pausedMessages.filter(message => message.role === 'tool').map(message => [message.id, message.type, message.batchOrdinal]), [['pause-0', 'success', 0], ['pause-1', 'tool_request', 1]]);
-		await runChatAgent(paused, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot, callThisToolFirst: pausedMessages.find(message => message.role === 'tool' && message.id === 'pause-1') });
+		const pausedApproval = pausedMessages.find(message => message.role === 'tool' && message.id === 'pause-1');
+		pausedApproval.rawParams = { terminalId: 'pause-1', command: 'echo approve' };
+		pausedApproval.params = { terminalId: 'poisoned', command: 'echo must-not-run' };
+		await runChatAgent(paused, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot, callThisToolFirst: pausedApproval });
 		assert.deepStrictEqual({ sends: pausedSends, conversions: pausedConversions, runs: pausedRuns, completedRuns }, { sends: 2, conversions: 2, runs: ['pause-0', 'pause-1', 'pause-1', 'pause-2'], completedRuns: ['pause-0', 'pause-1', 'pause-2'] });
+		assert.deepStrictEqual(approvedParams, [{ command: 'echo approve', terminalId: 'pause-1' }], 'resume must revalidate declaration-bound raw arguments instead of trusting persisted params');
 		assert.deepStrictEqual(pausedMessages.filter(message => message.role === 'tool').map(message => [message.id, message.type, message.batchOrdinal]), [['pause-0', 'success', 0], ['pause-1', 'success', 1], ['pause-2', 'success', 2]]);
 	});
 
@@ -946,6 +1013,7 @@ suite('Assistant message lifecycle', () => {
 			state: { allThreads: { task: { messages: resumedMessages, state: {}, filesWithUserChanges: new Set<string>() } } }, streamState: resumedState,
 			_agentControlGeneration: new Map([['task', 0]]), _parentRunTokenOfThread: new Map(), _agentDelegationAuthorityOfThread: new Map(),
 			_settingsService: { state: { globalSettings: { chatMode: 'agent' } } }, _convertToLLMMessagesService: { prepareLLMChatMessages: async () => ({ messages: [], separateSystemMessage: false }) },
+			_toolsService: { validateParams: { run_command: (raw: any) => ({ command: raw.command, cwd: raw.cwd, terminalId: raw.terminalId }) } },
 			_llmMessageService: { sendLLMMessage: () => { resumedSends++; throw new Error('provider must not run after resumed identical-failure circuit'); }, abort() { } },
 			_mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } }, _computeMCPServerOfToolName: () => undefined,
 			_setStreamState(id: string, value: any) { resumedState[id] = value; }, _addMessageToThread(_id: string, message: any) { resumedMessages.push(message); }, _editMessageInThread(_id: string, index: number, message: any) { resumedMessages[index] = message; },
