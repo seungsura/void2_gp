@@ -82,13 +82,29 @@ suite('Void controlled Search browser facade and ToolsService', () => {
 		assert.strictEqual(fixture.fallbackRequests.length, 0);
 	});
 
-	test('falls back exactly once only for the precise bundled-rg missing code and normalizes page zero', async () => {
+	test('falls back exactly once only for the precise bundled-rg missing code', async () => {
 		const pathnameFixture = toolsFixture({ fileSearch: async () => { throw missing(); } });
-		assert.strictEqual((await pathname(pathnameFixture.service, 0)).result.backendTrace, 'terminal-fallback');
+		assert.strictEqual((await pathname(pathnameFixture.service, 1)).result.backendTrace, 'terminal-fallback');
 		assert.strictEqual(pathnameFixture.fallbackRequests.length, 1); assert.strictEqual(pathnameFixture.fallbackRequests[0].skipResults, 0); assert.strictEqual(pathnameFixture.fallbackRequests[0].kind, 'pathname');
 		const contentFixture = toolsFixture({ textSearch: async () => { throw missing(); } });
 		assert.strictEqual((await content(contentFixture.service)).result.backendTrace, 'terminal-fallback');
 		assert.strictEqual(contentFixture.fallbackRequests.length, 1); assert.strictEqual(contentFixture.fallbackRequests[0].kind, 'content');
+	});
+
+	test('accepts only raw positive safe numeric page_number values before paginated tool I/O', () => {
+		const fixture = toolsFixture({ fileSearch: async () => { throw new Error('must not search while validating'); }, textSearch: async () => { throw new Error('must not search while validating'); } });
+		const rawByTool = {
+			ls_dir: { uri: '/workspace' },
+			search_pathnames_only: { query: 'alpha' },
+			search_for_files: { query: 'alpha' },
+		} as const;
+		const invalid = [null, false, true, '1', '', 0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1];
+		for (const [name, raw] of Object.entries(rawByTool) as Array<[keyof typeof rawByTool, Record<string, unknown>]>) {
+			assert.strictEqual((fixture.service.validateParams[name] as (params: any) => any)(raw).pageNumber, 1, `${name} defaults only when omitted`);
+			assert.strictEqual((fixture.service.validateParams[name] as (params: any) => any)({ ...raw, page_number: 2 }).pageNumber, 2, `${name} accepts a numeric page`);
+			for (const page_number of invalid) assert.throws(() => (fixture.service.validateParams[name] as (params: any) => any)({ ...raw, page_number }), /page_number must be a positive safe integer/, `${name} rejects ${String(page_number)}`);
+		}
+		assert.strictEqual(fixture.fallbackRequests.length, 0);
 	});
 
 	test('does not fallback for generic, regex, cancellation, or zero-result outcomes', async () => {

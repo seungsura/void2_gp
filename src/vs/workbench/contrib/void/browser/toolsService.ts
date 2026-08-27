@@ -89,11 +89,11 @@ const validateOptionalStr = (argName: string, str: unknown) => {
 
 
 const validatePageNum = (pageNumberUnknown: unknown) => {
-	if (!pageNumberUnknown) return 1
-	const parsedInt = Number.parseInt(pageNumberUnknown + '')
-	if (!Number.isInteger(parsedInt)) throw new Error(`Page number was not an integer: "${pageNumberUnknown}".`)
-	if (parsedInt < 1) throw new Error(`Invalid LLM output format: Specified page number must be 1 or greater: "${pageNumberUnknown}".`)
-	return parsedInt
+	if (pageNumberUnknown === undefined) return 1
+	if (typeof pageNumberUnknown !== 'number' || !Number.isSafeInteger(pageNumberUnknown) || pageNumberUnknown < 1) {
+		throw new Error(`Invalid LLM output format: page_number must be a positive safe integer, but was "${pageNumberUnknown}".`)
+	}
+	return pageNumberUnknown
 }
 
 const validateProposedTerminalId = (terminalIdUnknown: unknown) => {
