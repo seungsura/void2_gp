@@ -2883,6 +2883,23 @@ const PendingChatInputsPanel = ({
 	</section>
 }
 
+export const LandingSuggestedPrompts = ({ onSubmit, disabled }: { onSubmit: (text: string) => void, disabled: boolean }) => <div className='flex flex-col gap-2 w-full text-nowrap text-void-fg-3 select-none'>
+	{[
+		'Summarize my codebase',
+		'How do types work in Rust?'
+	].map((text) => (
+		<button
+			key={text}
+			type='button'
+			disabled={disabled}
+			className='w-full py-1 px-2 rounded text-left text-sm bg-zinc-700/5 hover:bg-zinc-700/10 dark:bg-zinc-300/5 dark:hover:bg-zinc-300/10 cursor-pointer opacity-80 hover:opacity-100 disabled:cursor-default disabled:opacity-50'
+			onClick={() => onSubmit(text)}
+		>
+			{text}
+		</button>
+	))}
+</div>
+
 export const SidebarChat = () => {
 	const textAreaRef = useRef<HTMLTextAreaElement | null>(null)
 	const textAreaFnsRef = useRef<TextAreaFns | null>(null)
@@ -3205,20 +3222,7 @@ export const SidebarChat = () => {
 	const isLandingPage = previousMessages.length === 0 && !pendingSubmission && pendingInputs.length === 0
 
 
-	const initiallySuggestedPromptsHTML = <div className='flex flex-col gap-2 w-full text-nowrap text-void-fg-3 select-none'>
-		{[
-			'Summarize my codebase',
-			'How do types work in Rust?'
-		].map((text, index) => (
-			<div
-				key={index}
-				className='py-1 px-2 rounded text-sm bg-zinc-700/5 hover:bg-zinc-700/10 dark:bg-zinc-300/5 dark:hover:bg-zinc-300/10 cursor-pointer opacity-80 hover:opacity-100'
-				onClick={() => onSubmit(text)}
-			>
-				{text}
-			</div>
-		))}
-	</div>
+	const initiallySuggestedPromptsHTML = <LandingSuggestedPrompts onSubmit={onSubmit} disabled={chatModelUnavailable} />
 
 
 
