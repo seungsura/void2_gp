@@ -518,6 +518,15 @@ suite('Assistant message lifecycle', () => {
 			[...history, { ...history[2], batchId: 'orphan', batchOrdinal: 0 }],
 			[...history, { ...history[1], displayContent: 'reused', toolBatch: { ...history[1].toolBatch, calls: [{ id: 'tool-3', name: 'fixture_tool', rawParams: { value: 'gamma' } }] } }, { ...history[2], id: 'tool-3', batchOrdinal: 0 }],
 		]) await assert.rejects(() => converter.prepareLLMChatMessages({ chatMessages: corrupt as any, chatMode: 'agent', modelSelection: { providerName: 'openAI', modelName: 'gpt-4.1' }, instructionSnapshot: instructionSnapshot() as never }), /native_tool_batch_(invalid_declaration|unclosed)/);
+		const sparseCalls: any[] = [{ id: 'tool-1', name: 'fixture_tool', rawParams: { value: 'alpha' } }]; sparseCalls.length = 2;
+		for (const malformedBatch of [
+			null, 7, { version: 1, batchId: 'native-batch', calls: null }, { version: 1, batchId: 'native-batch', calls: {} }, { version: 1, batchId: 'native-batch', calls: 'not-an-array' },
+			{ version: 1, batchId: 'native-batch', calls: [null] }, { version: 1, batchId: 'native-batch', calls: [3] }, { version: 1, batchId: 'native-batch', calls: ['call'] }, { version: 1, batchId: 'native-batch', calls: sparseCalls },
+			{ version: 1, batchId: 3, calls: [{ id: 'tool-1', name: 'fixture_tool', rawParams: { value: 'alpha' } }] }, { version: 1, batchId: 'native-batch', calls: [{ id: 3, name: 'fixture_tool', rawParams: { value: 'alpha' } }] }, { version: 1, batchId: 'native-batch', calls: [{ id: 'tool-1', name: 3, rawParams: { value: 'alpha' } }] },
+			{ version: 1, batchId: 'native-batch', calls: [{ id: 'tool-1', name: 'fixture_tool', rawParams: null }] },
+		]) {
+			await assert.rejects(() => converter.prepareLLMChatMessages({ chatMessages: [history[0], { ...history[1], toolBatch: malformedBatch }, ...history.slice(2)] as any, chatMode: 'agent', modelSelection: { providerName: 'openAI', modelName: 'gpt-4.1' }, instructionSnapshot: instructionSnapshot() as never }), /native_tool_batch_(invalid_declaration|unclosed)/, 'malformed persisted batch must use a deterministic contract error');
+		}
 	});
 
 	test('Anthropic, Gemini, and XML retain tool-only native blocks without fake text', async () => {
@@ -925,7 +934,7 @@ suite('Assistant message lifecycle', () => {
 			await runChatAgent(rejected, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot, callThisToolFirst: pending });
 			const settled = messages.find(message => message.id === pending.id);
 			const shouldCloseTail = pending.batchId !== undefined && pending.batchOrdinal !== undefined;
-			assert.deepStrictEqual({ label, rejectedRuns, rejectedConversions, rejectedSends, type: settled.type, hasParams: Object.prototype.hasOwnProperty.call(settled, 'params'), tail: messages.find(message => message.id === 'corrupt-2')?.type, error: rejectedStream.task.error.message }, { label, rejectedRuns: 0, rejectedConversions: 0, rejectedSends: 0, type: 'skipped', hasParams: false, tail: shouldCloseTail ? 'skipped' : undefined, error: 'The pending native tool batch no longer matches its declaration.' });
+			assert.deepStrictEqual({ label, rejectedRuns, rejectedConversions, rejectedSends, type: settled.type, hasParams: Object.prototype.hasOwnProperty.call(settled, 'params'), tail: messages.find(message => message.id === 'corrupt-2')?.type, error: rejectedStream.task.error.message }, { label, rejectedRuns: 0, rejectedConversions: 0, rejectedSends: 0, type: 'skipped', hasParams: false, tail: label === 'duplicate declaration' ? undefined : shouldCloseTail ? 'skipped' : undefined, error: 'The pending native tool batch no longer matches its declaration.' });
 		}
 
 		const restoreState = (messages: any[]) => {
@@ -948,6 +957,32 @@ suite('Assistant message lifecycle', () => {
 		const restoredLegacy: any[] = [{ role: 'user', content: 'closed then legacy', displayContent: 'closed then legacy' }, healthyClosedBatch, { role: 'tool', type: 'success', name: 'run_command', params: { command: 'echo closed', terminalId: 'closed-0' }, content: 'closed', result: 'closed', id: 'closed-0', rawParams: { command: 'echo closed', terminalId: 'closed-0' }, mcpServerName: undefined, batchId: 'closed-before-legacy', batchOrdinal: 0 }, validLegacyPending];
 		const restoredLegacyStream = restoreState(restoredLegacy);
 		assert.deepStrictEqual({ type: restoredLegacy.at(-1).type, stream: restoredLegacyStream.task }, { type: 'tool_request', stream: { isRunning: 'awaiting_user' } }, 'a healthy closed native batch must not poison a later legacy approval');
+
+		const sparseShapeCalls: any[] = [{ id: 'shape-0', name: 'run_command', rawParams: { command: 'echo shape', terminalId: 'shape-0' } }]; sparseShapeCalls.length = 2;
+		const malformedShapeCases: ReadonlyArray<readonly [string, unknown]> = [
+			['toolBatch null', null], ['toolBatch number', 7], ['calls null', { version: 1, batchId: 'shape-batch', calls: null }], ['calls object', { version: 1, batchId: 'shape-batch', calls: {} }],
+			['calls string', { version: 1, batchId: 'shape-batch', calls: 'not-an-array' }], ['sparse calls', { version: 1, batchId: 'shape-batch', calls: sparseShapeCalls }], ['call null', { version: 1, batchId: 'shape-batch', calls: [null] }], ['call number', { version: 1, batchId: 'shape-batch', calls: [5] }],
+			['numeric batch id', { version: 1, batchId: 5, calls: [{ id: 'shape-0', name: 'run_command', rawParams: { command: 'echo shape', terminalId: 'shape-0' } }] }],
+			['numeric call id', { version: 1, batchId: 'shape-batch', calls: [{ id: 5, name: 'run_command', rawParams: { command: 'echo shape', terminalId: 'shape-0' } }] }],
+			['numeric call name', { version: 1, batchId: 'shape-batch', calls: [{ id: 'shape-0', name: 5, rawParams: { command: 'echo shape', terminalId: 'shape-0' } }] }],
+		];
+		for (const [label, toolBatch] of malformedShapeCases) {
+			const makeMessages = () => [{ role: 'user', content: label, displayContent: label }, { role: 'assistant', displayContent: '', reasoning: '', anthropicReasoning: null, toolBatch }, { role: 'tool', type: 'tool_request', name: 'run_command', params: { command: 'echo shape', terminalId: 'shape-0' }, content: '(Awaiting user permission...)', result: null, id: 'shape-0', rawParams: { command: 'echo shape', terminalId: 'shape-0' }, mcpServerName: undefined, batchId: 'shape-batch', batchOrdinal: 0 }];
+			const resumeMessages: any[] = makeMessages(); const resumeStream: any = {}; let shapeRuns = 0; let shapeConversions = 0; let shapeSends = 0;
+			const resumeReceiver: any = {
+				state: { allThreads: { task: { messages: resumeMessages, state: {}, filesWithUserChanges: new Set<string>() } } }, streamState: resumeStream,
+				_agentControlGeneration: new Map([['task', 0]]), _parentRunTokenOfThread: new Map(), _agentDelegationAuthorityOfThread: new Map(), _settingsService: { state: { globalSettings: { chatMode: 'agent' } } },
+				_convertToLLMMessagesService: { prepareLLMChatMessages: async () => { shapeConversions++; return { messages: [], separateSystemMessage: false }; } }, _llmMessageService: { sendLLMMessage: () => { shapeSends++; throw new Error('malformed shape must not send'); }, abort() { } },
+				_mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } }, _computeMCPServerOfToolName: () => undefined, _setStreamState(id: string, value: any) { resumeStream[id] = value; }, _editMessageInThread(_id: string, index: number, message: any) { resumeMessages[index] = message; }, _addMessageToThread(_id: string, message: any) { resumeMessages.push(message); },
+				_terminalizeBatchTailAfter(...args: any[]) { return (ChatThreadService.prototype as any)._terminalizeBatchTailAfter.call(this, ...args); }, _runToolCall: async () => { shapeRuns++; return {}; },
+			};
+			await runChatAgent(resumeReceiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot, callThisToolFirst: resumeMessages[2] });
+			assert.deepStrictEqual({ label, shapeRuns, shapeConversions, shapeSends, rows: resumeMessages.filter(message => message.role === 'tool').map(message => [message.type, Object.prototype.hasOwnProperty.call(message, 'params')]), error: resumeStream.task.error.message }, { label, shapeRuns: 0, shapeConversions: 0, shapeSends: 0, rows: [['skipped', false]], error: 'The pending native tool batch no longer matches its declaration.' });
+
+			const restoredShape: any[] = makeMessages();
+			assert.doesNotThrow(() => restoreState(restoredShape), `${label} must restore without a TypeError`);
+			assert.deepStrictEqual(restoredShape.filter(message => message.role === 'tool').map(message => [message.type, Object.prototype.hasOwnProperty.call(message, 'params')]), [['skipped', false]], `${label} restore must settle only the persisted row without guessing a malformed tail`);
+		}
 
 		const pausedMessages: any[] = [{ role: 'user', content: 'pause on the second native call', displayContent: 'pause on the second native call' }];
 		const pausedStream: any = {}; const pausedRuns: string[] = []; const completedRuns: string[] = []; const approvedParams: any[] = []; let pausedSends = 0; let pausedConversions = 0;

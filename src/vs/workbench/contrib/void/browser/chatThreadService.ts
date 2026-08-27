@@ -17,7 +17,7 @@ import { generateUuid } from '../../../../base/common/uuid.js';
 import { FeatureName, ModelSelection, ModelSelectionOptions, SettingsOfProvider } from '../common/voidSettingsTypes.js';
 import { IVoidSettingsService } from '../common/voidSettingsService.js';
 import { getIsReasoningEnabledState, getModelCapabilities, getReservedOutputTokenSpace } from '../common/modelCapabilities.js';
-import { closeNativeToolBatchForProspectiveAdmission, estimateHistoryTokensForReadBudget, protectedSkillResourceHistoryLength, requiresNativeToolBatchRowIdentity, validateNativeToolBatchRowIdentity } from './convertToLLMMessageService.js';
+import { closeNativeToolBatchForProspectiveAdmission, estimateHistoryTokensForReadBudget, protectedSkillResourceHistoryLength, requiresNativeToolBatchRowIdentity, resolveNativeToolBatchDeclaration, validateNativeToolBatchRowIdentity } from './convertToLLMMessageService.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, BuiltinToolResultType, ToolCallParams, ToolName, ToolResult } from '../common/toolsServiceTypes.js';
 import { computeMaxReadOutputTokens, isBoundedReadHistory, isBoundedReadHistoryString } from '../common/readFileReliability.js';
 import { IToolsService } from './toolsServiceInterface.js';
@@ -1139,9 +1139,10 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	 * there is deliberately no in-memory batch cursor to revive after reload. */
 	private _terminalizeBatchTail(threadId: string, batchId: string, reason: string): void {
 		const messages = this.state.allThreads[threadId]?.messages ?? []
-		const declaration = messages.find((message): message is Extract<ChatMessage, { role: 'assistant' }> => message.role === 'assistant' && message.toolBatch?.batchId === batchId)?.toolBatch
+		const declaration = resolveNativeToolBatchDeclaration(messages, batchId)
 		if (!declaration) return
-		for (const [batchOrdinal, call] of declaration.calls.entries()) {
+		for (let batchOrdinal = 0; batchOrdinal < declaration.batch.calls.length; batchOrdinal++) {
+			const call = declaration.batch.calls[batchOrdinal]
 			const existing = (this.state.allThreads[threadId]?.messages ?? []).find(message => message.role === 'tool' && message.id === call.id && message.batchId === batchId && message.batchOrdinal === batchOrdinal)
 			if (existing?.role === 'tool' && existing.type !== 'running_now' && existing.type !== 'tool_request') continue
 			if (existing?.role === 'tool') {
@@ -1156,10 +1157,10 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 	private _terminalizeBatchTailAfter(threadId: string, batchRef: BatchCallRef, reason: string): void {
 		const messages = this.state.allThreads[threadId]?.messages ?? []
-		const declaration = messages.find((message): message is Extract<ChatMessage, { role: 'assistant' }> => message.role === 'assistant' && message.toolBatch?.batchId === batchRef.batchId)?.toolBatch
+		const declaration = resolveNativeToolBatchDeclaration(messages, batchRef.batchId)
 		if (!declaration) return
-		for (let batchOrdinal = batchRef.batchOrdinal + 1; batchOrdinal < declaration.calls.length; batchOrdinal++) {
-			const call = declaration.calls[batchOrdinal]
+		for (let batchOrdinal = batchRef.batchOrdinal + 1; batchOrdinal < declaration.batch.calls.length; batchOrdinal++) {
+			const call = declaration.batch.calls[batchOrdinal]
 			const existing = (this.state.allThreads[threadId]?.messages ?? []).find(message => message.role === 'tool' && message.id === call.id && message.batchId === batchRef.batchId && message.batchOrdinal === batchOrdinal)
 			if (existing?.role === 'tool' && existing.type !== 'running_now' && existing.type !== 'tool_request') continue
 			if (existing?.role === 'tool') {
@@ -1854,7 +1855,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				this._setStreamState(threadId, { isRunning: undefined, error: { message: invalidPendingBatch, fullError: null } })
 				return
 			}
-			const callRef = persistedIdentity ? { batchId: persistedIdentity.declaration.toolBatch!.batchId, batchOrdinal: callThisToolFirst.batchOrdinal! } : undefined
+			const callRef = persistedIdentity ? { batchId: persistedIdentity.batch.batchId, batchOrdinal: callThisToolFirst.batchOrdinal! } : undefined
 			const authoritativeRawParams = persistedIdentity?.call.rawParams ?? callThisToolFirst.rawParams
 			let authoritativeValidatedParams = callThisToolFirst.params
 			if (persistedIdentity) {
@@ -1883,7 +1884,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			// assistant row so reload never needs a mutable cursor and cannot replay the
 			// already-approved call.
 			if (!current.receiptCancelled && callThisToolFirst.batchId !== undefined && callThisToolFirst.batchOrdinal !== undefined) {
-				const declaration = persistedIdentity?.declaration.toolBatch
+				const declaration = persistedIdentity?.batch
 				if (!declaration || declaration.calls[callThisToolFirst.batchOrdinal]?.id !== callThisToolFirst.id) {
 					this._setStreamState(threadId, { isRunning: undefined, error: { message: 'The pending native tool batch no longer matches its declaration.', fullError: null } })
 					return
