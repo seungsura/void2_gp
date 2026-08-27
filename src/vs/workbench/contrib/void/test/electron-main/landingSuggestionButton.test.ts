@@ -34,9 +34,9 @@ const buildRuntime = async (generatedSidebarPath: string) => {
 		import { createRoot } from 'react-dom/client';
 		import { flushSync } from 'react-dom';
 		import { LandingSuggestedPrompts } from ${JSON.stringify(importPath)};
-		const submissions: string[] = []; let root: ReturnType<typeof createRoot> | undefined; let setDisabled: (disabled: boolean) => void;
-		const Harness = () => { const [disabled, updateDisabled] = useState(false); setDisabled = updateDisabled; return <form onSubmit={event => event.preventDefault()}><LandingSuggestedPrompts disabled={disabled} onSubmit={text => submissions.push(text)} /></form>; };
-		(window as any).__landingSuggestionButton = { submissions, mount(node: HTMLElement) { root = createRoot(node); flushSync(() => root!.render(<Harness />)); }, setDisabled(value: boolean) { flushSync(() => setDisabled(value)); }, dispose() { flushSync(() => root?.unmount()); } };
+		const submissions: string[] = []; let formSubmits = 0; let root: ReturnType<typeof createRoot> | undefined; let setDisabled: (disabled: boolean) => void;
+		const Harness = () => { const [disabled, updateDisabled] = useState(false); setDisabled = updateDisabled; return <form onSubmit={event => { formSubmits += 1; event.preventDefault(); }}><LandingSuggestedPrompts disabled={disabled} onSubmit={text => submissions.push(text)} /></form>; };
+		(window as any).__landingSuggestionButton = { submissions, getFormSubmits: () => formSubmits, mount(node: HTMLElement) { root = createRoot(node); flushSync(() => root!.render(<Harness />)); }, setDisabled(value: boolean) { flushSync(() => setDisabled(value)); }, dispose() { flushSync(() => root?.unmount()); } };
 	`, 'utf8');
 	try {
 		await build({
@@ -110,8 +110,11 @@ suite('Landing suggestion buttons', function () {
 			await page.keyboard.press('Tab');
 			assert.strictEqual(await first.evaluate(button => document.activeElement === button), true);
 			await first.press('Enter');
+			assert.strictEqual(await page.evaluate(() => (window as any).__landingSuggestionButton.getFormSubmits()), 0);
 			await second.press('Space');
+			assert.strictEqual(await page.evaluate(() => (window as any).__landingSuggestionButton.getFormSubmits()), 0);
 			await first.click();
+			assert.strictEqual(await page.evaluate(() => (window as any).__landingSuggestionButton.getFormSubmits()), 0);
 			assert.deepStrictEqual(await page.evaluate(() => (window as any).__landingSuggestionButton.submissions), ['Summarize my codebase', 'How do types work in Rust?', 'Summarize my codebase']);
 			assert.strictEqual(await page.locator('form').evaluate(form => (form as HTMLFormElement).checkValidity()), true);
 
@@ -119,12 +122,16 @@ suite('Landing suggestion buttons', function () {
 			assert.deepStrictEqual(await page.locator('button[type=button]').evaluateAll(buttons => buttons.map(button => (button as HTMLButtonElement).disabled)), [true, true]);
 			const beforeDisabledDispatch = await page.evaluate(() => (window as any).__landingSuggestionButton.submissions.length);
 			await first.evaluate(button => (button as HTMLButtonElement).click());
+			assert.strictEqual(await page.evaluate(() => (window as any).__landingSuggestionButton.getFormSubmits()), 0);
 			await first.press('Enter');
+			assert.strictEqual(await page.evaluate(() => (window as any).__landingSuggestionButton.getFormSubmits()), 0);
 			await first.press('Space');
+			assert.strictEqual(await page.evaluate(() => (window as any).__landingSuggestionButton.getFormSubmits()), 0);
 			const box = await first.boundingBox();
 			assert.ok(box);
 			await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
 			assert.strictEqual(await page.evaluate(() => (window as any).__landingSuggestionButton.submissions.length), beforeDisabledDispatch);
+			assert.strictEqual(await page.evaluate(() => (window as any).__landingSuggestionButton.getFormSubmits()), 0);
 			await page.evaluate(() => (window as any).__landingSuggestionButton.dispose());
 			assert.deepStrictEqual(pageErrors, []);
 			assert.deepStrictEqual(consoleErrors, []);
