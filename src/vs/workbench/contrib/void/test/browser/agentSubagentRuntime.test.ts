@@ -107,10 +107,18 @@ suite('Void agent subagent Chat runtime routing', () => {
 		const root: any = { generation: 1, childId: 'root', depth: 1, status: 'completed', capabilityProfile: 'read_only', queuedMs: 0, runningMs: 1, totalMs: 1, anchor: { toolId: 'spawn' } };
 		const child: any = { ...root, childId: 'nested', parentRunId: 'root', depth: 2 };
 		const keep: any = { ...root, childId: 'keep', anchor: { toolId: 'keep-spawn' } };
-		const thread: any = { childActivities: { version: 1, records: [root, child, keep], omitted: 0, retentionSaturated: false } };
-		const messages: any[] = [{ role: 'tool', type: 'success', name: 'spawn_agent', id: 'keep-spawn', result: { id: 'keep' } }];
+		const thread: any = { messages: [{ role: 'tool', type: 'success', name: 'spawn_agent', id: 'spawn', result: { id: 'root' } }, { role: 'tool', type: 'success', name: 'spawn_agent', id: 'keep-spawn', result: { id: 'keep' } }], childActivities: { version: 1, records: [root, child, keep], omitted: 3, retentionSaturated: true } };
+		const messages: any[] = [thread.messages[1]];
 		const pruned = (ChatThreadService.prototype as any)._pruneChildActivitiesForMessages.call({}, thread, messages);
-		assert.deepStrictEqual(pruned.records.map((record: any) => record.childId), ['keep']);
+		assert.deepStrictEqual(pruned.records.map((record: any) => record.childId), ['keep']); assert.strictEqual(pruned.omitted, 0); assert.strictEqual(pruned.retentionSaturated, false);
+		const unrelated: any = { id: 'unrelated', generation: 2, depth: 1, status: 'completed', capabilityProfile: 'read_only', queuedMs: 0, runningMs: 1, totalMs: 1, authority: {} }; const writes: any[] = [];
+		const fake: any = childActivityFixture({ state: { allThreads: { parent: { ...thread, messages, childActivities: pruned } } }, _agentSubagentService: { getRunViews: () => [unrelated] }, _storeAllThreads: (value: any) => writes.push(value), _setState() { } });
+		(ChatThreadService.prototype as any)._appendSpawnSuccessAndBind.call(fake, 'parent', { role: 'tool', type: 'success', name: 'spawn_agent', id: 'unrelated-spawn', result: { id: 'unrelated' } }, { id: 'unrelated' }, { toolId: 'unrelated-spawn' });
+		assert.deepStrictEqual(writes[0].parent.childActivities.records.map((record: any) => record.childId), ['keep', 'unrelated']); assert.strictEqual(writes[0].parent.childActivities.omitted, 0); assert.strictEqual(writes[0].parent.childActivities.retentionSaturated, false);
+		const emptyPruned = (ChatThreadService.prototype as any)._pruneChildActivitiesForMessages.call({}, { messages: [thread.messages[0]], childActivities: { version: 1, records: [], omitted: 33, retentionSaturated: true } }, []);
+		assert.deepStrictEqual(emptyPruned.records, []); assert.strictEqual(emptyPruned.omitted, 0); assert.strictEqual(emptyPruned.retentionSaturated, false);
+		const retainedSaturated: any = { version: 1, records: [], omitted: 33, retentionSaturated: true }; const retained = (ChatThreadService.prototype as any)._pruneChildActivitiesForMessages.call({}, { messages: [thread.messages[0]], childActivities: retainedSaturated }, [thread.messages[0]]);
+		assert.strictEqual(retained, retainedSaturated);
 	});
 	test('duplicating makes active activity inert and deleted tasks cannot be resurrected by late events', () => {
 		const active: any = { generation: 1, childId: 'child', depth: 1, status: 'running', capabilityProfile: 'read_only', queuedMs: 0, runningMs: 1, totalMs: 1, anchor: { toolId: 'spawn' } };

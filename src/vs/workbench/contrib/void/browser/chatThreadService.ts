@@ -1212,11 +1212,16 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const allThreads = { ...this.state.allThreads, [threadId]: next }; this._storeAllThreads(allThreads); this._setState({ allThreads });
 	}
 	private _pruneChildActivitiesForMessages(thread: ThreadType, messages: readonly ChatMessage[]): ChildActivitiesLedger {
-		const anchors = new Set(messages.filter((message): message is ToolMessage<any> => message.role === 'tool' && message.type === 'success' && message.name === 'spawn_agent' && !!(message.result as any)?.id).map(message => JSON.stringify([message.id, message.batchId, message.batchOrdinal, (message.result as any).id])));
+		const anchorOf = (message: ChatMessage) => message.role === 'tool' && message.type === 'success' && message.name === 'spawn_agent' && !!(message.result as any)?.id ? JSON.stringify([message.id, message.batchId, message.batchOrdinal, (message.result as any).id]) : undefined;
+		const anchors = new Set(messages.map(anchorOf).filter((anchor): anchor is string => !!anchor));
+		const removedSpawnSuccess = thread.messages.map(anchorOf).some(anchor => !!anchor && !anchors.has(anchor));
 		const roots = new Set(thread.childActivities.records.filter(record => !record.parentRunId && !anchors.has(JSON.stringify([record.anchor.toolId, record.anchor.batchId, record.anchor.batchOrdinal, record.childId]))).map(record => record.childId));
-		if (!roots.size) return thread.childActivities;
+		if (!roots.size && !removedSpawnSuccess) return thread.childActivities;
 		const removed = new Set(roots); for (let index = 0; index < thread.childActivities.records.length; index++) { const record = thread.childActivities.records[index]; if (record.parentRunId && removed.has(record.parentRunId)) removed.add(record.childId); }
-		return normalizeChildActivities({ ...thread.childActivities, records: thread.childActivities.records.filter(record => !removed.has(record.childId)) });
+		// Omission/saturation has no per-root provenance. A successful-spawn history
+		// rewrite therefore starts a fresh metadata epoch rather than attaching an old
+		// global warning to an unrelated future child receipt.
+		return normalizeChildActivities({ ...thread.childActivities, records: thread.childActivities.records.filter(record => !removed.has(record.childId)), omitted: 0, retentionSaturated: false });
 	}
 
 	/** Global Stop owns every live receipt.  Unlike card Stop it intentionally does
