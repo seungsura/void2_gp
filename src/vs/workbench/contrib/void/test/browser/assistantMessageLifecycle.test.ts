@@ -813,7 +813,7 @@ suite('Assistant message lifecycle', () => {
 				{ role: 'user', content: 'parent safe wave', displayContent: 'parent safe wave' },
 				{ role: 'assistant', displayContent: '', reasoning: '', anthropicReasoning: null, toolBatch: { version: 1, batchId: 'safe-batch', calls: declarations.map(({ id, name, rawParams }) => ({ id, name, rawParams })) } },
 			];
-			let safeCurrent = true; let didStop = false; const safeStarts: string[] = []; const safeInterrupts: string[] = []; const safeStream: any = {};
+			let safeCurrent = true; let didStop = false; const safeStarts: string[] = []; const safeInterrupts: string[] = []; const safeStream: any = {}; const safeStreamEvents: any[] = [];
 			const safeReceiver: any = {
 				state: { allThreads: { task: { messages: safeMessages, state: {}, filesWithUserChanges: new Set<string>() } } }, streamState: safeStream,
 				_agentControlGeneration: new Map([['task', 0]]), _activeToolCardReceiptsOfThread: new Map(), _cancellingToolReceiptsOfThread: new Map(),
@@ -827,10 +827,10 @@ suite('Assistant message lifecycle', () => {
 				_revokeAgentDelegation() { safeCurrent = false; this._agentControlGeneration.set('task', 1); },
 				_addMessageToThread(threadId: string, message: any) { safeMessages.push(message); if (stopWhenFirstPublished && !didStop && message.role === 'tool' && message.type === 'running_now') { didStop = true; void chatLifecycle.abortRunning.call(safeReceiver, threadId); } },
 				_editMessageInThread(_threadId: string, index: number, message: any) { safeMessages[index] = message; },
-				_setStreamState(threadId: string, value: any) { safeStream[threadId] = value; },
+				_setStreamState(threadId: string, value: any) { safeStream[threadId] = value; safeStreamEvents.push(value); },
 			};
 			Object.setPrototypeOf(safeReceiver, ChatThreadService.prototype);
-			return { safeReceiver, safeMessages, safeStarts, safeInterrupts, isCurrent: () => safeCurrent };
+			return { safeReceiver, safeMessages, safeStarts, safeInterrupts, safeStreamEvents, isCurrent: () => safeCurrent };
 		};
 
 		const mixedA = deferred<any>(); const mixedC = deferred<any>();
@@ -869,6 +869,12 @@ suite('Assistant message lifecycle', () => {
 		await cardRun;
 		assert.deepStrictEqual({ starts: cardStopped.safeStarts, rows: cardStopped.safeMessages.filter(message => message.role === 'tool').map(message => [message.id, message.type, message.batchOrdinal]) }, { starts: ['card-a', 'card-b'], rows: [['card-a', 'rejected', 0], ['card-b', 'success', 1], ['card-c', 'skipped', 2]] });
 
+		const oversizedLeaf = deferred<any>(); const oversized = makeSafeReceiver([{ id: 'oversized', name: 'ls_dir', rawParams: { key: 'oversized' }, ordinal: 0 }], { oversized: oversizedLeaf });
+		const oversizedRun = chatLifecycle._runParentSafeReadWave.call(oversized.safeReceiver, 'task', oversized.safeMessages[1].toolBatch.calls.map((call: any, ordinal: number) => ({ ...call, ordinal })), 'safe-batch', instructionSnapshot(), undefined, 0, oversized.isCurrent);
+		await flushMicrotasks(); const rawOversizedResult = { content: 'x'.repeat(100_000), entries: ['still on the UI result object'] }; oversizedLeaf.resolve(rawOversizedResult); await oversizedRun;
+		const oversizedRow = oversized.safeMessages.find(message => message.id === 'oversized');
+		assert.deepStrictEqual({ result: oversizedRow.result, bounded: oversizedRow.content.length < rawOversizedResult.content.length, marker: oversizedRow.content.includes('truncated to this tool\'s assigned read budget') }, { result: rawOversizedResult, bounded: true, marker: true });
+
 		const stopA = deferred<any>(); const stopB = deferred<any>(); const stopC = deferred<any>();
 		const globallyStopped = makeSafeReceiver([
 			{ id: 'stop-a', name: 'ls_dir', rawParams: { key: 'stop-a' }, ordinal: 0 }, { id: 'stop-b', name: 'ls_dir', rawParams: { key: 'stop-b' }, ordinal: 1 }, { id: 'stop-c', name: 'ls_dir', rawParams: { key: 'stop-c' }, ordinal: 2 },
@@ -876,7 +882,7 @@ suite('Assistant message lifecycle', () => {
 		const stoppedRun = chatLifecycle._runNativeBatchRange.call(globallyStopped.safeReceiver, 'task', globallyStopped.safeMessages[1].toolBatch.calls.map((call: any, ordinal: number) => ({ ...call, ordinal })), 'safe-batch', instructionSnapshot(), undefined, true, 0, globallyStopped.isCurrent, () => false);
 		await flushMicrotasks(); stopA.resolve({ content: 'late A' }); stopB.resolve({ content: 'late B' });
 		assert.deepStrictEqual(await stoppedRun, { interrupted: true });
-		assert.deepStrictEqual({ starts: globallyStopped.safeStarts, interrupts: globallyStopped.safeInterrupts.sort(), rows: globallyStopped.safeMessages.filter(message => message.role === 'tool').map(message => [message.id, message.type, message.batchOrdinal]), active: globallyStopped.safeReceiver._activeToolCardReceiptsOfThread.size }, { starts: [], interrupts: [], rows: [['stop-a', 'rejected', 0], ['stop-b', 'skipped', 1], ['stop-c', 'skipped', 2]], active: 0 });
+		assert.deepStrictEqual({ starts: globallyStopped.safeStarts, interrupts: globallyStopped.safeInterrupts.sort(), rows: globallyStopped.safeMessages.filter(message => message.role === 'tool').map(message => [message.id, message.type, message.batchOrdinal]), staleToolProjection: globallyStopped.safeStreamEvents.some(event => event?.isRunning === 'tool'), active: globallyStopped.safeReceiver._activeToolCardReceiptsOfThread.size }, { starts: [], interrupts: [], rows: [['stop-a', 'rejected', 0], ['stop-b', 'skipped', 1], ['stop-c', 'skipped', 2]], staleToolProjection: false, active: 0 });
 
 		const activeA = deferred<any>(); const activeB = deferred<any>(); const activeC = deferred<any>();
 		const activeStopped = makeSafeReceiver([
@@ -1036,8 +1042,10 @@ suite('Assistant message lifecycle', () => {
 				state: { allThreads: { task: { id: 'task', messages, state: {}, filesWithUserChanges: new Set<string>() } }, currentThreadId: 'task' }, streamState,
 				_onDidChangeCurrentThread: { fire() { } },
 				_setStreamState(id: string, value: any) { streamState[id] = value; }, _editMessageInThread(_id: string, index: number, message: any) { messages[index] = message; }, _addMessageToThread(_id: string, message: any) { messages.push(message); },
+				_updateLatestTool(_id: string, message: any) { const index = messages.findIndex(candidate => candidate.role === 'tool' && candidate.id === message.id && candidate.batchId === message.batchId && candidate.batchOrdinal === message.batchOrdinal && (candidate.type === 'running_now' || candidate.type === 'tool_request')); if (index >= 0) messages[index] = message; else messages.push(message); },
 				_computeMCPServerOfToolName: () => undefined,
 				_terminalizeBatchTail(...args: any[]) { return (ChatThreadService.prototype as any)._terminalizeBatchTail.call(this, ...args); },
+				_terminalizeBatchTailAfter(...args: any[]) { return (ChatThreadService.prototype as any)._terminalizeBatchTailAfter.call(this, ...args); },
 			};
 			(ChatThreadService.prototype as any)._setState.call(receiver, { allThreads: receiver.state.allThreads, currentThreadId: 'task' }, true);
 			return streamState;
@@ -1045,6 +1053,10 @@ suite('Assistant message lifecycle', () => {
 		const restoredCorrupt: any[] = [{ role: 'user', content: 'restore corrupt', displayContent: 'restore corrupt' }, corruptDeclaration, corruptPrior, { ...corruptPending, rawParams: { command: 'echo changed', terminalId: 'corrupt-1' } }];
 		const restoredCorruptStream = restoreState(restoredCorrupt);
 		assert.deepStrictEqual({ rows: restoredCorrupt.filter(message => message.role === 'tool').map(message => [message.id, message.type, Object.prototype.hasOwnProperty.call(message, 'params')]), stream: restoredCorruptStream.task }, { rows: [['corrupt-0', 'success', true], ['corrupt-1', 'skipped', false], ['corrupt-2', 'skipped', false]], stream: undefined });
+		const reloadBatchId = 'reload-two-running'; const reloadCalls = ['reload-a', 'reload-b', 'reload-c'].map((id, ordinal) => ({ id, name: 'run_command', rawParams: { command: `echo ${id}`, terminalId: id }, ordinal }));
+		const restoredTwoRunning: any[] = [{ role: 'user', content: 'reload two running', displayContent: 'reload two running' }, { role: 'assistant', displayContent: '', reasoning: '', anthropicReasoning: null, toolBatch: { version: 1, batchId: reloadBatchId, calls: reloadCalls } }, ...reloadCalls.slice(0, 2).map(call => ({ role: 'tool', type: 'running_now', name: call.name, params: { command: call.rawParams.command, terminalId: call.rawParams.terminalId }, content: 'running', result: null, id: call.id, rawParams: call.rawParams, mcpServerName: undefined, batchId: reloadBatchId, batchOrdinal: call.ordinal }))];
+		const restoredTwoRunningStream = restoreState(restoredTwoRunning);
+		assert.deepStrictEqual({ rows: restoredTwoRunning.filter(message => message.role === 'tool').map(message => [message.id, message.type, message.batchOrdinal]), contiguous: restoredTwoRunning.filter(message => message.role === 'tool').map(message => message.batchOrdinal), stream: restoredTwoRunningStream.task }, { rows: [['reload-a', 'rejected', 0], ['reload-b', 'rejected', 1], ['reload-c', 'skipped', 2]], contiguous: [0, 1, 2], stream: undefined });
 		const validLegacyPending = { role: 'tool', type: 'tool_request', name: 'run_command', params: { command: 'echo legacy', terminalId: 'legacy' }, content: '(Awaiting user permission...)', result: null, id: 'legacy', rawParams: { command: 'echo legacy', terminalId: 'legacy' }, mcpServerName: undefined };
 		const healthyClosedBatch = { role: 'assistant', displayContent: '', reasoning: '', anthropicReasoning: null, toolBatch: { version: 1, batchId: 'closed-before-legacy', calls: [{ name: 'run_command', id: 'closed-0', rawParams: { command: 'echo closed', terminalId: 'closed-0' } }] } };
 		const restoredLegacy: any[] = [{ role: 'user', content: 'closed then legacy', displayContent: 'closed then legacy' }, healthyClosedBatch, { role: 'tool', type: 'success', name: 'run_command', params: { command: 'echo closed', terminalId: 'closed-0' }, content: 'closed', result: 'closed', id: 'closed-0', rawParams: { command: 'echo closed', terminalId: 'closed-0' }, mcpServerName: undefined, batchId: 'closed-before-legacy', batchOrdinal: 0 }, validLegacyPending];

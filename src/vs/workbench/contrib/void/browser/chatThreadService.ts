@@ -963,6 +963,11 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				if (message.role !== 'tool') continue
 				const ref = message.batchId === undefined || message.batchOrdinal === undefined ? undefined : { batchId: message.batchId, batchOrdinal: message.batchOrdinal }
 				if (message.type === 'running_now') {
+					// Earlier snapshot entries may already have been terminalized when a
+					// sibling closed this batch. Revalidate the exact live row before
+					// touching it so reload never appends a duplicate after the tail.
+					const current = (this.state.allThreads[threadId]?.messages ?? []).find(candidate => candidate.role === 'tool' && candidate.id === message.id && candidate.batchId === message.batchId && candidate.batchOrdinal === message.batchOrdinal)
+					if (current !== message || current.type !== 'running_now') continue
 					// A reload has no physical receipt to resume. Close its later ordinals and
 					// settle this exact persisted row once; it must never be replayed.
 					if (ref) this._terminalizeBatchTailAfter(threadId, ref, 'Native tool batch was interrupted by restart before this call could finish.')
@@ -1913,7 +1918,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			this._addMessageToThread(threadId, { role: 'tool', type: 'running_now', name: item.call.name as ToolName, params: item.params, content: '(value not received yet...)', result: null, id: item.call.id, rawParams: item.rawParams, mcpServerName: undefined, startedAt: Date.now(), receiptId: item.receiptId, cardStopUnavailableReason: 'Stop becomes available once this tool provides its cancellation handle.', ...item.batchRef });
 		}
 		const first = prepared.find(item => item.published);
-		if (first) {
+		if (first && isCurrentParentRun()) {
 			this._setStreamState(threadId, { isRunning: 'tool', interrupt: Promise.resolve(() => { void this.abortRunning(threadId); }), toolInfo: { toolName: first.call.name as ToolName, toolParams: first.params, id: first.call.id, content: 'interrupted...', rawParams: first.rawParams, mcpServerName: undefined, receiptId: first.receiptId } });
 		}
 		const execute = async (item: Prepared) => {
