@@ -5,10 +5,11 @@
 
 import * as assert from 'assert';
 import { ChatThreadService } from '../../browser/chatThreadService.js';
+import { EMPTY_CHILD_ACTIVITIES } from '../../common/agentSubagents.js';
 import { createSkillComposerDollarSession, updateSkillComposerDollarQuery } from '../../common/agentSkills.js';
 import { submitChatComposer } from '../../common/chatComposerSubmission.js';
 
-const thread = (stagingSelections: string[] = []) => ({ id: '', messages: [], state: { stagingSelections }, filesWithUserChanges: new Set() });
+const thread = (stagingSelections: string[] = []) => ({ id: '', messages: [], childActivities: EMPTY_CHILD_ACTIVITIES, state: { stagingSelections }, filesWithUserChanges: new Set() });
 const draftReceiver = () => {
 	const value: any = Object.create(ChatThreadService.prototype);
 	value.state = { allThreads: { A: { ...thread(['selection-a']), id: 'A' }, B: { ...thread(['selection-b']), id: 'B' } }, currentThreadId: 'A' };

@@ -3,7 +3,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
-import { ChatThreadService } from '../../browser/chatThreadService.js';
+import { ChatThreadService, PENDING_CHAT_INPUT_MAX_RECORDS, PENDING_CHAT_INPUT_MAX_SERIALIZED_BYTES } from '../../browser/chatThreadService.js';
 import { closeNativeToolBatchForProspectiveAdmission, ConvertToLLMMessageService } from '../../browser/convertToLLMMessageService.js';
 import { projectAgentConfig, resolveAgentInstructions, stableAgentInstructionRevision } from '../../common/agentInstructions.js';
 import { createSkillCatalog } from '../../common/agentSkills.js';
@@ -110,13 +110,14 @@ const flushMicrotasks = async (): Promise<void> => {
 	await Promise.resolve();
 };
 
-const createPendingInboxReceiver = (options?: { storage?: Map<string, string>; owner?: string | undefined; trusted?: boolean }) => {
+const createPendingInboxReceiver = (options?: { storage?: Map<string, string>; owner?: string | undefined; trusted?: boolean; messages?: any[] }) => {
 	const storage = options?.storage ?? new Map<string, string>();
 	const context = { owner: options?.owner ?? 'file:///workspace', trusted: options?.trusted ?? true };
-	const messages: any[] = [];
+	const messages: any[] = options?.messages ?? [];
 	const deliveries: string[] = [];
 	const storageScopes: unknown[] = [];
 	const pendingEvents: string[] = [];
+	const warnings: string[] = [];
 	const receiver: any = {
 		state: { allThreads: { task: { id: 'task', messages, state: { stagingSelections: [], linksOfMessageIdx: {} }, filesWithUserChanges: new Set<string>() } }, currentThreadId: 'task' },
 		streamState: {},
@@ -137,7 +138,9 @@ const createPendingInboxReceiver = (options?: { storage?: Map<string, string>; o
 		_storageService: {
 			store(key: string, value: string, scope: unknown) { storage.set(key, value); storageScopes.push(scope); },
 			get(key: string, _scope: unknown) { return storage.get(key); },
+			remove(key: string, _scope: unknown) { storage.delete(key); },
 		},
+		_notificationService: { notify(notification: { message: string }) { warnings.push(notification.message); } },
 		_onDidChangePendingChatSubmission: { fire() { } },
 		_onDidChangePendingChatInputs: { fire(event: { threadId: string }) { pendingEvents.push(event.threadId); } },
 		_addMessageToThread(_threadId: string, message: any) { messages.push(message); },
@@ -151,7 +154,7 @@ const createPendingInboxReceiver = (options?: { storage?: Map<string, string>; o
 		_setState(partial: unknown) { this.state = { ...this.state, ...(partial as object) }; },
 	};
 	Object.setPrototypeOf(receiver, ChatThreadService.prototype);
-	return { receiver, context, storage, storageScopes, pendingEvents, messages, deliveries };
+	return { receiver, context, storage, storageScopes, pendingEvents, warnings, messages, deliveries };
 };
 
 suite('Assistant message lifecycle', () => {
@@ -584,7 +587,7 @@ suite('Assistant message lifecycle', () => {
 		);
 		(converter as any)._generateChatMessagesSystemMessage = async () => 'matrix system';
 		const history: any[] = [
-			{ role: 'user', content: 'first', displayContent: 'first' },
+			{ role: 'user', pendingInputId: 'provider-invisible-pending-provenance', content: 'first', displayContent: 'first' },
 			{ role: 'assistant', displayContent: '', reasoning: 'kept in the UI', anthropicReasoning: null },
 			{ role: 'user', content: 'continue', displayContent: 'continue' },
 		];
@@ -597,7 +600,10 @@ suite('Assistant message lifecycle', () => {
 		] as const;
 		for (const modelSelection of routes) {
 			const result = await converter.prepareLLMChatMessages({ chatMessages: history, chatMode: 'agent', modelSelection, instructionSnapshot: instructionSnapshot() as never });
-			assert.strictEqual(JSON.stringify(result.messages).includes(INTERNAL_EMPTY_MESSAGE_SENTINEL), false);
+			const serialized = JSON.stringify(result.messages);
+			assert.strictEqual(serialized.includes(INTERNAL_EMPTY_MESSAGE_SENTINEL), false);
+			assert.strictEqual(serialized.includes('pendingInputId'), false);
+			assert.strictEqual(serialized.includes('provider-invisible-pending-provenance'), false);
 			assert.strictEqual(result.messages.some((message: any) => message.role === 'assistant' || message.role === 'model'), false);
 		}
 		const presentation = assistantMessagePresentation({ displayContent: '', reasoning: 'kept in the UI' });
@@ -614,7 +620,7 @@ suite('Assistant message lifecycle', () => {
 		}
 
 		let serializedThreads = '';
-		const thread: any = { id: 'task', messages: [], state: {}, filesWithUserChanges: new Set<string>() };
+		const thread: any = { id: 'task', messages: [{ role: 'user', pendingInputId: 'persisted-pending-provenance', content: 'queued content', displayContent: 'queued content', selections: [], state: {} }], state: {}, filesWithUserChanges: new Set<string>() };
 		const receiver: any = {
 			state: { allThreads: { task: thread }, currentThreadId: 'task' },
 			streamState: { task: { isRunning: 'LLM', llmInfo: { displayContentSoFar: INTERNAL_EMPTY_MESSAGE_SENTINEL, reasoningSoFar: 'abort reasoning', toolCallSoFar: null }, interrupt: Promise.resolve(() => { }) } },
@@ -629,6 +635,9 @@ suite('Assistant message lifecycle', () => {
 		const aborted = receiver.state.allThreads.task.messages.at(-1);
 		assert.deepStrictEqual({ display: aborted.displayContent, reasoning: aborted.reasoning, visible: assistantMessagePresentation(aborted).renderDisplay }, { display: '', reasoning: 'abort reasoning', visible: '' });
 		assert.strictEqual(JSON.parse(serializedThreads).task.messages.at(-1).displayContent, '');
+		assert.strictEqual(JSON.parse(serializedThreads).task.messages[0].pendingInputId, 'persisted-pending-provenance');
+		const restoredWithProvenance = (ChatThreadService.prototype as any)._convertThreadDataFromStorage.call({}, serializedThreads);
+		assert.strictEqual(restoredWithProvenance.task.messages[0].pendingInputId, 'persisted-pending-provenance');
 
 		const legacy = JSON.stringify({ task: { id: 'task', messages: [{ role: 'assistant', displayContent: INTERNAL_EMPTY_MESSAGE_SENTINEL, reasoning: 'legacy reasoning', anthropicReasoning: null }, { role: 'assistant', displayContent: `keep ${INTERNAL_EMPTY_MESSAGE_SENTINEL}`, reasoning: '', anthropicReasoning: null }], state: {} } });
 		const migrated = (ChatThreadService.prototype as any)._convertThreadDataFromStorage.call({}, legacy);
@@ -1357,11 +1366,13 @@ suite('Assistant message lifecycle', () => {
 		assert.deepStrictEqual(deliveries, []);
 
 		const admission = deferred<boolean>();
-		receiver._addUserMessageAndStreamResponse = async (args: any) => { (deliveries as any).push(args.userMessage); return admission.promise; };
+		let deliveredPendingInputId: string | undefined;
+		receiver._addUserMessageAndStreamResponse = async (args: any) => { deliveredPendingInputId = args.pendingInputId; (deliveries as any).push(args.userMessage); return admission.promise; };
 		receiver._runQuiescenceOfThread.delete('task');
 		const draining = receiver._drainPendingChatInputs('task');
 		await flushMicrotasks();
 		assert.deepStrictEqual(deliveries, ['third edited']);
+		assert.strictEqual(deliveredPendingInputId, third.id);
 		assert.strictEqual(receiver.getPendingChatInputs('task')[0].phase, 'claiming');
 		assert.deepStrictEqual(messages, []);
 		admission.resolve(true);
@@ -1402,10 +1413,88 @@ suite('Assistant message lifecycle', () => {
 		assert.strictEqual(untrusted.receiver.resumePendingInput('task', pending.id), false);
 		assert.deepStrictEqual(untrusted.deliveries, []);
 
+		restarted.receiver._addUserMessageAndStreamResponse = async (args: any) => { restarted.deliveries.push(args.userMessage); restarted.messages.push({ role: 'user', pendingInputId: args.pendingInputId }); return true; };
 		assert.strictEqual(restarted.receiver.resumePendingInput('task', pending.id), true);
+		assert.strictEqual(restarted.receiver.resumePendingInput('task', pending.id), false);
 		await flushMicrotasks();
 		assert.deepStrictEqual(restarted.deliveries, ['resume this']);
+		assert.deepStrictEqual(restarted.messages.filter(message => message.role === 'user').map(message => message.pendingInputId), [pending.id]);
 		assert.deepStrictEqual(restarted.receiver.getPendingChatInputs('task'), []);
+
+		const crashedEnvelope = JSON.parse(persisted.get(PENDING_CHAT_INPUT_STORAGE_KEY)!);
+		crashedEnvelope.records = [{ ...envelope.records[0], phase: 'claiming', claimId: 'claim-after-history' }];
+		persisted.set(PENDING_CHAT_INPUT_STORAGE_KEY, JSON.stringify(crashedEnvelope));
+		const crashRestart = createPendingInboxReceiver({ storage: persisted, messages: [{ role: 'user', pendingInputId: pending.id }] });
+		crashRestart.receiver._restorePendingChatInputs();
+		assert.deepStrictEqual(crashRestart.receiver.getPendingChatInputs('task'), []);
+		assert.deepStrictEqual(crashRestart.warnings, []);
+		await crashRestart.receiver._drainPendingChatInputs('task');
+		assert.deepStrictEqual(crashRestart.deliveries, []);
+	});
+
+	test('bounds live pending admission and edits by global count and UTF-8 envelope bytes', () => {
+		const { receiver, storage, warnings } = createPendingInboxReceiver();
+		receiver.state.allThreads.other = { id: 'other', messages: [], state: { stagingSelections: [], linksOfMessageIdx: {} }, filesWithUserChanges: new Set<string>() };
+		receiver._runQuiescenceOfThread.set('task', { runId: 'hold', generation: 0, settled: new Promise<void>(() => { }) });
+		receiver._runQuiescenceOfThread.set('other', { runId: 'hold-other', generation: 0, settled: new Promise<void>(() => { }) });
+		for (let index = 0; index < PENDING_CHAT_INPUT_MAX_RECORDS; index++) {
+			const threadId = index % 2 === 0 ? 'task' : 'other';
+			assert.ok(receiver.submitPendingInput({ threadId, text: `draft ${index}`, mode: 'queue' }));
+		}
+		const before = storage.get(PENDING_CHAT_INPUT_STORAGE_KEY);
+		assert.strictEqual(receiver.submitPendingInput({ threadId: 'task', text: 'count overflow', mode: 'queue' }), undefined);
+		assert.strictEqual(storage.get(PENDING_CHAT_INPUT_STORAGE_KEY), before);
+		const first = receiver.getPendingChatInputs('task')[0];
+		assert.strictEqual(receiver.editPendingInput('task', first.id, '한'.repeat(30_000)), false);
+		assert.strictEqual(storage.get(PENDING_CHAT_INPUT_STORAGE_KEY), before);
+		assert.strictEqual(receiver.getPendingChatInputs('task')[0].text, 'draft 0');
+		assert.ok(new TextEncoder().encode(storage.get(PENDING_CHAT_INPUT_STORAGE_KEY)!).byteLength <= PENDING_CHAT_INPUT_MAX_SERIALIZED_BYTES);
+		assert.ok(warnings.length >= 2);
+
+		const fitsMultibyte = (length: number) => {
+			const probe = createPendingInboxReceiver();
+			probe.receiver._runQuiescenceOfThread.set('task', { runId: 'hold', generation: 0, settled: new Promise<void>(() => { }) });
+			return !!probe.receiver.submitPendingInput({ threadId: 'task', text: '한'.repeat(length), mode: 'queue' });
+		};
+		let low = 1; let high = 30_000;
+		while (low < high) { const middle = Math.ceil((low + high) / 2); if (fitsMultibyte(middle)) low = middle; else high = middle - 1; }
+		const boundary = createPendingInboxReceiver();
+		boundary.receiver._runQuiescenceOfThread.set('task', { runId: 'hold', generation: 0, settled: new Promise<void>(() => { }) });
+		const boundaryInput = boundary.receiver.submitPendingInput({ threadId: 'task', text: '한'.repeat(low), mode: 'queue' });
+		assert.ok(boundaryInput);
+		const byteBoundary = boundary.storage.get(PENDING_CHAT_INPUT_STORAGE_KEY)!;
+		assert.strictEqual(boundary.receiver.editPendingInput('task', boundaryInput.id, '한'.repeat(low + 1)), false);
+		assert.strictEqual(boundary.storage.get(PENDING_CHAT_INPUT_STORAGE_KEY), byteBoundary);
+	});
+
+	test('restores only deterministic dormant survivors that fit the global inbox limits', () => {
+		const storage = new Map<string, string>();
+		const source = createPendingInboxReceiver({ storage });
+		source.receiver._runQuiescenceOfThread.set('task', { runId: 'hold', generation: 0, settled: new Promise<void>(() => { }) });
+		assert.ok(source.receiver.submitPendingInput({ threadId: 'task', text: 'seed', mode: 'queue' }));
+		const seed = JSON.parse(storage.get(PENDING_CHAT_INPUT_STORAGE_KEY)!).records[0];
+		const records = Array.from({ length: PENDING_CHAT_INPUT_MAX_RECORDS + 2 }, (_, index) => ({ ...seed, id: `restore-${index}`, order: index, text: index === 0 ? '한'.repeat(30_000) : `restored ${index}`, draft: `restored ${index}`, phase: 'claiming', claimId: 'stale-claim' }));
+		// Public inbox identity is `(threadId, id)`, so a corrupt cross-thread UUID
+		// collision must not discard either thread's otherwise valid draft.
+		records[1] = { ...records[1], threadId: 'other', id: records[2].id, order: records[2].order };
+		storage.set(PENDING_CHAT_INPUT_STORAGE_KEY, JSON.stringify({ version: 1, records }));
+		const restarted = createPendingInboxReceiver({ storage });
+		restarted.receiver.state.allThreads.other = { id: 'other', messages: [], state: { stagingSelections: [], linksOfMessageIdx: {} }, filesWithUserChanges: new Set<string>() };
+		restarted.receiver._restorePendingChatInputs();
+		const restored = restarted.receiver.getPendingChatInputs('task');
+		assert.ok(restored.length <= PENDING_CHAT_INPUT_MAX_RECORDS);
+		assert.ok(restored.every((input: any) => input.phase === 'dormant'));
+		assert.strictEqual(restarted.receiver.getPendingChatInputs('other').length, 1);
+		assert.deepStrictEqual(restarted.deliveries, []);
+		assert.ok(new TextEncoder().encode(storage.get(PENDING_CHAT_INPUT_STORAGE_KEY)!).byteLength <= PENDING_CHAT_INPUT_MAX_SERIALIZED_BYTES);
+		assert.ok(restarted.warnings.length >= 1);
+
+		const oversizedStorage = new Map<string, string>([[PENDING_CHAT_INPUT_STORAGE_KEY, ' '.repeat(512 * 1024 + 1)]]);
+		const oversized = createPendingInboxReceiver({ storage: oversizedStorage });
+		oversized.receiver._restorePendingChatInputs();
+		assert.strictEqual(oversizedStorage.has(PENDING_CHAT_INPUT_STORAGE_KEY), false);
+		assert.deepStrictEqual(oversized.receiver.getPendingChatInputs('task'), []);
+		assert.strictEqual(oversized.warnings.length, 1);
 	});
 
 	test('keeps a failed queued admission as an explicit dormant draft without history or provider mutation', async () => {
@@ -1491,7 +1580,8 @@ suite('Assistant message lifecycle', () => {
 			_beginInstructionTurn: async () => instructionTurn, _purgeInstructionTurn() { }, _rememberInstructionTurn() { },
 			_workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: URI.parse('file:///workspace') }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => true },
 			_agentSkillsService: { getCatalog: async () => createSkillCatalog([]), readSkillBody: async () => ({}) }, _directoryStringService: {}, _fileService: {},
-			_mcpService: { getMCPTools: () => [] }, _notificationService: { notify() { } },
+			_mcpService: { getMCPTools: () => [] }, _notificationService: { notify() { } }, _toolsService: { invalidateReadReceipts() { } },
+			_agentSubagentService: { cancelParent() { }, forgetParent() { } }, _childToolApprovals: new Map(), _onDidChangeChildToolApprovals: { fire() { } },
 			_agentControlGeneration: new Map([['task', 0]]), _agentDelegationAuthorityOfThread: new Map(), _parentRunTokenOfThread: new Map(),
 			_pendingChatSubmissionOfThread: new Map(), _pendingChatInputsOfThread: new Map(), _drainingPendingChatInputs: new Set(), _runQuiescenceOfThread: new Map(), _startingParentRunOfThread: new Map(), _deletingPendingInputThreads: new Set(), _stopAndSendFlights: new Map(), _transientComposerDraftOfThread: new Map(),
 			_onDidChangePendingChatInputs: { fire() { } }, _storePendingChatInputs() { }, _onDidChangePendingChatSubmission: { fire() { } },
@@ -1516,6 +1606,52 @@ suite('Assistant message lifecycle', () => {
 		receiver.deletePendingInput('task', queued.id);
 		runGate.resolve();
 		await flushMicrotasks();
+
+		const providerStartsBeforeClaimFence = providerStarts;
+		const exactClaim = { id: 'queued-pending-id', threadId: 'task', claimId: 'queued-claim-id', phase: 'claiming', generation: 0, ownerProjectRoot: 'file:///workspace', trustedAtSubmit: true };
+		receiver._pendingChatInputsOfThread.set('task', [exactClaim]);
+		const fencedAdmission = (ChatThreadService.prototype as any)._addUserMessageAndStreamResponse.call(receiver, { userMessage: 'must not duplicate', threadId: 'task', pendingInputId: exactClaim.id, pendingInputClaim: exactClaim });
+		thread.messages.push({ role: 'user', pendingInputId: 'queued-pending-id', content: 'must not duplicate', displayContent: 'must not duplicate' });
+		assert.strictEqual(await fencedAdmission, false);
+		assert.strictEqual(providerStarts, providerStartsBeforeClaimFence);
+		assert.strictEqual(thread.messages.filter((message: any) => message.pendingInputId === 'queued-pending-id').length, 1);
+
+		const replacedClaim = { id: 'replaced-pending-id', threadId: 'task', claimId: 'original-claim-id', phase: 'claiming', generation: 0, ownerProjectRoot: 'file:///workspace', trustedAtSubmit: true };
+		receiver._pendingChatInputsOfThread.set('task', [replacedClaim]);
+		const replacedAdmission = (ChatThreadService.prototype as any)._addUserMessageAndStreamResponse.call(receiver, { userMessage: 'must preserve replacement', threadId: 'task', pendingInputId: replacedClaim.id, pendingInputClaim: replacedClaim });
+		const replacement = { ...replacedClaim, claimId: 'replacement-claim-id' };
+		receiver._pendingChatInputsOfThread.set('task', [replacement]);
+		assert.strictEqual(await replacedAdmission, false);
+		assert.strictEqual(providerStarts, providerStartsBeforeClaimFence);
+		assert.strictEqual(receiver._pendingChatInputsOfThread.get('task')[0], replacement);
+
+		const deletedClaim = { id: 'deleted-pending-id', threadId: 'task', claimId: 'deleted-claim-id', phase: 'claiming', generation: 0, ownerProjectRoot: 'file:///workspace', trustedAtSubmit: true };
+		receiver._pendingChatInputsOfThread.set('task', [deletedClaim]);
+		const deletedAdmission = (ChatThreadService.prototype as any)._addUserMessageAndStreamResponse.call(receiver, { userMessage: 'must stay deleted', threadId: 'task', pendingInputId: deletedClaim.id, pendingInputClaim: deletedClaim });
+		receiver._pendingChatInputsOfThread.delete('task');
+		assert.strictEqual(await deletedAdmission, false);
+		assert.strictEqual(providerStarts, providerStartsBeforeClaimFence);
+		assert.strictEqual(thread.messages.some((message: any) => message.pendingInputId === deletedClaim.id), false);
+
+		const reorderClaim: any = { id: 'reorder-pending-id', threadId: 'task', text: 'still deliver once', draft: 'still deliver once', selections: [], mode: 'queue', order: 0, createdAt: 1, generation: 0, ownerProjectRoot: 'file:///workspace', trustedAtSubmit: true, claimId: 'reorder-claim-id', phase: 'claiming' };
+		const queuedB: any = { ...reorderClaim, id: 'queued-b', text: 'B', draft: 'B', order: 1, claimId: undefined, phase: 'queued' };
+		const queuedC: any = { ...reorderClaim, id: 'queued-c', text: 'C', draft: 'C', order: 2, claimId: undefined, phase: 'queued' };
+		receiver._pendingChatInputsOfThread.set('task', [reorderClaim, queuedB, queuedC]);
+		const reorderedAdmission = (ChatThreadService.prototype as any)._addUserMessageAndStreamResponse.call(receiver, { userMessage: reorderClaim.text, threadId: 'task', pendingInputId: reorderClaim.id, pendingInputClaim: reorderClaim });
+		assert.strictEqual(receiver.reorderPendingInput('task', queuedB.id), true);
+		assert.strictEqual(await reorderedAdmission, true);
+		assert.strictEqual(providerStarts, providerStartsBeforeClaimFence + 1);
+		assert.strictEqual(thread.messages.filter((message: any) => message.pendingInputId === reorderClaim.id).length, 1);
+
+		let claimTrusted = true;
+		receiver._workspaceTrustManagementService = { isWorkspaceTrusted: () => claimTrusted };
+		const trustClaim = { ...reorderClaim, id: 'trust-pending-id', text: 'must not cross trust', draft: 'must not cross trust', claimId: 'trust-claim-id' };
+		receiver._pendingChatInputsOfThread.set('task', [trustClaim]);
+		const trustAdmission = (ChatThreadService.prototype as any)._addUserMessageAndStreamResponse.call(receiver, { userMessage: trustClaim.text, threadId: 'task', pendingInputId: trustClaim.id, pendingInputClaim: trustClaim });
+		claimTrusted = false;
+		assert.strictEqual(await trustAdmission, false);
+		assert.strictEqual(providerStarts, providerStartsBeforeClaimFence + 1);
+		assert.strictEqual(thread.messages.some((message: any) => message.pendingInputId === trustClaim.id), false);
 	});
 
 	test('registers a parent lease before synchronous start events can submit Steer', async () => {
@@ -1554,6 +1690,8 @@ suite('Assistant message lifecycle', () => {
 		receiver._runQuiescenceOfThread.set('task', { runId: parentRun.runId, generation: parentRun.generation, settled: new Promise<void>(() => { }) });
 		receiver.submitPendingInput({ threadId: 'task', text: 'attachment fallback', mode: 'steer', selections: [{ type: 'File', uri: URI.parse('file:///workspace/attached.ts'), language: 'typescript', state: { wasAddedAsCurrentFile: false } }] });
 		const stale = receiver.submitPendingInput({ threadId: 'task', text: 'stale steer', mode: 'steer' });
+		const delivered = receiver.submitPendingInput({ threadId: 'task', text: 'already delivered', mode: 'steer' });
+		messages.push({ role: 'user', pendingInputId: delivered.id, content: delivered.text, displayContent: delivered.text });
 		let reentered = false;
 		receiver._onDidChangePendingChatInputs = { fire() {
 			if (reentered) return;
@@ -1562,7 +1700,8 @@ suite('Assistant message lifecycle', () => {
 			receiver.submitPendingInput({ threadId: 'task', text: 'replacement steer', mode: 'steer' });
 		} };
 		(ChatThreadService.prototype as any)._promoteSteerAtSafeBoundary.call(receiver, 'task', parentRun);
-		assert.deepStrictEqual(messages.filter(message => message.role === 'user').map(message => message.displayContent), ['replacement steer']);
+		assert.deepStrictEqual(messages.filter(message => message.role === 'user').map(message => message.displayContent), ['already delivered', 'replacement steer']);
+		assert.strictEqual(receiver.getPendingChatInputs('task').some((input: any) => input.id === delivered.id || input.id === stale.id), false);
 	});
 
 	test('promotes plain steering only after a tool settles and falls attachment steering back to FIFO', async () => {

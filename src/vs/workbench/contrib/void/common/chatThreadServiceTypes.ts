@@ -76,6 +76,8 @@ export type DecorativeCanceledTool = {
 export type ChatMessage =
 	| {
 		role: 'user';
+		/** Durable inbox provenance. It is not model-visible content. */
+		pendingInputId?: string;
 		content: string; // content displayed to the LLM on future calls; allowed to be empty without fabricating display text
 		displayContent: string; // content displayed to user  - allowed to be '', will be ignored
 		selections: StagingSelectionItem[] | null; // the user's selection

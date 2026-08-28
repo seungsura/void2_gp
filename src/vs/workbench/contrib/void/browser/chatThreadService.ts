@@ -52,6 +52,13 @@ import { CustomAgentCatalog, customAgentAdvertisement } from '../common/agentCus
 import { sanitizeAssistantDisplayContent } from '../common/assistantMessagePresentation.js';
 import { divideToolWaveOutputBudget, parentSafeReadToolNames, planToolBatchWaves } from '../common/toolBatchPlanner.js';
 
+/** Global durable-inbox limits, measured on the serialized v1 envelope. */
+export const PENDING_CHAT_INPUT_MAX_RECORDS = 32;
+export const PENDING_CHAT_INPUT_MAX_SERIALIZED_BYTES = 64 * 1024;
+const PENDING_CHAT_INPUT_LEGACY_IMPORT_MAX_RECORDS = 256;
+const PENDING_CHAT_INPUT_RAW_RESTORE_MAX_BYTES = 512 * 1024;
+const PENDING_CHAT_INPUT_CLAIM_ID_RESERVE = '00000000-0000-0000-0000-000000000000';
+
 
 // related to retrying when LLM message has error
 const CHAT_RETRIES = 3
@@ -220,6 +227,8 @@ type StartingParentRun = Readonly<{ id: string; generation: number }>;
 
 const comparePendingChatInputs = (a: PendingChatInput, b: PendingChatInput): number =>
 	a.order - b.order || a.id.localeCompare(b.id);
+const comparePendingChatInputsGlobally = (a: PendingChatInput, b: PendingChatInput): number =>
+	comparePendingChatInputs(a, b) || a.threadId.localeCompare(b.threadId);
 
 const isPendingInputMode = (value: unknown): value is PendingInputMode =>
 	value === 'queue' || value === 'steer' || value === 'stop_and_send';
@@ -620,9 +629,20 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		return ownerProjectRoot === this._currentPendingInputOwner() && trustedAtSubmit === this._workspaceTrustManagementService.isWorkspaceTrusted()
 	}
 	private _storePendingChatInputs(): void {
-		const records = [...this._pendingChatInputsOfThread.values()].flat().sort(comparePendingChatInputs).map(record => ({ ...record, selections: this._clonePendingSelections(record.selections) }))
+		const records = [...this._pendingChatInputsOfThread.values()].flat().sort(comparePendingChatInputsGlobally).map(record => ({ ...record, selections: this._clonePendingSelections(record.selections) }))
 		const envelope: PendingChatInputStorageEnvelope = { version: 1, records }
 		this._storageService.store(PENDING_CHAT_INPUT_STORAGE_KEY, JSON.stringify(envelope), StorageScope.WORKSPACE, StorageTarget.USER)
+	}
+	private _pendingInboxBytes(records: readonly PendingChatInputRecord[], reserveClaim = false): number {
+		const serialized = [...records].sort(comparePendingChatInputsGlobally).map(record => ({ ...record, selections: this._clonePendingSelections(record.selections), ...(reserveClaim ? { phase: 'claiming' as const, claimId: PENDING_CHAT_INPUT_CLAIM_ID_RESERVE } : {}) }))
+		return new TextEncoder().encode(JSON.stringify({ version: 1, records: serialized })).byteLength
+	}
+	private _fitsPendingInbox(records: readonly PendingChatInputRecord[]): boolean {
+		return records.length <= PENDING_CHAT_INPUT_MAX_RECORDS && this._pendingInboxBytes(records, true) <= PENDING_CHAT_INPUT_MAX_SERIALIZED_BYTES
+	}
+	private _warnPendingInbox(message: string): void { this._notificationService.notify({ severity: Severity.Warning, message }) }
+	private _hasPersistedPendingInputId(threadId: string, id: string): boolean {
+		return this.state.allThreads[threadId]?.messages.some(message => message.role === 'user' && message.pendingInputId === id) ?? false
 	}
 	private _revivePendingSelection(value: unknown): StagingSelectionItem | undefined {
 		if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
@@ -675,19 +695,34 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const raw = this._storageService.get(PENDING_CHAT_INPUT_STORAGE_KEY, StorageScope.WORKSPACE)
 		if (!raw) return
 		try {
+			if (raw.length > PENDING_CHAT_INPUT_RAW_RESTORE_MAX_BYTES || new TextEncoder().encode(raw).byteLength > PENDING_CHAT_INPUT_RAW_RESTORE_MAX_BYTES) { this._storageService.remove(PENDING_CHAT_INPUT_STORAGE_KEY, StorageScope.WORKSPACE); this._warnPendingInbox('Pending inputs were discarded because stored inbox data was too large.'); return }
 			const parsed = JSON.parse(raw) as unknown
 			const records = Array.isArray(parsed) ? parsed : (parsed && typeof parsed === 'object' && (parsed as PendingChatInputStorageEnvelope).version === 1 && Array.isArray((parsed as PendingChatInputStorageEnvelope).records) ? (parsed as PendingChatInputStorageEnvelope).records : undefined)
-			if (!records) return
-			const seen = new Set<string>()
-			for (const value of records) {
+			if (!records) { this._storageService.remove(PENDING_CHAT_INPUT_STORAGE_KEY, StorageScope.WORKSPACE); this._warnPendingInbox('Pending inputs were discarded because stored inbox data was invalid.'); return }
+			let omitted = records.length > PENDING_CHAT_INPUT_LEGACY_IMPORT_MAX_RECORDS
+			const revived: PendingChatInputRecord[] = []
+			for (const value of records.slice(0, PENDING_CHAT_INPUT_LEGACY_IMPORT_MAX_RECORDS)) {
 				const record = this._revivePendingChatInput(value)
-				if (!record || seen.has(record.id)) continue
-				seen.add(record.id)
-				const items = this._pendingChatInputsOfThread.get(record.threadId) ?? []
-				items.push(record); this._pendingChatInputsOfThread.set(record.threadId, items)
+				if (!record) { omitted = true; continue }
+				// A crash after durable history append but before inbox removal is a
+				// completed delivery, not corrupt or omitted user data.
+				if (this._hasPersistedPendingInputId(record.threadId, record.id)) continue
+				revived.push(record)
 			}
+			revived.sort(comparePendingChatInputsGlobally)
+			const seen = new Set<string>()
+			const accepted: PendingChatInputRecord[] = []
+			for (const record of revived) {
+				const identity = JSON.stringify([record.threadId, record.id])
+				if (seen.has(identity)) { omitted = true; continue }
+				seen.add(identity)
+				if (!this._fitsPendingInbox([...accepted, record])) { omitted = true; continue }
+				accepted.push(record)
+			}
+			for (const record of accepted) { const items = this._pendingChatInputsOfThread.get(record.threadId) ?? []; items.push(record); this._pendingChatInputsOfThread.set(record.threadId, items) }
 			this._storePendingChatInputs()
-		} catch { /* Malformed or foreign-workspace inbox data is never replayed. */ }
+			if (omitted) this._warnPendingInbox('Some pending inputs were discarded because the stored inbox was invalid or over its limit.')
+		} catch { this._storageService.remove(PENDING_CHAT_INPUT_STORAGE_KEY, StorageScope.WORKSPACE); this._warnPendingInbox('Pending inputs were discarded because stored inbox data was invalid.') }
 	}
 	private _setPendingChatInputs(threadId: string, records: readonly PendingChatInputRecord[]): void {
 		const seen = new Set<string>()
@@ -726,6 +761,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			maxOrder = items.length - 1
 		}
 		const record = this._freezePendingInput({ id: generateUuid(), threadId, text, draft: text, selections: selections ?? thread.state.stagingSelections, mode, order: maxOrder + 1, createdAt: Date.now(), ownerProjectRoot: this._currentPendingInputOwner(), trustedAtSubmit: this._workspaceTrustManagementService.isWorkspaceTrusted(), generation: active?.generation ?? (this._agentControlGeneration.get(threadId) ?? 0), ...(active ? { runId: active.runId } : {}), phase })
+		if (!this._fitsPendingInbox([...this._pendingChatInputsOfThread.values()].flat().filter(item => item.threadId !== threadId).concat(items, record))) { this._warnPendingInbox('Pending inbox is full. Your draft was kept in the composer.'); return undefined }
 		items.push(record); this._setPendingChatInputs(threadId, items)
 		// The event is synchronous. A listener may delete this record before any
 		// privileged Stop side effect runs, so re-read the exact stored identity.
@@ -735,7 +771,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		return record
 	}
 	deletePendingInput(threadId: string, id: string): boolean { const items = this._pendingChatInputsOfThread.get(threadId) ?? []; if (!items.some(item => item.id === id)) return false; this._setPendingChatInputs(threadId, items.filter(item => item.id !== id)); return true }
-	editPendingInput(threadId: string, id: string, text: string, selections?: readonly StagingSelectionItem[]): boolean { if (!text.trim()) return false; const items = this._pendingChatInputsOfThread.get(threadId) ?? []; const index = items.findIndex(item => item.id === id); if (index < 0 || items[index].phase === 'claiming') return false; items[index] = this._freezePendingInput({ ...items[index], text, draft: text, ...(selections ? { selections } : {}) }); this._setPendingChatInputs(threadId, items); return true }
+	editPendingInput(threadId: string, id: string, text: string, selections?: readonly StagingSelectionItem[]): boolean { if (!text.trim()) return false; const items = this._pendingChatInputsOfThread.get(threadId) ?? []; const index = items.findIndex(item => item.id === id); if (index < 0 || items[index].phase === 'claiming') return false; const replacement = this._freezePendingInput({ ...items[index], text, draft: text, ...(selections ? { selections } : {}) }); const next = [...items]; next[index] = replacement; if (!this._fitsPendingInbox([...this._pendingChatInputsOfThread.values()].flat().filter(item => item.threadId !== threadId).concat(next))) { this._warnPendingInbox('Pending inbox is full. The existing draft was unchanged.'); return false } this._setPendingChatInputs(threadId, next); return true }
 	reorderPendingInput(threadId: string, id: string, beforeId?: string): boolean { const items = [...(this._pendingChatInputsOfThread.get(threadId) ?? [])].sort(comparePendingChatInputs); const index = items.findIndex(item => item.id === id); if (index < 0 || items[index].phase === 'claiming') return false; const [item] = items.splice(index, 1); const target = beforeId === undefined ? items.length : items.findIndex(candidate => candidate.id === beforeId && candidate.phase !== 'claiming'); if (target < 0) return false; items.splice(target, 0, item); this._setPendingChatInputs(threadId, items.map((candidate, order) => this._freezePendingInput({ ...candidate, order }))); return true }
 	resumePendingInput(threadId: string, id: string): boolean { const items = this._pendingChatInputsOfThread.get(threadId) ?? []; const index = items.findIndex(item => item.id === id); if (this._deletingPendingInputThreads.has(threadId) || index < 0 || items[index].phase !== 'dormant' || !this._canDeliverPendingChatInput(items[index])) return false; items[index] = this._freezePendingInput({ ...items[index], mode: 'queue', phase: 'queued', runId: undefined, claimId: undefined }); this._setPendingChatInputs(threadId, items); void this._drainPendingChatInputs(threadId); return true }
 	async getSkillCatalog(threadId = this.state.currentThreadId) {
@@ -2608,10 +2644,22 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	}
 	private _promoteSteerAtSafeBoundary(threadId: string, parentRun: ParentRunOwnership): boolean {
 		const initialItems = this._pendingChatInputsOfThread.get(threadId) ?? []
+		const undeliveredItems = initialItems.filter(item => {
+			if (!this._hasPersistedPendingInputId(threadId, item.id)) return true
+			return false
+		})
+		if (undeliveredItems.length !== initialItems.length) this._setPendingChatInputs(threadId, undeliveredItems)
+		// `_setPendingChatInputs` emits synchronously. A listener may delete,
+		// reorder, or add records while delivered provenance is being pruned, so
+		// normalization must start from the latest map rather than the stale
+		// pre-event snapshot.
+		const currentUndeliveredItems = undeliveredItems.length === initialItems.length
+			? undeliveredItems
+			: (this._pendingChatInputsOfThread.get(threadId) ?? [])
 		// Normalize every ineligible steer now. Leaving a later attachment-bearing
 		// record in `steering` would strand it if this is the parent's last boundary.
 		let normalized = false
-		const items = initialItems.map(item => {
+		const items = currentUndeliveredItems.map(item => {
 			if (item.phase !== 'steering' || item.runId !== parentRun.runId || item.generation !== parentRun.generation) return item
 			if (!this._canDeliverPendingChatInput(item)) { normalized = true; return this._freezePendingInput({ ...item, phase: 'dormant', claimId: undefined }) }
 			if (!this._steerCanBePromotedInRun(item)) { normalized = true; return this._freezePendingInput({ ...item, mode: 'queue', phase: 'queued', runId: undefined, claimId: undefined }) }
@@ -2625,11 +2673,12 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		if (!record) return false
 		const claimed = this._claimPendingChatInput(threadId, record.id, 'steering')
 		if (!claimed) return false
+		if (this._hasPersistedPendingInputId(threadId, claimed.id)) { this._finishPendingChatInputClaim(threadId, claimed, 'remove'); return false }
 		if (!parentRun.isActive() || !this._canDeliverPendingChatInput(claimed) || this._findPendingChatInput(threadId, claimed.id)?.claimId !== claimed.claimId) {
 			this._finishPendingChatInputClaim(threadId, claimed, this._canDeliverPendingChatInput(claimed) ? 'queued' : 'dormant')
 			return false
 		}
-		this._addMessageToThread(threadId, { role: 'user', content: claimed.text, displayContent: claimed.text, selections: [], state: defaultMessageState })
+		this._addMessageToThread(threadId, { role: 'user', pendingInputId: claimed.id, content: claimed.text, displayContent: claimed.text, selections: [], state: defaultMessageState })
 		this._finishPendingChatInputClaim(threadId, claimed, 'remove')
 		return true
 	}
@@ -2671,14 +2720,17 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				const items = this._pendingChatInputsOfThread.get(threadId) ?? []
 				const record = [...items].sort(comparePendingChatInputs).find(item => item.phase === 'queued')
 				if (!record) return
+				if (this._hasPersistedPendingInputId(threadId, record.id)) { this._setPendingChatInputs(threadId, items.filter(item => item.id !== record.id)); continue }
 				if (!this._canDeliverPendingChatInput(record)) { this._setPendingChatInputs(threadId, items.map(item => item.id === record.id ? this._freezePendingInput({ ...item, phase: 'dormant', claimId: undefined }) : item)); continue }
 				const claimed = this._claimPendingChatInput(threadId, record.id, 'queued')
 				if (!claimed) continue
+				if (this._hasPersistedPendingInputId(threadId, claimed.id)) { this._finishPendingChatInputClaim(threadId, claimed, 'remove'); continue }
 				if (!this.state.allThreads[threadId] || !this._canDeliverPendingChatInput(claimed) || this._findPendingChatInput(threadId, claimed.id)?.claimId !== claimed.claimId) return
 				let accepted = false
-				try { accepted = await this._addUserMessageAndStreamResponse({ userMessage: claimed.text, _chatSelections: this._clonePendingSelections(claimed.selections), threadId }) }
+				try { accepted = await this._addUserMessageAndStreamResponse({ userMessage: claimed.text, _chatSelections: this._clonePendingSelections(claimed.selections), threadId, pendingInputId: claimed.id, pendingInputClaim: claimed }) }
 				catch { accepted = false }
 				if (!this.state.allThreads[threadId]) return
+				if (this._hasPersistedPendingInputId(threadId, claimed.id)) { this._finishPendingChatInputClaim(threadId, claimed, 'remove'); continue }
 				// A successful admission already owns the user-history append. Remove its
 				// exact claim even if a later owner/trust event arrives, otherwise that
 				// same input could be delivered twice on a future drain.
@@ -2697,7 +2749,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	}
 
 
-	private async _addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, pending }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string, pending?: PendingChatSubmissionRecord }) {
+	private async _addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, pending, pendingInputId, pendingInputClaim }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string, pending?: PendingChatSubmissionRecord, pendingInputId?: string, pendingInputClaim?: PendingChatInputRecord }) {
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return false // should never happen
 		const capturedSelections = [...(_chatSelections ?? thread.state.stagingSelections)]
@@ -2724,7 +2776,19 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const turnGeneration = pending?.generation ?? this._agentControlGeneration.get(threadId)
 		if (turnGeneration === undefined) return false
 		const isCurrentGeneration = () => this._agentControlGeneration.has(threadId) && this._agentControlGeneration.get(threadId) === turnGeneration
-		const isCurrentTurn = () => isCurrentGeneration() && (!pending || this._pendingChatSubmissionOfThread.get(threadId) === pending)
+		const isCurrentPendingInput = () => {
+			if (!pendingInputId) return true
+			if (!pendingInputClaim || pendingInputClaim.id !== pendingInputId || pendingInputClaim.threadId !== threadId || pendingInputClaim.phase !== 'claiming' || typeof pendingInputClaim.claimId !== 'string' || !pendingInputClaim.claimId) return false
+			const current = this._findPendingChatInput(threadId, pendingInputId)
+			return current?.phase === 'claiming'
+				&& current.claimId === pendingInputClaim.claimId
+				&& current.generation === pendingInputClaim.generation
+				&& current.ownerProjectRoot === pendingInputClaim.ownerProjectRoot
+				&& current.trustedAtSubmit === pendingInputClaim.trustedAtSubmit
+				&& this._canDeliverPendingChatInput(current)
+				&& !this._hasPersistedPendingInputId(threadId, pendingInputId)
+		}
+		const isCurrentTurn = () => isCurrentGeneration() && (!pending || this._pendingChatSubmissionOfThread.get(threadId) === pending) && isCurrentPendingInput()
 		if (priorRun) await priorRun
 		if (!isCurrentTurn()) return false
 		const owner = this._workspaceContextService.getWorkspace().folders[0]?.uri
@@ -2817,8 +2881,11 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		startingParentRuns.set(threadId, startingParent)
 		try {
 			if (pending && !this._settlePendingChatSubmission(pending, true)) return false
-			if (!isCurrentGeneration() || !this.state.allThreads[threadId]) return false
-			const userHistoryElt: ChatMessage = { role: 'user', content: userMessageContent, displayContent: instructions, selections: currSelns, state: defaultMessageState }
+			// A direct pending receipt is intentionally removed by settlement above.
+			// Queue admission has a separate exact-claim/provenance fence that must
+			// remain current through the final history append boundary.
+			if (!isCurrentGeneration() || !isCurrentPendingInput() || !this.state.allThreads[threadId]) return false
+			const userHistoryElt: ChatMessage = { role: 'user', ...(pendingInputId ? { pendingInputId } : {}), content: userMessageContent, displayContent: instructions, selections: currSelns, state: defaultMessageState }
 			this._addMessageToThread(threadId, userHistoryElt)
 
 			const parentRun = beginParentRunOwnership(threadId, this._parentRunTokenOfThread, this._agentControlGeneration)
