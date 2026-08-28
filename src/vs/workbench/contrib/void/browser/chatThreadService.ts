@@ -50,7 +50,7 @@ import { IAgentSubagentService } from './agentSubagentService.js';
 import { IAgentCustomAgentService } from './agentCustomAgentService.js';
 import { CustomAgentCatalog, customAgentAdvertisement } from '../common/agentCustomAgents.js';
 import { sanitizeAssistantDisplayContent } from '../common/assistantMessagePresentation.js';
-import { divideToolWaveOutputBudget, planToolBatchWaves } from '../common/toolBatchPlanner.js';
+import { divideToolWaveOutputBudget, parentSafeReadToolNames, planToolBatchWaves } from '../common/toolBatchPlanner.js';
 
 
 // related to retrying when LLM message has error
@@ -1194,6 +1194,16 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			const call = declaration.batch.calls[batchOrdinal];
 			const existing = (this.state.allThreads[threadId]?.messages ?? []).find(message => message.role === 'tool' && message.id === call.id && message.batchId === batchId && message.batchOrdinal === batchOrdinal);
 			if (existing) continue;
+			// Stop can close a later physical safe-read wave before that wave reaches its
+			// own validation pass. Preserve the deterministic invalid-params outcome for
+			// exactly those parent safe-read declarations; barriers remain unstarted skips.
+			if (isABuiltinToolName(call.name) && parentSafeReadToolNames.includes(call.name as never)) {
+				try { this._toolsService.validateParams[call.name](call.rawParams); }
+				catch (error) {
+					this._addMessageToThread(threadId, { role: 'tool', type: 'invalid_params', rawParams: call.rawParams, result: null, name: call.name, content: getErrorMessage(error), id: call.id, mcpServerName: undefined, batchId, batchOrdinal });
+					continue;
+				}
+			}
 			this._addMessageToThread(threadId, { role: 'tool', type: 'skipped', name: call.name, content: reason, result: null, id: call.id, rawParams: call.rawParams, mcpServerName: this._computeMCPServerOfToolName(call.name), batchId, batchOrdinal });
 		}
 	}
@@ -1589,6 +1599,13 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			const interruptor = () => { if (interrupted) return; interrupted = true; readCancellation.cancel(); };
 			const cardInterruptor = () => { cancelledByCard = true; interruptor(); };
 			const cancellationOutcome = () => cancelledByCard && isCurrentParentRun() && sameGeneration() ? { receiptCancelled: true } : { interrupted: true };
+			const resourceAuthorityFailure = () => {
+				const cancelling = this._cancellingToolReceiptsOfThread.get(threadId);
+				if (cancelling?.delete(receiptId) && cancelling.size === 0) this._cancellingToolReceiptsOfThread.delete(threadId);
+				if (sameRememberedSnapshot()) this._purgeInstructionTurn(threadId);
+				this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: applicationParams, result: 'skill_owner_or_trust_changed', name: toolName, content: 'skill_owner_or_trust_changed', id: toolId, rawParams: applicationParams, mcpServerName: undefined, ...batchRef });
+				return { interrupted: true as const };
+			};
 			const interruptorPromise = Promise.resolve(interruptor);
 			registerActiveToolCardReceipt.call(this, threadId, receiptId, toolId, batchRef, cardInterruptor, () => isCurrentParentRun() && sameGeneration(), true);
 			// Establish global-Stop authority before publishing the live card. `_updateLatestTool`
@@ -1606,20 +1623,29 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 					? await this._agentSubagentService.acquireGroupIo(threadId, agentRunGeneration, 'read', readCancellation.token)
 					: { release() { } };
 				let read: Awaited<ReturnType<IAgentSkillsService['readSkillResource']>>;
+				let transferredResourceLease = false;
 				try {
-					if (interrupted || !sameResourceAuthority()) return cancellationOutcome();
+					if (interrupted || !isCurrentParentRun() || !sameGeneration()) return cancellationOutcome();
+					if (!sameResourceAuthority()) return resourceAuthorityFailure();
 					const cancelled = Object.freeze({ cancelled: true as const });
 					const cancellationRace = new Promise<typeof cancelled>(resolve => readCancellation.token.onCancellationRequested(() => resolve(cancelled)));
-					const settledRead = await Promise.race([this._agentSkillsService.readSkillResource(selection, params.resourcePath, { maxResourceBytes, token: readCancellation.token }), cancellationRace]);
-					if ('cancelled' in settledRead || interrupted || !isCurrentParentRun() || !sameGeneration()) return cancellationOutcome();
-					read = settledRead;
-				} finally { resourceLease.release(); }
-				if (!sameResourceAuthority()) {
-					if (sameRememberedSnapshot()) {
-						this._purgeInstructionTurn(threadId);
-						this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: applicationParams, result: 'skill_owner_or_trust_changed', name: toolName, content: 'skill_owner_or_trust_changed', id: toolId, rawParams: applicationParams, mcpServerName: undefined, ...batchRef });
+					const resourceRead = this._agentSkillsService.readSkillResource(selection, params.resourcePath, { maxResourceBytes, token: readCancellation.token });
+					const settledRead = await Promise.race([resourceRead, cancellationRace]);
+					if ('cancelled' in settledRead) {
+						// The UI/card can settle promptly, but the underlying local file read can
+						// ignore cancellation. Keep the group reader leased until that physical
+						// promise drains, and consume a late rejection without publishing it.
+						transferredResourceLease = true;
+						const releaseTransferredLease = () => { try { resourceLease.release(); } catch { } };
+						void resourceRead.then(releaseTransferredLease, releaseTransferredLease);
+						return cancellationOutcome();
 					}
-					return { interrupted: true };
+					if ('cancelled' in settledRead || interrupted || !isCurrentParentRun() || !sameGeneration()) return cancellationOutcome();
+					if (!sameResourceAuthority()) return resourceAuthorityFailure();
+					read = settledRead;
+				} finally { if (!transferredResourceLease) resourceLease.release(); }
+				if (!sameResourceAuthority()) {
+					return resourceAuthorityFailure();
 				}
 				if (read.body === undefined) throw new Error(read.diagnostic?.code ?? 'skill_resource_unreadable');
 				const resource = admitSkillResourceContext(read.body, maxReadOutputTokens);
@@ -1636,22 +1662,14 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				} catch { throw new Error('skill_resource_context_admission_failed'); }
 				if (interrupted || !isCurrentParentRun() || !sameGeneration()) return cancellationOutcome();
 				if (!sameResourceAuthority()) {
-					if (sameRememberedSnapshot()) {
-						this._purgeInstructionTurn(threadId);
-						this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: applicationParams, result: 'skill_owner_or_trust_changed', name: toolName, content: 'skill_owner_or_trust_changed', id: toolId, rawParams: applicationParams, mcpServerName: undefined, ...batchRef });
-					}
-					return { interrupted: true };
+					return resourceAuthorityFailure();
 				}
 				this._updateLatestTool(threadId, successMessage);
 				return {};
 			} catch (error) {
 				if (interrupted || !isCurrentParentRun() || !sameGeneration()) return cancellationOutcome();
 				if (!sameResourceAuthority()) {
-					if (sameRememberedSnapshot()) {
-						this._purgeInstructionTurn(threadId);
-						this._updateLatestTool(threadId, { role: 'tool', type: 'tool_error', params: applicationParams, result: 'skill_owner_or_trust_changed', name: toolName, content: 'skill_owner_or_trust_changed', id: toolId, rawParams: applicationParams, mcpServerName: undefined, ...batchRef });
-					}
-					return { interrupted: true };
+					return resourceAuthorityFailure();
 				}
 				const errorMessage = getErrorMessage(error);
 				const content = errorMessage.includes('skill_resource_context_admission_failed') ? 'skill_resource_context_admission_failed' : errorMessage;
@@ -1766,7 +1784,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		let interrupted = false
 		let cancelledByCard = false
 		let interruptTool: (() => void) | undefined
-		const interruptor = () => { if (interrupted) return; interrupted = true; try { interruptTool?.() } catch { } }
+		const operationCancellation = new CancellationTokenSource()
+		const interruptor = () => { if (interrupted) return; interrupted = true; try { operationCancellation.cancel() } catch { } try { interruptTool?.() } catch { } }
 		const cardInterruptor = () => { cancelledByCard = true; interruptor() }
 		const cancellationOutcome = () => cancelledByCard && isCurrentParentRun() ? { receiptCancelled: true } : { interrupted: true }
 		const runningTool = {
@@ -1779,12 +1798,12 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		// The global Stop path needs this stream before a synchronous live-row listener
 		// can observe the card. If it revokes during the stream event, publish nothing.
 		this._setStreamState(threadId, { isRunning: 'tool', interrupt: interruptorPromise, toolInfo: { toolName, toolParams, id: toolId, content: 'interrupted...', rawParams: opts.unvalidatedToolParams, mcpServerName, receiptId } })
-		if (!isCurrentParentRun()) { retireActiveToolCardReceipt.call(this, threadId, receiptId); return { interrupted: true } }
+		if (!isCurrentParentRun()) { operationCancellation.dispose(); retireActiveToolCardReceipt.call(this, threadId, receiptId); return { interrupted: true } }
 		this._updateLatestTool(threadId, runningTool)
 		// A row observer can synchronously invoke global Stop. It has already marked
 		// this exact receipt Cancelling; settle before returning because no underlying
 		// operation has been started yet.
-		if (!isCurrentParentRun()) { settleCancelled(); retireActiveToolCardReceipt.call(this, threadId, receiptId); return { interrupted: true } }
+		if (!isCurrentParentRun()) { settleCancelled(); operationCancellation.dispose(); retireActiveToolCardReceipt.call(this, threadId, receiptId); return { interrupted: true } }
 
 		try {
 			try {
@@ -1808,7 +1827,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				// mutations. The approval registry is the authoritative full edit/terminal
 				// set; read-only builtins and application controls stay outside it.
 				const requiresWriteLease = !!approvalTypeOfBuiltinToolName[toolName];
-				const ioLease = requiresWriteLease && agentRunGeneration !== undefined && this._agentSubagentService?.acquireGroupIo ? await this._agentSubagentService.acquireGroupIo(threadId, agentRunGeneration, 'write') : { release() { } };
+				const ioLease = requiresWriteLease && agentRunGeneration !== undefined && this._agentSubagentService?.acquireGroupIo ? await this._agentSubagentService.acquireGroupIo(threadId, agentRunGeneration, 'write', operationCancellation.token) : { release() { } };
 				try {
 					if (interrupted || !isCurrentParentRun()) { settleCancelled(); return cancellationOutcome() }
 					const call = preparedWrite
@@ -1836,7 +1855,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				if (!mcpTool) { throw new Error(`MCP tool ${toolName} not found`) }
 
 				if (!isCurrentParentRun()) { settleCancelled(); return { interrupted: true } }
-				const ioLease = agentRunGeneration !== undefined && this._agentSubagentService?.acquireGroupIo ? await this._agentSubagentService.acquireGroupIo(threadId, agentRunGeneration, 'write') : { release() { } };
+				const ioLease = agentRunGeneration !== undefined && this._agentSubagentService?.acquireGroupIo ? await this._agentSubagentService.acquireGroupIo(threadId, agentRunGeneration, 'write', operationCancellation.token) : { release() { } };
 				try {
 					if (!isCurrentParentRun()) { settleCancelled(); return { interrupted: true } }
 					toolResult = (await this._mcpService.callMCPTool({
@@ -1892,6 +1911,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		} finally {
 			// The terminal history row carries no live receipt after settlement; only an
 			// exact in-flight row remains card-cancellable.
+			operationCancellation.dispose()
 			retireActiveToolCardReceipt.call(this, threadId, receiptId)
 		}
 	}
@@ -1905,7 +1925,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			? computeMaxReadOutputTokens(instructionSnapshot.model.contextWindow, instructionSnapshot.model.reservedOutputTokens, estimateHistoryTokensForReadBudget(history))
 			: 0;
 		const budgets = divideToolWaveOutputBudget(totalBudget, calls.length);
-		type Prepared = { call: NativeBatchRangeCall; batchRef: BatchCallRef; params: ToolCallParams<ToolName>; rawParams: RawToolParamsObj; budget: number; receiptId: string; messageIndex: number; interrupted: boolean; cancelledByCard: boolean; published: boolean; interruptTool?: () => void; ledger: ParentSafeReadLedgerEntry };
+		type Prepared = { call: NativeBatchRangeCall; batchRef: BatchCallRef; params: ToolCallParams<ToolName>; rawParams: RawToolParamsObj; budget: number; receiptId: string; messageIndex: number; interrupted: boolean; cancelledByCard: boolean; published: boolean; interruptTool?: () => void; cancellation: CancellationTokenSource; ledger: ParentSafeReadLedgerEntry };
 		type Invalid = { kind: 'invalid'; call: NativeBatchRangeCall; batchRef: BatchCallRef; content: string };
 		const results: { call: NativeBatchRangeCall; batchRef: BatchCallRef; interrupted?: boolean; receiptCancelled?: boolean; failure?: string; validatedParams?: ToolCallParams<ToolName> }[] = [];
 		const prepared: Prepared[] = [];
@@ -1925,26 +1945,35 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			const receiptId = generateUuid();
 			const messageIndex = messageBase + waveOrdinal;
 			const ledger: ParentSafeReadLedgerEntry = { toolId: call.id, receiptId, batchRef, messageIndex, started: false, interruptInstalled: false, settled: false, cancelled: false };
-			const item: Prepared = { call, batchRef, params, rawParams: call.rawParams, budget: budgets[waveOrdinal] ?? 0, receiptId, messageIndex, interrupted: false, cancelledByCard: false, published: false, ledger };
-			const cancel = () => { item.cancelledByCard = true; item.ledger.cancelled = true; if (!item.interrupted) { item.interrupted = true; try { item.interruptTool?.(); } catch { } } };
+			const item: Prepared = { call, batchRef, params, rawParams: call.rawParams, budget: budgets[waveOrdinal] ?? 0, receiptId, messageIndex, interrupted: false, cancelledByCard: false, published: false, cancellation: new CancellationTokenSource(), ledger };
+			const cancel = () => { item.cancelledByCard = true; item.ledger.cancelled = true; if (!item.interrupted) { item.interrupted = true; try { item.cancellation.cancel(); } catch { } try { item.interruptTool?.(); } catch { } } };
 			this._registerActiveToolCardReceipt(threadId, receiptId, call.id, batchRef, cancel, () => isCurrentParentRun() && (this._agentControlGeneration.get(threadId) ?? 0) === agentRunGeneration, false, messageIndex);
 			prepared.push(item);
 			staged.push(item);
 		}
+		const publishInvalid = (item: Invalid) => {
+			// A re-entrant global Stop may materialize a skipped placeholder for a
+			// declaration before this already-validated malformed call is published.
+			// Preserve one durable tuple. A skipped row at this exact staged tuple can
+			// only have been materialized by re-entrant cancellation before this loop
+			// reaches the already-validated malformed declaration.
+			const messages = this.state.allThreads[threadId]?.messages ?? [];
+			const index = messages.findIndex(message => message.role === 'tool' && message.id === item.call.id && message.batchId === item.batchRef.batchId && message.batchOrdinal === item.batchRef.batchOrdinal);
+			const invalid = { role: 'tool' as const, type: 'invalid_params' as const, rawParams: item.call.rawParams, result: null, name: item.call.name, content: item.content, id: item.call.id, mcpServerName: undefined, ...item.batchRef };
+			if (index < 0) this._addMessageToThread(threadId, invalid);
+			else if (messages[index].role === 'tool' && messages[index].type === 'skipped') this._editMessageInThread(threadId, index, invalid);
+		};
 		// Publish all rows in declaration order only after every receipt exists. A
 		// synchronous Stop can therefore cancel any member of this wave exactly once.
 		for (const item of staged) {
 			if ('kind' in item) {
-				// Stop can synchronously materialize a skipped/rejected row for every
-				// declaration while this loop is publishing. Respect that durable tuple so
-				// an invalid sibling cannot append a second terminal row afterwards.
-				const exists = (this.state.allThreads[threadId]?.messages ?? []).some(message => message.role === 'tool' && message.id === item.call.id && message.batchId === item.batchRef.batchId && message.batchOrdinal === item.batchRef.batchOrdinal);
-				if (!exists) this._addMessageToThread(threadId, { role: 'tool', type: 'invalid_params', rawParams: item.call.rawParams, result: null, name: item.call.name, content: item.content, id: item.call.id, mcpServerName: undefined, ...item.batchRef });
+				publishInvalid(item);
 				continue;
 			}
 			if (!isCurrentParentRun() || item.interrupted) {
 				const exists = (this.state.allThreads[threadId]?.messages ?? []).some(message => message.role === 'tool' && message.id === item.call.id && message.batchId === item.batchRef.batchId && message.batchOrdinal === item.batchRef.batchOrdinal);
 				if (!exists) this._addMessageToThread(threadId, { role: 'tool', type: 'skipped', name: item.call.name as ToolName, content: 'Native tool batch was cancelled before this call could start.', result: null, id: item.call.id, rawParams: item.rawParams, mcpServerName: undefined, ...item.batchRef });
+				item.cancellation.dispose();
 				this._retireActiveToolCardReceipt(threadId, item.receiptId);
 				results.push(item.cancelledByCard && isCurrentParentRun() ? { call: item.call, batchRef: item.batchRef, receiptCancelled: true } : { call: item.call, batchRef: item.batchRef, interrupted: true });
 				continue;
@@ -1965,7 +1994,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				item.ledger.started = true;
 				// This is an operation-scoped lease only. If this parent has no live child
 				// group, the service returns a no-op lease and creates no phantom group.
-				const groupLease = this._agentSubagentService?.acquireGroupIo ? await this._agentSubagentService.acquireGroupIo(threadId, agentRunGeneration, 'read') : { release() { } };
+				const groupLease = this._agentSubagentService?.acquireGroupIo ? await this._agentSubagentService.acquireGroupIo(threadId, agentRunGeneration, 'read', item.cancellation.token) : { release() { } };
 				try {
 				if (!isCurrentParentRun() || item.interrupted) { settleCancelled(); return cancelled(); }
 				const context = { ownerThreadId: threadId, maxReadOutputTokens: item.budget };
@@ -2003,9 +2032,13 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				const message = getErrorMessage(error); const receipt = this._activeToolCardReceipts(threadId)?.get(item.receiptId);
 				if (receipt) this._replaceExactLiveToolCard(threadId, receipt, item.receiptId, () => ({ role: 'tool', type: 'tool_error', params: item.params, result: message, name: item.call.name as ToolName, content: message, id: item.call.id, rawParams: item.rawParams, mcpServerName: undefined, ...item.batchRef }));
 				return failure(message);
-			} finally { item.ledger.settled = true; this._retireActiveToolCardReceipt(threadId, item.receiptId); }
+			} finally { item.cancellation.dispose(); item.ledger.settled = true; this._retireActiveToolCardReceipt(threadId, item.receiptId); }
 		};
 		const completed = await Promise.all(prepared.filter(item => item.published).map(execute));
+		// `abortRunning` can be re-entered by a message listener and finish its
+		// declaration-tail terminalization only after the first publication pass.
+		// Re-upsert the immutable staged diagnosis before this wave returns.
+		for (const item of staged) if ('kind' in item) publishInvalid(item);
 		results.push(...completed);
 		return results.sort((a, b) => a.batchRef.batchOrdinal - b.batchRef.batchOrdinal);
 	}

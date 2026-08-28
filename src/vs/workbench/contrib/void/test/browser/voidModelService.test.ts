@@ -25,8 +25,9 @@ suite('Void model reference initialization', () => {
 		const retry = new descriptor!.ctor(retryResolver, fileService, identity) as IVoidModelService & { dispose(): void };
 		const originalLog = console.log;
 		console.log = () => { };
-		try { await retry.initializeModel(URI.parse('file:///workspace/retry.ts')); } finally { console.log = originalLog; }
-		await retry.initializeModel(URI.parse('file:///workspace/retry.ts'));
+		const retryUri = URI.parse('file:///workspace/retry.ts');
+		try { assert.strictEqual((await retry.getModelSafe(retryUri)).editorModel, null); } finally { console.log = originalLog; }
+		assert.strictEqual((await retry.getModelSafe(retryUri)).editorModel, retryReference.object);
 		assert.strictEqual(calls, 2);
 		assert.strictEqual(retry.getModel(URI.parse('file:///WORKSPACE/RETRY.ts')).editorModel, retryReference.object);
 

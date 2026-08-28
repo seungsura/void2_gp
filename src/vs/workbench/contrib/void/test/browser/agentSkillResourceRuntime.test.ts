@@ -130,11 +130,34 @@ suite('Void selected Skill resource Chat runtime', () => {
 		const pending = run(f.value, f.runtimeSnapshot, { skill: 'demo', resource_path: 'references/a' }); await Promise.resolve();
 		const stopping = ChatThreadService.prototype.abortRunning.call(f.value, 'parent'); release({ body: 'LATE-SUCCESS' });
 		await stopping; assert.deepStrictEqual(await pending, { interrupted: true }); assert.strictEqual(f.messages.some(message => message.type === 'success' || message.content === 'LATE-SUCCESS'), false); assert.strictEqual(f.messages.length, 1); assert.strictEqual(f.messages[0].type, 'rejected'); assert.strictEqual(f.value._activeToolCardReceiptsOfThread?.get('parent'), undefined); assert.strictEqual(f.value._cancellingToolReceiptsOfThread.get('parent'), undefined);
+
+		// Cancellation settles the card promptly, while a non-cooperative resource
+		// read retains its group reader until the losing physical promise drains.
+		const draining = fixture(); let rejectRead!: (error: Error) => void; let readStarted!: () => void; const started = new Promise<void>(resolve => readStarted = resolve); let readers = 0; let writerGranted = false; let grantWriter: ((lease: { release(): void }) => void) | undefined;
+		draining.value._agentSubagentService = {
+			cancelParent() { }, forgetParent() { },
+			async acquireGroupIo(_parentId: string, _generation: number, kind: 'read' | 'write') {
+				if (kind === 'read') { readers += 1; let released = false; return { release() { if (released) return; released = true; readers -= 1; if (readers === 0) grantWriter?.({ release() { } }); } }; }
+				if (readers === 0) { writerGranted = true; return { release() { } }; }
+				return new Promise<{ release(): void }>(resolve => grantWriter = lease => { writerGranted = true; resolve(lease); });
+			},
+		};
+		draining.value._agentSkillsService.readSkillResource = () => new Promise((_resolve, reject) => { rejectRead = reject; readStarted(); });
+		const drainingRun = run(draining.value, draining.runtimeSnapshot, { skill: 'demo', resource_path: 'references/non-cooperative.md' }); await started;
+		const queuedWriter = draining.value._agentSubagentService.acquireGroupIo('parent', 0, 'write'); await ChatThreadService.prototype.abortRunning.call(draining.value, 'parent');
+		assert.deepStrictEqual(await drainingRun, { interrupted: true }); assert.strictEqual(writerGranted, false); assert.strictEqual(readers, 1); assert.strictEqual(draining.messages[0].type, 'rejected');
+		rejectRead(new Error('late resource rejection')); await Promise.resolve(); await Promise.resolve(); assert.strictEqual(writerGranted, true); assert.strictEqual(readers, 0); (await queuedWriter).release();
 	});
 
 	test('fails closed before and after the read when owner or trust drifts', async () => {
 		const before = fixture(); before.setOwner('file:///other'); assert.deepStrictEqual(await run(before.value, before.runtimeSnapshot, { skill: 'demo', resource_path: 'references/a' }), { interrupted: true }); assert.strictEqual(before.serviceCalls.length, 0); assert.strictEqual(before.purges(), 1); assert.strictEqual(before.messages.length, 1); assert.ok(before.messages[0].content.includes('skill_owner_or_trust_changed'));
 		const after = fixture(); let release!: (value: { body: string }) => void; after.value._agentSkillsService.readSkillResource = () => new Promise(resolve => release = resolve); const pending = run(after.value, after.runtimeSnapshot, { skill: 'demo', resource_path: 'references/a' }); await Promise.resolve(); after.setTrusted(false); release({ body: 'LATE-SUCCESS' }); assert.deepStrictEqual(await pending, { interrupted: true }); assert.strictEqual(after.purges(), 1); assert.strictEqual(after.messages.length, 1); assert.strictEqual(after.messages[0].type, 'tool_error'); assert.strictEqual(after.messages[0].content, 'skill_owner_or_trust_changed');
+
+		const afterLease = fixture(); let grantLease!: (lease: { release(): void }) => void; let releaseCount = 0; let postAcquireReads = 0;
+		afterLease.value._agentSubagentService = { cancelParent() { }, forgetParent() { }, acquireGroupIo: () => new Promise<{ release(): void }>(resolve => grantLease = resolve) };
+		afterLease.value._agentSkillsService.readSkillResource = async () => { postAcquireReads += 1; return { body: 'must not read after authority drift' }; };
+		const waitingForLease = run(afterLease.value, afterLease.runtimeSnapshot, { skill: 'demo', resource_path: 'references/after-lease.md' }); await Promise.resolve(); afterLease.setOwner('file:///other'); grantLease({ release() { releaseCount += 1; } });
+		assert.deepStrictEqual(await waitingForLease, { interrupted: true }); assert.deepStrictEqual({ reads: postAcquireReads, conversions: afterLease.conversionCalls.length, purges: afterLease.purges(), releases: releaseCount, rows: afterLease.messages.map(message => [message.type, message.content]), active: afterLease.value._activeToolCardReceiptsOfThread?.get('parent'), cancelling: afterLease.value._cancellingToolReceiptsOfThread.get('parent') }, { reads: 0, conversions: 0, purges: 1, releases: 1, rows: [['tool_error', 'skill_owner_or_trust_changed']], active: undefined, cancelling: undefined });
 	});
 
 	test('fails closed when owner or trust drifts during prospective resource conversion', async () => {

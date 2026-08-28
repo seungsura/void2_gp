@@ -847,15 +847,16 @@ suite('Assistant message lifecycle', () => {
 		await mixedRun;
 		assert.deepStrictEqual(mixed.safeMessages.filter(message => message.role === 'tool').map(message => [message.id, message.type, message.batchOrdinal]), [['mixed-a', 'rejected', 0], ['mixed-invalid', 'invalid_params', 1], ['mixed-c', 'success', 2]]);
 
-		const mixedStopA = deferred<any>(); const mixedStopC = deferred<any>();
 		const mixedStop = makeSafeReceiver([
-			{ id: 'mixed-stop-a', name: 'ls_dir', rawParams: { key: 'mixed-stop-a' }, ordinal: 0 },
-			{ id: 'mixed-stop-invalid', name: 'ls_dir', rawParams: { key: 'mixed-stop-invalid', invalid: true }, ordinal: 1 },
-			{ id: 'mixed-stop-c', name: 'ls_dir', rawParams: { key: 'mixed-stop-c' }, ordinal: 2 },
-		], { 'mixed-stop-a': mixedStopA, 'mixed-stop-c': mixedStopC }, true);
+			{ id: 'mixed-stop-invalid-before', name: 'ls_dir', rawParams: { key: 'mixed-stop-invalid-before', invalid: true }, ordinal: 0 },
+			{ id: 'mixed-stop-live', name: 'ls_dir', rawParams: { key: 'mixed-stop-live' }, ordinal: 1 },
+			{ id: 'mixed-stop-invalid-after-a', name: 'ls_dir', rawParams: { key: 'mixed-stop-invalid-after-a', invalid: true }, ordinal: 2 },
+			{ id: 'mixed-stop-invalid-after-b', name: 'ls_dir', rawParams: { key: 'mixed-stop-invalid-after-b', invalid: true }, ordinal: 3 },
+			{ id: 'mixed-stop-tail', name: 'ls_dir', rawParams: { key: 'mixed-stop-tail' }, ordinal: 4 },
+		], {}, true);
 		const mixedStopRun = chatLifecycle._runNativeBatchRange.call(mixedStop.safeReceiver, 'task', mixedStop.safeMessages[1].toolBatch.calls.map((call: any, ordinal: number) => ({ ...call, ordinal })), 'safe-batch', instructionSnapshot(), undefined, true, 0, mixedStop.isCurrent, () => false);
-		await flushMicrotasks(); mixedStopA.resolve({ content: 'late A' }); mixedStopC.resolve({ content: 'late C' }); assert.deepStrictEqual(await mixedStopRun, { interrupted: true });
-		const mixedStopRows = mixedStop.safeMessages.filter(message => message.role === 'tool'); assert.deepStrictEqual(mixedStopRows.map(message => [message.id, message.type, message.batchOrdinal]), [['mixed-stop-a', 'rejected', 0], ['mixed-stop-invalid', 'skipped', 1], ['mixed-stop-c', 'skipped', 2]]); assert.strictEqual(new Set(mixedStopRows.map(message => `${message.id}/${message.batchId}/${message.batchOrdinal}`)).size, 3); assert.deepStrictEqual(mixedStop.safeStarts, []);
+		await flushMicrotasks(); assert.deepStrictEqual(await mixedStopRun, { interrupted: true });
+			const mixedStopRows = mixedStop.safeMessages.filter(message => message.role === 'tool'); assert.deepStrictEqual(mixedStopRows.map(message => [message.id, message.type, message.batchOrdinal]), [['mixed-stop-invalid-before', 'invalid_params', 0], ['mixed-stop-live', 'rejected', 1], ['mixed-stop-invalid-after-a', 'invalid_params', 2], ['mixed-stop-invalid-after-b', 'invalid_params', 3], ['mixed-stop-tail', 'skipped', 4]]); assert.strictEqual(new Set(mixedStopRows.map(message => `${message.id}/${message.batchId}/${message.batchOrdinal}`)).size, 5); assert.deepStrictEqual(mixedStop.safeStarts, []);
 
 		const capA = deferred<any>(); const capB = deferred<any>(); const capC = deferred<any>();
 		const capped = makeSafeReceiver([
@@ -904,6 +905,48 @@ suite('Assistant message lifecycle', () => {
 		activeA.resolve({ content: 'late active A' }); activeB.resolve({ content: 'late active B' });
 		assert.deepStrictEqual(await activeRun, { interrupted: true });
 		assert.deepStrictEqual({ interrupts: activeStopped.safeInterrupts.sort(), rows: activeStopped.safeMessages.filter(message => message.role === 'tool').map(message => [message.id, message.type, message.batchOrdinal]), active: activeStopped.safeReceiver._activeToolCardReceiptsOfThread.size }, { interrupts: ['active-a', 'active-b'], rows: [['active-a', 'rejected', 0], ['active-b', 'rejected', 1], ['active-c', 'skipped', 2]], active: 0 });
+
+		// A fresh parent receipt waiting behind an old physical generation must be
+		// cancellable without releasing that old operation or starting a new one.
+		const orphanCoordinator = () => {
+			let oldPhysicalActive = true; let queued = 0; let realLeases = 1; const tokens: any[] = [];
+			const acquireGroupIo = (_parentId: string, _generation: number, _kind: 'read' | 'write', token?: any) => {
+				tokens.push(token);
+				if (!oldPhysicalActive) { realLeases += 1; let released = false; return Promise.resolve({ release() { if (!released) { released = true; realLeases -= 1; } } }); }
+				return new Promise<{ release(): void }>(resolve => {
+					queued += 1; let settled = false; let listener: { dispose(): void } | undefined;
+					const settleNoop = () => { if (settled) return; settled = true; queued -= 1; listener?.dispose(); resolve({ release() { } }); };
+					if (token?.isCancellationRequested) settleNoop(); else listener = token?.onCancellationRequested(settleNoop);
+				});
+			};
+			return {
+				acquireGroupIo, cancelParent() { }, forgetParent() { }, tokens,
+				oldLease: { release() { if (!oldPhysicalActive) return; oldPhysicalActive = false; realLeases -= 1; } },
+				state: () => ({ oldPhysicalActive, queued, realLeases }),
+			};
+		};
+		const safeOrphan = orphanCoordinator(); const orphanSafe = makeSafeReceiver([{ id: 'orphan-safe', name: 'ls_dir', rawParams: { key: 'orphan-safe' }, ordinal: 0 }], {});
+		orphanSafe.safeReceiver._agentSubagentService = safeOrphan;
+		const orphanSafeRun = chatLifecycle._runParentSafeReadWave.call(orphanSafe.safeReceiver, 'task', orphanSafe.safeMessages[1].toolBatch.calls.map((call: any, ordinal: number) => ({ ...call, ordinal })), 'safe-batch', instructionSnapshot(), undefined, 0, orphanSafe.isCurrent);
+		await flushMicrotasks(); assert.deepStrictEqual({ starts: orphanSafe.safeStarts, state: safeOrphan.state(), token: safeOrphan.tokens[0]?.isCancellationRequested }, { starts: [], state: { oldPhysicalActive: true, queued: 1, realLeases: 1 }, token: false });
+		await chatLifecycle.abortRunning.call(orphanSafe.safeReceiver, 'task'); assert.deepStrictEqual(await orphanSafeRun, [{ call: { id: 'orphan-safe', name: 'ls_dir', rawParams: { key: 'orphan-safe' }, ordinal: 0 }, batchRef: { batchId: 'safe-batch', batchOrdinal: 0 }, interrupted: true }]);
+		assert.deepStrictEqual({ starts: orphanSafe.safeStarts, state: safeOrphan.state(), token: safeOrphan.tokens[0]?.isCancellationRequested }, { starts: [], state: { oldPhysicalActive: true, queued: 0, realLeases: 1 }, token: true }); safeOrphan.oldLease.release(); assert.deepStrictEqual(safeOrphan.state(), { oldPhysicalActive: false, queued: 0, realLeases: 0 });
+
+		const directOrphan = orphanCoordinator(); const directMessages: any[] = []; const directStream: any = {}; let directCurrent = true; let directCalls = 0;
+		const directReceiver: any = {
+			state: { allThreads: { task: { messages: directMessages, state: {}, filesWithUserChanges: new Set<string>() } } }, streamState: directStream,
+			_agentControlGeneration: new Map([['task', 0]]), _activeToolCardReceiptsOfThread: new Map(), _cancellingToolReceiptsOfThread: new Map(), _agentSubagentService: directOrphan,
+			toolErrMsgs: { interrupted: 'interrupted', errWhenStringifying: () => 'must not stringify' }, _mcpService: { getMCPTools: () => [] },
+			_revokeAgentDelegation() { directCurrent = false; this._agentControlGeneration.set('task', 1); },
+			_toolsService: { callTool: { run_command: async () => { directCalls += 1; return { result: Promise.resolve({}), interruptTool: undefined }; } }, stringOfResult: { run_command: () => 'done' } },
+			_updateLatestTool(_threadId: string, message: any) { const index = directMessages.findIndex(candidate => candidate.role === 'tool' && candidate.id === message.id && candidate.type === 'running_now'); if (index >= 0) directMessages[index] = message; else directMessages.push(message); },
+			_editMessageInThread(_threadId: string, index: number, message: any) { directMessages[index] = message; }, _setStreamState(threadId: string, state: any) { directStream[threadId] = state; },
+		};
+		Object.setPrototypeOf(directReceiver, ChatThreadService.prototype);
+		const orphanDirectRun = chatLifecycle._runToolCall.call(directReceiver, 'task', 'run_command', 'orphan-direct', undefined, { preapproved: true, unvalidatedToolParams: { command: 'echo orphan', terminalId: 'orphan' }, validatedParams: { command: 'echo orphan', terminalId: 'orphan' } }, instructionSnapshot(), undefined, false, 0, () => directCurrent);
+		await flushMicrotasks(); assert.deepStrictEqual({ calls: directCalls, state: directOrphan.state(), token: directOrphan.tokens[0]?.isCancellationRequested }, { calls: 0, state: { oldPhysicalActive: true, queued: 1, realLeases: 1 }, token: false });
+		await chatLifecycle.abortRunning.call(directReceiver, 'task'); assert.deepStrictEqual(await orphanDirectRun, { interrupted: true });
+		assert.deepStrictEqual({ calls: directCalls, state: directOrphan.state(), token: directOrphan.tokens[0]?.isCancellationRequested }, { calls: 0, state: { oldPhysicalActive: true, queued: 0, realLeases: 1 }, token: true }); directOrphan.oldLease.release(); assert.deepStrictEqual(directOrphan.state(), { oldPhysicalActive: false, queued: 0, realLeases: 0 });
 
 		// Every approval-registry edit/terminal builtin must wait behind same-parent
 		// reads. This deliberately exercises the four former omissions too, while
