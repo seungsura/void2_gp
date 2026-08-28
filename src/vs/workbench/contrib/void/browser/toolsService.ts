@@ -563,6 +563,7 @@ export class ToolsService implements IToolsService {
 			},
 			search_in_file: async ({ uri, query, isRegex }, context = '') => {
 				const child = typeof context === 'string' ? undefined : context.childId ? context : undefined
+				const bounded = typeof context === 'string' ? undefined : context
 				if (child && isRegex) throw new Error('agent_child_regex_not_supported')
 				if (child) await validateChildReadFile(uri, child)
 				await voidModelService.initializeModel(uri);
@@ -574,22 +575,22 @@ export class ToolsService implements IToolsService {
 				const totalLines = model.getLineCount();
 				const regex = isRegex ? new RegExp(query) : null;
 				const lines: number[] = []
-				const boundedMatches: string[] = []; let boundedChars = 0; const maxBoundedChars = child ? Math.max(1, Math.min(MAX_FILE_CHARS_PAGE, child.maxReadOutputTokens * 4)) : 0;
+				const boundedMatches: string[] = []; let boundedChars = 0; const maxBoundedChars = bounded ? Math.max(0, Math.min(MAX_FILE_CHARS_PAGE, bounded.maxReadOutputTokens * 4)) : 0;
 				for (let i = 1; i <= totalLines; i++) {
 					if (child?.cancellationToken?.isCancellationRequested) throw new Error('agent_child_cancelled');
 					const line = model.getLineContent(i);
 					if ((isRegex && regex!.test(line)) || (!isRegex && line.includes(query))) {
 						lines.push(i);
-						if (child) {
+						if (bounded) {
 							const separator = boundedMatches.length ? '\n\n' : ''; const prefix = `Line ${i}:\n\`\`\`\n`; const suffix = '\n```'; const available = maxBoundedChars - boundedChars - separator.length;
 							if (available <= 0) break;
 							const lineBudget = Math.max(0, available - prefix.length - suffix.length); const clipped = line.slice(0, lineBudget); const entry = `${prefix}${clipped}${suffix}`.slice(0, available); boundedMatches.push(entry); boundedChars += separator.length + entry.length;
-							if (clipped.length < line.length || lines.length >= Math.max(1, Math.min(child.maxResults ?? AGENT_SUBAGENT_MAX_RESULTS, AGENT_SUBAGENT_MAX_RESULTS))) break;
+							if (clipped.length < line.length || (child && lines.length >= Math.max(1, Math.min(child.maxResults ?? AGENT_SUBAGENT_MAX_RESULTS, AGENT_SUBAGENT_MAX_RESULTS)))) break;
 						}
 					}
 				}
 				if (child) await validateChildReadFile(uri, child)
-				return { result: { lines, ...(child ? { boundedContent: boundedMatches.join('\n\n') } : {}) } };
+				return { result: { lines, ...(bounded ? { boundedContent: boundedMatches.join('\n\n') } : {}) } };
 			},
 
 			read_lint_errors: async ({ uri }) => {

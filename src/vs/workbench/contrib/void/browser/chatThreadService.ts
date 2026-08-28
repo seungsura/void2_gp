@@ -50,6 +50,7 @@ import { IAgentSubagentService } from './agentSubagentService.js';
 import { IAgentCustomAgentService } from './agentCustomAgentService.js';
 import { CustomAgentCatalog, customAgentAdvertisement } from '../common/agentCustomAgents.js';
 import { sanitizeAssistantDisplayContent } from '../common/assistantMessagePresentation.js';
+import { divideToolWaveOutputBudget, planToolBatchWaves } from '../common/toolBatchPlanner.js';
 
 
 // related to retrying when LLM message has error
@@ -78,6 +79,7 @@ type ParentRunOwnership = Readonly<{ token: symbol; runId: string; generation: n
 /** Durable identity of a call within one native provider declaration. Provider ids are
  * only unique inside that declaration, so they are never sufficient row identity. */
 type BatchCallRef = Readonly<{ batchId: string; batchOrdinal: number }>;
+type NativeBatchRangeCall = Readonly<{ id: string; name: ToolName; rawParams: RawToolParamsObj; ordinal: number }>;
 const skippedPendingToolRow = (message: ToolMessage<ToolName> & { type: 'tool_request' }, content: string): ToolMessage<ToolName> => ({
 	role: 'tool',
 	type: 'skipped',
@@ -101,6 +103,16 @@ type ActiveToolCardReceipt = {
 	interruptInstalled: boolean;
 	cancelling: boolean;
 }
+type ParentSafeReadLedgerEntry = {
+	toolId: string;
+	receiptId: string;
+	batchRef: BatchCallRef;
+	messageIndex: number;
+	started: boolean;
+	interruptInstalled: boolean;
+	settled: boolean;
+	cancelled: boolean;
+};
 
 const beginParentRunOwnership = (threadId: string, tokens: Map<string, symbol>, generations: Map<string, number>): ParentRunOwnership => {
 	const token = Symbol('parent-run')
@@ -1028,11 +1040,11 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	/** Register before the visible row is published. `_updateLatestTool` fires state
 	 * listeners synchronously, so publishing first would leave a re-entrant card Stop
 	 * with no exact receipt to validate. */
-	private _registerActiveToolCardReceipt(threadId: string, receiptId: string, toolId: string, batchRef: BatchCallRef | undefined, cancel: () => void, isCurrent: () => boolean, interruptInstalled: boolean): void {
+	private _registerActiveToolCardReceipt(threadId: string, receiptId: string, toolId: string, batchRef: BatchCallRef | undefined, cancel: () => void, isCurrent: () => boolean, interruptInstalled: boolean, messageIndex = this._expectedLiveToolMessageIndex(threadId, toolId, batchRef)): void {
 		this._activeToolCardReceipts(threadId, true)!.set(receiptId, {
 			toolId,
 			batchRef,
-			messageIndex: this._expectedLiveToolMessageIndex(threadId, toolId, batchRef),
+			messageIndex,
 			cancel,
 			isCurrent,
 			interruptInstalled,
@@ -1050,7 +1062,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		}
 	}
 
-	private _replaceExactLiveToolCard(threadId: string, receipt: ActiveToolCardReceipt, receiptId: string, update: (message: ToolMessage<ToolName> & { type: 'running_now' }) => ToolMessage<ToolName> & { type: 'running_now' }): boolean {
+	private _replaceExactLiveToolCard(threadId: string, receipt: ActiveToolCardReceipt, receiptId: string, update: (message: ToolMessage<ToolName> & { type: 'running_now' }) => ToolMessage<ToolName>): boolean {
 		const messages = this.state.allThreads[threadId]?.messages
 		const message = messages?.[receipt.messageIndex]
 		if (!message || message.role !== 'tool' || message.type !== 'running_now' || message.lifecycle === 'cancelling' || message.id !== receipt.toolId || message.batchId !== receipt.batchRef?.batchId || message.batchOrdinal !== receipt.batchRef?.batchOrdinal || message.receiptId !== receiptId) return false
@@ -1132,6 +1144,27 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const swapped = this._swapOutLatestStreamingToolWithResult(threadId, tool)
 		if (swapped) return
 		this._addMessageToThread(threadId, tool)
+	}
+
+	/** Global Stop owns every live receipt.  Unlike card Stop it intentionally does
+	 * not require the old generation to remain current, because revocation is the
+	 * fence that makes every late completion unable to replace a newer run. */
+	private _cancelAllActiveToolReceipts(threadId: string): boolean {
+		const receipts = [...(this._activeToolCardReceipts(threadId)?.entries() ?? [])];
+		let cancelled = false;
+		for (const [receiptId, receipt] of receipts) {
+			if (receipt.cancelling) continue;
+			const current = this.state.allThreads[threadId]?.messages[receipt.messageIndex];
+			if (!current || current.role !== 'tool' || current.type !== 'running_now' || current.receiptId !== receiptId || current.id !== receipt.toolId) continue;
+			receipt.cancelling = true;
+			const cancelling = this._cancellingToolReceiptsOfThread.get(threadId) ?? new Map<string, { toolId: string; batchRef?: BatchCallRef; messageIndex: number }>();
+			cancelling.set(receiptId, { toolId: receipt.toolId, batchRef: receipt.batchRef, messageIndex: receipt.messageIndex });
+			this._cancellingToolReceiptsOfThread.set(threadId, cancelling);
+			this._replaceExactLiveToolCard(threadId, receipt, receiptId, message => ({ ...message, lifecycle: 'cancelling', cardStopAvailable: false, cardStopUnavailableReason: 'Waiting for this tool to stop.' }));
+			try { receipt.cancel(); } catch { /* settlement is still fenced by receipt */ }
+			cancelled = true;
+		}
+		return cancelled;
 	}
 
 	/** Close every unresolved declaration deterministically before history can be sent
@@ -1343,6 +1376,11 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 	async abortRunning(threadId: string) {
 		if (this._pendingChatSubmissionOfThread?.get(threadId) && this._cancelPendingChatSubmission(threadId)) return
+		// A safe-read wave can have more than one physical leaf while stream state has
+		// only one representative. Cancel all exact receipts before revoking the
+		// generation; the leaves drain and settle their own rows afterwards.
+		const hadActiveCards = (this._activeToolCardReceipts(threadId)?.size ?? 0) > 0
+		this._cancelAllActiveToolReceipts(threadId)
 		// Child controls deliberately use an idle stream projection so they never enter
 		// parent/model history. Capture and mark it before revocation: revocation wakes a
 		// deferred wait, but the card must remain visibly Cancelling until that wait has
@@ -1366,7 +1404,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			if (toolCallSoFar) this._addMessageToThread(threadId, { role: 'interrupted_streaming_tool', name: toolCallSoFar.name, mcpServerName: this._computeMCPServerOfToolName(toolCallSoFar.name) })
 		}
 		// add tool that's running
-		else if (this.streamState[threadId]?.isRunning === 'tool') {
+		else if (!hadActiveCards && this.streamState[threadId]?.isRunning === 'tool') {
 			const { toolName, toolParams, id, content: content_, rawParams, mcpServerName, receiptId } = this.streamState[threadId].toolInfo
 			const content = content_ || this.toolErrMsgs.interrupted
 			const messages = this.state.allThreads[threadId]?.messages ?? []
@@ -1788,6 +1826,104 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		}
 	}
 
+	/** Executes one already-planned parent safe-read wave.  It deliberately never
+	 * calls `_updateLatestTool`: every visible mutation is addressed by the receipt
+	 * and declaration ordinal that was registered before the row became visible. */
+	private async _runParentSafeReadWave(threadId: string, calls: readonly NativeBatchRangeCall[], batchId: string, instructionSnapshot: AgentRuntimeTurnSnapshot, agentDelegationAuthority: AgentDelegationTurnAuthority | undefined, agentRunGeneration: number, isCurrentParentRun: () => boolean): Promise<readonly { call: NativeBatchRangeCall; batchRef: BatchCallRef; interrupted?: boolean; receiptCancelled?: boolean; failure?: string; validatedParams?: ToolCallParams<ToolName> }[]> {
+		const history = this.state.allThreads[threadId]?.messages ?? [];
+		const totalBudget = instructionSnapshot.model.hasModel
+			? computeMaxReadOutputTokens(instructionSnapshot.model.contextWindow, instructionSnapshot.model.reservedOutputTokens, estimateHistoryTokensForReadBudget(history))
+			: 0;
+		const budgets = divideToolWaveOutputBudget(totalBudget, calls.length);
+		type Prepared = { call: NativeBatchRangeCall; batchRef: BatchCallRef; params: ToolCallParams<ToolName>; rawParams: RawToolParamsObj; budget: number; receiptId: string; messageIndex: number; interrupted: boolean; cancelledByCard: boolean; interruptTool?: () => void; ledger: ParentSafeReadLedgerEntry };
+		const results: { call: NativeBatchRangeCall; batchRef: BatchCallRef; interrupted?: boolean; receiptCancelled?: boolean; failure?: string; validatedParams?: ToolCallParams<ToolName> }[] = [];
+		const prepared: Prepared[] = [];
+		for (let waveOrdinal = 0; waveOrdinal < calls.length; waveOrdinal++) {
+			const call = calls[waveOrdinal]; const batchRef = { batchId, batchOrdinal: call.ordinal };
+			if (!isABuiltinToolName(call.name)) { results.push({ call, batchRef, failure: 'safe_read_not_builtin' }); continue; }
+			let params: ToolCallParams<ToolName>;
+			try { params = this._toolsService.validateParams[call.name](call.rawParams); }
+			catch (error) {
+				const content = getErrorMessage(error);
+				this._addMessageToThread(threadId, { role: 'tool', type: 'invalid_params', rawParams: call.rawParams, result: null, name: call.name, content, id: call.id, mcpServerName: undefined, ...batchRef });
+				results.push({ call, batchRef });
+				continue;
+			}
+			const receiptId = generateUuid();
+			const messageIndex = (this.state.allThreads[threadId]?.messages.length ?? 0) + prepared.length;
+			const ledger: ParentSafeReadLedgerEntry = { toolId: call.id, receiptId, batchRef, messageIndex, started: false, interruptInstalled: false, settled: false, cancelled: false };
+			const item: Prepared = { call, batchRef, params, rawParams: call.rawParams, budget: budgets[waveOrdinal] ?? 0, receiptId, messageIndex, interrupted: false, cancelledByCard: false, ledger };
+			const cancel = () => { item.cancelledByCard = true; item.ledger.cancelled = true; if (!item.interrupted) { item.interrupted = true; item.interruptTool?.(); } };
+			this._registerActiveToolCardReceipt(threadId, receiptId, call.id, batchRef, cancel, () => isCurrentParentRun() && (this._agentControlGeneration.get(threadId) ?? 0) === agentRunGeneration, false, messageIndex);
+			prepared.push(item);
+		}
+		// Publish all rows in declaration order only after every receipt exists. A
+		// synchronous Stop can therefore cancel any member of this wave exactly once.
+		for (const item of prepared) this._addMessageToThread(threadId, { role: 'tool', type: 'running_now', name: item.call.name as ToolName, params: item.params, content: '(value not received yet...)', result: null, id: item.call.id, rawParams: item.rawParams, mcpServerName: undefined, startedAt: Date.now(), receiptId: item.receiptId, cardStopUnavailableReason: 'Stop becomes available once this tool provides its cancellation handle.', ...item.batchRef });
+		if (prepared.length) {
+			const first = prepared[0];
+			this._setStreamState(threadId, { isRunning: 'tool', interrupt: Promise.resolve(() => { void this.abortRunning(threadId); }), toolInfo: { toolName: first.call.name as ToolName, toolParams: first.params, id: first.call.id, content: 'interrupted...', rawParams: first.rawParams, mcpServerName: undefined, receiptId: first.receiptId } });
+		}
+		const execute = async (item: Prepared) => {
+			const failure = (content: string) => ({ call: item.call, batchRef: item.batchRef, failure: content.trim().replace(/\s+/g, ' ').toLowerCase(), validatedParams: item.params });
+			const cancelled = () => item.cancelledByCard && isCurrentParentRun() ? { call: item.call, batchRef: item.batchRef, receiptCancelled: true } : { call: item.call, batchRef: item.batchRef, interrupted: true };
+			const settleCancelled = () => this._settleCancelledTool(threadId, item.receiptId, item.call.id, item.call.name as ToolName, item.params, item.rawParams, undefined, item.batchRef);
+			try {
+				if (!isCurrentParentRun() || item.interrupted) { settleCancelled(); return cancelled(); }
+				item.ledger.started = true;
+				const context = { ownerThreadId: threadId, maxReadOutputTokens: item.budget };
+				const operation = await this._toolsService.callTool[item.call.name as BuiltinToolName](item.params as never, context);
+				item.interruptTool = operation.interruptTool;
+				if (operation.interruptTool) { item.ledger.interruptInstalled = true; this._markToolCardInterruptInstalled(threadId, item.receiptId); }
+				if (!isCurrentParentRun() || item.interrupted) { operation.interruptTool?.(); try { await operation.result; } catch { } settleCancelled(); return cancelled(); }
+				const value = await operation.result;
+				if (!isCurrentParentRun() || item.interrupted) { settleCancelled(); return cancelled(); }
+				let content: string;
+				try { content = this._toolsService.stringOfResult[item.call.name as BuiltinToolName](item.params as never, value as never, context); }
+				catch (error) { const message = this.toolErrMsgs.errWhenStringifying(error); this._replaceExactLiveToolCard(threadId, this._activeToolCardReceipts(threadId)!.get(item.receiptId)!, item.receiptId, () => ({ role: 'tool', type: 'tool_error', params: item.params, result: message, name: item.call.name as ToolName, content: message, id: item.call.id, rawParams: item.rawParams, mcpServerName: undefined, ...item.batchRef })); return failure(message); }
+				if (item.call.name === 'read_file' && (!isBoundedReadHistory(value as BuiltinToolResultType['read_file'], this._settingsService.state.globalSettings.readFileLimits) || !isBoundedReadHistoryString(content, this._settingsService.state.globalSettings.readFileLimits))) {
+					const message = 'read_file rejected: bounded history validation failed; re-read a smaller continuation.';
+					this._replaceExactLiveToolCard(threadId, this._activeToolCardReceipts(threadId)!.get(item.receiptId)!, item.receiptId, () => ({ role: 'tool', type: 'tool_error', params: item.params, result: message, name: item.call.name as ToolName, content: message, id: item.call.id, rawParams: item.rawParams, mcpServerName: undefined, ...item.batchRef })); return failure(message);
+				}
+				const receipt = this._activeToolCardReceipts(threadId)?.get(item.receiptId);
+				if (receipt) this._replaceExactLiveToolCard(threadId, receipt, item.receiptId, () => ({ role: 'tool', type: 'success', params: item.params, result: value as never, name: item.call.name as ToolName, content, id: item.call.id, rawParams: item.rawParams, mcpServerName: undefined, ...item.batchRef }));
+				return { call: item.call, batchRef: item.batchRef, validatedParams: item.params };
+			} catch (error) {
+				if (!isCurrentParentRun() || item.interrupted) { settleCancelled(); return cancelled(); }
+				const message = getErrorMessage(error); const receipt = this._activeToolCardReceipts(threadId)?.get(item.receiptId);
+				if (receipt) this._replaceExactLiveToolCard(threadId, receipt, item.receiptId, () => ({ role: 'tool', type: 'tool_error', params: item.params, result: message, name: item.call.name as ToolName, content: message, id: item.call.id, rawParams: item.rawParams, mcpServerName: undefined, ...item.batchRef }));
+				return failure(message);
+			} finally { item.ledger.settled = true; this._retireActiveToolCardReceipt(threadId, item.receiptId); }
+		};
+		const completed = await Promise.all(prepared.map(execute));
+		results.push(...completed);
+		return results.sort((a, b) => a.batchRef.batchOrdinal - b.batchRef.batchOrdinal);
+	}
+
+	private async _runNativeBatchRange(threadId: string, calls: readonly NativeBatchRangeCall[], batchId: string, instructionSnapshot: AgentRuntimeTurnSnapshot, agentDelegationAuthority: AgentDelegationTurnAuthority | undefined, agentSkillResourceReadAllowed: boolean, agentRunGeneration: number, isCurrentParentRun: () => boolean, accountFailure: (call: NativeBatchRangeCall, mcpServerName: string | undefined, outcome: { failure?: string; validatedParams?: ToolCallParams<ToolName> }, batchRef: BatchCallRef) => boolean): Promise<{ awaitingUserApproval?: boolean; interrupted?: boolean; receiptCancelled?: boolean; circuitOpen?: boolean }> {
+		const planned = planToolBatchWaves('parent', calls.map(call => ({ ordinal: call.ordinal, name: call.name })));
+		for (const wave of planned) {
+			const waveCalls = wave.calls.map(member => calls.find(call => call.ordinal === member.ordinal)!).filter(Boolean);
+			if (wave.kind === 'safe_read') {
+				const outcomes = await this._runParentSafeReadWave(threadId, waveCalls, batchId, instructionSnapshot, agentDelegationAuthority, agentRunGeneration, isCurrentParentRun);
+				for (const outcome of outcomes) {
+					if (!isCurrentParentRun() || outcome.interrupted) return { interrupted: true };
+					if (outcome.receiptCancelled) { this._terminalizeBatchTailAfter(threadId, outcome.batchRef, 'Native tool batch was cancelled before this call could start.'); return { receiptCancelled: true }; }
+					if (accountFailure(outcome.call, undefined, outcome, outcome.batchRef)) return { circuitOpen: true };
+				}
+				continue;
+			}
+			const toolCall = waveCalls[0]; const batchRef = { batchId, batchOrdinal: toolCall.ordinal };
+			const mcpTool = isAgentSubagentControlName(toolCall.name) || isReadSkillResourceToolName(toolCall.name) ? undefined : this._mcpService.getMCPTools()?.find(tool => tool.name === toolCall.name);
+			const outcome = await this._runToolCall(threadId, toolCall.name, toolCall.id, mcpTool?.mcpServerName, { preapproved: false, unvalidatedToolParams: toolCall.rawParams }, instructionSnapshot, agentDelegationAuthority, agentSkillResourceReadAllowed, agentRunGeneration, isCurrentParentRun, batchRef);
+			if (!isCurrentParentRun() || outcome.interrupted) return { interrupted: true };
+			if (outcome.receiptCancelled) { this._terminalizeBatchTailAfter(threadId, batchRef, 'Native tool batch was cancelled before this call could start.'); return { receiptCancelled: true }; }
+			if (outcome.awaitingUserApproval) return { awaitingUserApproval: true };
+			if (accountFailure(toolCall, mcpTool?.mcpServerName, outcome, batchRef)) return { circuitOpen: true };
+		}
+		return {};
+	}
+
 
 
 
@@ -1885,22 +2021,16 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			// assistant row so reload never needs a mutable cursor and cannot replay the
 			// already-approved call.
 			if (!current.receiptCancelled && callThisToolFirst.batchId !== undefined && callThisToolFirst.batchOrdinal !== undefined) {
+				const resumedOrdinal = callThisToolFirst.batchOrdinal;
 				const declaration = persistedIdentity?.batch
-				if (!declaration || declaration.calls[callThisToolFirst.batchOrdinal]?.id !== callThisToolFirst.id) {
+				if (!declaration || declaration.calls[resumedOrdinal]?.id !== callThisToolFirst.id) {
 					this._setStreamState(threadId, { isRunning: undefined, error: { message: 'The pending native tool batch no longer matches its declaration.', fullError: null } })
 					return
 				}
-				for (let batchOrdinal = callThisToolFirst.batchOrdinal + 1; batchOrdinal < declaration.calls.length; batchOrdinal++) {
-					if (!isCurrentRun()) return
-					const toolCall = declaration.calls[batchOrdinal]
-					const mcpTool = isAgentSubagentControlName(toolCall.name) || isReadSkillResourceToolName(toolCall.name) ? undefined : this._mcpService.getMCPTools()?.find(tool => tool.name === toolCall.name)
-					const tailRef = { batchId: declaration.batchId, batchOrdinal }
-					const tail = await this._runToolCall(threadId, toolCall.name, toolCall.id, mcpTool?.mcpServerName, { preapproved: false, unvalidatedToolParams: toolCall.rawParams }, snapshot, agentDelegationAuthority, chatMode === 'agent', agentRunGeneration, isCurrentRun, tailRef)
-					if (tail.interrupted) { this._setStreamState(threadId, undefined); return }
-					if (tail.receiptCancelled) { this._terminalizeBatchTailAfter(threadId, tailRef, 'Native tool batch was cancelled before this call could start.'); break }
-					if (tail.awaitingUserApproval) { this._setStreamState(threadId, { isRunning: 'awaiting_user' }); return }
-					if (accountIdenticalFailure(toolCall.name, mcpTool?.mcpServerName, tail.failure, tail.validatedParams, toolCall.rawParams, tailRef)) return
-				}
+				const tail = await this._runNativeBatchRange(threadId, declaration.calls.slice(resumedOrdinal + 1).map((call, offset) => ({ ...call, ordinal: resumedOrdinal + 1 + offset })), declaration.batchId, snapshot, agentDelegationAuthority, chatMode === 'agent', agentRunGeneration, isCurrentRun, (toolCall, mcpServerName, outcome, tailRef) => accountIdenticalFailure(toolCall.name, mcpServerName, outcome.failure, outcome.validatedParams, toolCall.rawParams, tailRef));
+				if (tail.interrupted) { this._setStreamState(threadId, undefined); return }
+				if (tail.awaitingUserApproval) { this._setStreamState(threadId, { isRunning: 'awaiting_user' }); return }
+				if (tail.circuitOpen) return
 			}
 		}
 		shouldSendAnotherMessage = true
@@ -2057,38 +2187,15 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 				this._setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' }) // just decorative for clarity
 
-				// Native batches deliberately execute in provider order in 8A. The next provider
-				// request is assembled only after every declared call settles or one pauses.
+				// The planner keeps serial barriers provider-ordered while allowing only the
+				// approved parent safe-read names to share a physical cap-two wave. The next
+				// provider request remains behind all declared terminal rows.
 				if (toolCalls.length) {
-					for (const [batchOrdinal, toolCall] of toolCalls.entries()) {
-					const mcpTool = isAgentSubagentControlName(toolCall.name) || isReadSkillResourceToolName(toolCall.name) ? undefined : this._mcpService.getMCPTools()?.find(t => t.name === toolCall.name)
-
-					const batchRef = { batchId: batchId!, batchOrdinal }
-					const { awaitingUserApproval, interrupted, receiptCancelled, failure, validatedParams } = await this._runToolCall(threadId, toolCall.name, toolCall.id, mcpTool?.mcpServerName, { preapproved: false, unvalidatedToolParams: toolCall.rawParams }, snapshot, agentDelegationAuthority, chatMode === 'agent', agentRunGeneration, isCurrentRun, batchRef)
-					if (!isCurrentRun()) return
-					if (interrupted) {
-						this._setStreamState(threadId, undefined)
-						return
-					}
-					if (receiptCancelled) {
-						this._terminalizeBatchTailAfter(threadId, batchRef, 'Native tool batch was cancelled before this call could start.')
-						shouldSendAnotherMessage = true
-						break
-					}
-					if (awaitingUserApproval) {
-						// An earlier call in the same provider batch may already have marked a
-						// continuation as necessary. Approval is a stronger boundary: keep the
-						// declaration open and do not assemble another provider request yet.
-						shouldSendAnotherMessage = false
-						isRunningWhenEnd = 'awaiting_user'
-						break
-					}
-					else if (failure) {
-						if (accountIdenticalFailure(toolCall.name, mcpTool?.mcpServerName, failure, validatedParams, toolCall.rawParams, batchRef)) return
-						shouldSendAnotherMessage = true
-					}
-					else { shouldSendAnotherMessage = true }
-					}
+					const batch = await this._runNativeBatchRange(threadId, toolCalls.map((call, ordinal) => ({ ...call, ordinal })), batchId!, snapshot, agentDelegationAuthority, chatMode === 'agent', agentRunGeneration, isCurrentRun, (toolCall, mcpServerName, outcome, batchRef) => accountIdenticalFailure(toolCall.name, mcpServerName, outcome.failure, outcome.validatedParams, toolCall.rawParams, batchRef));
+					if (!isCurrentRun() || batch.interrupted) { this._setStreamState(threadId, undefined); return }
+					if (batch.awaitingUserApproval) { shouldSendAnotherMessage = false; isRunningWhenEnd = 'awaiting_user'; }
+					else if (!batch.circuitOpen) shouldSendAnotherMessage = true
+					else return
 
 					this._setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' }) // just decorative, for clarity
 				}

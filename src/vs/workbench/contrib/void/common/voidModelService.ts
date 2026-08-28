@@ -31,6 +31,10 @@ class VoidModelService extends Disposable implements IVoidModelService {
 	 * systems).  Keep both a stable identity key and one shared creation promise so
 	 * two simultaneous first reads never acquire competing strong references. */
 	private readonly _modelRefOfURI = new Map<string, IReference<IResolvedTextEditorModel>>();
+	/** `IResolvedTextEditorModel` does not promise a URI. Preserve the admitted URI
+	 * alongside its reference for legacy fsPath lookup instead of reaching into an
+	 * implementation-only `resource` field. */
+	private readonly _fsPathOfModelKey = new Map<string, string>();
 	private readonly _initializingModelOfURI = new Map<string, Promise<void>>();
 	private _disposed = false;
 
@@ -58,7 +62,7 @@ class VoidModelService extends Disposable implements IVoidModelService {
 				const editorModelRef = await this._textModelService.createModelReference(uri);
 				// A service disposal must not leak a reference that resolved afterwards.
 				if (this._disposed) editorModelRef.dispose();
-				else if (!this._modelRefOfURI.has(key)) this._modelRefOfURI.set(key, editorModelRef);
+				else if (!this._modelRefOfURI.has(key)) { this._modelRefOfURI.set(key, editorModelRef); this._fsPathOfModelKey.set(key, uri.fsPath); }
 				else editorModelRef.dispose();
 			} catch (error) {
 				// Failures are deliberately not cached: a transient resolver error can be retried.
@@ -72,7 +76,8 @@ class VoidModelService extends Disposable implements IVoidModelService {
 	};
 
 	getModelFromFsPath = (fsPath: string): VoidModelType => {
-		const editorModelRef = [...this._modelRefOfURI.values()].find(ref => ref.object.resource.fsPath === fsPath);
+		const key = [...this._fsPathOfModelKey.entries()].find(([, path]) => path === fsPath)?.[0];
+		const editorModelRef = key === undefined ? undefined : this._modelRefOfURI.get(key);
 		if (!editorModelRef) {
 			return { model: null, editorModel: null };
 		}
@@ -107,6 +112,7 @@ class VoidModelService extends Disposable implements IVoidModelService {
 			ref.dispose(); // release reference to allow disposal
 		}
 		this._modelRefOfURI.clear();
+		this._fsPathOfModelKey.clear();
 	}
 }
 
