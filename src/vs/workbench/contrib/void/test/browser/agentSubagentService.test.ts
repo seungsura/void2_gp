@@ -883,6 +883,9 @@ suite('Void AgentSubagentService', () => {
 		pendingOptions.onFinalMessage({ fullText: 'late', fullReasoning: '', anthropicReasoning: null }); await Promise.resolve();
 		assert.strictEqual(f.service.getRunView('parent')?.status, 'cancelled'); assert.strictEqual(f.events.filter(event => event.status === 'cancelled').length, 1); assert.strictEqual(f.aborts(), 1); assert.strictEqual(f.service.getBudgetView('parent')?.activeProviderSends, 0); assert.deepStrictEqual(f.invalidations, [child.id]);
 		let abortThrowOptions: any; const abortThrow = fixture({ send: options => { abortThrowOptions = options; return 'abort-throw'; }, abort: () => { throw new Error('abort exploded'); } }); const abortThrowChild = await abortThrow.service.spawn('abort-throw', 'inspect', snapshot()); assert.doesNotThrow(() => abortThrow.service.interrupt('abort-throw', abortThrowChild.id)); abortThrowOptions.onFinalMessage({ fullText: 'late', fullReasoning: '', anthropicReasoning: null }); await new Promise(resolve => setTimeout(resolve, 0)); assert.strictEqual(abortThrow.service.getRunView('abort-throw')?.status, 'cancelled'); assert.strictEqual(abortThrow.events.filter(event => event.status === 'cancelled').length, 1); assert.strictEqual(abortThrow.service.getBudgetView('abort-throw')?.activeProviderSends, 0); assert.strictEqual((abortThrow.service as any).groups.get('abort-throw').runs[0].released, true); assert.deepStrictEqual(abortThrow.invalidations, [abortThrowChild.id]);
+		let releaseSetup!: () => void; const setup = new Promise<void>(resolve => releaseSetup = resolve); let setupInterrupts = 0; let releaseResult!: (value: unknown) => void; const setupResult = new Promise<unknown>(resolve => releaseResult = resolve);
+		const setupRace = fixture({ callTool: async () => { await setup; return { result: setupResult, interruptTool: () => { setupInterrupts++; releaseResult({}); } }; }, send: toolThenFinal({ id: 'setup-read', name: 'read_file', rawParams: { uri: 'file:///workspace/a' } }) });
+		const setupChild = await setupRace.service.spawn('setup-race', 'inspect', snapshot()); for (let index = 0; index < 10 && setupRace.providerCalls.length < 1; index++) await Promise.resolve(); setupRace.service.interrupt('setup-race', setupChild.id); releaseSetup(); await setupRace.service.wait('setup-race', 1_000); assert.strictEqual(setupInterrupts, 1); assert.strictEqual((setupRace.service as any).groups.get('setup-race').runs[0].activeDirectInterrupts.size, 0); setupRace.service.dispose();
 	});
 
 	test('wait timeout is non-mutating; terminal summary delivers once; targets are direct', async () => {
@@ -925,9 +928,11 @@ suite('Void AgentSubagentService', () => {
 		writerLease.release(); const r3Lease = await r3; assert.strictEqual(r3Granted, true); r3Lease.release();
 		const stale = await coordinator.service.acquireGroupIo('io-parent', 0, 'read');
 		await coordinator.service.spawn('io-parent', 'inspect-again', snapshot(), undefined, undefined, undefined, undefined, 1);
-		stale.release(); const fresh = await coordinator.service.acquireGroupIo('io-parent', 1, 'write'); fresh.release();
-		const held1 = await coordinator.service.acquireGroupIo('io-parent', 1, 'read'); const held2 = await coordinator.service.acquireGroupIo('io-parent', 1, 'read'); const cancelledWaiter = new CancellationTokenSource();
-		const cancelledLeasePromise = coordinator.service.acquireGroupIo('io-parent', 1, 'write', cancelledWaiter.token); cancelledWaiter.cancel(); const cancelledLease = await cancelledLeasePromise; cancelledLease.release(); cancelledWaiter.dispose(); held1.release(); held2.release();
+		stale.release(); const oldWrite = await coordinator.service.acquireGroupIo('io-parent', 1, 'write');
+		await coordinator.service.spawn('io-parent', 'inspect-third', snapshot(), undefined, undefined, undefined, undefined, 2);
+		let freshGranted = false; const freshPending = coordinator.service.acquireGroupIo('io-parent', 2, 'write').then(lease => { freshGranted = true; return lease; }); await Promise.resolve(); assert.strictEqual(freshGranted, false); oldWrite.release(); const fresh = await freshPending; assert.strictEqual(freshGranted, true); fresh.release();
+		const held1 = await coordinator.service.acquireGroupIo('io-parent', 2, 'read'); const held2 = await coordinator.service.acquireGroupIo('io-parent', 2, 'read'); const cancelledWaiter = new CancellationTokenSource();
+		const cancelledLeasePromise = coordinator.service.acquireGroupIo('io-parent', 2, 'write', cancelledWaiter.token); cancelledWaiter.cancel(); const cancelledLease = await cancelledLeasePromise; cancelledLease.release(); cancelledWaiter.dispose(); held1.release(); held2.release();
 		const absent = await coordinator.service.acquireGroupIo('absent-parent', 0, 'read'); absent.release(); assert.strictEqual((coordinator.service as any).groups.has('absent-parent'), false);
 		coordinator.service.forgetParent('io-parent'); coordinator.service.dispose();
 	});

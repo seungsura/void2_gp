@@ -1367,15 +1367,17 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 							state.pendingKey = approvalKeyOf(request); const decision = await this._awaitChildToolApproval(request); state.pendingKey = undefined;
 							if (decision === 'rejected') return fail('rejected'); if (decision !== 'approved') return fail('cancelled'); if (!admitted(request, state)) return stale(request, state);
 						}
+						let prepared: Awaited<ReturnType<IToolsService['prepareWriteFile']>> | undefined;
+						if (builtinName === 'write_file') {
+							prepared = await this._toolsService.prepareWriteFile(params as BuiltinToolCallParams['write_file'], request.childId);
+							if (!prepared || !admitted(request, state)) return stale(request, state);
+						}
 						const ioLease = this._agentSubagentService?.acquireGroupIo ? await this._agentSubagentService.acquireGroupIo(request.parentId, request.generation, 'write', request.cancellationToken) : { release() { } };
 						let result: unknown;
 						try {
-						if (builtinName === 'write_file') {
-							const prepared = await this._toolsService.prepareWriteFile(params as BuiltinToolCallParams['write_file'], request.childId);
-							if (!prepared || !admitted(request, state)) return stale(request, state);
-							state.executing = true;
-							result = await prepared.execute();
-						} else {
+							if (!admitted(request, state)) return stale(request, state);
+							if (prepared) { state.executing = true; result = await prepared.execute(); }
+							else {
 							const calls = this._toolsService.callTool as unknown as Record<string, (params: unknown, context: unknown) => Promise<{ result: unknown | Promise<unknown>; interruptTool?: () => void }>>;
 							const call = await calls[builtinName](params, { ownerThreadId: request.childId, childId: request.childId, maxReadOutputTokens: request.maxReadOutputTokens, cancellationToken: request.cancellationToken });
 							state.interrupt = typeof (call as { interruptTool?: unknown }).interruptTool === 'function' ? (call as { interruptTool: () => void }).interruptTool : undefined;
@@ -1384,18 +1386,19 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 							result = await call.result;
 						}
 						if (!admitted(request, state)) return stale(request, state);
+						} finally { ioLease.release(); }
 						const stringify = this._toolsService.stringOfResult as unknown as Record<string, (params: unknown, result: unknown) => string>;
 						return Object.freeze({ ok: true as const, content: stringify[builtinName](params, result), result });
-						} finally { ioLease.release(); }
 					}
 					if (request.tool.kind !== 'mcp' || !request.tool.mcpServerName || !admitted(request, state)) return stale(request, state);
 					if (!authority.autoApprove.mcp) { state.pendingKey = approvalKeyOf(request); const decision = await this._awaitChildToolApproval(request); state.pendingKey = undefined; if (decision === 'rejected') return fail('rejected'); if (decision !== 'approved') return fail('cancelled'); if (!admitted(request, state)) return stale(request, state); }
 					const ioLease = this._agentSubagentService?.acquireGroupIo ? await this._agentSubagentService.acquireGroupIo(request.parentId, request.generation, 'write', request.cancellationToken) : { release() { } };
-					try { state.executing = true;
-						const result = (await this._mcpService.callMCPTool({ serverName: request.tool.mcpServerName, toolName: request.name, params: request.rawParams })).result;
+					let result: unknown;
+					try { if (!admitted(request, state)) return stale(request, state); state.executing = true;
+						result = (await this._mcpService.callMCPTool({ serverName: request.tool.mcpServerName, toolName: request.name, params: request.rawParams })).result;
 						if (!admitted(request, state)) return stale(request, state);
-						return Object.freeze({ ok: true as const, content: this._mcpService.stringifyResult(result), result });
 					} finally { ioLease.release(); }
+					return Object.freeze({ ok: true as const, content: this._mcpService.stringifyResult(result), result });
 				} catch (error) { return fail(state.cancelled || request.cancellationToken.isCancellationRequested ? 'cancelled' : error instanceof Error && /invalid|param/i.test(error.message) ? 'invalid_params' : 'execution_failed'); }
 				finally { settle(state); requests.delete(key); rememberCompleted(key); }
 			},
@@ -1793,6 +1796,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				const requiresWriteLease = toolName === 'write_file' || toolName === 'run_command' || toolName === 'run_persistent_command';
 				const ioLease = requiresWriteLease && agentRunGeneration !== undefined && this._agentSubagentService?.acquireGroupIo ? await this._agentSubagentService.acquireGroupIo(threadId, agentRunGeneration, 'write') : { release() { } };
 				try {
+					if (interrupted || !isCurrentParentRun()) { settleCancelled(); return cancellationOutcome() }
 					const call = preparedWrite
 						? { result: preparedWrite.execute(), interruptTool: undefined }
 						: await this._toolsService.callTool[toolName](toolParams as any, readContext)
@@ -1820,6 +1824,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				if (!isCurrentParentRun()) { settleCancelled(); return { interrupted: true } }
 				const ioLease = agentRunGeneration !== undefined && this._agentSubagentService?.acquireGroupIo ? await this._agentSubagentService.acquireGroupIo(threadId, agentRunGeneration, 'write') : { release() { } };
 				try {
+					if (!isCurrentParentRun()) { settleCancelled(); return { interrupted: true } }
 					toolResult = (await this._mcpService.callMCPTool({
 						serverName: mcpTool.mcpServerName ?? 'unknown_mcp_server',
 						toolName: toolName,
@@ -1944,6 +1949,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				// group, the service returns a no-op lease and creates no phantom group.
 				const groupLease = this._agentSubagentService?.acquireGroupIo ? await this._agentSubagentService.acquireGroupIo(threadId, agentRunGeneration, 'read') : { release() { } };
 				try {
+				if (!isCurrentParentRun() || item.interrupted) { settleCancelled(); return cancelled(); }
 				const context = { ownerThreadId: threadId, maxReadOutputTokens: item.budget };
 				const operation = await this._toolsService.callTool[item.call.name as BuiltinToolName](item.params as never, context);
 				item.interruptTool = operation.interruptTool;

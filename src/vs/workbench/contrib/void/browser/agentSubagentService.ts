@@ -75,6 +75,8 @@ export interface IAgentSubagentService {
 export class AgentSubagentService extends Disposable implements IAgentSubagentService {
 	readonly _serviceBrand: undefined;
 	private readonly groups = new Map<string, ChildGroup>();
+	/** Active physical I/O survives a forgotten generation until its operation drains. */
+	private readonly activeGroupIo = new Map<string, number>();
 	/** Kept outside a generation so a forgotten, still-running writer cannot overlap a new generation. */
 	private readonly mutationOwners = new Map<string, string>();
 	private readonly _onDidChangeRun = this._register(new Emitter<AgentSubagentRunChangeEvent>());
@@ -352,6 +354,10 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 					if (!this.isCurrent(run)) throw new Error('agent_child_cancelled');
 					const context = { ownerThreadId: run.id, maxReadOutputTokens: item.budget, childId: run.id, ownerRoot: owner, cancellationToken: run.cancellation.token, maxResults: AGENT_SUBAGENT_MAX_RESULTS, maxFileSize: 1024 * 1024 };
 					const call = await (this.tools.callTool as Record<string, (params: unknown, context?: unknown) => Promise<{ result: Promise<unknown>; interruptTool?: () => void }>>)[tool.name](item.params, context);
+					// `callTool` setup itself can race Stop. Its returned operation has already
+					// started, so interrupt and drain it before this wave can settle or release
+					// its I/O lease; never publish it as a normal active child handle.
+					if (!this.isCurrent(run) || run.cancellation.token.isCancellationRequested) { call.interruptTool?.(); try { await call.result; } catch { } throw new Error('agent_child_cancelled'); }
 					const interrupt = call.interruptTool; if (interrupt) run.activeDirectInterrupts.add(interrupt);
 					try {
 						const result = await call.result; if (!this.isCurrent(run)) throw new Error('agent_child_cancelled');
@@ -555,6 +561,11 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 	private readonly noopIoLease: AgentSubagentGroupIoLease = Object.freeze({ release() { } });
 	private pumpGroupIo(group: ChildGroup): void {
 		if (group.cancellation || group.activeIoWriter) return;
+		const localActive = group.activeIoReads + (group.activeIoWriter ? 1 : 0);
+		// A forgotten old generation has no map entry but can still be physically
+		// draining. Do not let a new generation overlap it merely because its queue is
+		// fresh; old queued waiters are cancelled separately by cancelGroupIo.
+		if ((this.activeGroupIo.get(group.parentId) ?? 0) > localActive) return;
 		while (group.ioQueue[0]?.cancelled) group.ioQueue.shift();
 		const head = group.ioQueue[0]; if (!head) return;
 		if (head.kind === 'write') {
@@ -571,12 +582,16 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 	}
 	private grantGroupIo(group: ChildGroup, waiter: GroupIoWaiter): void {
 		waiter.listener?.dispose();
+		this.activeGroupIo.set(group.parentId, (this.activeGroupIo.get(group.parentId) ?? 0) + 1);
 		let released = false;
 		const release = () => {
 			if (released) return; released = true;
 			if (waiter.kind === 'write') group.activeIoWriter = false;
 			else group.activeIoReads = Math.max(0, group.activeIoReads - 1);
+			const remaining = Math.max(0, (this.activeGroupIo.get(group.parentId) ?? 1) - 1);
+			if (remaining === 0) this.activeGroupIo.delete(group.parentId); else this.activeGroupIo.set(group.parentId, remaining);
 			this.pumpGroupIo(group);
+			const current = this.groups.get(group.parentId); if (current && current !== group) this.pumpGroupIo(current);
 		};
 		waiter.resolve(Object.freeze({ release }));
 	}
