@@ -45,6 +45,7 @@ type ChildRun = { readonly id: string; readonly parentId: string; readonly gener
 export type AgentSubagentGroupIoKind = 'read' | 'write';
 export type AgentSubagentGroupIoLease = Readonly<{ release(): void }>;
 type GroupIoWaiter = { readonly kind: AgentSubagentGroupIoKind; readonly resolve: (lease: AgentSubagentGroupIoLease) => void; cancelled: boolean; listener?: { dispose(): void } };
+type GroupIoDrainWaiter = { readonly resolve: (lease: AgentSubagentGroupIoLease) => void; cancelled: boolean; listener?: { dispose(): void } };
 type ChildGroup = { readonly parentId: string; readonly generation: number; readonly createdAt: number; readonly limits: AgentDelegationLimits; readonly budgetLimits: ReturnType<typeof budgetFor>; readonly runs: ChildRun[]; readonly admissions: Map<CancellationTokenSource, string | undefined>; cancellation: boolean; accepted: number; providerSends: number; activeProviderSends: number; resultChars: number; retainedResultChars: number; truncatedResultCount: number; traceSequence: number; readonly traceEvents: AgentSubagentTraceEvent[]; droppedTraceEvents: number; admissionChain: Promise<void>; readonly ioQueue: GroupIoWaiter[]; activeIoReads: number; activeIoWriter: boolean };
 export const IAgentSubagentService = createDecorator<IAgentSubagentService>('voidAgentSubagentService');
 export type AgentSubagentRunChangeEvent = Readonly<
@@ -77,6 +78,8 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 	private readonly groups = new Map<string, ChildGroup>();
 	/** Active physical I/O survives a forgotten generation until its operation drains. */
 	private readonly activeGroupIo = new Map<string, number>();
+	/** Parent-only callers have no ChildGroup to queue on, but must still wait for an old drain. */
+	private readonly groupIoDrainWaiters = new Map<string, Set<GroupIoDrainWaiter>>();
 	/** Kept outside a generation so a forgotten, still-running writer cannot overlap a new generation. */
 	private readonly mutationOwners = new Map<string, string>();
 	private readonly _onDidChangeRun = this._register(new Emitter<AgentSubagentRunChangeEvent>());
@@ -357,7 +360,7 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 					// `callTool` setup itself can race Stop. Its returned operation has already
 					// started, so interrupt and drain it before this wave can settle or release
 					// its I/O lease; never publish it as a normal active child handle.
-					if (!this.isCurrent(run) || run.cancellation.token.isCancellationRequested) { call.interruptTool?.(); try { await call.result; } catch { } throw new Error('agent_child_cancelled'); }
+					if (!this.isCurrent(run) || run.cancellation.token.isCancellationRequested) { try { call.interruptTool?.(); } catch { } try { await call.result; } catch { } throw new Error('agent_child_cancelled'); }
 					const interrupt = call.interruptTool; if (interrupt) run.activeDirectInterrupts.add(interrupt);
 					try {
 						const result = await call.result; if (!this.isCurrent(run)) throw new Error('agent_child_cancelled');
@@ -546,7 +549,8 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 		const group = this.groups.get(parentId);
 		// A parent can safely use this API before it has spawned a child.  Do not create
 		// a group merely to serialize that parent-only operation.
-		if (!group || group.generation !== generation || group.cancellation || token?.isCancellationRequested) return this.noopIoLease;
+		if (!group || group.generation !== generation || group.cancellation) return this.waitForGroupIoDrain(parentId, token);
+		if (token?.isCancellationRequested) return this.noopIoLease;
 		return new Promise<AgentSubagentGroupIoLease>(resolve => {
 			const waiter: GroupIoWaiter = { kind, resolve, cancelled: false };
 			if (token) waiter.listener = token.onCancellationRequested(() => {
@@ -559,6 +563,26 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 		});
 	}
 	private readonly noopIoLease: AgentSubagentGroupIoLease = Object.freeze({ release() { } });
+	private waitForGroupIoDrain(parentId: string, token?: CancellationToken): Promise<AgentSubagentGroupIoLease> {
+		if ((this.activeGroupIo.get(parentId) ?? 0) === 0 || token?.isCancellationRequested) return Promise.resolve(this.noopIoLease);
+		return new Promise<AgentSubagentGroupIoLease>(resolve => {
+			const waiter: GroupIoDrainWaiter = { resolve, cancelled: false };
+			if (token) waiter.listener = token.onCancellationRequested(() => {
+				if (waiter.cancelled) return;
+				waiter.cancelled = true;
+				const waiters = this.groupIoDrainWaiters.get(parentId);
+				waiters?.delete(waiter);
+				if (waiters?.size === 0) this.groupIoDrainWaiters.delete(parentId);
+				waiter.listener?.dispose();
+				resolve(this.noopIoLease);
+			});
+			const waiters = this.groupIoDrainWaiters.get(parentId) ?? new Set<GroupIoDrainWaiter>(); waiters.add(waiter); this.groupIoDrainWaiters.set(parentId, waiters);
+		});
+	}
+	private releaseGroupIoDrainWaiters(parentId: string): void {
+		const waiters = this.groupIoDrainWaiters.get(parentId); if (!waiters) return;
+		this.groupIoDrainWaiters.delete(parentId); for (const waiter of waiters) { waiter.listener?.dispose(); waiter.resolve(this.noopIoLease); }
+	}
 	private pumpGroupIo(group: ChildGroup): void {
 		if (group.cancellation || group.activeIoWriter) return;
 		const localActive = group.activeIoReads + (group.activeIoWriter ? 1 : 0);
@@ -589,7 +613,7 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 			if (waiter.kind === 'write') group.activeIoWriter = false;
 			else group.activeIoReads = Math.max(0, group.activeIoReads - 1);
 			const remaining = Math.max(0, (this.activeGroupIo.get(group.parentId) ?? 1) - 1);
-			if (remaining === 0) this.activeGroupIo.delete(group.parentId); else this.activeGroupIo.set(group.parentId, remaining);
+			if (remaining === 0) { this.activeGroupIo.delete(group.parentId); this.releaseGroupIoDrainWaiters(group.parentId); } else this.activeGroupIo.set(group.parentId, remaining);
 			this.pumpGroupIo(group);
 			const current = this.groups.get(group.parentId); if (current && current !== group) this.pumpGroupIo(current);
 		};

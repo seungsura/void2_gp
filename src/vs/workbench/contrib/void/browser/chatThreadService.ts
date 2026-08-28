@@ -1381,7 +1381,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 							const calls = this._toolsService.callTool as unknown as Record<string, (params: unknown, context: unknown) => Promise<{ result: unknown | Promise<unknown>; interruptTool?: () => void }>>;
 							const call = await calls[builtinName](params, { ownerThreadId: request.childId, childId: request.childId, maxReadOutputTokens: request.maxReadOutputTokens, cancellationToken: request.cancellationToken });
 							state.interrupt = typeof (call as { interruptTool?: unknown }).interruptTool === 'function' ? (call as { interruptTool: () => void }).interruptTool : undefined;
-							if (state.cancelled && state.interrupt && !state.interruptIssued) { state.interruptIssued = true; state.interrupt(); }
+							if (state.cancelled && state.interrupt && !state.interruptIssued) { state.interruptIssued = true; try { state.interrupt(); } catch { } }
 							state.executing = true;
 							result = await call.result;
 						}
@@ -1755,7 +1755,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		let interrupted = false
 		let cancelledByCard = false
 		let interruptTool: (() => void) | undefined
-		const interruptor = () => { if (interrupted) return; interrupted = true; interruptTool?.() }
+		const interruptor = () => { if (interrupted) return; interrupted = true; try { interruptTool?.() } catch { } }
 		const cardInterruptor = () => { cancelledByCard = true; interruptor() }
 		const cancellationOutcome = () => cancelledByCard && isCurrentParentRun() ? { receiptCancelled: true } : { interrupted: true }
 		const runningTool = {
@@ -1804,7 +1804,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 					interruptTool = installedInterruptTool
 					if (installedInterruptTool) markToolCardInterruptInstalled.call(this, threadId, receiptId)
 					if (interrupted || !isCurrentParentRun()) {
-						interruptTool?.()
+						try { interruptTool?.() } catch { }
 						// An installed terminal receipt owns physical cleanup. Retain Cancelling
 						// until its result settles so a late-created terminal cannot outlive the row.
 						try { await result } catch { }
@@ -1912,7 +1912,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			const messageIndex = messageBase + waveOrdinal;
 			const ledger: ParentSafeReadLedgerEntry = { toolId: call.id, receiptId, batchRef, messageIndex, started: false, interruptInstalled: false, settled: false, cancelled: false };
 			const item: Prepared = { call, batchRef, params, rawParams: call.rawParams, budget: budgets[waveOrdinal] ?? 0, receiptId, messageIndex, interrupted: false, cancelledByCard: false, published: false, ledger };
-			const cancel = () => { item.cancelledByCard = true; item.ledger.cancelled = true; if (!item.interrupted) { item.interrupted = true; item.interruptTool?.(); } };
+			const cancel = () => { item.cancelledByCard = true; item.ledger.cancelled = true; if (!item.interrupted) { item.interrupted = true; try { item.interruptTool?.(); } catch { } } };
 			this._registerActiveToolCardReceipt(threadId, receiptId, call.id, batchRef, cancel, () => isCurrentParentRun() && (this._agentControlGeneration.get(threadId) ?? 0) === agentRunGeneration, false, messageIndex);
 			prepared.push(item);
 			staged.push(item);
@@ -1954,7 +1954,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				const operation = await this._toolsService.callTool[item.call.name as BuiltinToolName](item.params as never, context);
 				item.interruptTool = operation.interruptTool;
 				if (operation.interruptTool) { item.ledger.interruptInstalled = true; this._markToolCardInterruptInstalled(threadId, item.receiptId); }
-				if (!isCurrentParentRun() || item.interrupted) { operation.interruptTool?.(); try { await operation.result; } catch { } settleCancelled(); return cancelled(); }
+				if (!isCurrentParentRun() || item.interrupted) { try { operation.interruptTool?.(); } catch { } try { await operation.result; } catch { } settleCancelled(); return cancelled(); }
 				const value = await operation.result;
 				if (!isCurrentParentRun() || item.interrupted) { settleCancelled(); return cancelled(); }
 				let content: string;
