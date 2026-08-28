@@ -13,6 +13,7 @@ import { StorageScope } from '../../../../../platform/storage/common/storage.js'
 import { URI } from '../../../../../base/common/uri.js';
 import { Severity } from '../../../../../platform/notification/common/notification.js';
 import { TerminalToolService } from '../../browser/terminalToolService.js';
+import { divideToolWaveOutputBudget, planToolBatchWaves } from '../../common/toolBatchPlanner.js';
 
 const bytes = (value: string) => new TextEncoder().encode(value);
 
@@ -69,6 +70,8 @@ interface ChatLifecycleTestAdapter {
 	_revokeAgentDelegation(this: unknown, threadId: string, forget?: boolean): void;
 	abortRunning(this: unknown, threadId: string): Promise<void>;
 	cancelToolReceipt(this: unknown, threadId: string, receiptId: string, toolId: string): boolean;
+	_runParentSafeReadWave(this: unknown, threadId: string, calls: readonly { id: string; name: string; rawParams: Record<string, unknown>; ordinal: number }[], batchId: string, snapshot: ReturnType<typeof instructionSnapshot>, authority: undefined, generation: number, isCurrent: () => boolean): Promise<readonly TestToolCallResult[]>;
+	_runNativeBatchRange(this: unknown, threadId: string, calls: readonly { id: string; name: string; rawParams: Record<string, unknown>; ordinal: number }[], batchId: string, snapshot: ReturnType<typeof instructionSnapshot>, authority: undefined, skillReadAllowed: boolean, generation: number, isCurrent: () => boolean, accountFailure: (call: { id: string; name: string; rawParams: Record<string, unknown>; ordinal: number }, server: undefined, outcome: TestToolCallResult, batchRef: { batchId: string; batchOrdinal: number }) => boolean): Promise<TestToolCallResult>;
 }
 const chatLifecycle = ChatThreadService.prototype as unknown as ChatLifecycleTestAdapter;
 let nextTestParentRunId = 0;
@@ -206,9 +209,9 @@ suite('Assistant message lifecycle', () => {
 		callbacks[1].onText({ fullText: 'continuation partial', fullReasoning: '', toolCalls: undefined }); callbacks[0].onText({ fullText: 'stale A', fullReasoning: '', toolCalls: undefined });
 		await callbacks[0].onFinalMessage({ fullText: 'stale A', fullReasoning: '', anthropicReasoning: null }); await runA;
 		assert.strictEqual(llmInfoOf(streamState.task).displayContentSoFar, 'continuation partial'); assert.strictEqual(messages.length, 0);
-		const final = callbacks[1].onFinalMessage({ fullText: 'continuation complete', fullReasoning: '', toolCalls: [{ name: 'read_file', id: 'batch-a', rawParams: {} }, { name: 'read_file', id: 'batch-b', rawParams: {} }], anthropicReasoning: null });
-		await flushMicrotasks(); assert.deepStrictEqual(executionOrder, ['batch-a']); assert.strictEqual(callbacks.length, 2);
-		firstTool.resolve(); await final; await flushMicrotasks(); assert.deepStrictEqual(executionOrder, ['batch-a', 'batch-b']); assert.strictEqual(callbacks.length, 3);
+		const final = callbacks[1].onFinalMessage({ fullText: 'continuation complete', fullReasoning: '', toolCalls: [{ name: 'run_command', id: 'batch-a', rawParams: {} }, { name: 'run_command', id: 'batch-b', rawParams: {} }], anthropicReasoning: null });
+		await flushMicrotasks(); await flushMicrotasks(); assert.deepStrictEqual(executionOrder, ['batch-a']); assert.strictEqual(callbacks.length, 2);
+		firstTool.resolve(); await final; await flushMicrotasks(); await flushMicrotasks(); assert.deepStrictEqual(executionOrder, ['batch-a', 'batch-b']); assert.strictEqual(callbacks.length, 3);
 		await callbacks[2].onFinalMessage({ fullText: 'continuation after batch', fullReasoning: '', anthropicReasoning: null }); await runB;
 		const declaration = messages.find(message => message.role === 'assistant' && message.toolBatch);
 		assert.deepStrictEqual({ calls: declaration.toolBatch.calls.map((call: any) => call.id), rows: messages.filter(message => message.role === 'tool').map(message => [message.id, message.batchId === declaration.toolBatch.batchId, message.batchOrdinal]) }, { calls: ['batch-a', 'batch-b'], rows: [['batch-a', true, 0], ['batch-b', true, 1]] });
@@ -795,6 +798,96 @@ suite('Assistant message lifecycle', () => {
 		await runSibling;
 		assert.strictEqual(otherMessages[0].type, 'success');
 		assert.strictEqual(interrupts.sibling, 0);
+
+		// Unit 8B parent safe waves: plan cap/tie-breaking, ordinal publication, exact
+		// card/global Stop fencing, and model-content budgeting all remain within this
+		// existing lifecycle declaration so the release gate stays at 35 tests.
+		assert.deepStrictEqual(planToolBatchWaves('parent', [
+			{ ordinal: 7, name: 'ls_dir' }, { ordinal: 5, name: 'read_file' }, { ordinal: 4, name: 'run_command' }, { ordinal: 3, name: 'search_for_files' },
+		], Number.POSITIVE_INFINITY).map(wave => [wave.kind, wave.calls.map(call => call.ordinal)]), [['safe_read', [7, 5]], ['barrier', [4]], ['safe_read', [3]]]);
+		assert.deepStrictEqual(divideToolWaveOutputBudget(7, 3), [3, 2, 2]);
+		assert.deepStrictEqual(divideToolWaveOutputBudget(Number.NaN, 3), [0, 0, 0]);
+
+		const makeSafeReceiver = (declarations: any[], leaves: Record<string, ReturnType<typeof deferred<any>>>, stopWhenFirstPublished = false) => {
+			const safeMessages: any[] = [
+				{ role: 'user', content: 'parent safe wave', displayContent: 'parent safe wave' },
+				{ role: 'assistant', displayContent: '', reasoning: '', anthropicReasoning: null, toolBatch: { version: 1, batchId: 'safe-batch', calls: declarations.map(({ id, name, rawParams }) => ({ id, name, rawParams })) } },
+			];
+			let safeCurrent = true; let didStop = false; const safeStarts: string[] = []; const safeInterrupts: string[] = []; const safeStream: any = {};
+			const safeReceiver: any = {
+				state: { allThreads: { task: { messages: safeMessages, state: {}, filesWithUserChanges: new Set<string>() } } }, streamState: safeStream,
+				_agentControlGeneration: new Map([['task', 0]]), _activeToolCardReceiptsOfThread: new Map(), _cancellingToolReceiptsOfThread: new Map(),
+				toolErrMsgs: { interrupted: 'interrupted', errWhenStringifying: () => 'stringify failed' },
+				_toolsService: {
+					validateParams: { ls_dir: (raw: any) => { if (raw.invalid) throw new Error('invalid ls_dir'); return { key: raw.key }; } },
+					callTool: { ls_dir: async (params: any) => { safeStarts.push(params.key); const leaf = leaves[params.key]; if (!leaf) throw new Error(`missing leaf ${params.key}`); return { result: leaf.promise, interruptTool: () => safeInterrupts.push(params.key) }; } },
+					stringOfResult: { ls_dir: (_params: any, value: any) => value.content },
+				},
+				_settingsService: { state: { globalSettings: { readFileLimits: {} } } }, _mcpService: { getMCPTools: () => [] },
+				_revokeAgentDelegation() { safeCurrent = false; this._agentControlGeneration.set('task', 1); },
+				_addMessageToThread(threadId: string, message: any) { safeMessages.push(message); if (stopWhenFirstPublished && !didStop && message.role === 'tool' && message.type === 'running_now') { didStop = true; void chatLifecycle.abortRunning.call(safeReceiver, threadId); } },
+				_editMessageInThread(_threadId: string, index: number, message: any) { safeMessages[index] = message; },
+				_setStreamState(threadId: string, value: any) { safeStream[threadId] = value; },
+			};
+			Object.setPrototypeOf(safeReceiver, ChatThreadService.prototype);
+			return { safeReceiver, safeMessages, safeStarts, safeInterrupts, isCurrent: () => safeCurrent };
+		};
+
+		const mixedA = deferred<any>(); const mixedC = deferred<any>();
+		const mixed = makeSafeReceiver([
+			{ id: 'mixed-a', name: 'ls_dir', rawParams: { key: 'mixed-a' }, ordinal: 0 },
+			{ id: 'mixed-invalid', name: 'ls_dir', rawParams: { key: 'mixed-invalid', invalid: true }, ordinal: 1 },
+			{ id: 'mixed-c', name: 'ls_dir', rawParams: { key: 'mixed-c' }, ordinal: 2 },
+		], { 'mixed-a': mixedA, 'mixed-c': mixedC });
+		const mixedRun = chatLifecycle._runParentSafeReadWave.call(mixed.safeReceiver, 'task', mixed.safeMessages[1].toolBatch.calls.map((call: any, ordinal: number) => ({ ...call, ordinal })), 'safe-batch', instructionSnapshot(), undefined, 0, mixed.isCurrent);
+		await flushMicrotasks();
+		assert.deepStrictEqual(mixed.safeMessages.filter(message => message.role === 'tool').map(message => [message.id, message.type, message.batchOrdinal]), [['mixed-a', 'running_now', 0], ['mixed-invalid', 'invalid_params', 1], ['mixed-c', 'running_now', 2]]);
+		assert.strictEqual(chatLifecycle.cancelToolReceipt.call(mixed.safeReceiver, 'task', mixed.safeMessages[2].receiptId, 'mixed-a'), true, 'valid A must retain its own ordinal row despite an invalid sibling');
+		mixedC.resolve({ content: 'C complete' }); mixedA.resolve({ content: 'A late after card Stop' });
+		await mixedRun;
+		assert.deepStrictEqual(mixed.safeMessages.filter(message => message.role === 'tool').map(message => [message.id, message.type, message.batchOrdinal]), [['mixed-a', 'rejected', 0], ['mixed-invalid', 'invalid_params', 1], ['mixed-c', 'success', 2]]);
+
+		const capA = deferred<any>(); const capB = deferred<any>(); const capC = deferred<any>();
+		const capped = makeSafeReceiver([
+			{ id: 'cap-a', name: 'ls_dir', rawParams: { key: 'cap-a' }, ordinal: 0 }, { id: 'cap-b', name: 'ls_dir', rawParams: { key: 'cap-b' }, ordinal: 1 }, { id: 'cap-c', name: 'ls_dir', rawParams: { key: 'cap-c' }, ordinal: 2 },
+		], { 'cap-a': capA, 'cap-b': capB, 'cap-c': capC });
+		const cappedRun = chatLifecycle._runNativeBatchRange.call(capped.safeReceiver, 'task', capped.safeMessages[1].toolBatch.calls.map((call: any, ordinal: number) => ({ ...call, ordinal })), 'safe-batch', instructionSnapshot(), undefined, true, 0, capped.isCurrent, () => false);
+		await flushMicrotasks(); assert.deepStrictEqual(capped.safeStarts, ['cap-a', 'cap-b']);
+		capB.resolve({ content: 'B complete first' }); await flushMicrotasks(); assert.deepStrictEqual(capped.safeStarts, ['cap-a', 'cap-b']);
+		capA.resolve({ content: 'A complete second' }); await flushMicrotasks(); await flushMicrotasks(); assert.deepStrictEqual(capped.safeStarts, ['cap-a', 'cap-b', 'cap-c']);
+		capC.resolve({ content: 'C complete' }); await cappedRun;
+		assert.deepStrictEqual(capped.safeMessages.filter(message => message.role === 'tool').map(message => [message.id, message.type, message.content]), [['cap-a', 'success', 'A complete second'], ['cap-b', 'success', 'B complete first'], ['cap-c', 'success', 'C complete']]);
+
+		const cardA = deferred<any>(); const cardB = deferred<any>(); const cardC = deferred<any>();
+		const cardStopped = makeSafeReceiver([
+			{ id: 'card-a', name: 'ls_dir', rawParams: { key: 'card-a' }, ordinal: 0 }, { id: 'card-b', name: 'ls_dir', rawParams: { key: 'card-b' }, ordinal: 1 }, { id: 'card-c', name: 'ls_dir', rawParams: { key: 'card-c' }, ordinal: 2 },
+		], { 'card-a': cardA, 'card-b': cardB, 'card-c': cardC });
+		const cardRun = chatLifecycle._runNativeBatchRange.call(cardStopped.safeReceiver, 'task', cardStopped.safeMessages[1].toolBatch.calls.map((call: any, ordinal: number) => ({ ...call, ordinal })), 'safe-batch', instructionSnapshot(), undefined, true, 0, cardStopped.isCurrent, () => false);
+		await flushMicrotasks(); const cardAReceipt = cardStopped.safeMessages.find(message => message.id === 'card-a').receiptId;
+		assert.strictEqual(chatLifecycle.cancelToolReceipt.call(cardStopped.safeReceiver, 'task', cardAReceipt, 'card-a'), true);
+		cardB.resolve({ content: 'active sibling wins' }); cardA.resolve({ content: 'cancelled A' });
+		await cardRun;
+		assert.deepStrictEqual({ starts: cardStopped.safeStarts, rows: cardStopped.safeMessages.filter(message => message.role === 'tool').map(message => [message.id, message.type, message.batchOrdinal]) }, { starts: ['card-a', 'card-b'], rows: [['card-a', 'rejected', 0], ['card-b', 'success', 1], ['card-c', 'skipped', 2]] });
+
+		const stopA = deferred<any>(); const stopB = deferred<any>(); const stopC = deferred<any>();
+		const globallyStopped = makeSafeReceiver([
+			{ id: 'stop-a', name: 'ls_dir', rawParams: { key: 'stop-a' }, ordinal: 0 }, { id: 'stop-b', name: 'ls_dir', rawParams: { key: 'stop-b' }, ordinal: 1 }, { id: 'stop-c', name: 'ls_dir', rawParams: { key: 'stop-c' }, ordinal: 2 },
+		], { 'stop-a': stopA, 'stop-b': stopB, 'stop-c': stopC }, true);
+		const stoppedRun = chatLifecycle._runNativeBatchRange.call(globallyStopped.safeReceiver, 'task', globallyStopped.safeMessages[1].toolBatch.calls.map((call: any, ordinal: number) => ({ ...call, ordinal })), 'safe-batch', instructionSnapshot(), undefined, true, 0, globallyStopped.isCurrent, () => false);
+		await flushMicrotasks(); stopA.resolve({ content: 'late A' }); stopB.resolve({ content: 'late B' });
+		assert.deepStrictEqual(await stoppedRun, { interrupted: true });
+		assert.deepStrictEqual({ starts: globallyStopped.safeStarts, interrupts: globallyStopped.safeInterrupts.sort(), rows: globallyStopped.safeMessages.filter(message => message.role === 'tool').map(message => [message.id, message.type, message.batchOrdinal]), active: globallyStopped.safeReceiver._activeToolCardReceiptsOfThread.size }, { starts: [], interrupts: [], rows: [['stop-a', 'rejected', 0], ['stop-b', 'skipped', 1], ['stop-c', 'skipped', 2]], active: 0 });
+
+		const activeA = deferred<any>(); const activeB = deferred<any>(); const activeC = deferred<any>();
+		const activeStopped = makeSafeReceiver([
+			{ id: 'active-a', name: 'ls_dir', rawParams: { key: 'active-a' }, ordinal: 0 }, { id: 'active-b', name: 'ls_dir', rawParams: { key: 'active-b' }, ordinal: 1 }, { id: 'active-c', name: 'ls_dir', rawParams: { key: 'active-c' }, ordinal: 2 },
+		], { 'active-a': activeA, 'active-b': activeB, 'active-c': activeC });
+		const activeRun = chatLifecycle._runNativeBatchRange.call(activeStopped.safeReceiver, 'task', activeStopped.safeMessages[1].toolBatch.calls.map((call: any, ordinal: number) => ({ ...call, ordinal })), 'safe-batch', instructionSnapshot(), undefined, true, 0, activeStopped.isCurrent, () => false);
+		await flushMicrotasks(); assert.deepStrictEqual(activeStopped.safeStarts, ['active-a', 'active-b']);
+		await chatLifecycle.abortRunning.call(activeStopped.safeReceiver, 'task');
+		activeA.resolve({ content: 'late active A' }); activeB.resolve({ content: 'late active B' });
+		assert.deepStrictEqual(await activeRun, { interrupted: true });
+		assert.deepStrictEqual({ interrupts: activeStopped.safeInterrupts.sort(), rows: activeStopped.safeMessages.filter(message => message.role === 'tool').map(message => [message.id, message.type, message.batchOrdinal]), active: activeStopped.safeReceiver._activeToolCardReceiptsOfThread.size }, { interrupts: ['active-a', 'active-b'], rows: [['active-a', 'rejected', 0], ['active-b', 'rejected', 1], ['active-c', 'skipped', 2]], active: 0 });
 	});
 
 	test('card Stop rejects a stale parent receipt before touching its live row', () => {
@@ -1375,11 +1468,11 @@ suite('Assistant message lifecycle', () => {
 		const attached = receiver.submitPendingInput({ threadId: 'task', text: 'queue attachment safely', mode: 'steer', selections: [{ type: 'File', uri: URI.parse('file:///workspace/attached.ts'), language: 'typescript', state: { wasAddedAsCurrentFile: false } }] });
 		assert.strictEqual(plain.phase, 'steering');
 		assert.strictEqual(attached.phase, 'steering');
-		await callbacks[0].onFinalMessage({ fullText: '', fullReasoning: '', toolCalls: [{ name: 'read_file', id: 'tool-a', rawParams: {} }], anthropicReasoning: null });
+		await callbacks[0].onFinalMessage({ fullText: '', fullReasoning: '', toolCalls: [{ name: 'run_command', id: 'tool-a', rawParams: {} }], anthropicReasoning: null });
 		await toolEntered.promise;
 		assert.strictEqual(messages.filter(message => message.role === 'user').length, 0);
 		toolSettled.resolve(undefined);
-		await flushMicrotasks();
+		await flushMicrotasks(); await flushMicrotasks();
 		assert.strictEqual(callbacks.length, 2);
 		assert.deepStrictEqual(messages.filter(message => message.role === 'user').map(message => message.displayContent), ['steer after tool']);
 		const fallback = receiver.getPendingChatInputs('task').find((input: any) => input.id === attached.id);
