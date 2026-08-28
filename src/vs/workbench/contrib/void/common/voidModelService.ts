@@ -5,6 +5,7 @@ import { IResolvedTextEditorModel, ITextModelService } from '../../../../editor/
 import { registerSingleton, InstantiationType } from '../../../../platform/instantiation/common/extensions.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { ITextFileService } from '../../../services/textfile/common/textfiles.js';
+import { IUriIdentityService } from '../../../../platform/uriIdentity/common/uriIdentity.js';
 
 type VoidModelType = {
 	model: ITextModel | null;
@@ -26,11 +27,17 @@ export const IVoidModelService = createDecorator<IVoidModelService>('voidVoidMod
 class VoidModelService extends Disposable implements IVoidModelService {
 	_serviceBrand: undefined;
 	static readonly ID = 'voidVoidModelService';
-	private readonly _modelRefOfURI: Record<string, IReference<IResolvedTextEditorModel>> = {};
+	/** The resolver can canonicalise file URIs (notably on case-insensitive file
+	 * systems).  Keep both a stable identity key and one shared creation promise so
+	 * two simultaneous first reads never acquire competing strong references. */
+	private readonly _modelRefOfURI = new Map<string, IReference<IResolvedTextEditorModel>>();
+	private readonly _initializingModelOfURI = new Map<string, Promise<void>>();
+	private _disposed = false;
 
 	constructor(
 		@ITextModelService private readonly _textModelService: ITextModelService,
 		@ITextFileService private readonly _textFileService: ITextFileService,
+		@IUriIdentityService private readonly _uriIdentityService: IUriIdentityService,
 	) {
 		super();
 	}
@@ -42,19 +49,30 @@ class VoidModelService extends Disposable implements IVoidModelService {
 	}
 
 	initializeModel = async (uri: URI) => {
-		try {
-			if (uri.fsPath in this._modelRefOfURI) return;
-			const editorModelRef = await this._textModelService.createModelReference(uri);
-			// Keep a strong reference to prevent disposal
-			this._modelRefOfURI[uri.fsPath] = editorModelRef;
-		}
-		catch (e) {
-			console.log('InitializeModel error:', e)
-		}
+		const key = this._uriIdentityService.extUri.getComparisonKey(uri);
+		if (this._modelRefOfURI.has(key)) return;
+		const inFlight = this._initializingModelOfURI.get(key);
+		if (inFlight) return inFlight;
+		const initialize = (async () => {
+			try {
+				const editorModelRef = await this._textModelService.createModelReference(uri);
+				// A service disposal must not leak a reference that resolved afterwards.
+				if (this._disposed) editorModelRef.dispose();
+				else if (!this._modelRefOfURI.has(key)) this._modelRefOfURI.set(key, editorModelRef);
+				else editorModelRef.dispose();
+			} catch (error) {
+				// Failures are deliberately not cached: a transient resolver error can be retried.
+				console.log('InitializeModel error:', error);
+			} finally {
+				this._initializingModelOfURI.delete(key);
+			}
+		})();
+		this._initializingModelOfURI.set(key, initialize);
+		return initialize;
 	};
 
 	getModelFromFsPath = (fsPath: string): VoidModelType => {
-		const editorModelRef = this._modelRefOfURI[fsPath];
+		const editorModelRef = [...this._modelRefOfURI.values()].find(ref => ref.object.resource.fsPath === fsPath);
 		if (!editorModelRef) {
 			return { model: null, editorModel: null };
 		}
@@ -69,21 +87,26 @@ class VoidModelService extends Disposable implements IVoidModelService {
 	};
 
 	getModel = (uri: URI) => {
-		return this.getModelFromFsPath(uri.fsPath)
+		const editorModelRef = this._modelRefOfURI.get(this._uriIdentityService.extUri.getComparisonKey(uri));
+		if (!editorModelRef) return { model: null, editorModel: null };
+		const model = editorModelRef.object.textEditorModel;
+		return { model, editorModel: editorModelRef.object };
 	}
 
 
 	getModelSafe = async (uri: URI): Promise<VoidModelType> => {
-		if (!(uri.fsPath in this._modelRefOfURI)) await this.initializeModel(uri);
+		if (!this._modelRefOfURI.has(this._uriIdentityService.extUri.getComparisonKey(uri))) await this.initializeModel(uri);
 		return this.getModel(uri);
 
 	};
 
 	override dispose() {
+		this._disposed = true;
 		super.dispose();
-		for (const ref of Object.values(this._modelRefOfURI)) {
+		for (const ref of this._modelRefOfURI.values()) {
 			ref.dispose(); // release reference to allow disposal
 		}
+		this._modelRefOfURI.clear();
 	}
 }
 

@@ -202,10 +202,12 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 			// even a native multi-call response is executed one receipt at a time.
 			for (const [batchOrdinal, responseTool] of responseTools.entries()) {
 			const batchRef = { batchId: childBatchId!, batchOrdinal };
-			response.tool = responseTool;
-			if (isAgentSubagentControlName(response.tool.name)) {
+			// Each declared call owns its immutable response record. Reusing response.tool
+			// races a later streamed/provider mutation against this child receipt.
+			const tool = responseTool;
+			if (isAgentSubagentControlName(tool.name)) {
 				try {
-					const control = validateAgentSubagentControlParams(response.tool.name, response.tool.rawParams);
+					const control = validateAgentSubagentControlParams(tool.name, tool.rawParams);
 					let result: object;
 					if (control.name === 'spawn_agent') result = await this.spawnWithin(run.parentId, control.message, run.snapshot, control.agentType, run.admittedRoles, run.admittedSettingsState, run.settingsOfProvider, run.generation, run, run.parentTools, run.broker);
 					else if (control.name === 'wait_agent') {
@@ -218,27 +220,27 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 						// Timeout/receipt completion is observable before this parent competes
 						// for a scheduler (and possible mutation) lease again.
 						this.setSchedulerActivity(run, false, 'ready_to_resume');
-						history.push({ role: 'tool', type: 'success', content: JSON.stringify(result), id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: undefined, name: response.tool.name, params: response.tool.rawParams, result: result as never, ...batchRef });
+						history.push({ role: 'tool', type: 'success', content: JSON.stringify(result), id: tool.id, rawParams: tool.rawParams, mcpServerName: undefined, name: tool.name, params: tool.rawParams, result: result as never, ...batchRef });
 						await this.reacquire(run);
 						if (!this.isCurrent(run)) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; }
 						continue;
 					}
 					else result = this.interruptFor(run.parentId, run.id, control.target, run.generation);
 					if (!this.isCurrent(run)) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; }
-					history.push({ role: 'tool', type: 'success', content: JSON.stringify(result), id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: undefined, name: response.tool.name, params: response.tool.rawParams, result: result as never, ...batchRef });
+					history.push({ role: 'tool', type: 'success', content: JSON.stringify(result), id: tool.id, rawParams: tool.rawParams, mcpServerName: undefined, name: tool.name, params: tool.rawParams, result: result as never, ...batchRef });
 				} catch (error) {
 					const content = `The child-control call failed: ${error instanceof Error ? error.message : String(error)}`;
-					history.push({ role: 'tool', type: 'tool_error', content, id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: undefined, name: response.tool.name, params: response.tool.rawParams, result: content, ...batchRef });
+					history.push({ role: 'tool', type: 'tool_error', content, id: tool.id, rawParams: tool.rawParams, mcpServerName: undefined, name: tool.name, params: tool.rawParams, result: content, ...batchRef });
 				}
 				continue;
 			}
-			if (run.toolExecutionProfile === 'inherited-parent-write-child' && !(readOnlyChildToolNames as readonly string[]).includes(response.tool.name)) {
-				const capturedEntries = run.parentTools?.tools.filter(tool => tool.name === response.tool!.name) ?? [];
+			if (run.toolExecutionProfile === 'inherited-parent-write-child' && !(readOnlyChildToolNames as readonly string[]).includes(tool.name)) {
+				const capturedEntries = run.parentTools?.tools.filter(entry => entry.name === tool.name) ?? [];
 				const captured = capturedEntries.length === 1 ? capturedEntries[0] : undefined;
-				if (!captured || !run.broker) { const content = !captured ? 'The requested tool is absent from this child\'s frozen parent capability snapshot.' : 'The inherited parent tool broker is unavailable.'; history.push({ role: 'tool', type: 'tool_error', content, id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: captured?.mcpServerName, name: response.tool.name, params: response.tool.rawParams, result: content, ...batchRef }); continue; }
-				if (isReadSkillResourceToolName(response.tool.name)) {
+				if (!captured || !run.broker) { const content = !captured ? 'The requested tool is absent from this child\'s frozen parent capability snapshot.' : 'The inherited parent tool broker is unavailable.'; history.push({ role: 'tool', type: 'tool_error', content, id: tool.id, rawParams: tool.rawParams, mcpServerName: captured?.mcpServerName, name: tool.name, params: tool.rawParams, result: content, ...batchRef }); continue; }
+				if (isReadSkillResourceToolName(tool.name)) {
 					try {
-						const params = validateReadSkillResourceToolParams(response.tool.rawParams); const selection = run.snapshot.selected.find(item => item.identity === params.skill);
+						const params = validateReadSkillResourceToolParams(tool.rawParams); const selection = run.snapshot.selected.find(item => item.identity === params.skill);
 						if (!selection) throw new Error('skill_not_selected');
 						const maxReadOutputTokens = run.snapshot.model.hasModel ? computeMaxReadOutputTokens(run.snapshot.model.contextWindow, run.snapshot.model.reservedOutputTokens, estimateHistoryTokensForReadBudget(history)) : 0;
 						const exactInputBudgetChars = run.snapshot.model.hasModel ? Math.max(0, run.snapshot.model.contextWindow - run.snapshot.model.reservedOutputTokens) * 4 : 0;
@@ -249,18 +251,18 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 						if (!this.isCurrent(run)) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; }
 						if (read.body === undefined) throw new Error(read.diagnostic?.code ?? 'skill_resource_unreadable');
 						const content = admitSkillResourceContext(read.body, maxReadOutputTokens);
-						const success: ChatMessage & { role: 'tool' } = { role: 'tool', type: 'success', content, id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: undefined, name: response.tool.name, params: response.tool.rawParams, result: content as never, ...batchRef };
+						const success: ChatMessage & { role: 'tool' } = { role: 'tool', type: 'success', content, id: tool.id, rawParams: tool.rawParams, mcpServerName: undefined, name: tool.name, params: tool.rawParams, result: content as never, ...batchRef };
 						try {
 							const prospective = closeNativeToolBatchForProspectiveAdmission([...history, success], batchRef);
 							await this.converter.prepareLLMChatMessages({ chatMessages: prospective, chatMode: 'agent', modelSelection, instructionSnapshot: run.snapshot, toolExecutionProfile: run.toolExecutionProfile, childRoot: owner.toString(), agentDelegationAllowed: run.remainingDepth > 0, frozenToolSnapshot: run.parentTools });
 						} catch { throw new Error('skill_resource_context_admission_failed'); }
 						if (!this.isCurrent(run)) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; }
 						history.push(success);
-					} catch (error) { if (!this.isCurrent(run)) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; } const content = error instanceof Error ? error.message : 'skill_resource_unreadable'; history.push({ role: 'tool', type: 'tool_error', content, id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: undefined, name: response.tool.name, params: response.tool.rawParams, result: content, ...batchRef }); }
+					} catch (error) { if (!this.isCurrent(run)) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; } const content = error instanceof Error ? error.message : 'skill_resource_unreadable'; history.push({ role: 'tool', type: 'tool_error', content, id: tool.id, rawParams: tool.rawParams, mcpServerName: undefined, name: tool.name, params: tool.rawParams, result: content, ...batchRef }); }
 					continue;
 				}
 				const maxReadOutputTokens = run.snapshot.model.hasModel ? computeMaxReadOutputTokens(run.snapshot.model.contextWindow, run.snapshot.model.reservedOutputTokens, estimateHistoryTokensForReadBudget(history)) : 0;
-				const request: AgentSubagentToolBrokerRequest = Object.freeze({ parentId: run.parentId, generation: run.generation, childId: run.id, batchId: batchRef.batchId, batchOrdinal: batchRef.batchOrdinal, toolId: response.tool.id, name: response.tool.name, tool: captured, rawParams: Object.freeze({ ...response.tool.rawParams }), snapshotRevision: run.parentTools!.revision, maxReadOutputTokens, cancellationToken: run.cancellation.token });
+				const request: AgentSubagentToolBrokerRequest = Object.freeze({ parentId: run.parentId, generation: run.generation, childId: run.id, batchId: batchRef.batchId, batchOrdinal: batchRef.batchOrdinal, toolId: tool.id, name: tool.name, tool: captured, rawParams: Object.freeze({ ...tool.rawParams }), snapshotRevision: run.parentTools!.revision, maxReadOutputTokens, cancellationToken: run.cancellation.token });
 				run.brokerRequest = request;
 				try {
 					const execute = run.broker.execute(request); run.brokerExecute = execute;
@@ -268,36 +270,36 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 					run.brokerExecute = undefined;
 					if (!this.isCurrent(run) || run.brokerRequest !== request) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; }
 					run.brokerRequest = undefined;
-					if (brokered.ok) history.push({ role: 'tool', type: 'success', content: brokered.content, id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: captured.mcpServerName, name: response.tool.name, params: response.tool.rawParams, result: brokered.result as never, ...batchRef });
-					else history.push({ role: 'tool', type: 'tool_error', content: brokered.error, id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: captured.mcpServerName, name: response.tool.name, params: response.tool.rawParams, result: brokered.error, ...batchRef });
-				} catch { run.brokerExecute = undefined; if (!this.isCurrent(run) || run.brokerRequest !== request) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; } run.brokerRequest = undefined; const content = 'execution_failed'; history.push({ role: 'tool', type: 'tool_error', content, id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: captured.mcpServerName, name: response.tool.name, params: response.tool.rawParams, result: content, ...batchRef }); }
+					if (brokered.ok) history.push({ role: 'tool', type: 'success', content: brokered.content, id: tool.id, rawParams: tool.rawParams, mcpServerName: captured.mcpServerName, name: tool.name, params: tool.rawParams, result: brokered.result as never, ...batchRef });
+					else history.push({ role: 'tool', type: 'tool_error', content: brokered.error, id: tool.id, rawParams: tool.rawParams, mcpServerName: captured.mcpServerName, name: tool.name, params: tool.rawParams, result: brokered.error, ...batchRef });
+				} catch { run.brokerExecute = undefined; if (!this.isCurrent(run) || run.brokerRequest !== request) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; } run.brokerRequest = undefined; const content = 'execution_failed'; history.push({ role: 'tool', type: 'tool_error', content, id: tool.id, rawParams: tool.rawParams, mcpServerName: captured.mcpServerName, name: tool.name, params: tool.rawParams, result: content, ...batchRef }); }
 				continue;
 			}
-			if (!(readOnlyChildToolNames as readonly string[]).includes(response.tool.name) || !Object.prototype.hasOwnProperty.call(this.tools.validateParams, response.tool.name)) { history.push({ role: 'tool', type: 'tool_error', content: 'The requested tool is not authorized for this read-only child.', id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: undefined, name: response.tool.name, params: response.tool.rawParams, result: 'The requested tool is not authorized for this read-only child.', ...batchRef }); continue; }
+			if (!(readOnlyChildToolNames as readonly string[]).includes(tool.name) || !Object.prototype.hasOwnProperty.call(this.tools.validateParams, tool.name)) { history.push({ role: 'tool', type: 'tool_error', content: 'The requested tool is not authorized for this read-only child.', id: tool.id, rawParams: tool.rawParams, mcpServerName: undefined, name: tool.name, params: tool.rawParams, result: 'The requested tool is not authorized for this read-only child.', ...batchRef }); continue; }
 			try {
 				if (!this.isCurrent(run)) throw new Error('agent_child_owner_or_trust_changed');
 				if (run.toolExecutionProfile === 'inherited-parent-write-child') {
 					// A same-name MCP or duplicate frozen entry must not fall through to the
 					// local read registry: inherited authority is the complete snapshot.
-					const exact = run.parentTools?.tools.filter(tool => tool.name === response.tool!.name) ?? [];
-					if (exact.length !== 1 || exact[0].kind !== 'builtin' || exact[0].mcpServerName || !(readOnlyChildToolNames as readonly string[]).includes(response.tool.name) || !isABuiltinToolName(response.tool.name)) throw new Error('tool_stale');
+					const exact = run.parentTools?.tools.filter(entry => entry.name === tool.name) ?? [];
+					if (exact.length !== 1 || exact[0].kind !== 'builtin' || exact[0].mcpServerName || !(readOnlyChildToolNames as readonly string[]).includes(tool.name) || !isABuiltinToolName(tool.name)) throw new Error('tool_stale');
 				}
-				assertExactReadOnlyChildRawKeys(response.tool.name, response.tool.rawParams);
-				assertCanonicalReadOnlyChildRawPaths(response.tool.name, response.tool.rawParams);
-				const params = (this.tools.validateParams as Record<string, (raw: Record<string, unknown>) => unknown>)[response.tool.name](response.tool.rawParams);
+				assertExactReadOnlyChildRawKeys(tool.name, tool.rawParams);
+				assertCanonicalReadOnlyChildRawPaths(tool.name, tool.rawParams);
+				const params = (this.tools.validateParams as Record<string, (raw: Record<string, unknown>) => unknown>)[tool.name](tool.rawParams);
 				await this.assertContainedRead(params as Record<string, unknown>, owner);
 				if (!this.isCurrent(run)) throw new Error('agent_child_owner_or_trust_changed');
 				const maxReadOutputTokens = run.snapshot.model.hasModel ? computeMaxReadOutputTokens(run.snapshot.model.contextWindow, run.snapshot.model.reservedOutputTokens, estimateHistoryTokensForReadBudget(history)) : 0;
 				const toolContext = { ownerThreadId: run.id, maxReadOutputTokens, childId: run.id, ownerRoot: owner, cancellationToken: run.cancellation.token, maxResults: AGENT_SUBAGENT_MAX_RESULTS, maxFileSize: 1024 * 1024 };
-				const call = await (this.tools.callTool as Record<string, (params: unknown, context?: unknown) => Promise<{ result: Promise<unknown> }>>)[response.tool.name](params, toolContext);
+				const call = await (this.tools.callTool as Record<string, (params: unknown, context?: unknown) => Promise<{ result: Promise<unknown> }>>)[tool.name](params, toolContext);
 				const result = await call.result;
 				if (!this.isCurrent(run)) throw new Error('agent_child_owner_or_trust_changed');
 				await this.assertContainedRead(params as Record<string, unknown>, owner);
-				await this.assertContainedSearchResults(response.tool.name, result, owner);
+				await this.assertContainedSearchResults(tool.name, result, owner);
 				if (!this.isCurrent(run)) throw new Error('agent_child_owner_or_trust_changed');
-				const rawPrintable = (this.tools.stringOfResult as Record<string, (params: unknown, result: unknown, context?: unknown) => string>)[response.tool.name](params, result, toolContext); const maxPrintableChars = maxReadOutputTokens * 4; const marker = '\n[child tool output truncated]'; const printable = rawPrintable.length <= maxPrintableChars ? rawPrintable : `${rawPrintable.slice(0, maxPrintableChars - marker.length)}${marker}`;
-				history.push({ role: 'tool', type: 'success', content: printable, id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: undefined, name: response.tool.name, params: params as never, result: result as never, ...batchRef });
-			} catch (error) { if (!this.isCurrent(run)) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; } const content = `The read-only tool call failed: ${error instanceof Error ? error.message : String(error)}`; history.push({ role: 'tool', type: 'tool_error', content, id: response.tool.id, rawParams: response.tool.rawParams, mcpServerName: undefined, name: response.tool.name, params: response.tool.rawParams, result: content, ...batchRef }); }
+				const rawPrintable = (this.tools.stringOfResult as Record<string, (params: unknown, result: unknown, context?: unknown) => string>)[tool.name](params, result, toolContext); const maxPrintableChars = maxReadOutputTokens * 4; const marker = '\n[child tool output truncated]'; const printable = rawPrintable.length <= maxPrintableChars ? rawPrintable : `${rawPrintable.slice(0, maxPrintableChars - marker.length)}${marker}`;
+				history.push({ role: 'tool', type: 'success', content: printable, id: tool.id, rawParams: tool.rawParams, mcpServerName: undefined, name: tool.name, params: params as never, result: result as never, ...batchRef });
+			} catch (error) { if (!this.isCurrent(run)) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; } const content = `The read-only tool call failed: ${error instanceof Error ? error.message : String(error)}`; history.push({ role: 'tool', type: 'tool_error', content, id: tool.id, rawParams: tool.rawParams, mcpServerName: undefined, name: tool.name, params: tool.rawParams, result: content, ...batchRef }); }
 			}
 			}
 			if (run.cancellation.token.isCancellationRequested) this.settle(run, 'cancelled', 'Child cancelled.');
