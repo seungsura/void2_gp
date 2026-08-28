@@ -1,9 +1,15 @@
 import assert from 'assert';
+import { VSBuffer } from '../../../../../base/common/buffer.js';
 import { CancellationTokenSource } from '../../../../../base/common/cancellation.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { Event } from '../../../../../base/common/event.js';
+import { DisposableStore } from '../../../../../base/common/lifecycle.js';
+import { Schemas } from '../../../../../base/common/network.js';
+import { FileService } from '../../../../../platform/files/common/fileService.js';
+import { InMemoryFileSystemProvider } from '../../../../../platform/files/common/inMemoryFilesystemProvider.js';
 import { getSingletonServiceDescriptors } from '../../../../../platform/instantiation/common/extensions.js';
 import { TestDialogService } from '../../../../../platform/dialogs/test/common/testDialogService.js';
+import { NullLogService } from '../../../../../platform/log/common/log.js';
 import { TestNotificationService } from '../../../../../platform/notification/test/common/testNotificationService.js';
 import { UndoRedoService } from '../../../../../platform/undoRedo/common/undoRedoService.js';
 import { createTextModel } from '../../../../../editor/test/common/testTextModel.js';
@@ -240,45 +246,64 @@ suite('Void AgentSubagentService', () => {
 		assert.strictEqual(tools![0].schema, schema); assert.deepStrictEqual(entry.schema, schema); assert.strictEqual(entry.kind, 'mcp'); assert.strictEqual(entry.mcpServerName, 'server-a');
 	});
 
-	test('real child write_file broker uses a child receipt, editor transaction, save, and one Undo element', async () => {
+	test('real child write_file broker approval persists Apply, Undo, Redo, and a fresh child read', async () => {
 		const uri = URI.parse('file:///workspace/note.txt');
-		const model = createTextModel('alpha\nbeta', null, undefined, uri);
+		let model: ReturnType<typeof createTextModel> | undefined = createTextModel('alpha\nbeta', null, undefined, uri);
+		const disposables = new DisposableStore();
+		const fileService = disposables.add(new FileService(new NullLogService()));
+		disposables.add(fileService.registerProvider(Schemas.file, disposables.add(new InMemoryFileSystemProvider())));
+		await fileService.createFolder(URI.parse('file:///workspace'));
+		await fileService.writeFile(uri, VSBuffer.fromString('alpha\nbeta'));
 		const undoRedo = new UndoRedoService(new TestDialogService(), new TestNotificationService());
 		const saved: Uint8Array[] = [];
+		const loadModel = async () => model ??= createTextModel((await fileService.readFile(uri)).value.toString(), null, undefined, uri);
+		const currentModel = () => { if (!model) { throw new Error('expected a live model'); } return model; };
 		const voidModels: any = {
-			initializeModel: async () => { }, getModelSafe: async () => ({ model }), getModel: () => ({ model }),
-			saveModel: async () => { saved.push(new TextEncoder().encode(model.getValue())); },
+			initializeModel: async () => { }, getModelSafe: async () => ({ model: await loadModel() }), getModel: () => ({ model }),
+			saveModel: async () => { const contents = (await loadModel()).getValue(); saved.push(new TextEncoder().encode(contents)); await fileService.writeFile(uri, VSBuffer.fromString(contents)); },
 		};
 		const editDescriptor = getSingletonServiceDescriptors().find(([id]) => id === IEditCodeService)?.[1];
 		assert.ok(editDescriptor, 'editCodeService side-effect registration must be loaded');
 		const editCode = new editDescriptor.ctor(
-			{ listCodeEditors: () => [], onCodeEditorAdd: Event.None }, { getModels: () => [model], onModelAdded: Event.None }, undoRedo,
+			{ listCodeEditors: () => [], onCodeEditorAdd: Event.None }, { getModels: () => model ? [model] : [], onModelAdded: Event.None }, undoRedo,
 			{}, { addConsistentItemToURI: () => 'none', removeConsistentItemFromURI: () => { } }, { createInstance: () => ({}), invokeFunction: () => undefined },
 			{ addToEditor: () => 'none', removeFromEditor: () => { } }, { capture: () => { } }, new TestNotificationService(),
 			{ state: { globalSettings: { autoAcceptLLMChanges: false } } }, voidModels, {},
 		);
-		const safeFile: any = { resolve: async (value: URI) => ({ resource: value, isSymbolicLink: false, isDirectory: true }), stat: async (value: URI) => ({ resource: value, isSymbolicLink: false, size: model.getValueLength() }) };
-		const tools = new ToolsService(safeFile, { getWorkspace: () => ({ folders: [{ uri: URI.parse('file:///workspace') }] }) } as never, {} as never, { search: async () => ({ ok: false, code: 'search_backend_unavailable', trace: 'terminal-fallback-unavailable' }) } as never, { createInstance: () => ({}) } as never, voidModels, { state: { globalSettings: {} } } as never, editCode, {} as never, { getStreamState: () => undefined } as never, {} as never, { read: () => [] } as never);
-		const childContext: any = { ownerThreadId: 'child', childId: 'child', ownerRoot: URI.parse('file:///workspace'), maxReadOutputTokens: 1024, maxFileSize: 1_048_576, maxResults: 100 };
-		const read = await tools.callTool.read_file({ uri, startLine: 1, endLine: null, lineByteOffset: 0 }, childContext);
-		const receipt = (await read.result).receipt.id;
-		const params: any = { uri, operation: 'modify', readReceiptId: receipt, edits: [{ oldText: 'beta', newText: 'gamma' }] };
-		await assert.rejects(() => tools.prepareWriteFile(params, 'wrong-parent'), /stale_read/);
-		const runtime = snapshot(); const parentTools = captureParentModelToolSnapshot('agent', [], true);
-		const authority: any = Object.freeze({ allowed: true, generation: 4, runtimeSnapshot: runtime, parentTools, autoApprove: Object.freeze({ edits: false, terminal: false, mcp: false }) });
-		const approvalEvents: number[] = []; const receiver: any = { state: { allThreads: { parent: { messages: [], state: {}, filesWithUserChanges: new Set() } } }, streamState: {}, _instructionTurnOfThread: new Map([['parent', runtime]]), _agentDelegationAuthorityOfThread: new Map([['parent', authority]]), _agentControlGeneration: new Map([['parent', 4]]), _workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: URI.parse('file:///workspace') }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => true }, _mcpService: { getMCPTools: () => [], stringifyResult: () => '' }, _toolsService: tools };
-		bindManualApproval(receiver); receiver._onDidChangeChildToolApprovals = { fire: () => approvalEvents.push(receiver._childToolApprovals.size) };
-		const broker = (ChatThreadService.prototype as any)._createAgentSubagentToolBroker.call(receiver, 'parent', authority);
-		const write = parentTools.tools.find(tool => tool.name === 'write_file')!;
-		const request = (toolId: string): any => Object.freeze({ parentId: 'parent', generation: 4, childId: 'child', batchId: `batch-${toolId}`, batchOrdinal: 0, toolId, name: 'write_file', tool: write, rawParams: Object.freeze({ uri: uri.toString(), operation: 'modify', read_receipt_id: receipt, edits: [{ old_text: 'beta', new_text: 'gamma' }] }), snapshotRevision: parentTools.revision, maxReadOutputTokens: 1024, cancellationToken: { isCancellationRequested: false } });
-		const rejectedPending = broker.execute(request('write-reject')); await Promise.resolve(); const rejectedView = [...receiver._childToolApprovals.values()][0].view; assert.strictEqual(receiver.rejectChildToolApproval(rejectedView.key), true); assert.strictEqual(receiver.approveChildToolApproval(rejectedView.key), false); assert.deepStrictEqual(await rejectedPending, { ok: false, error: 'rejected' }); assert.strictEqual(model.getValue(), 'alpha\nbeta'); assert.strictEqual(saved.length, 0); assert.strictEqual(undoRedo.getElements(uri).past.length, 0);
-		const pending = broker.execute(request('write-approve')); await Promise.resolve(); const approvalView = [...receiver._childToolApprovals.values()][0].view; for (const field of ['parentId', 'generation', 'childId', 'toolId', 'snapshotRevision'] as const) { const wrong = { ...approvalView.key, [field]: field === 'generation' ? 5 : `${approvalView.key[field]}-wrong` }; assert.strictEqual(receiver.approveChildToolApproval(wrong), false); assert.strictEqual(receiver._childToolApprovals.size, 1); } assert.strictEqual(receiver.approveChildToolApproval(approvalView.key), true); assert.strictEqual(receiver.rejectChildToolApproval(approvalView.key), false); const result = await pending;
-		assert.deepStrictEqual(result, { ok: true, content: JSON.stringify({ operation: 'modify', didChange: true, editCount: 1 }), result: { operation: 'modify', didChange: true, editCount: 1 } });
-		assert.deepStrictEqual(approvalEvents, [1, 0, 1, 0]); assert.strictEqual(receiver.state.allThreads.parent.messages.length, 0); assert.deepStrictEqual(receiver.streamState, {});
-		assert.strictEqual(model.getValue(), 'alpha\ngamma'); assert.deepStrictEqual([...saved.at(-1)!], [...new TextEncoder().encode('alpha\ngamma')]); assert.strictEqual(undoRedo.getElements(uri).past.length, 1);
-		await undoRedo.undo(uri);
-		assert.strictEqual(model.getValue(), 'alpha\nbeta'); assert.deepStrictEqual([...saved.at(-1)!], [...new TextEncoder().encode('alpha\nbeta')]);
-		model.dispose(); editCode.dispose();
+		try {
+			const tools = new ToolsService(fileService, { getWorkspace: () => ({ folders: [{ uri: URI.parse('file:///workspace') }] }) } as never, {} as never, { search: async () => ({ ok: false, code: 'search_backend_unavailable', trace: 'terminal-fallback-unavailable' }) } as never, { createInstance: () => ({}) } as never, voidModels, { state: { globalSettings: {} } } as never, editCode, {} as never, { getStreamState: () => undefined } as never, {} as never, { read: () => [] } as never);
+			const childContext: any = { ownerThreadId: 'child', childId: 'child', ownerRoot: URI.parse('file:///workspace'), maxReadOutputTokens: 1024, maxFileSize: 1_048_576, maxResults: 100 };
+			const read = await tools.callTool.read_file({ uri, startLine: 1, endLine: null, lineByteOffset: 0 }, childContext);
+			const receipt = (await read.result).receipt.id;
+			const params: any = { uri, operation: 'modify', readReceiptId: receipt, edits: [{ oldText: 'beta', newText: 'gamma' }] };
+			await assert.rejects(() => tools.prepareWriteFile(params, 'wrong-parent'), /stale_read/);
+			const runtime = snapshot(); const parentTools = captureParentModelToolSnapshot('agent', [], true);
+			const authority: any = Object.freeze({ allowed: true, generation: 4, runtimeSnapshot: runtime, parentTools, autoApprove: Object.freeze({ edits: false, terminal: false, mcp: false }) });
+			const approvalEvents: number[] = []; const receiver: any = { state: { allThreads: { parent: { messages: [], state: {}, filesWithUserChanges: new Set() } } }, streamState: {}, _instructionTurnOfThread: new Map([['parent', runtime]]), _agentDelegationAuthorityOfThread: new Map([['parent', authority]]), _agentControlGeneration: new Map([['parent', 4]]), _workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: URI.parse('file:///workspace') }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => true }, _mcpService: { getMCPTools: () => [], stringifyResult: () => '' }, _toolsService: tools };
+			bindManualApproval(receiver); receiver._onDidChangeChildToolApprovals = { fire: () => approvalEvents.push(receiver._childToolApprovals.size) };
+			const broker = (ChatThreadService.prototype as any)._createAgentSubagentToolBroker.call(receiver, 'parent', authority);
+			const write = parentTools.tools.find(tool => tool.name === 'write_file')!;
+			const request = (toolId: string): any => Object.freeze({ parentId: 'parent', generation: 4, childId: 'child', batchId: `batch-${toolId}`, batchOrdinal: 0, toolId, name: 'write_file', tool: write, rawParams: Object.freeze({ uri: uri.toString(), operation: 'modify', read_receipt_id: receipt, edits: [{ old_text: 'beta', new_text: 'gamma' }] }), snapshotRevision: parentTools.revision, maxReadOutputTokens: 1024, cancellationToken: { isCancellationRequested: false } });
+			const rejectedPending = broker.execute(request('write-reject')); await Promise.resolve(); const rejectedView = [...receiver._childToolApprovals.values()][0].view; assert.strictEqual(receiver.rejectChildToolApproval(rejectedView.key), true); assert.strictEqual(receiver.approveChildToolApproval(rejectedView.key), false); assert.deepStrictEqual(await rejectedPending, { ok: false, error: 'rejected' }); assert.strictEqual(currentModel().getValue(), 'alpha\nbeta'); assert.strictEqual((await fileService.readFile(uri)).value.toString(), 'alpha\nbeta'); assert.strictEqual(saved.length, 0); assert.strictEqual(undoRedo.getElements(uri).past.length, 0);
+			const pending = broker.execute(request('write-approve')); await Promise.resolve(); const approvalView = [...receiver._childToolApprovals.values()][0].view; for (const field of ['parentId', 'generation', 'childId', 'batchId', 'batchOrdinal', 'toolId', 'snapshotRevision'] as const) { const wrong = { ...approvalView.key, [field]: field === 'generation' || field === 'batchOrdinal' ? 5 : `${approvalView.key[field]}-wrong` }; assert.strictEqual(receiver.approveChildToolApproval(wrong), false); assert.strictEqual(receiver._childToolApprovals.size, 1); } assert.strictEqual(receiver.approveChildToolApproval(approvalView.key), true); assert.strictEqual(receiver.rejectChildToolApproval(approvalView.key), false); const result = await pending;
+			assert.deepStrictEqual(result, { ok: true, content: JSON.stringify({ operation: 'modify', didChange: true, editCount: 1 }), result: { operation: 'modify', didChange: true, editCount: 1 } });
+			assert.deepStrictEqual(approvalEvents, [1, 0, 1, 0]); assert.strictEqual(receiver.state.allThreads.parent.messages.length, 0); assert.deepStrictEqual(receiver.streamState, {});
+			assert.strictEqual(currentModel().getValue(), 'alpha\ngamma'); assert.strictEqual((await fileService.readFile(uri)).value.toString(), 'alpha\ngamma'); assert.deepStrictEqual([...saved.at(-1)!], [...new TextEncoder().encode('alpha\ngamma')]); assert.strictEqual(undoRedo.getElements(uri).past.length, 1); assert.strictEqual(undoRedo.getElements(uri).future.length, 0);
+			const projectDiffZones = [...editCode.diffAreasOfURI[uri.fsPath] ?? []].map(id => editCode.diffAreaOfId[id]).filter(area => area.type === 'DiffZone');
+			assert.strictEqual(projectDiffZones.length, 1); assert.strictEqual(projectDiffZones[0]._streamState.isStreaming, false); assert.strictEqual(Object.keys(projectDiffZones[0]._diffOfId).length, 1);
+			await undoRedo.undo(uri);
+			assert.strictEqual(currentModel().getValue(), 'alpha\nbeta'); assert.strictEqual((await fileService.readFile(uri)).value.toString(), 'alpha\nbeta'); assert.deepStrictEqual([...saved.at(-1)!], [...new TextEncoder().encode('alpha\nbeta')]); assert.strictEqual(editCode.diffAreasOfURI[uri.fsPath]?.size, 0); assert.strictEqual(undoRedo.getElements(uri).past.length, 0); assert.strictEqual(undoRedo.getElements(uri).future.length, 1);
+			await undoRedo.redo(uri);
+			assert.strictEqual(currentModel().getValue(), 'alpha\ngamma'); assert.strictEqual((await fileService.readFile(uri)).value.toString(), 'alpha\ngamma'); assert.strictEqual(editCode.diffAreasOfURI[uri.fsPath]?.size, 1); assert.strictEqual(undoRedo.getElements(uri).past.length, 1); assert.strictEqual(undoRedo.getElements(uri).future.length, 0);
+			await assert.rejects(() => tools.prepareWriteFile(params, 'child'), /stale_read/);
+			currentModel().dispose(); model = undefined;
+			const freshRead = await tools.callTool.read_file({ uri, startLine: 1, endLine: null, lineByteOffset: 0 }, childContext);
+			const freshResult = await freshRead.result;
+			const freshModel = await loadModel();
+			assert.strictEqual(freshResult.fileContents, 'alpha\ngamma'); assert.notStrictEqual(freshResult.receipt.id, receipt); assert.strictEqual(freshModel.getValue(), 'alpha\ngamma');
+		} finally {
+			model?.dispose(); editCode.dispose(); disposables.dispose();
+		}
 	});
 
 	test('real ChatThread inherited-write spawn routes an auto-approved captured MCP tool without parent contamination', async () => {
