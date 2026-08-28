@@ -190,7 +190,9 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 			if (!this.isCurrent(run)) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; }
 			if (response.error) { this.settle(run, run.cancellation.token.isCancellationRequested ? 'cancelled' : 'failed', response.error); return; }
 			const responseText = sanitizeAssistantDisplayContent(response.text ?? '');
-			const responseTools = response.tools ?? [];
+			// The provider object is transport-owned and can be mutated by a late stream
+			// callback. Capture each declaration before either history or execution awaits.
+			const responseTools = (response.tools ?? []).map(responseTool => Object.freeze({ ...responseTool, rawParams: Object.freeze(deepClone(responseTool.rawParams)) }));
 			if (responseTools.some(tool => !tool.id || !tool.name) || new Set(responseTools.map(tool => tool.id)).size !== responseTools.length) {
 				this.settle(run, 'failed', 'Child provider returned an invalid or duplicate tool-call batch.');
 				return;

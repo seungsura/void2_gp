@@ -25,13 +25,14 @@ const isSafeRead = (executor: BatchExecutor, name: string): boolean =>
 
 /** Split at barriers and apply the physical read cap to each same-kind wave. */
 export const planToolBatchWaves = (executor: BatchExecutor, calls: readonly ToolBatchPlanCall[], maxConcurrentReads = 2): readonly ToolBatchWave[] => {
-	const cap = Math.max(1, Math.min(2, Math.floor(maxConcurrentReads)));
+	const cap = Number.isFinite(maxConcurrentReads) ? Math.max(1, Math.min(2, Math.floor(maxConcurrentReads))) : 2;
 	const result: ToolBatchWave[] = [];
 	let reads: ToolBatchPlanCall[] = [];
 	const flushReads = () => { if (reads.length) { result.push(Object.freeze({ kind: 'safe_read', calls: Object.freeze(reads) })); reads = []; } };
 	for (const call of calls) {
-		if (!isSafeRead(executor, call.name)) { flushReads(); result.push(Object.freeze({ kind: 'barrier', calls: Object.freeze([call]) })); continue; }
-		reads.push(call);
+		const immutable = Object.freeze({ ordinal: call.ordinal, name: call.name });
+		if (!isSafeRead(executor, immutable.name)) { flushReads(); result.push(Object.freeze({ kind: 'barrier', calls: Object.freeze([immutable]) })); continue; }
+		reads.push(immutable);
 		if (reads.length === cap) flushReads();
 	}
 	flushReads();
@@ -40,8 +41,8 @@ export const planToolBatchWaves = (executor: BatchExecutor, calls: readonly Tool
 
 /** A deterministic quotient/remainder split; earlier declaration ordinals receive the remainder. */
 export const divideToolWaveOutputBudget = (total: number, count: number): readonly number[] => {
-	const safeTotal = Math.max(0, Math.floor(total));
-	const safeCount = Math.max(0, Math.floor(count));
+	const safeTotal = Number.isSafeInteger(total) ? Math.max(0, total) : 0;
+	const safeCount = Number.isSafeInteger(count) ? Math.max(0, count) : 0;
 	if (safeCount === 0) return Object.freeze([]);
 	const quotient = Math.floor(safeTotal / safeCount);
 	const remainder = safeTotal % safeCount;
