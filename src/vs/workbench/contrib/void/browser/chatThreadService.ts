@@ -1393,9 +1393,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 					if (request.tool.kind !== 'mcp' || !request.tool.mcpServerName || !admitted(request, state)) return stale(request, state);
 					if (!authority.autoApprove.mcp) { state.pendingKey = approvalKeyOf(request); const decision = await this._awaitChildToolApproval(request); state.pendingKey = undefined; if (decision === 'rejected') return fail('rejected'); if (decision !== 'approved') return fail('cancelled'); if (!admitted(request, state)) return stale(request, state); }
 					const ioLease = this._agentSubagentService?.acquireGroupIo ? await this._agentSubagentService.acquireGroupIo(request.parentId, request.generation, 'write', request.cancellationToken) : { release() { } };
-					let result: unknown;
+					let result: RawMCPToolCall;
 					try { if (!admitted(request, state)) return stale(request, state); state.executing = true;
-						result = (await this._mcpService.callMCPTool({ serverName: request.tool.mcpServerName, toolName: request.name, params: request.rawParams })).result;
+						result = (await this._mcpService.callMCPTool({ serverName: request.tool.mcpServerName, toolName: request.name, params: request.rawParams })).result as RawMCPToolCall;
 						if (!admitted(request, state)) return stale(request, state);
 					} finally { ioLease.release(); }
 					return Object.freeze({ ok: true as const, content: this._mcpService.stringifyResult(result), result });
