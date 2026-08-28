@@ -948,6 +948,25 @@ suite('Assistant message lifecycle', () => {
 		await chatLifecycle.abortRunning.call(directReceiver, 'task'); assert.deepStrictEqual(await orphanDirectRun, { interrupted: true });
 		assert.deepStrictEqual({ calls: directCalls, state: directOrphan.state(), token: directOrphan.tokens[0]?.isCancellationRequested }, { calls: 0, state: { oldPhysicalActive: true, queued: 0, realLeases: 1 }, token: true }); directOrphan.oldLease.release(); assert.deepStrictEqual(directOrphan.state(), { oldPhysicalActive: false, queued: 0, realLeases: 0 });
 
+		// The direct MCP path has the same post-acquire authority fence: a stopped
+		// receipt waiting behind an old generation must never begin callMCPTool.
+		const mcpOrphan = orphanCoordinator(); const mcpMessages: any[] = []; const mcpStream: any = {}; let mcpCurrent = true; let mcpCalls = 0;
+		const mcpReceiver: any = {
+			state: { allThreads: { task: { messages: mcpMessages, state: {}, filesWithUserChanges: new Set<string>() } } }, streamState: mcpStream,
+			_agentControlGeneration: new Map([['task', 0]]), _activeToolCardReceiptsOfThread: new Map(), _cancellingToolReceiptsOfThread: new Map(), _agentSubagentService: mcpOrphan,
+			toolErrMsgs: { interrupted: 'interrupted', errWhenStringifying: () => 'must not stringify' },
+			_mcpService: { getMCPTools: () => [{ name: 'orphan_mcp', mcpServerName: 'orphan-server' }], callMCPTool: async () => { mcpCalls += 1; return { result: {} }; }, stringifyResult: () => 'must not stringify' },
+			_revokeAgentDelegation() { mcpCurrent = false; this._agentControlGeneration.set('task', 1); },
+			_toolsService: { callTool: {}, stringOfResult: {} },
+			_updateLatestTool(_threadId: string, message: any) { const index = mcpMessages.findIndex(candidate => candidate.role === 'tool' && candidate.id === message.id && candidate.type === 'running_now'); if (index >= 0) mcpMessages[index] = message; else mcpMessages.push(message); },
+			_editMessageInThread(_threadId: string, index: number, message: any) { mcpMessages[index] = message; }, _setStreamState(threadId: string, state: any) { mcpStream[threadId] = state; },
+		};
+		Object.setPrototypeOf(mcpReceiver, ChatThreadService.prototype);
+		const orphanMcpRun = chatLifecycle._runToolCall.call(mcpReceiver, 'task', 'orphan_mcp', 'orphan-mcp', 'orphan-server', { preapproved: true, unvalidatedToolParams: { value: 'orphan' }, validatedParams: { value: 'orphan' } }, instructionSnapshot(), undefined, false, 0, () => mcpCurrent);
+		await flushMicrotasks(); assert.deepStrictEqual({ calls: mcpCalls, state: mcpOrphan.state(), token: mcpOrphan.tokens[0]?.isCancellationRequested }, { calls: 0, state: { oldPhysicalActive: true, queued: 1, realLeases: 1 }, token: false });
+		await chatLifecycle.abortRunning.call(mcpReceiver, 'task'); assert.deepStrictEqual(await orphanMcpRun, { interrupted: true });
+		assert.deepStrictEqual({ calls: mcpCalls, state: mcpOrphan.state(), token: mcpOrphan.tokens[0]?.isCancellationRequested }, { calls: 0, state: { oldPhysicalActive: true, queued: 0, realLeases: 1 }, token: true }); mcpOrphan.oldLease.release(); assert.deepStrictEqual(mcpOrphan.state(), { oldPhysicalActive: false, queued: 0, realLeases: 0 });
+
 		// Every approval-registry edit/terminal builtin must wait behind same-parent
 		// reads. This deliberately exercises the four former omissions too, while
 		// keeping prepareWriteFile outside the operation-scoped writer lease.

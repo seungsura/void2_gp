@@ -1612,9 +1612,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			// notifies synchronously, so an observer can otherwise revoke this parent while
 			// it still looks idle and leave the just-published row without a settlement path.
 			this._setStreamState(threadId, { isRunning: 'tool', interrupt: interruptorPromise, toolInfo: { toolName, toolParams: applicationParams, id: toolId, content: 'interrupted...', rawParams: applicationParams, mcpServerName: undefined, receiptId } });
-			if (!isCurrentParentRun()) { retireActiveToolCardReceipt.call(this, threadId, receiptId); return { interrupted: true }; }
+			if (!isCurrentParentRun()) { readCancellation.dispose(); retireActiveToolCardReceipt.call(this, threadId, receiptId); return { interrupted: true }; }
 			this._updateLatestTool(threadId, { role: 'tool', type: 'running_now', name: toolName, params: applicationParams, content: '(value not received yet...)', result: null, id: toolId, rawParams: applicationParams, mcpServerName: undefined, startedAt: Date.now(), receiptId, cardStopAvailable: true, ...batchRef });
-			if (!isCurrentParentRun()) { settleCancelled(); retireActiveToolCardReceipt.call(this, threadId, receiptId); return { interrupted: true }; }
+			if (!isCurrentParentRun()) { settleCancelled(); readCancellation.dispose(); retireActiveToolCardReceipt.call(this, threadId, receiptId); return { interrupted: true }; }
 			try {
 				// A Skill resource is a filesystem read, so it participates in the same
 				// parent/child reader lane, but only for the actual service call. Conversion
@@ -1857,7 +1857,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				if (!isCurrentParentRun()) { settleCancelled(); return { interrupted: true } }
 				const ioLease = agentRunGeneration !== undefined && this._agentSubagentService?.acquireGroupIo ? await this._agentSubagentService.acquireGroupIo(threadId, agentRunGeneration, 'write', operationCancellation.token) : { release() { } };
 				try {
-					if (!isCurrentParentRun()) { settleCancelled(); return { interrupted: true } }
+					if (interrupted || !isCurrentParentRun()) { settleCancelled(); return cancellationOutcome() }
 					toolResult = (await this._mcpService.callMCPTool({
 						serverName: mcpTool.mcpServerName ?? 'unknown_mcp_server',
 						toolName: toolName,
