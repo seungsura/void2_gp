@@ -1367,7 +1367,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 							state.pendingKey = approvalKeyOf(request); const decision = await this._awaitChildToolApproval(request); state.pendingKey = undefined;
 							if (decision === 'rejected') return fail('rejected'); if (decision !== 'approved') return fail('cancelled'); if (!admitted(request, state)) return stale(request, state);
 						}
+						const ioLease = this._agentSubagentService?.acquireGroupIo ? await this._agentSubagentService.acquireGroupIo(request.parentId, request.generation, 'write', request.cancellationToken) : { release() { } };
 						let result: unknown;
+						try {
 						if (builtinName === 'write_file') {
 							const prepared = await this._toolsService.prepareWriteFile(params as BuiltinToolCallParams['write_file'], request.childId);
 							if (!prepared || !admitted(request, state)) return stale(request, state);
@@ -1384,13 +1386,16 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 						if (!admitted(request, state)) return stale(request, state);
 						const stringify = this._toolsService.stringOfResult as unknown as Record<string, (params: unknown, result: unknown) => string>;
 						return Object.freeze({ ok: true as const, content: stringify[builtinName](params, result), result });
+						} finally { ioLease.release(); }
 					}
 					if (request.tool.kind !== 'mcp' || !request.tool.mcpServerName || !admitted(request, state)) return stale(request, state);
 					if (!authority.autoApprove.mcp) { state.pendingKey = approvalKeyOf(request); const decision = await this._awaitChildToolApproval(request); state.pendingKey = undefined; if (decision === 'rejected') return fail('rejected'); if (decision !== 'approved') return fail('cancelled'); if (!admitted(request, state)) return stale(request, state); }
-					state.executing = true;
-					const result = (await this._mcpService.callMCPTool({ serverName: request.tool.mcpServerName, toolName: request.name, params: request.rawParams })).result;
-					if (!admitted(request, state)) return stale(request, state);
-					return Object.freeze({ ok: true as const, content: this._mcpService.stringifyResult(result), result });
+					const ioLease = this._agentSubagentService?.acquireGroupIo ? await this._agentSubagentService.acquireGroupIo(request.parentId, request.generation, 'write', request.cancellationToken) : { release() { } };
+					try { state.executing = true;
+						const result = (await this._mcpService.callMCPTool({ serverName: request.tool.mcpServerName, toolName: request.name, params: request.rawParams })).result;
+						if (!admitted(request, state)) return stale(request, state);
+						return Object.freeze({ ok: true as const, content: this._mcpService.stringifyResult(result), result });
+					} finally { ioLease.release(); }
 				} catch (error) { return fail(state.cancelled || request.cancellationToken.isCancellationRequested ? 'cancelled' : error instanceof Error && /invalid|param/i.test(error.message) ? 'invalid_params' : 'execution_failed'); }
 				finally { settle(state); requests.delete(key); rememberCompleted(key); }
 			},
@@ -1785,22 +1790,26 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 					if (!preparedWrite) throw new Error('Internal error: write_file did not produce a receipt.')
 				}
 				if (interrupted || !isCurrentParentRun()) { settleCancelled(); return cancellationOutcome() }
-				const call = preparedWrite
-					? { result: preparedWrite.execute(), interruptTool: undefined }
-					: await this._toolsService.callTool[toolName](toolParams as any, readContext)
-				const { result, interruptTool: installedInterruptTool } = call
-				interruptTool = installedInterruptTool
-				if (installedInterruptTool) markToolCardInterruptInstalled.call(this, threadId, receiptId)
-				if (interrupted || !isCurrentParentRun()) {
-					interruptTool?.()
-					// An installed terminal receipt owns physical cleanup. Retain Cancelling
-					// until its result settles so a late-created terminal cannot outlive the row.
-					try { await result } catch { }
-					settleCancelled(); return cancellationOutcome()
-				}
+				const requiresWriteLease = toolName === 'write_file' || toolName === 'run_command' || toolName === 'run_persistent_command';
+				const ioLease = requiresWriteLease && agentRunGeneration !== undefined && this._agentSubagentService?.acquireGroupIo ? await this._agentSubagentService.acquireGroupIo(threadId, agentRunGeneration, 'write') : { release() { } };
+				try {
+					const call = preparedWrite
+						? { result: preparedWrite.execute(), interruptTool: undefined }
+						: await this._toolsService.callTool[toolName](toolParams as any, readContext)
+					const { result, interruptTool: installedInterruptTool } = call
+					interruptTool = installedInterruptTool
+					if (installedInterruptTool) markToolCardInterruptInstalled.call(this, threadId, receiptId)
+					if (interrupted || !isCurrentParentRun()) {
+						interruptTool?.()
+						// An installed terminal receipt owns physical cleanup. Retain Cancelling
+						// until its result settles so a late-created terminal cannot outlive the row.
+						try { await result } catch { }
+						settleCancelled(); return cancellationOutcome()
+					}
 
-				toolResult = await result
-				if (interrupted || !isCurrentParentRun()) { settleCancelled(); return cancellationOutcome() }
+					toolResult = await result
+					if (interrupted || !isCurrentParentRun()) { settleCancelled(); return cancellationOutcome() }
+				} finally { ioLease.release(); }
 			}
 			else {
 				if (!isCurrentParentRun()) { settleCancelled(); return { interrupted: true } }
@@ -1809,12 +1818,15 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				if (!mcpTool) { throw new Error(`MCP tool ${toolName} not found`) }
 
 				if (!isCurrentParentRun()) { settleCancelled(); return { interrupted: true } }
-				toolResult = (await this._mcpService.callMCPTool({
-					serverName: mcpTool.mcpServerName ?? 'unknown_mcp_server',
-					toolName: toolName,
-					params: toolParams
-				})).result
-				if (!isCurrentParentRun()) { settleCancelled(); return cancellationOutcome() }
+				const ioLease = agentRunGeneration !== undefined && this._agentSubagentService?.acquireGroupIo ? await this._agentSubagentService.acquireGroupIo(threadId, agentRunGeneration, 'write') : { release() { } };
+				try {
+					toolResult = (await this._mcpService.callMCPTool({
+						serverName: mcpTool.mcpServerName ?? 'unknown_mcp_server',
+						toolName: toolName,
+						params: toolParams
+					})).result
+					if (!isCurrentParentRun()) { settleCancelled(); return cancellationOutcome() }
+				} finally { ioLease.release(); }
 			}
 
 			if (interrupted || !isCurrentParentRun()) { settleCancelled(); return cancellationOutcome() }
@@ -1928,6 +1940,10 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			try {
 				if (!isCurrentParentRun() || item.interrupted) { settleCancelled(); return cancelled(); }
 				item.ledger.started = true;
+				// This is an operation-scoped lease only. If this parent has no live child
+				// group, the service returns a no-op lease and creates no phantom group.
+				const groupLease = this._agentSubagentService?.acquireGroupIo ? await this._agentSubagentService.acquireGroupIo(threadId, agentRunGeneration, 'read') : { release() { } };
+				try {
 				const context = { ownerThreadId: threadId, maxReadOutputTokens: item.budget };
 				const operation = await this._toolsService.callTool[item.call.name as BuiltinToolName](item.params as never, context);
 				item.interruptTool = operation.interruptTool;
@@ -1957,6 +1973,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				const receipt = this._activeToolCardReceipts(threadId)?.get(item.receiptId);
 				if (receipt) this._replaceExactLiveToolCard(threadId, receipt, item.receiptId, () => ({ role: 'tool', type: 'success', params: item.params, result: value as never, name: item.call.name as ToolName, content, id: item.call.id, rawParams: item.rawParams, mcpServerName: undefined, ...item.batchRef }));
 				return { call: item.call, batchRef: item.batchRef, validatedParams: item.params };
+				} finally { groupLease.release(); }
 			} catch (error) {
 				if (!isCurrentParentRun() || item.interrupted) { settleCancelled(); return cancelled(); }
 				const message = getErrorMessage(error); const receipt = this._activeToolCardReceipts(threadId)?.get(item.receiptId);

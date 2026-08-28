@@ -908,6 +908,28 @@ suite('Void AgentSubagentService', () => {
 		const restarted = fixture(); assert.strictEqual(restarted.service.getRunView('parent'), undefined); first.service.forgetParent('parent'); assert.strictEqual(first.service.getRunView('parent'), undefined); assert.strictEqual(terminalViews.at(-1), undefined); assert.strictEqual(first.events.at(-1).removed, true); terminalListener.dispose();
 		const active = fixture(); const child = await active.service.spawn('active', 'inspect', snapshot()); for (let i = 0; i < 10 && active.providerCalls.length === 0; i++) await Promise.resolve(); assert.strictEqual(active.providerCalls.length, 1); const activeViews: Array<unknown> = []; const activeListener = active.service.onDidChangeRun(event => { if (event.parentId === 'active') activeViews.push(active.service.getRunView('active')); }); active.service.forgetParent('active'); assert.strictEqual(active.service.getRunView('active'), undefined); assert.strictEqual(activeViews.at(-1), undefined); assert.strictEqual(active.events.at(-1).removed, true); assert.strictEqual(active.aborts(), 1); assert.deepStrictEqual(active.invalidations, [child.id]); activeListener.dispose();
 		first.service.dispose(); active.service.dispose(); restarted.service.dispose();
+
+		// Keep the declaration count stable while pinning the internal same-parent I/O
+		// contract: two head readers, then a writer, then a later reader. The writer
+		// must not be overtaken and an old release must not affect a new generation.
+		const coordinator = fixture({ send: () => 'request' });
+		await coordinator.service.spawn('io-parent', 'inspect', snapshot());
+		const r1 = await coordinator.service.acquireGroupIo('io-parent', 0, 'read');
+		const r2 = await coordinator.service.acquireGroupIo('io-parent', 0, 'read');
+		let writerGranted = false; let r3Granted = false;
+		const writer = coordinator.service.acquireGroupIo('io-parent', 0, 'write').then(lease => { writerGranted = true; return lease; });
+		const r3 = coordinator.service.acquireGroupIo('io-parent', 0, 'read').then(lease => { r3Granted = true; return lease; });
+		await Promise.resolve(); assert.strictEqual(writerGranted, false); assert.strictEqual(r3Granted, false);
+		r1.release(); await Promise.resolve(); assert.strictEqual(writerGranted, false);
+		r2.release(); const writerLease = await writer; assert.strictEqual(r3Granted, false);
+		writerLease.release(); const r3Lease = await r3; assert.strictEqual(r3Granted, true); r3Lease.release();
+		const stale = await coordinator.service.acquireGroupIo('io-parent', 0, 'read');
+		await coordinator.service.spawn('io-parent', 'inspect-again', snapshot(), undefined, undefined, undefined, undefined, 1);
+		stale.release(); const fresh = await coordinator.service.acquireGroupIo('io-parent', 1, 'write'); fresh.release();
+		const held1 = await coordinator.service.acquireGroupIo('io-parent', 1, 'read'); const held2 = await coordinator.service.acquireGroupIo('io-parent', 1, 'read'); const cancelledWaiter = new CancellationTokenSource();
+		const cancelledLeasePromise = coordinator.service.acquireGroupIo('io-parent', 1, 'write', cancelledWaiter.token); cancelledWaiter.cancel(); const cancelledLease = await cancelledLeasePromise; cancelledLease.release(); cancelledWaiter.dispose(); held1.release(); held2.release();
+		const absent = await coordinator.service.acquireGroupIo('absent-parent', 0, 'read'); absent.release(); assert.strictEqual((coordinator.service as any).groups.has('absent-parent'), false);
+		coordinator.service.forgetParent('io-parent'); coordinator.service.dispose();
 	});
 
 	test('shows deferred wait control without contaminating persisted parent history', async () => {
