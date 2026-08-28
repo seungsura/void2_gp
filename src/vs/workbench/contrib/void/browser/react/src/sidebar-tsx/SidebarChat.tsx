@@ -24,7 +24,7 @@ import { WarningBox } from '../void-settings-tsx/WarningBox.js';
 import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../common/modelCapabilities.js';
 import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, CircleEllipsis, Folder, ALargeSmall, TypeOutline, Text } from 'lucide-react';
 import { ChatMessage, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
-import { ChildToolApprovalView, isActiveChildRun } from '../../../../common/agentSubagents.js';
+import { AgentSubagentRunView, ChildActivitiesLedger, ChildActivityRecord, ChildToolApprovalView, isActiveChildRun } from '../../../../common/agentSubagents.js';
 import { AgentSubagentPresentation, getAgentSubagentPresentation } from '../../../../common/agentSubagentPresentation.js';
 import { canSubmitChatCurrent, ChatCurrentStatusPresentation, getChatCurrentStatusPresentation } from '../../../../common/chatCurrentStatusPresentation.js';
 import { submitChatComposer } from '../../../../common/chatComposerSubmission.js';
@@ -2831,6 +2831,33 @@ const ChildRunPanel = ({ presentation, approvals }: { presentation: AgentSubagen
 	</section>;
 };
 
+/** Purely projects durable receipts beside their persisted spawn success row. */
+const childActivityInterleavePlan = (messages: readonly ChatMessage[], activities: ChildActivitiesLedger): ReadonlyMap<number, readonly ChildActivityRecord[]> => {
+	const plan = new Map<number, ChildActivityRecord[]>();
+	for (const record of activities.records) {
+		if (record.parentRunId) continue;
+		const index = messages.findIndex(message => message.role === 'tool' && message.type === 'success' && message.name === 'spawn_agent' && message.id === record.anchor.toolId && message.batchId === record.anchor.batchId && message.batchOrdinal === record.anchor.batchOrdinal && (message.result as { id?: unknown })?.id === record.childId);
+		if (index >= 0) plan.set(index, [...(plan.get(index) ?? []), record]);
+	}
+	return plan;
+};
+const ChildActivityCard = ({ root, all, live, ledger }: { root: ChildActivityRecord; all: readonly ChildActivityRecord[]; live: ReadonlyMap<string, AgentSubagentRunView>; ledger: ChildActivitiesLedger }) => {
+	const keyOf = (record: ChildActivityRecord) => JSON.stringify([record.generation, record.childId]);
+	const view = live.get(keyOf(root)); const status = view?.status ?? root.status; const elapsed = view?.totalMs ?? root.totalMs;
+	const renderChildren = (parent: ChildActivityRecord): React.ReactNode => all.filter(record => record.generation === parent.generation && record.parentRunId === parent.childId).map(child => { const current = live.get(keyOf(child)); return <div key={keyOf(child)} className='pl-2 pt-1'>Child {child.childId.slice(0, 8)} · {current?.status ?? child.status} · {current?.totalMs ?? child.totalMs}ms{(current?.summary ?? child.summary) ? ` · ${current?.summary ?? child.summary}` : ''}{renderChildren(child)}</div>; });
+	return <details className='border border-void-border-1 rounded-sm px-2 py-1 mt-1 text-xs' data-testid='child-activity-card'>
+		<summary className='focus-ring cursor-pointer select-none' aria-label={`Child Activity ${root.childId.slice(0, 8)} ${status}`}>Child Activity{root.role ? ` · ${root.role.name}` : ''} · {root.childId.slice(0, 8)} · {status} · {elapsed}ms</summary>
+		<div className='pt-1 text-void-fg-3'>
+			{root.role ? <div>{root.role.description}</div> : null}
+			<div>Capability: {root.capabilityProfile === 'inherit_parent_write' ? 'Inherited parent profile' : 'Read-only'}; Timing: {view?.queuedMs ?? root.queuedMs}ms queued, {view?.runningMs ?? root.runningMs}ms running, {elapsed}ms total</div>
+			{(view?.summary ?? root.summary) ? <div className='pt-1 whitespace-pre-wrap break-words'>{view?.summary ?? root.summary}</div> : null}
+			{(view?.resultTruncated ?? root.resultTruncated) ? <div className='text-void-warning'>Result compacted.</div> : null}
+			<div className='pt-1'>{renderChildren(root)}</div>
+			{ledger.omitted || ledger.retentionSaturated ? <div className='pt-1 text-void-warning'>{ledger.omitted ? `${ledger.omitted} activities omitted. ` : ''}{ledger.retentionSaturated ? 'Retention is saturated.' : ''}</div> : null}
+		</div>
+	</details>;
+};
+
 const pendingInputModeLabel = (mode: PendingInputMode): string => {
 	switch (mode) {
 		case 'queue': return 'Queue';
@@ -2944,6 +2971,9 @@ export const SidebarChat = () => {
 	const { runs: childRuns, budget: childBudget, diagnostics: childDiagnostics } = useAgentSubagentLiveSnapshot(currentThread.id)
 	const childToolApprovals = useChildToolApprovals(currentThread.id)
 	const childPresentation = getAgentSubagentPresentation(childBudget, childRuns, childDiagnostics)
+	// One live overlay is shared by every history card; cards never subscribe or tick.
+	const liveChildRunById = useMemo(() => new Map(childRuns.map(run => [JSON.stringify([run.generation, run.id]), run])), [childRuns])
+	const childActivityPlan = useMemo(() => childActivityInterleavePlan(previousMessages, currentThread.childActivities), [previousMessages, currentThread.childActivities])
 	const childIsActive = childRuns.some(isActiveChildRun)
 	const isAnyRunning = !!isRunning || childIsActive || !!pendingSubmission
 	const latestError = currThreadStreamState?.error
@@ -3052,21 +3082,25 @@ export const SidebarChat = () => {
 
 	const previousMessagesHTML = useMemo(() => {
 		// tool request shows up as Editing... if in progress
-		return previousMessages.map((message, i) => {
-			return <ChatBubble
+		return previousMessages.flatMap((message, i) => {
+			const bubble = <ChatBubble
 				key={i}
 				chatMessage={message}
 				messageIdx={i}
 				isCommitted={true}
 				threadId={threadId}
 				_scrollToBottom={() => scrollToBottom(scrollContainerRef)}
-			/>
+			/>;
+			const activities = childActivityPlan.get(i) ?? [];
+			return [bubble, ...activities.map(activity => <ChildActivityCard key={`child-activity-${activity.generation}-${activity.childId}`} root={activity} all={currentThread.childActivities.records} live={liveChildRunById} ledger={currentThread.childActivities} />)];
 		})
-	}, [previousMessages, threadId, isRunning])
-	const pendingMessageHTML = pendingSubmission ? <div data-testid='chat-pending-user' className='pointer-events-none'><ChatBubble key={`pending-${pendingSubmission.id}`} chatMessage={{ role: 'user', content: '', displayContent: pendingSubmission.displayContent, selections: [...pendingSubmission.selections], state: { stagingSelections: [], isBeingEdited: false } }} messageIdx={previousMessagesHTML.length} isCommitted={false} threadId={threadId} _scrollToBottom={null} editable={false} /></div> : null
+	}, [previousMessages, threadId, isRunning, childActivityPlan, currentThread.childActivities.records, liveChildRunById])
+	// Activity cards are DOM-only projections, never transcript rows. Keep every
+	// ChatBubble index anchored to the persisted message array.
+	const pendingMessageHTML = pendingSubmission ? <div data-testid='chat-pending-user' className='pointer-events-none'><ChatBubble key={`pending-${pendingSubmission.id}`} chatMessage={{ role: 'user', content: '', displayContent: pendingSubmission.displayContent, selections: [...pendingSubmission.selections], state: { stagingSelections: [], isBeingEdited: false } }} messageIdx={previousMessages.length} isCommitted={false} threadId={threadId} _scrollToBottom={null} editable={false} /></div> : null
 	const hasVisibleConversation = previousMessagesHTML.length > 0 || !!pendingMessageHTML
 
-	const streamingChatIdx = previousMessagesHTML.length
+	const streamingChatIdx = previousMessages.length
 	const currStreamingMessageHTML = reasoningSoFar || displayContentSoFar || (isRunning && !(currThreadStreamState?.isRunning === 'idle' && currThreadStreamState.toolInfo?.transient)) ?
 		<ChatBubble
 			key={'curr-streaming-msg'}

@@ -1,6 +1,6 @@
 import * as assert from 'assert';
 import { URI } from '../../../../../base/common/uri.js';
-import { AGENT_SUBAGENT_DEFAULT_WAIT_MS, AgentSubagentLifecycle, agentSubagentStatusLabel, agentSubagentToolSchemas, assertCanonicalAgentChildRawUri, assertCanonicalAgentChildUriPath, assertCanonicalReadOnlyChildRawPaths, assertExactReadOnlyChildRawKeys, childToolApprovalStructuralKey, createChildToolApprovalView, isActiveChildRun, isToolAllowedByProfile, readOnlyChildToolNames, validateAgentSubagentControlParams } from '../../common/agentSubagents.js';
+import { AGENT_SUBAGENT_DEFAULT_WAIT_MS, AgentSubagentLifecycle, agentSubagentStatusLabel, agentSubagentToolSchemas, assertCanonicalAgentChildRawUri, assertCanonicalAgentChildUriPath, assertCanonicalReadOnlyChildRawPaths, assertExactReadOnlyChildRawKeys, childToolApprovalStructuralKey, createChildToolApprovalView, isActiveChildRun, isToolAllowedByProfile, normalizeChildActivities, readOnlyChildToolNames, validateAgentSubagentControlParams } from '../../common/agentSubagents.js';
 import { AGENT_DELEGATION_SELECTION_LABEL, isAgentDelegationSelection, StagingSelectionItem } from '../../common/chatThreadServiceTypes.js';
 import { availableTools, chat_systemMessage, messageOfSelection } from '../../common/prompt/prompts.js';
 import { LLMMessageService } from '../../common/sendLLMMessageService.js';
@@ -115,6 +115,48 @@ suite('Void agent subagents', () => {
 
 	test('bounds terminal summaries and completion wins cancellation race once', () => { const lifecycle = new AgentSubagentLifecycle(); lifecycle.start(); assert.strictEqual(lifecycle.settle('completed', 'id', 'x'.repeat(9000)), true); assert.strictEqual(lifecycle.settle('cancelled', 'id', 'late'), false); const receipt = lifecycle.receipt(true).receipt!; assert.strictEqual(receipt.summary.length, 8000); assert.strictEqual(receipt.usage, null); });
 	test('keeps explicit aggregate-result compaction on the terminal receipt only', () => { const lifecycle = new AgentSubagentLifecycle(); lifecycle.start(); lifecycle.settle('completed', 'id', '', true); const receipt = lifecycle.receipt(true).receipt!; assert.strictEqual(receipt.resultTruncated, true); assert.strictEqual(lifecycle.receipt(false).receipt?.resultTruncated, true); });
+
+	test('normalizes only canonical child activity receipts and interrupts reload-active rows', () => {
+		const record = { generation: 1, childId: 'child-a', depth: 1, status: 'running', capabilityProfile: 'read_only', queuedMs: 2, runningMs: 3, totalMs: 5, anchor: { toolId: 'tool-a' } };
+		const parsed = normalizeChildActivities({ version: 1, records: [record], omitted: 0, retentionSaturated: false }, true);
+		assert.strictEqual(parsed.records[0].status, 'interrupted'); assert.ok(Object.isFrozen(parsed));
+		for (const bad of [null, [], { version: 1, records: [], omitted: 0, retentionSaturated: false, extra: true }, { version: 1, records: [{ ...record, childId: 1 }], omitted: 0, retentionSaturated: false }, { version: 1, records: [{ ...record, status: 'unknown' }], omitted: 0, retentionSaturated: false }, { version: 1, records: [{ ...record, parentRunId: 'missing', depth: 2 }], omitted: 0, retentionSaturated: false }]) assert.strictEqual(normalizeChildActivities(bad).records.length, 0);
+	});
+	test('omits malformed present optional receipt fields without treating them as absent', () => {
+		const base = { generation: 1, childId: 'child-a', depth: 1, status: 'completed', capabilityProfile: 'read_only', queuedMs: 0, runningMs: 1, totalMs: 1, anchor: { toolId: 'tool-a' } };
+		const parse = (record: any) => normalizeChildActivities({ version: 1, records: [record], omitted: 0, retentionSaturated: false });
+		assert.strictEqual(parse(base).records.length, 1);
+		for (const patch of [{ parentRunId: 7 }, { parentRunId: null }, { parentRunId: undefined }, { parentRunId: '' }, { parentRunId: 'x'.repeat(257) }, { role: undefined }, { summary: 7 }, { summary: null }, { summary: undefined }, { summary: '' }, { summary: 'x'.repeat(8001) }, { resultTruncated: undefined }, { anchor: { toolId: 'tool-a', batchId: 7, batchOrdinal: 0 } }, { anchor: { toolId: 'tool-a', batchId: undefined, batchOrdinal: 0 } }, { anchor: { toolId: 'tool-a', batchId: 'batch', batchOrdinal: null } }, { anchor: { toolId: 'tool-a', batchId: '', batchOrdinal: 0 } }]) assert.strictEqual(parse({ ...base, ...patch }).records.length, 0);
+		const child = { ...base, childId: 'child-b', parentRunId: 'child-a', depth: 2 }; const parseTree = (record: any) => normalizeChildActivities({ version: 1, records: [base, record], omitted: 0, retentionSaturated: false }); assert.strictEqual(parseTree(child).records.length, 2); assert.deepStrictEqual(parseTree({ ...child, anchor: { toolId: 'other-tool' } }).records.map(record => record.childId), ['child-a']);
+	});
+	test('fails closed on duplicate activity identities and retains bounded UTF-8 receipts', () => {
+		const row = (id: string, status: string = 'completed') => ({ generation: 1, childId: id, depth: 1, status, capabilityProfile: 'read_only', summary: '한'.repeat(8000), queuedMs: 0, runningMs: 1, totalMs: 1, anchor: { toolId: `tool-${id}` } });
+		assert.strictEqual(normalizeChildActivities({ version: 1, records: [row('same'), row('same')], omitted: 0, retentionSaturated: false }).records.length, 0);
+		const retained = normalizeChildActivities({ version: 1, records: Array.from({ length: 33 }, (_, i) => row(`child-${i}`)), omitted: 0, retentionSaturated: false });
+		assert.ok(retained.records.length <= 32); assert.ok(new TextEncoder().encode(JSON.stringify(retained)).byteLength <= 64 * 1024); assert.ok(retained.omitted > 0);
+		assert.ok(retained.records.some(record => record.resultTruncated)); assert.ok(retained.records.filter(record => record.resultTruncated).every(record => !Object.prototype.hasOwnProperty.call(record, 'summary'))); assert.deepStrictEqual(normalizeChildActivities(retained), retained);
+	});
+	test('never slices active activity receipts and evicts only whole terminal root trees', () => {
+		const row = (childId: string, status: 'queued' | 'running' | 'completed', parentRunId?: string, depth = parentRunId ? 2 : 1, summary?: string) => ({ generation: 9, childId, ...(parentRunId ? { parentRunId } : {}), depth, status, capabilityProfile: 'read_only', ...(summary ? { summary } : {}), queuedMs: 0, runningMs: 1, totalMs: 1, anchor: { toolId: `tool-${parentRunId ?? childId}` } });
+		const active = normalizeChildActivities({ version: 1, records: Array.from({ length: 33 }, (_, index) => row(`active-${index}`, index % 2 ? 'queued' : 'running')), omitted: 0, retentionSaturated: false });
+		assert.deepStrictEqual(active.records, []); assert.strictEqual(active.omitted, 33); assert.strictEqual(active.retentionSaturated, true);
+		const exact = normalizeChildActivities({ version: 1, records: Array.from({ length: 32 }, (_, index) => row(`exact-${index}`, 'running')), omitted: 7, retentionSaturated: false });
+		assert.deepStrictEqual(exact.records.map(record => record.childId), Array.from({ length: 32 }, (_, index) => `exact-${index}`)); assert.strictEqual(exact.omitted, 7); assert.strictEqual(exact.retentionSaturated, false);
+		const wide = (index: number) => ({ generation: 10, childId: `${'한'.repeat(254)}${index.toString().padStart(2, '0')}`, depth: 1, status: 'running', capabilityProfile: 'read_only', role: { name: 'r'.repeat(64), description: '한'.repeat(1024) }, queuedMs: 0, runningMs: 1, totalMs: 1, anchor: { toolId: '한'.repeat(256), batchId: '한'.repeat(256), batchOrdinal: index } });
+		const wideRaw = { version: 1, records: Array.from({ length: 32 }, (_, index) => wide(index)), omitted: 0, retentionSaturated: false }; assert.ok(new TextEncoder().encode(JSON.stringify(wideRaw)).byteLength > 64 * 1024);
+		const largeActive = normalizeChildActivities(wideRaw);
+		assert.deepStrictEqual(largeActive.records, []); assert.strictEqual(largeActive.omitted, 32); assert.strictEqual(largeActive.retentionSaturated, true);
+		const terminalTree = normalizeChildActivities({ version: 1, records: [row('old', 'completed', undefined, 1, '한'.repeat(8000)), row('old-child', 'completed', 'old', 2, '한'.repeat(8000)), ...Array.from({ length: 31 }, (_, index) => row(`new-${index}`, 'running'))], omitted: 0, retentionSaturated: false });
+		assert.ok(!terminalTree.records.some(record => record.childId === 'old')); assert.ok(!terminalTree.records.some(record => record.childId === 'old-child')); assert.deepStrictEqual(terminalTree.records.map(record => record.childId), Array.from({ length: 31 }, (_, index) => `new-${index}`)); assert.strictEqual(terminalTree.omitted, 2);
+		const activeDescendant = normalizeChildActivities({ version: 1, records: [row('terminal-root', 'completed'), row('still-running', 'running', 'terminal-root'), ...Array.from({ length: 31 }, (_, index) => row(`running-${index}`, 'running'))], omitted: 0, retentionSaturated: false });
+		assert.deepStrictEqual(activeDescendant.records, []); assert.strictEqual(activeDescendant.omitted, 33); assert.strictEqual(activeDescendant.retentionSaturated, true);
+	});
+	test('permits provider tuple reuse across generations but not within one persisted batch row', () => {
+		const root = (childId: string) => ({ generation: 1, childId, depth: 1, status: 'completed', capabilityProfile: 'read_only', queuedMs: 0, runningMs: 1, totalMs: 1, anchor: { toolId: 'spawn', batchId: 'batch', batchOrdinal: 0 } });
+		assert.deepStrictEqual(normalizeChildActivities({ version: 1, records: [root('one'), root('two')], omitted: 0, retentionSaturated: false }).records, []);
+		const nested = normalizeChildActivities({ version: 1, records: [root('one'), { ...root('nested'), childId: 'nested', parentRunId: 'one', depth: 2 }], omitted: 0, retentionSaturated: false }); assert.deepStrictEqual(nested.records.map(record => record.childId), ['one', 'nested']);
+		const laterGeneration = normalizeChildActivities({ version: 1, records: [root('one'), { ...root('two'), generation: 2 }], omitted: 0, retentionSaturated: false }); assert.deepStrictEqual(laterGeneration.records.map(record => record.childId), ['one', 'two']);
+	});
 
 	test('presents transient child status without coercing usage', () => {
 		const running = { id: 'child', status: 'running' as const, usage: null };

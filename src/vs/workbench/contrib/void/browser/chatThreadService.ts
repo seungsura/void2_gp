@@ -45,7 +45,7 @@ import { IAgentInstructionsService } from './agentInstructionsService.js';
 import { IAgentSkillsService } from './agentSkillsService.js';
 import { AgentDelegationLimits, AgentInstructionTaskSession, AgentInstructionTurnSnapshot } from '../common/agentInstructions.js';
 import { AgentRuntimeTurnSnapshot, admitProtectedAgentAuthority, admitSkillResourceContext, assembleProtectedAgentAuthority, createAgentRuntimeTurnSnapshot, isReadSkillResourceToolName, reviveAgentRuntimeTurnSnapshot, runtimeModelFingerprint, selectExplicitSkills, skillAdvertisement, validateReadSkillResourceToolParams } from '../common/agentSkills.js';
-import { AgentSubagentToolBroker, AgentSubagentToolBrokerRequest, AgentSubagentToolSnapshot, ChildToolApprovalKey, ChildToolApprovalView, childToolApprovalStructuralKey, createChildToolApprovalView, isAgentSubagentControlName, isNativeAgentToolFormat, readOnlyChildToolNames, validateAgentSubagentControlParams } from '../common/agentSubagents.js';
+import { AgentSubagentRunView, AgentSubagentToolBroker, AgentSubagentToolBrokerRequest, AgentSubagentToolSnapshot, ChildActivitiesLedger, ChildActivityRecord, EMPTY_CHILD_ACTIVITIES, ChildToolApprovalKey, ChildToolApprovalView, childToolApprovalStructuralKey, createChildToolApprovalView, isAgentSubagentControlName, isNativeAgentToolFormat, normalizeChildActivities, readOnlyChildToolNames, validateAgentSubagentControlParams } from '../common/agentSubagents.js';
 import { IAgentSubagentService } from './agentSubagentService.js';
 import { IAgentCustomAgentService } from './agentCustomAgentService.js';
 import { CustomAgentCatalog, customAgentAdvertisement } from '../common/agentCustomAgents.js';
@@ -248,6 +248,8 @@ export type ThreadType = {
 	lastModified: string; // ISO string
 
 	messages: ChatMessage[];
+	/** Separate durable child receipt ledger; never supplied to a provider. */
+	childActivities: ChildActivitiesLedger;
 	filesWithUserChanges: Set<string>;
 
 	// this doesn't need to go in a state object, but feels right
@@ -351,6 +353,7 @@ const newThreadObject = () => {
 		createdAt: now,
 		lastModified: now,
 		messages: [],
+		childActivities: EMPTY_CHILD_ACTIVITIES,
 		state: {
 			stagingSelections: [],
 			focusedMessageIdx: undefined,
@@ -503,6 +506,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		this._restoreInstructionTurns(allThreads)
 		this._restorePendingChatInputs()
 		this._storeAllThreads(allThreads)
+		this._register(this._agentSubagentService.onDidChangeRun(event => this._applyChildActivityEvent(event.parentId, event.generation, event.id)));
 
 		// always be in a thread
 		this.openNewThread()
@@ -867,6 +871,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		this._transientComposerDraftOfThread.clear()
 		for (const quiescence of this._runQuiescenceOfThread.values()) quiescence.releaseAwaitingApproval?.()
 		this._pendingChatInputsOfThread.clear(); this._drainingPendingChatInputs.clear(); this._runQuiescenceOfThread.clear(); this._startingParentRunOfThread?.clear(); this._stopAndSendFlights.clear(); this._storePendingChatInputs()
+		for (const thread of Object.values(newState.allThreads)) if (thread) thread.childActivities = normalizeChildActivities((thread as { childActivities?: unknown }).childActivities, true)
 		this._restoreInstructionTurns(newState.allThreads)
 		this.state = newState
 		this._deletingPendingInputThreads.clear()
@@ -913,6 +918,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				? { ...message, displayContent: sanitizeAssistantDisplayContent(message.displayContent) }
 				: message);
 			delete legacyThread.state.currCheckpointIdx;
+			legacyThread.childActivities = normalizeChildActivities((legacyThread as { childActivities?: unknown }).childActivities, true);
 		}
 
 		return threads;
@@ -1149,6 +1155,68 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const swapped = this._swapOutLatestStreamingToolWithResult(threadId, tool)
 		if (swapped) return
 		this._addMessageToThread(threadId, tool)
+	}
+
+	private _activityFromView(view: AgentSubagentRunView, anchor: ChildActivityRecord['anchor']): ChildActivityRecord {
+		const status = view.status; const roleDescription = view.roleDescription?.trim(); const summary = status !== 'queued' && status !== 'running' ? view.summary?.trim().slice(0, 8000).trim() : undefined;
+		return Object.freeze({ generation: view.generation, childId: view.id, ...(view.parentRunId ? { parentRunId: view.parentRunId } : {}), depth: view.depth, status, ...(view.roleName && roleDescription ? { role: Object.freeze({ name: view.roleName, description: roleDescription }) } : {}), capabilityProfile: view.capabilityProfile ?? 'read_only', ...(summary ? { summary } : {}), ...(status !== 'queued' && status !== 'running' && view.resultTruncated ? { resultTruncated: true as const } : {}), queuedMs: view.queuedMs, runningMs: view.runningMs, totalMs: view.totalMs, anchor });
+	}
+	/** The only history tree we may bind is the exact spawned root and its descendants. */
+	private _selectChildActivitySubtree(views: readonly AgentSubagentRunView[], root: AgentSubagentRunView): readonly AgentSubagentRunView[] {
+		const selected = new Set<string>([root.id]);
+		const sameGeneration = views.filter(view => view.generation === root.generation);
+		for (let changed = true; changed;) {
+			changed = false;
+			for (const view of sameGeneration) if (view.parentRunId && selected.has(view.parentRunId) && !selected.has(view.id)) { selected.add(view.id); changed = true; }
+		}
+		return sameGeneration.filter(view => selected.has(view.id));
+	}
+	private _applyChildActivityEvent(threadId: string, generation: number, childId: string): void {
+		const thread = this.state.allThreads[threadId]; if (!thread) return;
+		const views = this._agentSubagentService.getRunViews(threadId);
+		const view = views.find(run => run.generation === generation && run.id === childId); if (!view) return;
+		let existing = thread.childActivities.records.find(record => record.generation === generation && record.childId === childId);
+		if (!existing) {
+			// A nested run may be born after the root success receipt. It becomes durable
+			// only when every live ancestor reaches an already anchored root.
+			let cursor: AgentSubagentRunView | undefined = view; const chain: AgentSubagentRunView[] = []; const seen = new Set<string>();
+			while (cursor && !seen.has(cursor.id)) { seen.add(cursor.id); chain.push(cursor); cursor = cursor.parentRunId ? views.find(candidate => candidate.generation === generation && candidate.id === cursor!.parentRunId) : undefined; }
+			if (cursor) return; // corrupt cyclic live ancestry has no durable anchor
+			const rootView = chain[chain.length - 1];
+			const rootRecord = rootView && !rootView.parentRunId ? thread.childActivities.records.find(record => record.generation === generation && record.childId === rootView.id && !record.parentRunId) : undefined;
+			if (!rootRecord) return; // unanchored, stale, deleted or incomplete ancestry stays inert
+			const additions = chain.reverse().filter(candidate => !thread.childActivities.records.some(record => record.generation === generation && record.childId === candidate.id)).map(candidate => this._activityFromView(candidate, rootRecord.anchor));
+			if (!additions.length) return;
+			this._replaceChildActivities(threadId, normalizeChildActivities({ ...thread.childActivities, records: [...thread.childActivities.records, ...additions] }));
+			return;
+		}
+		// Lifecycle receipts are monotonic: the first terminal receipt is durable and
+		// a late queued/running or competing terminal notification cannot revise it.
+		const terminal = (status: ChildActivityRecord['status']) => status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'interrupted';
+		if (terminal(existing.status)) return;
+		const next = this._activityFromView(view, existing.anchor);
+		if (existing.status === 'running' && next.status === 'queued') return;
+		const records = thread.childActivities.records.map(record => record === existing ? next : record);
+		this._replaceChildActivities(threadId, normalizeChildActivities({ ...thread.childActivities, records }));
+	}
+	private _replaceChildActivities(threadId: string, childActivities: ChildActivitiesLedger): void {
+		const thread = this.state.allThreads[threadId]; if (!thread || thread.childActivities === childActivities) return;
+		const allThreads = { ...this.state.allThreads, [threadId]: { ...thread, childActivities, lastModified: new Date().toISOString() } };
+		this._storeAllThreads(allThreads); this._setState({ allThreads });
+	}
+	private _appendSpawnSuccessAndBind(threadId: string, success: ChatMessage, result: { id: string }, anchor: ChildActivityRecord['anchor']): void {
+		const thread = this.state.allThreads[threadId]; if (!thread) return;
+		const views = this._agentSubagentService.getRunViews(threadId); const root = views.find(view => view.id === result.id && !view.parentRunId);
+		const records = root ? [...thread.childActivities.records, ...this._selectChildActivitySubtree(views, root).filter(view => !thread.childActivities.records.some(record => record.generation === view.generation && record.childId === view.id)).map(view => this._activityFromView(view, anchor))] : thread.childActivities.records;
+		const next = { ...thread, lastModified: new Date().toISOString(), messages: [...thread.messages, success], childActivities: normalizeChildActivities({ ...thread.childActivities, records }) };
+		const allThreads = { ...this.state.allThreads, [threadId]: next }; this._storeAllThreads(allThreads); this._setState({ allThreads });
+	}
+	private _pruneChildActivitiesForMessages(thread: ThreadType, messages: readonly ChatMessage[]): ChildActivitiesLedger {
+		const anchors = new Set(messages.filter((message): message is ToolMessage<any> => message.role === 'tool' && message.type === 'success' && message.name === 'spawn_agent' && !!(message.result as any)?.id).map(message => JSON.stringify([message.id, message.batchId, message.batchOrdinal, (message.result as any).id])));
+		const roots = new Set(thread.childActivities.records.filter(record => !record.parentRunId && !anchors.has(JSON.stringify([record.anchor.toolId, record.anchor.batchId, record.anchor.batchOrdinal, record.childId]))).map(record => record.childId));
+		if (!roots.size) return thread.childActivities;
+		const removed = new Set(roots); for (let index = 0; index < thread.childActivities.records.length; index++) { const record = thread.childActivities.records[index]; if (record.parentRunId && removed.has(record.parentRunId)) removed.add(record.childId); }
+		return normalizeChildActivities({ ...thread.childActivities, records: thread.childActivities.records.filter(record => !removed.has(record.childId)) });
 	}
 
 	/** Global Stop owns every live receipt.  Unlike card Stop it intentionally does
@@ -1721,7 +1789,10 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				clearTransient();
 				const content = JSON.stringify(result);
 				if (!isControlCurrent()) return { interrupted: true };
-				this._addMessageToThread(threadId, { role: 'tool', type: 'success', rawParams: opts.unvalidatedToolParams, result: result as never, name: toolName, params: validatedParams as never, content, id: toolId, mcpServerName: undefined, ...batchRef });
+				const success = { role: 'tool' as const, type: 'success' as const, rawParams: opts.unvalidatedToolParams, result: result as never, name: toolName, params: validatedParams as never, content, id: toolId, mcpServerName: undefined, ...batchRef };
+				// The row is persisted before binding. This makes the success row the sole
+				// durable root anchor without altering provider-visible message order.
+				if (control.name === 'spawn_agent' && typeof (result as { id?: unknown }).id === 'string') this._appendSpawnSuccessAndBind(threadId, success, result as { id: string }, Object.freeze({ toolId, ...(batchRef ? { batchId: batchRef.batchId, batchOrdinal: batchRef.batchOrdinal } : {}) })); else this._addMessageToThread(threadId, success);
 				return {};
 			} catch (error) {
 				if (!isControlCurrent()) return { interrupted: true };
@@ -2367,16 +2438,18 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const oldThread = allThreads[threadId]
 		if (!oldThread) return // should never happen
 		// update state and store it
+		const messages = [
+			...oldThread.messages.slice(0, messageIdx),
+			newMessage,
+			...oldThread.messages.slice(messageIdx + 1, Infinity),
+		];
 		const newThreads = {
 			...allThreads,
 			[oldThread.id]: {
 				...oldThread,
 				lastModified: new Date().toISOString(),
-				messages: [
-					...oldThread.messages.slice(0, messageIdx),
-					newMessage,
-					...oldThread.messages.slice(messageIdx + 1, Infinity),
-				],
+				messages,
+				childActivities: this._pruneChildActivitiesForMessages(oldThread, messages),
 			}
 		}
 		this._storeAllThreads(newThreads)
@@ -2815,12 +2888,14 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 		// clear messages up to the index
 		const slicedMessages = thread.messages.slice(0, messageIdx)
+		const childActivities = this._pruneChildActivitiesForMessages(thread, slicedMessages)
 		this._setState({
 			allThreads: {
 				...this.state.allThreads,
 				[thread.id]: {
 					...thread,
-					messages: slicedMessages
+					messages: slicedMessages,
+					childActivities,
 				}
 			}
 		})
@@ -3135,7 +3210,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		// if a thread with 0 messages already exists, switch to it
 		const { allThreads: currentThreads } = this.state
 		for (const threadId in currentThreads) {
-			if (currentThreads[threadId]!.messages.length === 0) {
+			if (currentThreads[threadId]!.messages.length === 0 && currentThreads[threadId]!.childActivities.records.length === 0) {
 				// switch to the existing empty thread and exit
 				this.switchToThread(threadId)
 				return
@@ -3201,6 +3276,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const newThread = {
 			...deepClone(threadToDuplicate),
 			id: generateUuid(),
+			childActivities: normalizeChildActivities({ ...threadToDuplicate.childActivities, records: threadToDuplicate.childActivities.records.map(record => record.status === 'queued' || record.status === 'running' ? { ...record, status: 'interrupted' } : record) }),
 		}
 		const newThreads = {
 			...currentThreads,

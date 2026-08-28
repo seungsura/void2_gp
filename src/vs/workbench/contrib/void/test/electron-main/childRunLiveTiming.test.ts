@@ -89,6 +89,43 @@ const buildSkippedToolCardRuntime = async (sidebarPath: string) => {
 	} catch (error) { fs.rmSync(temporaryRoot, { recursive: true, force: true }); throw error; }
 };
 
+/** Mount only the production history/panel regions. The surrounding Sidebar is
+ * intentionally not duplicated: its message renderer is represented by stable
+ * persisted-row markers so card insertion can be checked without a fake card. */
+const buildChildActivityHistoryRuntime = async (sidebarPath: string, servicesPath: string) => {
+	const sourceRoot = path.resolve(process.cwd()); const temporaryRoot = fs.mkdtempSync(path.join(sourceRoot, '.child-activity-history-'));
+	assert.ok(temporaryRoot.startsWith(`${sourceRoot}${path.sep}`));
+	const entry = path.join(temporaryRoot, 'entry.tsx'); const outDir = path.join(temporaryRoot, 'out'); const sidebar = read(sidebarPath); const relativeServices = path.relative(temporaryRoot, servicesPath).replaceAll('\\', '/');
+	const panel = between(sidebar, 'const ChildRunPanel =', 'const childActivityInterleavePlan =');
+	const history = between(sidebar, 'const childActivityInterleavePlan =', 'const pendingInputModeLabel =');
+	fs.writeFileSync(entry, `
+		import React, { useState } from 'react'; import { createRoot } from 'react-dom/client'; import { flushSync } from 'react-dom'; import { _registerServices, useAgentSubagentLiveSnapshot } from ${JSON.stringify(relativeServices.startsWith('.') ? relativeServices : './' + relativeServices)};
+		type AgentSubagentPresentation = any; type ChildToolApprovalView = any; type ChatMessage = any; type ChildActivitiesLedger = any; type ChildActivityRecord = any; type AgentSubagentRunView = any; type PendingInputMode = any;
+		const runListeners = new Set<(event: any) => void>(); const diagnosticListeners = new Set<(event: any) => void>(); const listen = (set: Set<any>, listener: any) => { set.add(listener); return { dispose: () => set.delete(listener) }; }; let now = 0; let settled = false; let storageWrites = 0;
+		const authority = { runtimeRevision: 'runtime', instructionsRevision: 'instructions', catalogRevision: 'catalog', selectedSkills: [] };
+		const child = { getRunViews(id: string) { return id !== 'thread-1' || settled ? [] : [{ id: 'root', generation: 8, depth: 1, status: 'running', queuedMs: 10, runningMs: now, totalMs: now + 10, summary: 'LIVE_PROGRESS', shortId: 'root', statusLabel: 'Running', authority }, { id: 'nested', parentRunId: 'root', generation: 8, depth: 2, status: 'running', queuedMs: 10, runningMs: now, totalMs: now + 10, summary: 'NESTED_LIVE', shortId: 'nested', statusLabel: 'Running', authority }]; }, getBudgetView() { return undefined; }, getDiagnosticsView() { return undefined; }, onDidChangeRun(listener: any) { return listen(runListeners, listener); }, onDidChangeDiagnostics(listener: any) { return listen(diagnosticListeners, listener); } };
+		const generic = new Proxy({ state: {}, streamState: {}, getColorTheme: () => ({ type: 'dark' }) }, { get(target, key) { if (key in target) return (target as any)[key]; if (typeof key === 'string' && key.startsWith('onDidChange')) return () => ({ dispose() {} }); return () => undefined; } }); _registerServices({ get(identifier: any) { return String(identifier).includes('voidAgentSubagentService') ? child : generic; } } as any);
+		const timers = new Map<number, () => void>(); let nextTimer = 0; window.setInterval = ((callback: TimerHandler) => { const id = ++nextTimer; timers.set(id, callback as () => void); return id; }) as any; window.clearInterval = ((id: number) => timers.delete(id)) as any;
+		const useAccessor = () => ({ get: () => ({ approveChildToolApproval() {}, rejectChildToolApproval() {} }) });
+		${panel}
+		${history}
+		const messages: any[] = [
+			{ role: 'assistant', content: 'before' },
+			{ role: 'tool', type: 'success', name: 'spawn_agent', id: 'spawn', batchId: 'b', batchOrdinal: 2, result: { id: 'root' }, content: 'spawn receipt' },
+			{ role: 'assistant', content: 'after' },
+		];
+		const invalid: any = { generation: 8, childId: 'RAW_TRANSCRIPT', depth: 1, status: 'completed', capabilityProfile: 'read_only', queuedMs: 0, runningMs: 1, totalMs: 1, summary: 'RAW_TRANSCRIPT', anchor: { toolId: 'missing', batchId: 'b', batchOrdinal: 0 } };
+		const base: any = { generation: 8, childId: 'root', depth: 1, status: 'running', capabilityProfile: 'read_only', queuedMs: 10, runningMs: 0, totalMs: 10, role: { name: 'reader', description: 'durable role' }, anchor: { toolId: 'spawn', batchId: 'b', batchOrdinal: 2 } };
+		const nested: any = { ...base, childId: 'nested', parentRunId: 'root', depth: 2, role: undefined, anchor: { toolId: 'spawn', batchId: 'b', batchOrdinal: 2 } };
+		let root: ReturnType<typeof createRoot> | undefined; let original: Element | null = null; let setDurable!: (value: boolean) => void; let persistenceActive = true;
+		const persistence = child.onDidChangeRun((event: any) => { if (persistenceActive && event.parentId === 'thread-1' && settled) { storageWrites++; flushSync(() => setDurable(true)); } });
+		const Harness = () => { const [durableSettled, set] = useState(false); setDurable = set; const snapshot = useAgentSubagentLiveSnapshot('thread-1'); const durable = { version: 1, records: [durableSettled ? { ...base, status: 'completed', runningMs: 80, totalMs: 90, summary: 'DURABLE_TERMINAL' } : base, nested, invalid], omitted: 0, retentionSaturated: false }; const live = new Map(snapshot.runs.map((view: any) => [JSON.stringify([view.generation, view.id]), view])); const plan = childActivityInterleavePlan(messages, durable); const presentation: any = { summary: durableSettled ? 'settled' : 'live', actionRequired: false, runs: snapshot.runs, budget: undefined, diagnostics: undefined, usageLabel: '' }; return <><ChildRunPanel presentation={presentation} approvals={[]} /><main>{messages.flatMap((message, index) => [<div key={'m'+index} data-message={index}>{message.content}</div>, ...(plan.get(index) ?? []).map((record: any) => <ChildActivityCard key={record.childId} root={record} all={durable.records} live={live} ledger={durable} />)])}</main></>; };
+		(window as any).__childActivityHistory = { mount(node: HTMLElement) { root = createRoot(node); flushSync(() => root!.render(<Harness />)); original = document.querySelector('[data-testid=child-activity-card]'); }, advance(ms: number) { now += ms; for (const callback of [...timers.values()]) callback(); }, settle() { settled = true; for (const listener of [...runListeners]) listener({ parentId: 'thread-1' }); }, sameCard() { return original === document.querySelector('[data-testid=child-activity-card]'); }, timers() { return timers.size; }, listeners() { return { run: runListeners.size, diagnostics: diagnosticListeners.size, persistence: persistenceActive ? 1 : 0 }; }, storageWrites() { return storageWrites; }, dispose() { flushSync(() => root?.unmount()); persistenceActive = false; persistence.dispose(); } };
+	`, 'utf8');
+	try { await build({ entry: { runtime: entry }, outDir, format: ['iife'], globalName: 'ChildActivityHistoryRuntime', splitting: false, clean: true, platform: 'browser', target: 'es2022', silent: true, noExternal: [/^(?!\.).*$/], treeshake: true, esbuildOptions(options) { options.outbase = temporaryRoot; } }); const outputs = findJavaScriptFiles(outDir); assert.strictEqual(outputs.length, 1); return { script: read(outputs[0]), dispose: () => fs.rmSync(temporaryRoot, { recursive: true, force: true }) }; }
+	catch (error) { fs.rmSync(temporaryRoot, { recursive: true, force: true }); throw error; }
+};
+
 suite('Child Run live timing', function () {
 	this.timeout(20_000);
 	test('refreshes the three views together while active and clears its only timer', async () => {
@@ -130,5 +167,20 @@ suite('Child Run live timing', function () {
 			const callsBeforeStaleEvent = await fixture.calls(); await fixture.emitDiagnostics('A'); assert.deepStrictEqual(await fixture.calls(), callsBeforeStaleEvent);
 			await fixture.dispose(); assert.strictEqual(await fixture.activeTimers(), 0); assert.deepStrictEqual(await fixture.listenerCounts(), { run: 0, diagnostics: 0 }); assert.ok((await fixture.cleared()).length >= 2); assert.deepStrictEqual(errors, []); assert.deepStrictEqual(consoleErrors, []);
 		} finally { await browser?.close(); runtime.dispose(); skippedRuntime.dispose(); }
+	});
+	test('keeps a durable child card beside its exact spawn receipt without changing transcript indices', async function () {
+		this.timeout(40_000);
+		const sidebarPath = path.join(process.cwd(), 'src', 'vs', 'workbench', 'contrib', 'void', 'browser', 'react', 'src2', 'sidebar-tsx', 'SidebarChat.tsx');
+		const servicesPath = path.join(process.cwd(), 'src', 'vs', 'workbench', 'contrib', 'void', 'browser', 'react', 'src2', 'util', 'services.tsx');
+		const source = read(sidebarPath); assert.ok(source.includes('childActivityInterleavePlan')); assert.ok(source.includes('messageIdx={previousMessages.length}')); assert.ok(source.includes('streamingChatIdx = previousMessages.length'));
+		const runtime = await buildChildActivityHistoryRuntime(sidebarPath, servicesPath); let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
+		try {
+			browser = await chromium.launch({ headless: true }); const page = await browser.newPage(); const errors: string[] = []; const consoleErrors: string[] = []; page.on('pageerror', error => errors.push(error.message)); page.on('console', message => { if (message.type() === 'error') consoleErrors.push(message.text()); });
+			await page.setContent('<!doctype html><div id="root"></div>'); await page.addScriptTag({ content: runtime.script }); assert.strictEqual(await page.evaluate(() => typeof (window as any).__childActivityHistory?.mount), 'function', `history runtime failed before registration: ${errors.join('\n')}`); await page.locator('#root').evaluate(node => (window as any).__childActivityHistory.mount(node));
+			assert.deepStrictEqual(await page.locator('main > *').evaluateAll(nodes => nodes.map(node => node.getAttribute('data-message') ?? node.getAttribute('data-testid'))), ['0', '1', 'child-activity-card', '2']); assert.strictEqual(await page.locator('[data-testid=child-activity-card]').count(), 1); assert.strictEqual(await page.locator('text=RAW_TRANSCRIPT').count(), 0); assert.strictEqual(await page.locator('[aria-live=polite]').count(), 1); assert.strictEqual(await page.locator('[data-testid=child-activity-card] [aria-live]').count(), 0);
+			const card = page.locator('[data-testid=child-activity-card]'); const summary = card.locator('summary'); assert.strictEqual(await page.evaluate(() => (window as any).__childActivityHistory.timers()), 1); assert.deepStrictEqual(await page.evaluate(() => (window as any).__childActivityHistory.listeners()), { run: 2, diagnostics: 1, persistence: 1 }); assert.strictEqual(await card.evaluate(node => (node as HTMLDetailsElement).open), false); await summary.focus(); await summary.click(); assert.strictEqual(await card.evaluate(node => (node as HTMLDetailsElement).open), true); await summary.press('Enter'); assert.strictEqual(await card.evaluate(node => (node as HTMLDetailsElement).open), false); await summary.press(' '); assert.strictEqual(await card.evaluate(node => (node as HTMLDetailsElement).open), true); assert.strictEqual(await summary.evaluate(node => document.activeElement === node), true); assert.ok((await card.textContent())?.includes('LIVE_PROGRESS')); assert.ok((await card.textContent())?.includes('NESTED_LIVE'));
+			await page.evaluate(() => (window as any).__childActivityHistory.advance(1_000)); assert.ok((await card.textContent())?.includes('1010ms')); assert.strictEqual(await page.evaluate(() => (window as any).__childActivityHistory.storageWrites()), 0);
+			await page.evaluate(() => (window as any).__childActivityHistory.settle()); assert.strictEqual(await page.evaluate(() => (window as any).__childActivityHistory.sameCard()), true); assert.ok((await card.textContent())?.includes('DURABLE_TERMINAL')); assert.strictEqual(await page.locator('text=LIVE_PROGRESS').count(), 0); assert.strictEqual(await page.evaluate(() => (window as any).__childActivityHistory.storageWrites()), 1); assert.strictEqual(await page.evaluate(() => (window as any).__childActivityHistory.timers()), 0); await page.evaluate(() => (window as any).__childActivityHistory.dispose()); assert.strictEqual(await page.evaluate(() => (window as any).__childActivityHistory.timers()), 0); assert.deepStrictEqual(await page.evaluate(() => (window as any).__childActivityHistory.listeners()), { run: 0, diagnostics: 0, persistence: 0 }); assert.deepStrictEqual(errors, []); assert.deepStrictEqual(consoleErrors, []);
+		} finally { await browser?.close(); runtime.dispose(); }
 	});
 });

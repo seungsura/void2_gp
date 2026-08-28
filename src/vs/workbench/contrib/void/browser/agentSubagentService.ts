@@ -49,8 +49,8 @@ type GroupIoDrainWaiter = { readonly resolve: (lease: AgentSubagentGroupIoLease)
 type ChildGroup = { readonly parentId: string; readonly generation: number; readonly createdAt: number; readonly limits: AgentDelegationLimits; readonly budgetLimits: ReturnType<typeof budgetFor>; readonly runs: ChildRun[]; readonly admissions: Map<CancellationTokenSource, string | undefined>; cancellation: boolean; accepted: number; providerSends: number; activeProviderSends: number; resultChars: number; retainedResultChars: number; truncatedResultCount: number; traceSequence: number; readonly traceEvents: AgentSubagentTraceEvent[]; droppedTraceEvents: number; admissionChain: Promise<void>; readonly ioQueue: GroupIoWaiter[]; activeIoReads: number; activeIoWriter: boolean };
 export const IAgentSubagentService = createDecorator<IAgentSubagentService>('voidAgentSubagentService');
 export type AgentSubagentRunChangeEvent = Readonly<
-	{ parentId: string; id: string; status: AgentSubagentStatus; removed?: false }
-	| { parentId: string; id: string; removed: true }
+	{ parentId: string; generation: number; id: string; status: AgentSubagentStatus; removed?: false }
+	| { parentId: string; generation: number; id: string; removed: true }
 >;
 export type AgentSubagentDiagnosticsChangeEvent = Readonly<{ parentId: string; generation: number }>;
 export type AgentSubagentWaitChild = Readonly<{ id: string; status: AgentSubagentStatus; roleName?: string; roleDescription?: string; usage: null }>;
@@ -139,7 +139,7 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 			const run: ChildRun = { id: generateUuid(), parentId, generation, parentRunId: parentRun?.id, depth: parentRun ? parentRun.depth + 1 : 1, remainingDepth: parentRun ? parentRun.remainingDepth - 1 : admittedGroup.limits.maxDepth - 1, budgetLimits: admittedGroup.budgetLimits, message, snapshot, lifecycle: new AgentSubagentLifecycle(), cancellation: new CancellationTokenSource(), settingsOfProvider, admittedRoles, admittedSettingsState: capturedState, toolExecutionProfile, ...(effectiveParentTools ? { parentTools: effectiveParentTools } : {}), ...(effectiveBroker ? { broker: effectiveBroker } : {}), mutationCapable: toolExecutionProfile === 'inherited-parent-write-child' && isMutationCapableSnapshot(effectiveParentTools), brokerCancelled: false, released: false, capacityReleased: false, activeDirectInterrupts: new Set(), acceptedAt: Date.now(), ...(role ? { role: { name: role.name, description: role.description, revision: role.revision, capabilityProfile: role.capabilityProfile } } : {}), summary: '', resultTruncated: false, schedulerActive: false, schedulerActivity: 'ready_to_resume', yielded: false };
 			admittedGroup.runs.push(run); admittedGroup.accepted++; admittedGroup.admissions.delete(admission); admission.dispose();
 			this.trace(admittedGroup, 'child_queued', run);
-			this._onDidChangeRun.fire({ parentId, id: run.id, status: run.lifecycle.status });
+			this._onDidChangeRun.fire({ parentId, generation: run.generation, id: run.id, status: run.lifecycle.status });
 			this.promote(admittedGroup);
 			return { id: run.id, status: run.lifecycle.status };
 		} catch (error) { admittedGroup.admissions.delete(admission); admission.dispose(); this.trace(admittedGroup, 'admission_failed', undefined, undefined, this.diagnostic(error)); throw error; } };
@@ -173,7 +173,7 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 		try {
 			if (!run.lifecycle.start()) return;
 			run.startedAt = Date.now(); const groupAtStart = this.groups.get(run.parentId); if (groupAtStart?.generation === run.generation) this.trace(groupAtStart, 'child_running', run);
-			this._onDidChangeRun.fire({ parentId: run.parentId, id: run.id, status: run.lifecycle.status });
+			this._onDidChangeRun.fire({ parentId: run.parentId, generation: run.generation, id: run.id, status: run.lifecycle.status });
 			const model = run.snapshot.model;
 			if (!model.hasModel) { this.settle(run, 'failed', 'Child model is unavailable.'); return; }
 			if (!providerNames.includes(model.providerName as never)) { this.settle(run, 'failed', 'Child provider is invalid.'); return; }
@@ -392,7 +392,7 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 		run.schedulerActive = schedulerActive;
 		run.schedulerActivity = schedulerActivity;
 		if (!changed || !emit) return;
-		this._onDidChangeRun.fire({ parentId: run.parentId, id: run.id, status: run.lifecycle.status });
+		this._onDidChangeRun.fire({ parentId: run.parentId, generation: run.generation, id: run.id, status: run.lifecycle.status });
 		const group = this.groups.get(run.parentId);
 		if (group?.generation === run.generation) this._onDidChangeDiagnostics.fire({ parentId: run.parentId, generation: group.generation });
 	}
@@ -449,7 +449,7 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 				// The broker acknowledgement is the authoritative external quiescence
 				// boundary: execute may never settle after cancellation.
 				this.releaseExecution(run);
-				this._onDidChangeRun.fire({ parentId: run.parentId, id: run.id, status: run.lifecycle.status });
+				this._onDidChangeRun.fire({ parentId: run.parentId, generation: run.generation, id: run.id, status: run.lifecycle.status });
 				const group = this.groups.get(run.parentId); if (group) this._onDidChangeDiagnostics.fire({ parentId: run.parentId, generation: group.generation });
 			}, () => { /* fail closed: retain the mutation tombstone */ return new Promise<void>(() => { }); });
 		} catch { run.brokerCancelPromise = new Promise<void>(() => { }); }
@@ -506,7 +506,7 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 		run.resultTruncated = resultTruncated;
 		run.terminalView = this.createRunView(run);
 		this.tools.invalidateReadReceipts(run.id);
-		this._onDidChangeRun.fire({ parentId: run.parentId, id: run.id, status });
+		this._onDidChangeRun.fire({ parentId: run.parentId, generation: run.generation, id: run.id, status });
 		if (!run.runPromise) this.releaseExecution(run);
 		if (group?.generation === run.generation) this.promote(group);
 		return true;
@@ -664,6 +664,7 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 		const undoAvailable = !!run.parentTools?.tools.some(tool => tool.kind === 'builtin' && tool.name === 'write_file' && tool.approval === 'edits');
 		return Object.freeze({
 			id: run.id,
+			generation: run.generation,
 			...(run.parentRunId ? { parentRunId: run.parentRunId } : {}),
 			depth: run.depth,
 			remainingDepth: run.remainingDepth,
@@ -703,7 +704,7 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 	}
 	private cancelGroup(group: ChildGroup, summary: string): void { if (group.cancellation) return; group.cancellation = true; this.cancelGroupIo(group); this.trace(group, 'group_cancelled', undefined, undefined, 'cancelled'); for (const admission of group.admissions.keys()) { admission.cancel(); admission.dispose(); } group.admissions.clear(); for (const run of group.runs) this.cancelRun(run, summary); }
 	cancelParent(parentId: string) { const group = this.groups.get(parentId); if (group) this.cancelGroup(group, 'Child cancelled by parent.'); }
-	forgetParent(parentId: string) { const group = this.groups.get(parentId); if (!group) return; this.cancelGroup(group, 'Child cancelled by parent.'); this.groups.delete(parentId); this._onDidChangeDiagnostics.fire({ parentId, generation: group.generation }); for (const run of group.runs) this._onDidChangeRun.fire({ parentId, id: run.id, removed: true }); }
+	forgetParent(parentId: string) { const group = this.groups.get(parentId); if (!group) return; this.cancelGroup(group, 'Child cancelled by parent.'); this.groups.delete(parentId); this._onDidChangeDiagnostics.fire({ parentId, generation: group.generation }); for (const run of group.runs) this._onDidChangeRun.fire({ parentId, generation: run.generation, id: run.id, removed: true }); }
 	override dispose(): void { for (const parentId of [...this.groups.keys()]) this.forgetParent(parentId); this.groups.clear(); super.dispose(); }
 }
 registerSingleton(IAgentSubagentService, AgentSubagentService, InstantiationType.Eager);
