@@ -28,7 +28,7 @@ const fixture = (runtimeSnapshot = snapshot()) => {
 		_agentSkillsService: { readSkillResource: async (selection: unknown, resourcePath: string, options: unknown) => { serviceCalls.push({ selection, resourcePath, options }); return { body: 'RESOURCE\n' }; } },
 		_convertToLLMMessagesService: { prepareLLMChatMessages: async (options: unknown) => { conversionCalls.push(options); return { messages: [], separateSystemMessage: undefined }; } },
 		_toolsService: { invalidateReadReceipts(_threadId: string) { }, validateParams: new Proxy({}, { get() { throw new Error('builtin lookup'); } }) }, _mcpService: { getMCPTools() { throw new Error('MCP lookup'); } },
-		_agentSubagentService: { cancelParent() { }, forgetParent() { } },
+		_agentSubagentService: { cancelParent() { }, forgetParent() { }, async acquireGroupIo() { return { release() { } }; } },
 		_cancelChildToolApprovalsForParent() { },
 		_addMessageToThread(_threadId: string, message: any) { messages.push(message); },
 		_updateLatestTool(_threadId: string, message: any) { if (messages[messages.length - 1]?.role === 'tool') messages[messages.length - 1] = message; else messages.push(message); },
@@ -93,6 +93,31 @@ suite('Void selected Skill resource Chat runtime', () => {
 		const receiptId = f.messages[0]?.receiptId; const receipt = f.value._activeToolCardReceiptsOfThread?.get('parent')?.get(receiptId); assert.strictEqual(f.messages[0]?.type, 'running_now'); assert.strictEqual(typeof receiptId, 'string'); assert.deepStrictEqual({ toolId: receipt?.toolId, messageIndex: receipt?.messageIndex, interruptInstalled: receipt?.interruptInstalled, cancelling: receipt?.cancelling }, { toolId: 'provider-tool-id', messageIndex: 0, interruptInstalled: true, cancelling: false });
 		f.value.state.allThreads.parent.messages.push({ role: 'user', content: 'x'.repeat(20_000) }); release({ body: 'fits-in-captured-budget' });
 		assert.deepStrictEqual(await pending, {}); assert.strictEqual(f.messages[f.messages.length - 1].type, 'success'); assert.strictEqual(f.value._activeToolCardReceiptsOfThread?.get('parent'), undefined);
+
+		// The resource byte read holds the shared reader lane, but a writer becomes
+		// eligible before the deliberately deferred prospective conversion completes.
+		const coordinated = fixture(); let releaseResource!: (value: { body: string }) => void; let resourceStarted!: () => void; const resourceStartedPromise = new Promise<void>(resolve => resourceStarted = resolve); const resource = new Promise<{ body: string }>(resolve => releaseResource = resolve);
+		let releaseConversion!: () => void; let conversionStarted!: () => void; const conversionStartedPromise = new Promise<void>(resolve => conversionStarted = resolve); const conversion = new Promise<void>(resolve => releaseConversion = resolve);
+		let activeReaders = 0; let grantWriter: ((lease: { release(): void }) => void) | undefined;
+		coordinated.value._agentSubagentService = {
+			cancelParent() { }, forgetParent() { },
+			async acquireGroupIo(_parentId: string, _generation: number, kind: 'read' | 'write') {
+				if (kind === 'read') { activeReaders += 1; return { release() { activeReaders -= 1; if (activeReaders === 0) grantWriter?.({ release() { } }); } }; }
+				if (activeReaders === 0) return { release() { } };
+				return new Promise<{ release(): void }>(resolve => grantWriter = resolve);
+			},
+		};
+		coordinated.value._agentSkillsService.readSkillResource = () => { resourceStarted(); return resource; };
+		coordinated.value._convertToLLMMessagesService.prepareLLMChatMessages = async () => { conversionStarted(); await conversion; return { messages: [], separateSystemMessage: undefined }; };
+		const coordinatedRun = run(coordinated.value, coordinated.runtimeSnapshot, { skill: 'demo', resource_path: 'references/coordinated.md' }); await resourceStartedPromise;
+		let writerGranted = false; const writer = coordinated.value._agentSubagentService.acquireGroupIo('parent', 0, 'write').then((lease: { release(): void }) => { writerGranted = true; return lease; }); await Promise.resolve(); assert.strictEqual(writerGranted, false);
+		releaseResource({ body: 'RESOURCE' }); await conversionStartedPromise; await Promise.resolve(); assert.strictEqual(writerGranted, true, 'writer acquires immediately after resource I/O, not after conversion'); (await writer).release(); releaseConversion(); assert.deepStrictEqual(await coordinatedRun, {});
+
+		const stale = fixture(); let grantRead!: (lease: { release(): void }) => void; let staleReads = 0;
+		stale.value._agentSubagentService = { cancelParent() { }, forgetParent() { }, acquireGroupIo: () => new Promise<{ release(): void }>(resolve => grantRead = resolve) };
+		stale.value._agentSkillsService.readSkillResource = async () => { staleReads += 1; return { body: 'must not read' }; };
+		const staleRun = run(stale.value, stale.runtimeSnapshot, { skill: 'demo', resource_path: 'references/stale.md' }); await Promise.resolve(); stale.value._agentControlGeneration.set('parent', 1); grantRead({ release() { } });
+		assert.deepStrictEqual(await staleRun, { interrupted: true }); assert.strictEqual(staleReads, 0); assert.strictEqual(stale.conversionCalls.length, 0); assert.strictEqual(stale.messages.some(message => message.type === 'success'), false);
 	});
 
 	test('Stop settles the running tool once and drops the late resource completion', async () => {

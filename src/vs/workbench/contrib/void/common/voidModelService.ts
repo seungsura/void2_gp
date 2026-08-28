@@ -57,7 +57,11 @@ class VoidModelService extends Disposable implements IVoidModelService {
 		if (this._modelRefOfURI.has(key)) return;
 		const inFlight = this._initializingModelOfURI.get(key);
 		if (inFlight) return inFlight;
-		const initialize = (async () => {
+		// Register before invoking the resolver: it can throw synchronously, and a
+		// synchronous finally from an eager async IIFE would otherwise delete nothing
+		// before this promise is inserted, leaving a completed failed entry cached.
+		let initialize!: Promise<void>;
+		initialize = Promise.resolve().then(async () => {
 			try {
 				const editorModelRef = await this._textModelService.createModelReference(uri);
 				// A service disposal must not leak a reference that resolved afterwards.
@@ -68,9 +72,9 @@ class VoidModelService extends Disposable implements IVoidModelService {
 				// Failures are deliberately not cached: a transient resolver error can be retried.
 				console.log('InitializeModel error:', error);
 			} finally {
-				this._initializingModelOfURI.delete(key);
+				if (this._initializingModelOfURI.get(key) === initialize) this._initializingModelOfURI.delete(key);
 			}
-		})();
+		});
 		this._initializingModelOfURI.set(key, initialize);
 		return initialize;
 	};

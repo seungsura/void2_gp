@@ -262,8 +262,16 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 						const protectedCharsRemaining = Math.max(0, exactInputBudgetChars - assembleProtectedAgentAuthority(run.snapshot, true).length - protectedSkillResourceHistoryLength(history));
 						const maxResourceChars = Math.min(maxReadOutputTokens * 4, protectedCharsRemaining);
 						const maxResourceBytes = maxResourceChars > 0 ? Math.min(Number.MAX_SAFE_INTEGER, maxResourceChars * 3 + 3) : 0;
-						const read = await this.skills.readSkillResource(selection, params.resourcePath, { maxResourceBytes, token: run.cancellation.token });
-						if (!this.isCurrent(run)) { this.settle(run, 'cancelled', 'Child cancelled or owner changed.'); return; }
+						// Resource bytes are local read I/O, but formatting/prospective conversion
+						// must not retain the reader lease. A cancelled queued acquisition returns
+						// a no-op lease, so fence again before the physical read starts.
+						const resourceLease = await this.acquireGroupIo(run.parentId, run.generation, 'read', run.cancellation.token);
+						let read: Awaited<ReturnType<IAgentSkillsService['readSkillResource']>>;
+						try {
+							if (!this.isCurrent(run)) throw new Error('agent_child_cancelled');
+							read = await this.skills.readSkillResource(selection, params.resourcePath, { maxResourceBytes, token: run.cancellation.token });
+							if (!this.isCurrent(run)) throw new Error('agent_child_cancelled');
+						} finally { resourceLease.release(); }
 						if (read.body === undefined) throw new Error(read.diagnostic?.code ?? 'skill_resource_unreadable');
 						const content = admitSkillResourceContext(read.body, maxReadOutputTokens);
 						const success: ChatMessage & { role: 'tool' } = { role: 'tool', type: 'success', content, id: tool.id, rawParams: tool.rawParams, mcpServerName: undefined, name: tool.name, params: tool.rawParams, result: content as never, ...batchRef };

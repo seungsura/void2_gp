@@ -847,6 +847,16 @@ suite('Assistant message lifecycle', () => {
 		await mixedRun;
 		assert.deepStrictEqual(mixed.safeMessages.filter(message => message.role === 'tool').map(message => [message.id, message.type, message.batchOrdinal]), [['mixed-a', 'rejected', 0], ['mixed-invalid', 'invalid_params', 1], ['mixed-c', 'success', 2]]);
 
+		const mixedStopA = deferred<any>(); const mixedStopC = deferred<any>();
+		const mixedStop = makeSafeReceiver([
+			{ id: 'mixed-stop-a', name: 'ls_dir', rawParams: { key: 'mixed-stop-a' }, ordinal: 0 },
+			{ id: 'mixed-stop-invalid', name: 'ls_dir', rawParams: { key: 'mixed-stop-invalid', invalid: true }, ordinal: 1 },
+			{ id: 'mixed-stop-c', name: 'ls_dir', rawParams: { key: 'mixed-stop-c' }, ordinal: 2 },
+		], { 'mixed-stop-a': mixedStopA, 'mixed-stop-c': mixedStopC }, true);
+		const mixedStopRun = chatLifecycle._runNativeBatchRange.call(mixedStop.safeReceiver, 'task', mixedStop.safeMessages[1].toolBatch.calls.map((call: any, ordinal: number) => ({ ...call, ordinal })), 'safe-batch', instructionSnapshot(), undefined, true, 0, mixedStop.isCurrent, () => false);
+		await flushMicrotasks(); mixedStopA.resolve({ content: 'late A' }); mixedStopC.resolve({ content: 'late C' }); assert.deepStrictEqual(await mixedStopRun, { interrupted: true });
+		const mixedStopRows = mixedStop.safeMessages.filter(message => message.role === 'tool'); assert.deepStrictEqual(mixedStopRows.map(message => [message.id, message.type, message.batchOrdinal]), [['mixed-stop-a', 'rejected', 0], ['mixed-stop-invalid', 'skipped', 1], ['mixed-stop-c', 'skipped', 2]]); assert.strictEqual(new Set(mixedStopRows.map(message => `${message.id}/${message.batchId}/${message.batchOrdinal}`)).size, 3); assert.deepStrictEqual(mixedStop.safeStarts, []);
+
 		const capA = deferred<any>(); const capB = deferred<any>(); const capC = deferred<any>();
 		const capped = makeSafeReceiver([
 			{ id: 'cap-a', name: 'ls_dir', rawParams: { key: 'cap-a' }, ordinal: 0 }, { id: 'cap-b', name: 'ls_dir', rawParams: { key: 'cap-b' }, ordinal: 1 }, { id: 'cap-c', name: 'ls_dir', rawParams: { key: 'cap-c' }, ordinal: 2 },
@@ -894,6 +904,44 @@ suite('Assistant message lifecycle', () => {
 		activeA.resolve({ content: 'late active A' }); activeB.resolve({ content: 'late active B' });
 		assert.deepStrictEqual(await activeRun, { interrupted: true });
 		assert.deepStrictEqual({ interrupts: activeStopped.safeInterrupts.sort(), rows: activeStopped.safeMessages.filter(message => message.role === 'tool').map(message => [message.id, message.type, message.batchOrdinal]), active: activeStopped.safeReceiver._activeToolCardReceiptsOfThread.size }, { interrupts: ['active-a', 'active-b'], rows: [['active-a', 'rejected', 0], ['active-b', 'rejected', 1], ['active-c', 'skipped', 2]], active: 0 });
+
+		// Every approval-registry edit/terminal builtin must wait behind same-parent
+		// reads. This deliberately exercises the four former omissions too, while
+		// keeping prepareWriteFile outside the operation-scoped writer lease.
+		const writerMessages: any[] = []; const writerStarts: string[] = []; let activeReaders = 0; let activeWriter = false; const queuedWriters: Array<(lease: { release(): void }) => void> = [];
+		const pumpWriters = () => {
+			if (activeReaders !== 0 || activeWriter || queuedWriters.length === 0) return;
+			activeWriter = true; const grant = queuedWriters.shift()!; let released = false;
+			grant({ release() { if (released) return; released = true; activeWriter = false; pumpWriters(); } });
+		};
+		const ioCoordinator = {
+			async acquireGroupIo(_parentId: string, _generation: number, kind: 'read' | 'write') {
+				if (kind === 'read') { activeReaders += 1; let released = false; return { release() { if (released) return; released = true; activeReaders -= 1; pumpWriters(); } }; }
+				return new Promise<{ release(): void }>(resolve => { queuedWriters.push(resolve); pumpWriters(); });
+			},
+		};
+		const heldReadA = await ioCoordinator.acquireGroupIo('task', 0, 'read'); const heldReadB = await ioCoordinator.acquireGroupIo('task', 0, 'read');
+		const writerNames = ['create_file_or_folder', 'delete_file_or_folder', 'write_file', 'run_command', 'run_persistent_command', 'open_persistent_terminal', 'kill_persistent_terminal'] as const;
+		const writerParams: Record<string, any> = {
+			create_file_or_folder: { uri: URI.parse('file:///workspace/create.txt'), isFolder: false }, delete_file_or_folder: { uri: URI.parse('file:///workspace/delete.txt'), isRecursive: false, isFolder: false }, write_file: { uri: URI.parse('file:///workspace/write.txt'), operation: 'create', content: 'text' },
+			run_command: { command: 'echo command', cwd: null, terminalId: 'command' }, run_persistent_command: { command: 'echo persistent', persistentTerminalId: 'persistent' }, open_persistent_terminal: { cwd: null }, kill_persistent_terminal: { persistentTerminalId: 'persistent' },
+		};
+		const writerReceiver: any = {
+			state: { allThreads: { task: { messages: writerMessages, state: {}, filesWithUserChanges: new Set<string>() } } }, streamState: {}, _activeToolCardReceiptsOfThread: new Map(), _cancellingToolReceiptsOfThread: new Map(), _agentSubagentService: ioCoordinator,
+			toolErrMsgs: { interrupted: 'interrupted', errWhenStringifying: () => 'stringify failed' }, _mcpService: { getMCPTools: () => [] },
+			_toolsService: {
+				prepareWriteFile: async () => ({ execute: async () => { writerStarts.push('write_file'); return {}; } }),
+				callTool: Object.fromEntries(writerNames.filter(name => name !== 'write_file').map(name => [name, async () => { writerStarts.push(name); return { result: Promise.resolve({}), interruptTool: undefined }; }])),
+				stringOfResult: new Proxy({}, { get: () => () => 'done' }),
+			},
+			_setStreamState(threadId: string, state: any) { this.streamState[threadId] = state; },
+			_updateLatestTool(_threadId: string, message: any) { const index = writerMessages.findIndex(candidate => candidate.role === 'tool' && candidate.id === message.id && candidate.type === 'running_now'); if (index >= 0) writerMessages[index] = message; else writerMessages.push(message); },
+			_editMessageInThread(_threadId: string, index: number, message: any) { writerMessages[index] = message; },
+		};
+		Object.setPrototypeOf(writerReceiver, ChatThreadService.prototype);
+		const writerRuns = writerNames.map(name => chatLifecycle._runToolCall.call(writerReceiver, 'task', name, `writer-${name}`, undefined, { preapproved: true, unvalidatedToolParams: writerParams[name], validatedParams: writerParams[name] }, instructionSnapshot(), undefined, false, 0, () => true));
+		await flushMicrotasks(); assert.deepStrictEqual(writerStarts, []); heldReadA.release(); await flushMicrotasks(); assert.deepStrictEqual(writerStarts, []); heldReadB.release(); await Promise.all(writerRuns);
+		assert.deepStrictEqual([...writerStarts].sort(), [...writerNames].sort()); assert.strictEqual(writerStarts.length, writerNames.length);
 	});
 
 	test('card Stop rejects a stale parent receipt before touching its live row', () => {

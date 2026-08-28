@@ -1599,10 +1599,21 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			this._updateLatestTool(threadId, { role: 'tool', type: 'running_now', name: toolName, params: applicationParams, content: '(value not received yet...)', result: null, id: toolId, rawParams: applicationParams, mcpServerName: undefined, startedAt: Date.now(), receiptId, cardStopAvailable: true, ...batchRef });
 			if (!isCurrentParentRun()) { settleCancelled(); retireActiveToolCardReceipt.call(this, threadId, receiptId); return { interrupted: true }; }
 			try {
-				const cancelled = Object.freeze({ cancelled: true as const });
-				const cancellationRace = new Promise<typeof cancelled>(resolve => readCancellation.token.onCancellationRequested(() => resolve(cancelled)));
-				const read = await Promise.race([this._agentSkillsService.readSkillResource(selection, params.resourcePath, { maxResourceBytes, token: readCancellation.token }), cancellationRace]);
-				if ('cancelled' in read || interrupted || !isCurrentParentRun() || !sameGeneration()) return cancellationOutcome();
+				// A Skill resource is a filesystem read, so it participates in the same
+				// parent/child reader lane, but only for the actual service call. Conversion
+				// and prospective admission deliberately run after this lease is released.
+				const resourceLease = agentRunGeneration !== undefined && this._agentSubagentService?.acquireGroupIo
+					? await this._agentSubagentService.acquireGroupIo(threadId, agentRunGeneration, 'read', readCancellation.token)
+					: { release() { } };
+				let read: Awaited<ReturnType<IAgentSkillsService['readSkillResource']>>;
+				try {
+					if (interrupted || !sameResourceAuthority()) return cancellationOutcome();
+					const cancelled = Object.freeze({ cancelled: true as const });
+					const cancellationRace = new Promise<typeof cancelled>(resolve => readCancellation.token.onCancellationRequested(() => resolve(cancelled)));
+					const settledRead = await Promise.race([this._agentSkillsService.readSkillResource(selection, params.resourcePath, { maxResourceBytes, token: readCancellation.token }), cancellationRace]);
+					if ('cancelled' in settledRead || interrupted || !isCurrentParentRun() || !sameGeneration()) return cancellationOutcome();
+					read = settledRead;
+				} finally { resourceLease.release(); }
 				if (!sameResourceAuthority()) {
 					if (sameRememberedSnapshot()) {
 						this._purgeInstructionTurn(threadId);
@@ -1793,7 +1804,10 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 					if (!preparedWrite) throw new Error('Internal error: write_file did not produce a receipt.')
 				}
 				if (interrupted || !isCurrentParentRun()) { settleCancelled(); return cancellationOutcome() }
-				const requiresWriteLease = toolName === 'write_file' || toolName === 'run_command' || toolName === 'run_persistent_command';
+				// Keep parent mutations in the same exclusive lane as inherited child
+				// mutations. The approval registry is the authoritative full edit/terminal
+				// set; read-only builtins and application controls stay outside it.
+				const requiresWriteLease = !!approvalTypeOfBuiltinToolName[toolName];
 				const ioLease = requiresWriteLease && agentRunGeneration !== undefined && this._agentSubagentService?.acquireGroupIo ? await this._agentSubagentService.acquireGroupIo(threadId, agentRunGeneration, 'write') : { release() { } };
 				try {
 					if (interrupted || !isCurrentParentRun()) { settleCancelled(); return cancellationOutcome() }
@@ -1921,7 +1935,11 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		// synchronous Stop can therefore cancel any member of this wave exactly once.
 		for (const item of staged) {
 			if ('kind' in item) {
-				this._addMessageToThread(threadId, { role: 'tool', type: 'invalid_params', rawParams: item.call.rawParams, result: null, name: item.call.name, content: item.content, id: item.call.id, mcpServerName: undefined, ...item.batchRef });
+				// Stop can synchronously materialize a skipped/rejected row for every
+				// declaration while this loop is publishing. Respect that durable tuple so
+				// an invalid sibling cannot append a second terminal row afterwards.
+				const exists = (this.state.allThreads[threadId]?.messages ?? []).some(message => message.role === 'tool' && message.id === item.call.id && message.batchId === item.batchRef.batchId && message.batchOrdinal === item.batchRef.batchOrdinal);
+				if (!exists) this._addMessageToThread(threadId, { role: 'tool', type: 'invalid_params', rawParams: item.call.rawParams, result: null, name: item.call.name, content: item.content, id: item.call.id, mcpServerName: undefined, ...item.batchRef });
 				continue;
 			}
 			if (!isCurrentParentRun() || item.interrupted) {

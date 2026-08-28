@@ -431,9 +431,14 @@ suite('Void AgentSubagentService', () => {
 		const parentTools = captureParentModelToolSnapshot('agent', undefined, false);
 		assert.ok(parentTools.tools.some(tool => tool.name === 'read_skill_resource'));
 		const role: any = { identity: 'writer', name: 'writer', description: 'Write.', developerInstructions: 'writer', capabilityProfile: 'inherit_parent_write', revision: 'writer-1', skillRules: [] }; const roles: any = { revision: 'roles-1', agents: [role], diagnostics: [] };
-		const reads: any[] = []; const f = fixture({
+		const reads: any[] = []; let resourceStarted!: () => void; const resourceStartedPromise = new Promise<void>(resolve => resourceStarted = resolve); let releaseResource!: (value: { body: string }) => void; const resource = new Promise<{ body: string }>(resolve => releaseResource = resolve); let conversionStarted!: () => void; const conversionStartedPromise = new Promise<void>(resolve => conversionStarted = resolve); let releaseConversion!: () => void; const conversion = new Promise<void>(resolve => releaseConversion = resolve);
+		const f = fixture({
 			customCatalog: roles,
-			readSkillResource: async (_selection, path, options) => { reads.push({ path, options }); return { body: '' }; },
+			readSkillResource: async (_selection, path, options) => { reads.push({ path, options }); resourceStarted(); return resource; },
+			prepare: async options => {
+				if (options.chatMessages.some((message: any) => message.role === 'tool' && message.id === 'skill-read')) { conversionStarted(); await conversion; }
+				return { messages: [{ role: 'user', content: 'prepared' }], separateSystemMessage: 'protected' };
+			},
 			send: (options, turn) => {
 				queueMicrotask(() => options.onFinalMessage(turn === 1
 					? { fullText: 'resource first', fullReasoning: '', anthropicReasoning: null, toolCalls: [{ id: 'skill-read', name: 'read_skill_resource', rawParams: { skill: 'demo', resource_path: 'README.md' } }, { id: 'later-read', name: 'ls_dir', rawParams: { uri: 'file:///workspace' } }] }
@@ -441,12 +446,24 @@ suite('Void AgentSubagentService', () => {
 				return `resource-batch-${turn}`;
 			},
 		});
-		await f.service.spawn('empty-resource', '$demo read', snapshot(['demo']), 'writer', roles, undefined, undefined, 0, parentTools, f.broker); await f.service.wait('empty-resource', 1_000);
+		await f.service.spawn('empty-resource', '$demo read', snapshot(['demo']), 'writer', roles, undefined, undefined, 0, parentTools, f.broker); await resourceStartedPromise;
+		let writerGranted = false; const writerPending = f.service.acquireGroupIo('empty-resource', 0, 'write').then(lease => { writerGranted = true; return lease; }); await Promise.resolve(); assert.strictEqual(writerGranted, false);
+		releaseResource({ body: '' }); await conversionStartedPromise; await Promise.resolve(); assert.strictEqual(writerGranted, true, 'the queued writer must acquire after resource bytes drain, before conversion'); (await writerPending).release(); releaseConversion(); await f.service.wait('empty-resource', 1_000);
 		assert.strictEqual(reads.length, 1); assert.ok(reads[0].options.maxResourceBytes >= 0); assert.deepStrictEqual(f.toolCalls.map(call => call.name), ['ls_dir']);
 		const prospective = f.converterCalls.find(call => call.chatMessages.some((message: any) => message.role === 'tool' && message.type === 'skipped'));
 		assert.deepStrictEqual(prospective.chatMessages.filter((message: any) => message.role === 'tool').map((message: any) => [message.id, message.type, Object.prototype.hasOwnProperty.call(message, 'params')]), [['skill-read', 'success', true], ['later-read', 'skipped', false]]);
 		const continuation = f.converterCalls.find(call => call.chatMessages.filter((message: any) => message.role === 'tool').length === 2 && call.chatMessages.every((message: any) => message.role !== 'tool' || message.type === 'success'));
 		assert.ok(continuation); assert.deepStrictEqual(continuation.chatMessages.filter((message: any) => message.role === 'tool').map((message: any) => [message.id, message.type]), [['skill-read', 'success'], ['later-read', 'success']]);
+
+		let pendingOptions: any; let cancelledReads = 0;
+		const cancelled = fixture({
+			customCatalog: roles,
+			readSkillResource: async () => { cancelledReads += 1; return { body: 'must not read after cancellation' }; },
+			send: options => { pendingOptions = options; return 'resource-cancel'; },
+		});
+		const cancelledChild = await cancelled.service.spawn('resource-cancel', '$demo read', snapshot(['demo']), 'writer', roles, undefined, undefined, 0, parentTools, cancelled.broker); for (let index = 0; index < 10 && !pendingOptions; index++) await Promise.resolve(); assert.ok(pendingOptions);
+		const blocker = await cancelled.service.acquireGroupIo('resource-cancel', 0, 'write'); pendingOptions.onFinalMessage({ fullText: 'resource', fullReasoning: '', anthropicReasoning: null, toolCalls: [{ id: 'cancelled-resource', name: 'read_skill_resource', rawParams: { skill: 'demo', resource_path: 'README.md' } }] }); await Promise.resolve(); cancelled.service.interrupt('resource-cancel', cancelledChild.id); blocker.release();
+		const cancelledResult = await cancelled.service.wait('resource-cancel', 1_000); assert.strictEqual(cancelledResult.status, 'cancelled'); assert.strictEqual(cancelledReads, 0); assert.strictEqual(cancelled.providerCalls.length, 1);
 	});
 
 	test('keeps child Skill-resource failures inside the frozen selected manifest and does not dispatch a broker call', async () => {
