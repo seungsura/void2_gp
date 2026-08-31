@@ -219,9 +219,11 @@ Chat A에 전송하지 않은 `draft-a`를 입력하고 Chat B로 이동해 `dra
 
 Expected: Landing list와 current composer가 동시에 보이지 않습니다. A와 B의 draft가 byte-for-byte 분리되어 복원됩니다. Current marker는 선택한 chat을 따르고 background child/parent work는 별도 `Running` 상태로 남습니다. Current 또는 active row에는 Delete action이 나타나지 않습니다. Inactive safe row를 삭제하면 focus가 남은 row 또는 header로 이동합니다. Composer는 `Error > Needs approval > Running > unavailable > idle` 우선순위에 맞는 Send/Stop 상태를 표시합니다. Running tool card는 visible elapsed와 exact receipt Stop 또는 unavailable reason을 표시하고, concurrent draft는 Queue 또는 Steer pending row로 관찰합니다.
 
-Void를 정상 종료하고 같은 portable data로 다시 시작합니다. Expected: draft map은 memory-only이므로 A와 B의 unsent draft가 restart 뒤 복원되지 않습니다. Chat storage 또는 Project routing이 구현됐다고 추정하지 마세요.
+Void를 정상 종료하고 같은 portable data로 다시 시작합니다. Expected: unsent composer draft map은 memory-only이므로 A와 B의 unsent draft가 restart 뒤 복원되지 않습니다. Chat storage 또는 Project routing이 구현됐다고 추정하지 마세요.
 
-Record: landing/current surface / newest-first rows / `View Past Chats` / A/B draft / Current row / background status / Delete visibility·focus / composer announcement·Send·Stop / restart 뒤 draft.
+별도 관찰: Running 중 Queue와 Steer를 각각 하나씩 만들 수 있는 안전한 fixture에서 새 Queue/Steer pending inbox를 남긴 뒤 reload합니다. Expected는 **EXPLORATORY/BLOCKED until observed**입니다. source/focused contract상 inbox는 최대 32 records / UTF-8 64 KiB, reload 뒤 dormant, auto-send 0이며 사용자가 명시적으로 Resume할 때 한 번만 재개합니다. 이 문서와 source fixture만으로 packaged UI/provider/process-restart E2E PASS를 기록하지 마세요. Resume를 두 번 누르거나 reload 뒤 자동 전송이 보이면 실제 trace와 send count를 기록하고 FAIL로 분류하세요.
+
+Record: landing/current surface / newest-first rows / `View Past Chats` / A/B unsent composer draft / Current row / background status / Delete visibility·focus / composer announcement·Send·Stop / restart 뒤 draft / Queue·Steer inbox record count·UTF-8 bytes·dormant state·auto-send count·explicit Resume count.
 
 ## 9. Assistant tool-only/reasoning-only 표시
 
@@ -257,4 +259,4 @@ Record: saved file / pathname result / content result / approval count / termina
 
 ## 해석 주의
 
-이 릴리스는 direct custom role, configured depth nesting, `read_only`와 brokered `inherit_parent_write` profile을 지원합니다. Persistent group/restart replay, full child transcript history, invalid configured values와 arbitrary live provider/tool/permission elevation은 지원하지 않습니다. 정식 package gate에는 fixed startup, controlled Chat과 project instruction child UI 관찰이 포함되지만, 테스트 중 다른 동작이 보이더라도 지원 계약으로 일반화하지 말고 실제 trace와 재현 조건을 기록하세요. Source fixture, compile, React/Windows build와 visible artifact smoke는 general provider matrix, token usage 또는 performance를 증명하지 않습니다.
+이 릴리스는 direct custom role, configured depth nesting, `read_only`와 brokered `inherit_parent_write` profile을 지원합니다. Spawn receipt에 묶인 bounded expandable Child activity card는 지원하지만 full child transcript/session은 아닙니다. Child/group whole-run wall-clock·turn·cumulative-send quota는 없으며 configured scheduler capacity, operation timeout과 actual logical in-flight provider-dispatch lease를 사용합니다. Provider-native multi-tool batch는 ordinal identity와 provider-order serial execution을 보존하고 literal `multi_tool_use.parallel`은 없습니다. exact safe read만 최대 2개 concurrent이며 mutation/terminal/MCP는 serialized/exclusive입니다. Plan/orchestration은 main parent가 소유하며 새 Plan API/UI/storage와 same-child follow-up은 없습니다. Persistent group/automatic Queue·Steer resend/restart replay, invalid configured values와 arbitrary live provider/tool/permission elevation은 지원하지 않습니다. 정식 package gate에는 fixed startup, controlled Chat과 project instruction child UI 관찰이 포함되지만, 테스트 중 다른 동작이 보이더라도 지원 계약으로 일반화하지 말고 실제 trace와 재현 조건을 기록하세요. Source fixture, compile, React/Windows build와 visible artifact smoke는 general provider matrix, token usage 또는 performance를 증명하지 않습니다.

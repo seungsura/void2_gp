@@ -43,7 +43,11 @@ Role의 `read_only` profile은 exact five read tools만 제공하고 terminal, M
 
 `$`는 `@`의 기존 Skills catalog를 그대로 열어 filter하고 `$bare` 또는 `$qualified:identity`를 canonical selector text로 남깁니다. Markdown code의 selector-looking text는 literal이며 missing/ambiguous selection은 draft와 staging을 보존한 채 visible error로 중단합니다. `read_skill_resource`, `spawn_agent`, `wait_agent`, `interrupt_agent`는 exact application cards로 표시되며 MCP fallback이나 generic approval UI를 빌리지 않습니다.
 
-Child Run UI는 capacity/status, 실패와 bounded timing/timeline을 표시합니다. Local trace는 first 128 events와 이후 dropped count만 보존하고 provider usage가 없으면 `Usage unavailable`로 표시합니다. Landing의 non-empty Chat history는 newest-first이며 persistent history is not rendered below the current Chat composer. Header의 `View Past Chats`가 landing access path입니다. 정확한 지원 경계와 직접 관찰 절차는 `guides/agent-instructions-guide.md`와 `prompts/agent-instructions-test-prompts.md`를 확인하세요.
+Child Run UI는 capacity/status, 실패와 bounded timing/timeline을 표시합니다. Spawn receipt에 묶인 bounded expandable Child activity card는 남지만 full child transcript/session은 아닙니다. Local trace는 first 128 events와 이후 dropped count만 보존하고 provider usage가 없으면 `Usage unavailable`로 표시합니다. Landing의 non-empty Chat history는 newest-first이며 persistent history is not rendered below the current Chat composer. Header의 `View Past Chats`가 landing access path입니다. 정확한 지원 경계와 직접 관찰 절차는 `guides/agent-instructions-guide.md`와 `prompts/agent-instructions-test-prompts.md`를 확인하세요.
+
+전송하지 않은 composer draft는 memory-only라 restart 뒤 보존되지 않습니다. 이와 별도로 Queue/Steer pending inbox는 최대 32 records / UTF-8 64 KiB로 durable하게 보관됩니다. reload 뒤에는 dormant이며 자동 전송하지 않고, 사용자가 명시적으로 Resume하면 한 번만 재개합니다. 이는 source/focused 계약이며 실제 packaged process-restart 관찰은 아직 별도입니다.
+
+Child/group 전체 run의 wall-clock·turn·cumulative-send quota는 없습니다. configured scheduler capacity와 operation timeout은 유지되고, provider dispatch는 실제 logical in-flight lease만 센다. Provider-native multi-tool batch는 ordinal identity를 유지해 provider order로 serial 실행합니다. literal `multi_tool_use.parallel`은 제공하지 않습니다. exact safe read만 최대 2개 concurrent이며 mutation/terminal/MCP는 serialized/exclusive입니다. Plan과 orchestration은 main parent가 소유하며 새 Plan API/UI/storage와 same-child follow-up은 제공하지 않습니다.
 
 Provider/tool loop의 native empty tool-call content는 fake display text로 바꾸지 않습니다. Exact `(empty message)` sentinel은 parent/child outbound history, persisted display와 renderer에 남지 않으며 non-empty reasoning-only content는 reasoning bubble로 계속 보입니다.
 
