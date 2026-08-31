@@ -217,9 +217,9 @@ Expected:
 
 Disposable workspace에서 parent가 exact successful `spawn_agent`를 한 번 완료하는 작은 read-only task를 사용하세요. 성공 receipt가 나온 직후 Child activity를 관찰합니다.
 
-Expected: exact spawn receipt 뒤 하나의 default-closed expandable card가 바로 나타납니다. Pointer와 keyboard로 expand/collapse할 수 있고 compact status, role, timing과 bounded summary만 보입니다. raw tool args나 full child transcript/session은 나타나면 `FAIL`입니다. nested child가 실제로 있으면 optional hierarchy를 기록할 수 있지만 없으면 요구하지 않습니다. visible omitted/retentionSaturated warning이 있으면 그 표시를 기록하세요. terminal card revisit 또는 reload는 **EXPLORATORY/BLOCKED until observed**이며 source fixture를 product persistence PASS로 바꾸지 마세요. exact thread-level combined 32 records / UTF-8 64 KiB enforcement은 SOURCE/FOCUSED이며 defined storage instrumentation 없이는 BLOCKED입니다. single manual card는 그 bound를 증명하지 않습니다.
+Expected: exact spawn receipt 뒤 하나의 default-closed expandable root card가 바로 나타납니다. Pointer와 keyboard로 expand/collapse할 수 있고 compact status, role, timing과 bounded summary만 보입니다. raw tool args나 full child transcript/session은 나타나면 `FAIL`입니다. nested child가 실제로 있으면 optional nested activity rows와 hierarchy를 기록할 수 있지만 없으면 요구하지 않습니다. visible `${n} activities omitted.` 또는 `Retention is saturated.` notice가 있으면 exact 표시를 기록하세요. notice가 없다는 사실만으로 retention failure로 판정하지 마세요. terminal card revisit 또는 reload는 **EXPLORATORY/BLOCKED until observed**이며 source fixture를 product persistence PASS로 바꾸지 마세요. exact thread-level combined 32 records / UTF-8 64 KiB enforcement은 SOURCE/FOCUSED이며 defined storage instrumentation 없이는 BLOCKED입니다. single manual card는 그 bound를 증명하지 않습니다.
 
-Record: spawn-receipt identity / visible root and nested card count / pointer and keyboard expand-collapse / compact status-role-timing-summary / raw-transcript absence / optional nested hierarchy / visible omitted/retentionSaturated warning / terminal revisit or reload state.
+Record: spawn-receipt identity / visible root card count / nested activity-row count / pointer and keyboard expand-collapse / compact status-role-timing-summary / raw-transcript absence / optional nested hierarchy / visible `${n} activities omitted.` notice / visible `Retention is saturated.` notice / terminal revisit or reload state.
 
 ### 8.2 Controlled native-batch observation
 
