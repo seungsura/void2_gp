@@ -211,15 +211,17 @@ Expected:
 
 128개를 넘는 event를 안전하게 만들 수 없다면 cap 자체는 `BLOCKED`로 남기고 현재 count와 dropped 표시만 기록하세요.
 
-## 8a. Durable Child activity observation
+## 8. Child activity와 native batch 직접 관찰
+
+### 8.1 Durable Child activity observation
 
 Disposable workspace에서 parent가 exact successful `spawn_agent`를 한 번 완료하는 작은 read-only task를 사용하세요. 성공 receipt가 나온 직후 Child activity를 관찰합니다.
 
-Expected: exact spawn receipt 뒤 하나의 default-closed expandable card가 바로 나타납니다. Pointer와 keyboard로 expand/collapse할 수 있고 compact status, role, timing과 bounded summary만 보입니다. raw tool args나 full child transcript/session은 나타나면 `FAIL`입니다. nested child가 실제로 있으면 optional hierarchy를 기록할 수 있지만 없으면 요구하지 않습니다. terminal card revisit 또는 reload는 **EXPLORATORY/BLOCKED until observed**이며 source fixture를 product persistence PASS로 바꾸지 마세요. thread-level `ChildActivitiesLedger`는 retained root cards에 shared이고 combined total 32 records / UTF-8 64 KiB projection retention이며 separate Queue/Steer inbox envelope와 독립적입니다.
+Expected: exact spawn receipt 뒤 하나의 default-closed expandable card가 바로 나타납니다. Pointer와 keyboard로 expand/collapse할 수 있고 compact status, role, timing과 bounded summary만 보입니다. raw tool args나 full child transcript/session은 나타나면 `FAIL`입니다. nested child가 실제로 있으면 optional hierarchy를 기록할 수 있지만 없으면 요구하지 않습니다. visible omitted/retentionSaturated warning이 있으면 그 표시를 기록하세요. terminal card revisit 또는 reload는 **EXPLORATORY/BLOCKED until observed**이며 source fixture를 product persistence PASS로 바꾸지 마세요. exact thread-level combined 32 records / UTF-8 64 KiB enforcement은 SOURCE/FOCUSED이며 defined storage instrumentation 없이는 BLOCKED입니다. single manual card는 그 bound를 증명하지 않습니다.
 
-Record: spawn-receipt identity / default-closed card count / pointer and keyboard expand-collapse / compact status-role-timing-summary / raw-transcript absence / optional nested hierarchy / ChildActivitiesLedger combined records and UTF-8 projection / terminal revisit or reload state.
+Record: spawn-receipt identity / visible root and nested card count / pointer and keyboard expand-collapse / compact status-role-timing-summary / raw-transcript absence / optional nested hierarchy / visible omitted/retentionSaturated warning / terminal revisit or reload state.
 
-## 8b. Controlled native-batch observation
+### 8.2 Controlled native-batch observation
 
 Provider가 실제로 하나의 native multi-call batch를 emit하는 경우에만 disposable read-only workspace에서 관찰하세요. singleton tool output은 concurrency evidence가 아닙니다.
 
@@ -227,7 +229,7 @@ Expected: batch와 declaration/provider ordinal identity, physical start/complet
 
 Record: native batch evidence / declaration-provider ordinals / physical start-completion sequence / cap-two wave membership / durable settlement sequence / non-safe barrier or exclusive state / next continuation terminal-or-paused state / singleton BLOCKED/INCONCLUSIVE 여부.
 
-## 8. Chat history와 transient composer draft
+## 9. Chat history와 transient composer draft
 
 Landing에서 non-empty Chat A와 B가 newest-first로 보이는지 확인합니다. A를 열면 persistent Chat history가 current composer 아래에 남지 않아야 합니다. Header의 `View Past Chats`를 사용해 New Chat landing으로 돌아갑니다.
 
@@ -241,7 +243,7 @@ Void를 정상 종료하고 같은 portable data로 다시 시작합니다. Expe
 
 Record: landing/current surface / newest-first rows / `View Past Chats` / A/B unsent composer draft / Current row / background status / Delete visibility·focus / composer announcement·Send·Stop / restart 뒤 draft / Queue·Steer inbox record count·UTF-8 bytes·dormant state·auto-send count·explicit Resume count.
 
-## 9. Assistant tool-only/reasoning-only 표시
+## 10. Assistant tool-only/reasoning-only 표시
 
 Temp workspace에서 harmless read-only tool을 한 번 사용하도록 요청하고 assistant/tool trace를 관찰합니다. Provider가 separate reasoning을 지원한다면 별도 prompt에서 display text 없이 짧은 reasoning만 반환하도록 요청할 수 있습니다.
 
@@ -251,7 +253,7 @@ Child가 같은 exact sentinel을 response text로 반환하는 controlled fixtu
 
 Record: provider dialect / native tool-call content shape / visible display / persisted/reloaded display / next-turn outbound evidence가 있으면 그 값 / reasoning bubble / child summary.
 
-## 10. Settings native switch 표시
+## 11. Settings native switch 표시
 
 Normal theme와 dark theme에서 reversible하고 중요하지 않은 visible setting switch 하나를 선택합니다. Accessible name을 기록하고 pointer와 Space를 각각 한 번 사용해 checked state를 바꾼 뒤 원래 값으로 복원합니다. Disabled switch를 안전하게 관찰할 수 있으면 같은 동작을 시도합니다.
 
@@ -261,7 +263,7 @@ Chromium `forced-colors`는 focused emulation evidence이고 Windows OS High Con
 
 Record: setting label / theme / checked·disabled / pointer·Space callback / track·knob·focus count / Chromium emulation인지 Windows OS High Contrast인지.
 
-## 11. Bundled Search와 automatic fallback 경계
+## 12. Bundled Search와 automatic fallback 경계
 
 현재 Project에 이름이 `search-probe-alpha.txt`인 작은 saved file을 만들고 본문에 `SEARCH-PROBE-CONTENT`를 저장한 뒤, Agent가 `search_pathnames_only`와 `search_for_files`로 각각 찾게 하세요.
 
