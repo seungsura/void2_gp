@@ -282,7 +282,8 @@ suite('AGENTS instruction runtime paths', () => {
 		const metrics: unknown[] = [];
 		let preparation = 0;
 		let sends = 0;
-		let toolCalls = 0;
+		let safeReadWaves = 0;
+		let legacyToolCalls = 0;
 		const streamState: Record<string, unknown> = {};
 		const receiver = {
 			state: { allThreads: { task: thread }, overridesOfModel: {} },
@@ -316,7 +317,21 @@ suite('AGENTS instruction runtime paths', () => {
 				abort() { },
 			},
 			_mcpService: { getMCPTools: () => [{ name: 'read_file', mcpServerName: 'local' }] },
-			async _runToolCall() { toolCalls++; return { awaitingUserApproval: false, interrupted: false }; },
+			async _runParentSafeReadWave(threadId: string, calls: readonly { id: string; name: string; rawParams: Record<string, unknown>; ordinal: number }[], batchId: string, receivedSnapshot: unknown, authority: unknown, generation: number, isCurrentRun: () => boolean) {
+				safeReadWaves++;
+				assert.strictEqual(threadId, 'task');
+				assert.strictEqual(receivedSnapshot, instructionSnapshot);
+				assert.strictEqual(Object.isFrozen(receivedSnapshot), true);
+				assert.strictEqual(authority, undefined);
+				assert.strictEqual(generation, parentRun.generation);
+				assert.strictEqual(isCurrentRun, parentRun.isActive);
+				assert.strictEqual(isCurrentRun(), true);
+				assert.strictEqual(calls.length, 1);
+				const call = calls[0];
+				assert.deepStrictEqual({ id: call.id, name: call.name, rawParams: call.rawParams, ordinal: call.ordinal }, { id: 'tool-1', name: 'read_file', rawParams: {}, ordinal: 0 });
+				return [{ call, batchRef: { batchId, batchOrdinal: call.ordinal } }];
+			},
+			async _runToolCall() { legacyToolCalls++; return { awaitingUserApproval: false, interrupted: false }; },
 			_addMessageToThread(_threadId: string, message: unknown) { thread.messages.push(message); },
 			_metricsService: { capture: (...args: unknown[]) => metrics.push(args) },
 		};
@@ -327,7 +342,8 @@ suite('AGENTS instruction runtime paths', () => {
 
 		assert.strictEqual(sends, 3);
 		assert.strictEqual(preparedMessages.length, 2);
-		assert.strictEqual(toolCalls, 1);
+		assert.strictEqual(safeReadWaves, 1);
+		assert.strictEqual(legacyToolCalls, 0);
 		assert.strictEqual(sentMessages[0], sentMessages[1]);
 		assert.strictEqual(sentMessages[0], preparedMessages[0]);
 		assert.strictEqual(sentMessages[2], preparedMessages[1]);
