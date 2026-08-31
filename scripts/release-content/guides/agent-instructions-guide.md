@@ -170,7 +170,7 @@ Content primary는 bounded raw-match budget을 유지합니다. 한 file의 많�
 
 `wait_agent`는 target을 생략하면 current children 전체를 관찰합니다. `targets`를 사용하면 서로 다른 child `1..8`개를 선택할 수 있습니다. 새 terminal, timeout 또는 removed event에 깨어나고 결과 순서는 spawn order를 유지합니다. 이미 전달한 terminal summary는 다시 주입하지 않습니다. `interrupt_agent`는 current generation의 선택된 queued 또는 running child를 취소합니다. Parent Stop은 nested work를 포함한 current group 전체에 fanout합니다. Child failure나 targeted cancellation은 다른 child나 parent 전체를 자동 abort하지 않습니다.
 
-Group은 configured accepted/concurrent/depth로 live work를 조절하고, retained terminal result는 derived aggregate character budget 안에서 보관합니다. budget이 차면 later terminal row와 parent receipt는 남기되 result truncated metadata와 concise diagnostic을 표시합니다. Child/group 전체 wall-clock·turn·cumulative-send quota는 없습니다. finite configured scheduler capacity와 operation timeout은 유지하며, provider dispatch는 actual logical in-flight lease만 센다.
+Group은 configured accepted/concurrent/depth로 live work를 조절하고, retained terminal result는 derived aggregate character budget 안에서 보관합니다. budget이 차면 later terminal row와 parent receipt는 남기되 result truncated metadata와 concise diagnostic을 표시합니다. Child/group 전체 wall-clock·turn·cumulative-send quota는 없습니다. finite configured scheduler capacity와 operation-specific timeout/cancellation은 유지하며, provider dispatch는 actual logical in-flight lease만 센다.
 
 Direct/nested child의 accepted/concurrent state와 result characters는 root group 하나에서 추적됩니다. Nested wait 중인 parent child는 scheduler state를 별도로 표시하지만 별도 quota나 live authority를 만들지 않습니다.
 
@@ -184,9 +184,9 @@ Landing의 Chat history는 non-empty chat을 newest-first로 보여 주며 curre
 
 Current Chat composer는 `Error > Needs approval > Running > unavailable > idle` 상태와 Send/Stop 가능 여부를 같은 기준으로 표시합니다. Running 중에도 draft를 편집할 수 있습니다. 각 chat의 unsent composer draft는 A→B→A 이동에서 독립적으로 복원되지만 memory-only이므로 restart 뒤에는 보존되지 않습니다. 이 draft와 별도로 Queue/Steer pending inbox는 최대 **32 records / UTF-8 64 KiB**로 durable하게 보관됩니다. reload 뒤 inbox는 dormant이며 자동 전송하지 않고, 사용자가 명시적으로 **Resume**하면 한 번만 재개합니다. 이 restart behavior는 source/focused contract이며 actual packaged process-restart E2E는 아직 관찰하지 않았습니다. Escape는 실제 stoppable work만 중단합니다. Live tool card는 elapsed와 exact receipt-scoped Stop 또는 unavailable reason을 표시합니다. approval-only 상태에는 parent Stop이 없고 active child가 함께 있을 때만 child Stop을 제공합니다.
 
-Provider-native multi-tool batch는 durable ordinal identity를 보존하고 provider order로 serial 실행합니다. literal `multi_tool_use.parallel`은 제공하지 않습니다. exact safe read만 최대 **2**개 concurrent로 실행할 수 있으며 mutation, terminal, MCP는 serialized/exclusive입니다. Plan과 orchestration은 main parent의 책임입니다. 새 Plan API/UI/storage와 same-child follow-up은 제공하지 않습니다.
+Provider-native batch는 durable declaration/provider ordinal을 보존합니다. approved contiguous exact-safe-read calls만 physical cap-two waves로 실행할 수 있습니다. physical completion order는 durable tool/provider row settlement를 바꾸지 않으며 non-safe calls는 declaration-order barriers입니다. mutation, terminal, MCP는 serialized/exclusive이고 next provider continuation은 batch terminal or paused까지 기다립니다. literal `multi_tool_use.parallel`은 제공하지 않습니다. Plan과 orchestration은 main parent의 책임입니다. 새 Plan API/UI/storage와 same-child follow-up은 제공하지 않습니다.
 
-Child Run의 transient panel과 별도로 spawn receipt에 묶인 bounded expandable Child activity card가 Chat history에 남을 수 있습니다. 이는 full child transcript/session이 아니며 raw child transcript를 parent history로 복사하지 않습니다.
+Child Run의 transient panel과 별도로 spawn receipt에 묶인 bounded expandable Child activity card가 Chat history에 남을 수 있습니다. 이는 full child transcript/session이 아니며 raw child transcript를 parent history로 복사하지 않습니다. 이 card는 Queue/Steer inbox와 separate own 32 records / UTF-8 64 KiB bound를 가집니다.
 
 ## Assistant message와 native tool-only history
 
