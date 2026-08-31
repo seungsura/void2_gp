@@ -170,7 +170,7 @@ Content primary는 bounded raw-match budget을 유지합니다. 한 file의 많�
 
 `wait_agent`는 target을 생략하면 current children 전체를 관찰합니다. `targets`를 사용하면 서로 다른 child `1..8`개를 선택할 수 있습니다. 새 terminal, timeout 또는 removed event에 깨어나고 결과 순서는 spawn order를 유지합니다. 이미 전달한 terminal summary는 다시 주입하지 않습니다. `interrupt_agent`는 current generation의 선택된 queued 또는 running child를 취소합니다. Parent Stop은 nested work를 포함한 current group 전체에 fanout합니다. Child failure나 targeted cancellation은 다른 child나 parent 전체를 자동 abort하지 않습니다.
 
-Group은 configured accepted/concurrent/depth로 live work를 조절하고, retained terminal result는 derived aggregate character budget 안에서 보관합니다. budget이 차면 later terminal row와 parent receipt는 남기되 result truncated metadata와 concise diagnostic을 표시합니다. Child/group 전체 wall-clock·turn·cumulative-send quota는 없습니다. finite configured scheduler capacity와 operation-specific timeout/cancellation은 유지하며, provider dispatch는 actual logical in-flight lease만 센다.
+Group은 configured accepted/concurrent/depth로 live work를 조절하고, retained terminal result는 derived aggregate character budget 안에서 보관합니다. budget이 차면 later terminal row와 parent receipt는 남기되 result truncated metadata와 concise diagnostic을 표시합니다. Child/group 전체 wall-clock·turn·cumulative-send quota는 없습니다. finite configured scheduler capacity와 operation-specific timeout/cancellation; finite manual run은 whole-run child/group quota 부재를 증명하지 않으며 source/focused 결과와 separate long-running evidence를 구분합니다은 유지하며, provider dispatch는 actual logical in-flight lease만 센다.
 
 Direct/nested child의 accepted/concurrent state와 result characters는 root group 하나에서 추적됩니다. Nested wait 중인 parent child는 scheduler state를 별도로 표시하지만 별도 quota나 live authority를 만들지 않습니다.
 
@@ -186,7 +186,7 @@ Current Chat composer는 `Error > Needs approval > Running > unavailable > idle`
 
 Provider-native batch는 durable declaration/provider ordinal을 보존합니다. approved contiguous exact-safe-read calls만 physical cap-two waves로 실행할 수 있습니다. physical completion order는 durable tool/provider row settlement를 바꾸지 않으며 non-safe calls는 declaration-order barriers입니다. mutation, terminal, MCP는 serialized/exclusive이고 next provider continuation은 batch terminal or paused까지 기다립니다. literal `multi_tool_use.parallel`은 제공하지 않습니다. Plan과 orchestration은 main parent의 책임입니다. 새 Plan API/UI/storage와 same-child follow-up은 제공하지 않습니다.
 
-Child Run의 transient panel과 별도로 spawn receipt에 묶인 bounded expandable Child activity card가 Chat history에 남을 수 있습니다. 이는 full child transcript/session이 아니며 raw child transcript를 parent history로 복사하지 않습니다. 이 card는 Queue/Steer inbox와 separate own 32 records / UTF-8 64 KiB bound를 가집니다.
+Child Run의 transient panel과 별도로 spawn receipt에 묶인 bounded expandable Child activity card가 Chat history에 남을 수 있습니다. 이는 full child transcript/session이 아니며 raw child transcript를 parent history로 복사하지 않습니다. thread-level `ChildActivitiesLedger`는 그 thread의 retained root cards가 공유하며 combined total 32 records / UTF-8 64 KiB projection retention을 적용합니다. 이는 separate Queue/Steer inbox envelope의 32/64 상한과 독립적이고 per-card 상한이 아닙니다.
 
 ## Assistant message와 native tool-only history
 

@@ -211,6 +211,22 @@ Expected:
 
 128개를 넘는 event를 안전하게 만들 수 없다면 cap 자체는 `BLOCKED`로 남기고 현재 count와 dropped 표시만 기록하세요.
 
+## 8a. Durable Child activity observation
+
+Disposable workspace에서 parent가 exact successful `spawn_agent`를 한 번 완료하는 작은 read-only task를 사용하세요. 성공 receipt가 나온 직후 Child activity를 관찰합니다.
+
+Expected: exact spawn receipt 뒤 하나의 default-closed expandable card가 바로 나타납니다. Pointer와 keyboard로 expand/collapse할 수 있고 compact status, role, timing과 bounded summary만 보입니다. raw tool args나 full child transcript/session은 나타나면 `FAIL`입니다. nested child가 실제로 있으면 optional hierarchy를 기록할 수 있지만 없으면 요구하지 않습니다. terminal card revisit 또는 reload는 **EXPLORATORY/BLOCKED until observed**이며 source fixture를 product persistence PASS로 바꾸지 마세요. thread-level `ChildActivitiesLedger`는 retained root cards에 shared이고 combined total 32 records / UTF-8 64 KiB projection retention이며 separate Queue/Steer inbox envelope와 독립적입니다.
+
+Record: spawn-receipt identity / default-closed card count / pointer and keyboard expand-collapse / compact status-role-timing-summary / raw-transcript absence / optional nested hierarchy / ChildActivitiesLedger combined records and UTF-8 projection / terminal revisit or reload state.
+
+## 8b. Controlled native-batch observation
+
+Provider가 실제로 하나의 native multi-call batch를 emit하는 경우에만 disposable read-only workspace에서 관찰하세요. singleton tool output은 concurrency evidence가 아닙니다.
+
+Expected: batch와 declaration/provider ordinal identity, physical start/completion, durable provider/tool row settlement를 기록합니다. approved contiguous exact-safe-read calls만 at-most cap-two physical wave를 만들 수 있고 physical completion order는 durable settlement order를 바꾸지 않습니다. mutation/terminal/MCP와 다른 non-safe call은 declaration-order barrier이며 exclusive입니다. next provider continuation은 batch terminal or paused까지 기다려야 합니다. singleton output이면 **BLOCKED/INCONCLUSIVE**로 기록하고 parallelism PASS로 바꾸지 마세요. literal `multi_tool_use.parallel`은 제공되지 않습니다.
+
+Record: native batch evidence / declaration-provider ordinals / physical start-completion sequence / cap-two wave membership / durable settlement sequence / non-safe barrier or exclusive state / next continuation terminal-or-paused state / singleton BLOCKED/INCONCLUSIVE 여부.
+
 ## 8. Chat history와 transient composer draft
 
 Landing에서 non-empty Chat A와 B가 newest-first로 보이는지 확인합니다. A를 열면 persistent Chat history가 current composer 아래에 남지 않아야 합니다. Header의 `View Past Chats`를 사용해 New Chat landing으로 돌아갑니다.
@@ -259,4 +275,4 @@ Record: saved file / pathname result / content result / approval count / termina
 
 ## 해석 주의
 
-이 릴리스는 direct custom role, configured depth nesting, `read_only`와 brokered `inherit_parent_write` profile을 지원합니다. Spawn receipt에 묶인 bounded expandable Child activity card는 지원하지만 full child transcript/session은 아닙니다. 이 card는 Queue/Steer inbox와 separate own 32 records / UTF-8 64 KiB bound를 가집니다. Child/group whole-run wall-clock·turn·cumulative-send quota는 없으며 configured scheduler capacity, operation-specific timeout/cancellation과 actual logical in-flight provider-dispatch lease를 사용합니다. Provider-native batch는 durable declaration/provider ordinal을 보존합니다. approved contiguous exact-safe-read calls만 physical cap-two waves로 실행할 수 있고 physical completion order는 durable tool/provider row settlement를 바꾸지 않습니다. non-safe calls는 declaration-order barriers이며 mutation/terminal/MCP는 serialized/exclusive입니다. next provider continuation은 batch terminal or paused까지 기다리고 literal `multi_tool_use.parallel`은 없습니다. Plan/orchestration은 main parent가 소유하며 새 Plan API/UI/storage와 same-child follow-up은 없습니다. Persistent group/automatic Queue·Steer resend/restart replay, invalid configured values와 arbitrary live provider/tool/permission elevation은 지원하지 않습니다. 정식 package gate에는 fixed startup, controlled Chat과 project instruction child UI 관찰이 포함되지만, 테스트 중 다른 동작이 보이더라도 지원 계약으로 일반화하지 말고 실제 trace와 재현 조건을 기록하세요. Source fixture, compile, React/Windows build와 visible artifact smoke는 general provider matrix, token usage 또는 performance를 증명하지 않습니다.
+이 릴리스는 direct custom role, configured depth nesting, `read_only`와 brokered `inherit_parent_write` profile을 지원합니다. Spawn receipt에 묶인 bounded expandable Child activity card는 지원하지만 full child transcript/session은 아닙니다. thread-level `ChildActivitiesLedger`는 retained root cards에 shared이며 combined total 32 records / UTF-8 64 KiB projection retention을 적용합니다. 이는 separate Queue/Steer inbox envelope의 32/64 상한과 독립적이고 per-card 상한이 아닙니다. Child/group whole-run wall-clock·turn·cumulative-send quota는 없으며 configured scheduler capacity, operation-specific timeout/cancellation과 actual logical in-flight provider-dispatch lease를 사용합니다. finite manual run은 whole-run child/group quota 부재를 증명하지 않으며, 그 부재는 source/focused 결과이고 separate long-running evidence가 필요합니다. Provider-native batch는 durable declaration/provider ordinal을 보존합니다. approved contiguous exact-safe-read calls만 physical cap-two waves로 실행할 수 있고 physical completion order는 durable tool/provider row settlement를 바꾸지 않습니다. non-safe calls는 declaration-order barriers이며 mutation/terminal/MCP는 serialized/exclusive입니다. next provider continuation은 batch terminal or paused까지 기다리고 literal `multi_tool_use.parallel`은 없습니다. Child tool disclosure는 `plan`, `update_plan`, `todowrite` 같은 mutable Plan surface를 omit하며 이것이 new parent Plan API를 뜻하지는 않습니다. Plan/orchestration은 main parent가 소유하며 새 Plan API/UI/storage와 same-child follow-up은 없습니다. Persistent group/automatic Queue·Steer resend/restart replay, invalid configured values와 arbitrary live provider/tool/permission elevation은 지원하지 않습니다. 정식 package gate에는 fixed startup, controlled Chat과 project instruction child UI 관찰이 포함되지만, 테스트 중 다른 동작이 보이더라도 지원 계약으로 일반화하지 말고 실제 trace와 재현 조건을 기록하세요. Source fixture, compile, React/Windows build와 visible artifact smoke는 general provider matrix, token usage 또는 performance를 증명하지 않습니다.
