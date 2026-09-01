@@ -18,6 +18,9 @@ export const VOID_SETTINGS_STORAGE_KEY = 'void.settingsServiceStorageII'
 // 1.0.3
 export const THREAD_STORAGE_KEY = 'void.chatThreadStorageII'
 
+// 1.0.4. Individual records avoid a stale window replacing unrelated history.
+export const THREAD_STORAGE_RECORD_PREFIX = 'void.chatThreadStorageIII.'
+
 // Deliberately separate from model-visible chat history. Pending busy-composer input
 // survives a restart as dormant work and is never replayed automatically.
 export const PENDING_CHAT_INPUT_STORAGE_KEY = 'void.pendingChatInputStorageI'

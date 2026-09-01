@@ -8,7 +8,7 @@ import { closeNativeToolBatchForProspectiveAdmission, ConvertToLLMMessageService
 import { projectAgentConfig, resolveAgentInstructions, stableAgentInstructionRevision } from '../../common/agentInstructions.js';
 import { createSkillCatalog } from '../../common/agentSkills.js';
 import { assistantMessagePresentation, INTERNAL_EMPTY_MESSAGE_SENTINEL, sanitizeAssistantDisplayContent } from '../../common/assistantMessagePresentation.js';
-import { PENDING_CHAT_INPUT_STORAGE_KEY, THREAD_STORAGE_KEY } from '../../common/storageKeys.js';
+import { PENDING_CHAT_INPUT_STORAGE_KEY, THREAD_STORAGE_RECORD_PREFIX } from '../../common/storageKeys.js';
 import { StorageScope } from '../../../../../platform/storage/common/storage.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { Severity } from '../../../../../platform/notification/common/notification.js';
@@ -434,7 +434,7 @@ suite('Assistant message lifecycle', () => {
 			_mcpService: { getMCPTools: () => [] },
 			_metricsService: { capture() { } },
 			_setStreamState(threadId: string, value: any) { streamState[threadId] = value; if (value?.llmInfo) streamDisplays.push(value.llmInfo.displayContentSoFar); },
-			_storageService: { store(key: string, value: string) { assert.strictEqual(key, THREAD_STORAGE_KEY); serializedThreads = value; } },
+			_storageService: { get() { return undefined; }, keys() { return []; }, store(key: string, value: string) { assert.strictEqual(key, `${THREAD_STORAGE_RECORD_PREFIX}task`); serializedThreads = value; } },
 			_storeAllThreads(threads: any) { return (ChatThreadService.prototype as any)._storeAllThreads.call(this, threads); },
 			_setState(value: any) { this.state = { ...this.state, ...value }; },
 			_addMessageToThread(threadId: string, message: any) {
@@ -451,7 +451,7 @@ suite('Assistant message lifecycle', () => {
 
 		const stored = receiver.state.allThreads.task.messages.at(-1);
 		assert.strictEqual(stored.role, 'assistant');
-		const persisted = JSON.parse(serializedThreads).task.messages.at(-1);
+		const persisted = JSON.parse(serializedThreads).thread.messages.at(-1);
 		const presentation = assistantMessagePresentation(stored);
 		assert.deepStrictEqual({
 			requestContent,

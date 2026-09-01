@@ -31,7 +31,7 @@ import { IVoidModelService } from '../common/voidModelService.js';
 import { findLast } from '../../../../base/common/arraysFind.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { truncate } from '../../../../base/common/strings.js';
-import { PENDING_CHAT_INPUT_STORAGE_KEY, THREAD_STORAGE_KEY } from '../common/storageKeys.js';
+import { PENDING_CHAT_INPUT_STORAGE_KEY, THREAD_STORAGE_KEY, THREAD_STORAGE_RECORD_PREFIX } from '../common/storageKeys.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { timeout } from '../../../../base/common/async.js';
 import { deepClone } from '../../../../base/common/objects.js';
@@ -288,6 +288,13 @@ type ChatThreads = {
 	[id: string]: undefined | ThreadType;
 }
 
+type ThreadStorageEnvelope = {
+	version: 1;
+	revision: number;
+	deleted?: true;
+	thread?: ThreadType;
+}
+
 
 export type ThreadsState = {
 	allThreads: ChatThreads;
@@ -481,6 +488,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 	readonly streamState: ThreadStreamState = {}
 	state: ThreadsState // allThreads is persisted, currentThread is not
+	/** The blank view belongs to this service until a durable change materializes it. */
+	private _localEmptyThreadId: string | undefined;
+	private _didReadLegacyThreadStorage = false;
 
 	constructor(
 		@IStorageService private readonly _storageService: IStorageService,
@@ -508,13 +518,13 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const readThreads = this._readAllThreads() || {}
 
 		const allThreads = readThreads
-		this.state = {
-			allThreads: allThreads,
-			currentThreadId: null as unknown as string, // gets set in startNewThread()
-		}
+		// Keep the empty initial state while importing legacy records so each
+		// imported thread is written as its own record rather than as a map.
+		if (this._didReadLegacyThreadStorage) this._storeAllThreads(allThreads)
+		this.state = { allThreads, currentThreadId: null as unknown as string }
 		this._restoreInstructionTurns(allThreads)
 		this._restorePendingChatInputs()
-		this._storeAllThreads(allThreads)
+		this._registerExternalThreadStorageListener()
 		this._register(this._agentSubagentService.onDidChangeRun(event => this._applyChildActivityEvent(event.parentId, event.generation, event.id)));
 
 		// always be in a thread
@@ -845,9 +855,12 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		this._instructionTurnOfThread?.delete(threadId)
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return
-		delete thread.state.agentInstructionTurnSnapshot
+		const state = { ...thread.state }
+		delete state.agentInstructionTurnSnapshot
+		const allThreads = { ...this.state.allThreads, [threadId]: { ...thread, state } }
 		// Persist security metadata removal before a later provider or tool action.
-		this._storeAllThreads?.(this.state.allThreads)
+		this._storeAllThreads?.(allThreads)
+		this.state = { ...this.state, allThreads }
 	}
 	private _restoreInstructionTurns(threads: ChatThreads) {
 		this._instructionTurnOfThread.clear()
@@ -870,8 +883,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return
 		// Persist this non-UI metadata before provider/tool work can begin.
-		thread.state.agentInstructionTurnSnapshot = snapshot
-		this._storeAllThreads(this.state.allThreads)
+		const allThreads = { ...this.state.allThreads, [threadId]: { ...thread, state: { ...thread.state, agentInstructionTurnSnapshot: snapshot } } }
+		this._storeAllThreads(allThreads)
+		this.state = { ...this.state, allThreads }
 	}
 
 	async focusCurrentChat() {
@@ -926,6 +940,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		this._transientComposerDraftOfThread.clear()
 		for (const quiescence of this._runQuiescenceOfThread.values()) quiescence.releaseAwaitingApproval?.()
 		this._pendingChatInputsOfThread.clear(); this._drainingPendingChatInputs.clear(); this._runQuiescenceOfThread.clear(); this._startingParentRunOfThread?.clear(); this._stopAndSendFlights.clear(); this._storePendingChatInputs()
+		// Tombstone the exact former records before dropping this window's map.
+		this._storeAllThreads({})
+		this._tombstoneAllStoredThreads()
 		this.state = { allThreads: {}, currentThreadId: null as unknown as string } // see constructor
 		this._deletingPendingInputThreads.clear()
 		this.openNewThread()
@@ -961,23 +978,101 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	}
 
 	private _readAllThreads(): ChatThreads | null {
-		const threadsStr = this._storageService.get(THREAD_STORAGE_KEY, StorageScope.APPLICATION);
-		if (!threadsStr) {
-			return null
+		const threads: ChatThreads = {}
+		let foundRecords = false
+		for (const key of this._storageService.keys(StorageScope.APPLICATION, StorageTarget.USER)) {
+			if (!key.startsWith(THREAD_STORAGE_RECORD_PREFIX)) continue
+			const id = this._threadIdFromStorageKey(key)
+			const envelope = id && this._readThreadEnvelope(key, id)
+			if (!id || !envelope) continue
+			foundRecords = true
+			if (envelope.thread && !envelope.deleted) threads[id] = envelope.thread
 		}
-		const threads = this._convertThreadDataFromStorage(threadsStr);
-		this._storeAllThreads(threads);
-		return threads
+		if (foundRecords) return threads
+		const legacy = this._storageService.get(THREAD_STORAGE_KEY, StorageScope.APPLICATION)
+		if (!legacy) return null
+		this._didReadLegacyThreadStorage = true
+		return this._convertThreadDataFromStorage(legacy)
+	}
+	private _registerExternalThreadStorageListener(): void {
+		this._register(this._storageService.onDidChangeValue(StorageScope.APPLICATION, undefined, this._store)(event => {
+			if (event.external && event.key.startsWith(THREAD_STORAGE_RECORD_PREFIX)) this._applyExternalThreadRecord(event.key)
+		}))
 	}
 
 	private _storeAllThreads(threads: ChatThreads) {
-		const serializedThreads = JSON.stringify(threads);
-		this._storageService.store(
-			THREAD_STORAGE_KEY,
-			serializedThreads,
-			StorageScope.APPLICATION,
-			StorageTarget.USER
-		);
+		// Call sites build an immutable candidate map. Persist just the changed
+		// record, so a stale map can never overwrite unrelated threads.
+		const before = this.state?.allThreads ?? {}
+		const ids = new Set([...Object.keys(before), ...Object.keys(threads)])
+		for (const id of ids) {
+			const previous = before[id]
+			const next = threads[id]
+			if (previous === next) continue
+			if (!next) { if (previous) this._storeThreadTombstone(id); continue }
+			if (this._isUnmaterializedEmptyThread(next)) continue
+			this._storeThreadRecord(id, next)
+		}
+	}
+
+	private _threadStorageKey(id: string): string { return `${THREAD_STORAGE_RECORD_PREFIX}${encodeURIComponent(id)}` }
+	private _threadIdFromStorageKey(key: string): string | undefined {
+		if (!key.startsWith(THREAD_STORAGE_RECORD_PREFIX)) return undefined
+		try { const id = decodeURIComponent(key.slice(THREAD_STORAGE_RECORD_PREFIX.length)); return id && this._threadStorageKey(id) === key ? id : undefined } catch { return undefined }
+	}
+	private _isUnmaterializedEmptyThread(thread: ThreadType): boolean {
+		return thread.id === this._localEmptyThreadId && thread.messages.length === 0 && thread.childActivities.records.length === 0 && thread.state.stagingSelections.length === 0 && Object.keys(thread.state.linksOfMessageIdx).length === 0 && !thread.state.agentInstructionTurnSnapshot
+	}
+	private _readThreadEnvelope(key: string, id: string): ThreadStorageEnvelope | undefined {
+		const raw = this._storageService.get(key, StorageScope.APPLICATION)
+		if (!raw) return undefined
+		try {
+			const parsed = JSON.parse(raw) as ThreadStorageEnvelope
+			if (!parsed || parsed.version !== 1 || !Number.isSafeInteger(parsed.revision) || parsed.revision < 1 || (parsed.deleted !== true && !parsed.thread)) return undefined
+			if (parsed.deleted) return { version: 1, revision: parsed.revision, deleted: true }
+			const thread = this._convertThreadDataFromStorage(JSON.stringify({ [id]: parsed.thread }))[id]
+			return thread?.id === id ? { version: 1, revision: parsed.revision, thread } : undefined
+		} catch { return undefined }
+	}
+	private _nextThreadRevision(key: string): number {
+		const id = this._threadIdFromStorageKey(key); const current = id && this._readThreadEnvelope(key, id)
+		return (current?.revision ?? 0) + 1
+	}
+	private _storeThreadRecord(id: string, thread: ThreadType): void {
+		const key = this._threadStorageKey(id)
+		// Once a delivered delete is visible, a stale same-thread writer must not
+		// recreate it. New threads have fresh UUIDs, so fail closed is safe.
+		const current = this._readThreadEnvelope(key, id)
+		if (current?.deleted) return
+		this._storageService.store(key, JSON.stringify({ version: 1, revision: (current?.revision ?? 0) + 1, thread } satisfies ThreadStorageEnvelope), StorageScope.APPLICATION, StorageTarget.USER)
+	}
+	private _storeThreadTombstone(id: string): void {
+		const key = this._threadStorageKey(id)
+		this._storageService.store(key, JSON.stringify({ version: 1, revision: this._nextThreadRevision(key), deleted: true } satisfies ThreadStorageEnvelope), StorageScope.APPLICATION, StorageTarget.USER)
+	}
+	private _tombstoneAllStoredThreads(): void {
+		for (const key of this._storageService.keys(StorageScope.APPLICATION, StorageTarget.USER)) {
+			const id = this._threadIdFromStorageKey(key)
+			if (!id || !this._readThreadEnvelope(key, id)) continue
+			this._storeThreadTombstone(id)
+		}
+	}
+	private _applyExternalThreadRecord(key: string): void {
+		const id = this._threadIdFromStorageKey(key); if (!id) return
+		const envelope = this._readThreadEnvelope(key, id); if (!envelope) return
+		const locallyActive = !!this.streamState[id]?.isRunning || this._pendingChatSubmissionOfThread?.has(id) || this._runQuiescenceOfThread?.has(id) || this._startingParentRunOfThread?.has(id) || this._parentRunTokenOfThread?.has(id)
+		if (locallyActive) return
+		const allThreads = { ...this.state.allThreads }
+		if (envelope.deleted) delete allThreads[id]
+		else if (envelope.thread) {
+			const local = allThreads[id]
+			// History is shared; mounted controls and composer ownership are not.
+			allThreads[id] = local ? { ...envelope.thread, state: { ...envelope.thread.state, mountedInfo: local.state.mountedInfo, stagingSelections: local.state.stagingSelections, focusedMessageIdx: local.state.focusedMessageIdx } } : envelope.thread
+		}
+		else return
+		// Do not use _setState: it rebuilds mount data and settles interrupted runs.
+		this.state = { ...this.state, allThreads }
+		this._onDidChangeCurrentThread.fire()
 	}
 
 
@@ -3279,17 +3374,13 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 
 	openNewThread() {
-		// if a thread with 0 messages already exists, switch to it
+		// Only this window's unmaterialized blank view is reusable. Persisted
+		// empty history belongs to another window (or an earlier session).
 		const { allThreads: currentThreads } = this.state
-		for (const threadId in currentThreads) {
-			if (currentThreads[threadId]!.messages.length === 0 && currentThreads[threadId]!.childActivities.records.length === 0) {
-				// switch to the existing empty thread and exit
-				this.switchToThread(threadId)
-				return
-			}
-		}
+		if (this._localEmptyThreadId && currentThreads[this._localEmptyThreadId] && this._isUnmaterializedEmptyThread(currentThreads[this._localEmptyThreadId]!)) { this.switchToThread(this._localEmptyThreadId); return }
 		// otherwise, start a new thread
 		const newThread = newThreadObject()
+		this._localEmptyThreadId = newThread.id
 
 		// update state
 		const newThreads: ChatThreads = {
