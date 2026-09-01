@@ -19,6 +19,7 @@ const draftReceiver = () => {
 	value._pendingChatInputsOfThread = new Map<string, unknown[]>();
 	value._drainingPendingChatInputs = new Set<string>();
 	value._runQuiescenceOfThread = new Map<string, unknown>();
+	value._startingParentRunOfThread = new Map<string, unknown>(); value._deferredExternalThreadKey = new Map<string, string>();
 	value._startingParentRunOfThread = new Map<string, unknown>();
 	value._deletingPendingInputThreads = new Set<string>();
 	value._stopAndSendFlights = new Map<string, Promise<void>>();

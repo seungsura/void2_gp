@@ -1105,8 +1105,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			delete allThreads[id]
 			this._clearExternallyDeletedThreadMetadata(id)
 			if (this.state.currentThreadId === id) {
-				const blank = newThreadObject(); this._localEmptyThreadId = blank.id
-				this.state = { allThreads: { ...allThreads, [blank.id]: blank }, currentThreadId: blank.id }
+				const existing = this._localEmptyThreadId && allThreads[this._localEmptyThreadId] && this._isUnmaterializedEmptyThread(allThreads[this._localEmptyThreadId]!) ? allThreads[this._localEmptyThreadId]! : undefined
+				const blank = existing ?? newThreadObject(); this._localEmptyThreadId = blank.id
+				this.state = { allThreads: existing ? allThreads : { ...allThreads, [blank.id]: blank }, currentThreadId: blank.id }
 				this._notificationService.info('This chat was deleted in another window.')
 				this._onDidChangeCurrentThread.fire(); return
 			}
@@ -1123,9 +1124,14 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		this._onDidChangeCurrentThread.fire()
 	}
 	private _clearExternallyDeletedThreadMetadata(threadId: string): void {
+		this._setStreamState(threadId, undefined)
 		this.clearTransientComposerDraft(threadId)
 		this._pendingChatSubmissionOfThread.delete(threadId)
-		this._setPendingChatInputs(threadId, [])
+		// Do not rewrite the aggregate workspace inbox from a stale window. The
+		// removed thread's rows are locally inaccessible now; startup compaction
+		// filters them against restored threads and writes normalized bytes later.
+		this._pendingChatInputsOfThread.delete(threadId)
+		this._onDidChangePendingChatInputs.fire({ threadId })
 		this._drainingPendingChatInputs.delete(threadId); this._startingParentRunOfThread.delete(threadId); this._runQuiescenceOfThread.delete(threadId); this._parentRunTokenOfThread.delete(threadId); this._deferredExternalThreadKey.delete(threadId)
 		for (const key of this._stopAndSendFlights.keys()) if (key.startsWith(`${threadId}\u0000`)) this._stopAndSendFlights.delete(key)
 		this._agentInstructionSessionOfThread.delete(threadId); this._instructionTurnOfThread.delete(threadId); this._revokeAgentDelegation(threadId, true); this._agentControlGeneration.delete(threadId)
@@ -2722,7 +2728,11 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	}
 	private _releaseAwaitingApprovalQuiescence(threadId: string, drain = true): void {
 		const current = this._runQuiescenceOfThread.get(threadId)
-		if (!current?.releaseAwaitingApproval) return
+		if (!current) {
+			if (drain) { this._applyDeferredExternalThreadRecordIfQuiescent(threadId); if (this.state.allThreads[threadId]) void this._drainPendingChatInputs(threadId) }
+			return
+		}
+		if (!current.releaseAwaitingApproval) return
 		this._runQuiescenceOfThread.delete(threadId)
 		current.releaseAwaitingApproval()
 		this._releaseUndeliveredSteers(threadId, current)

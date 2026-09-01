@@ -133,6 +133,7 @@ const createPendingInboxReceiver = (options?: { storage?: Map<string, string>; o
 		_transientComposerDraftOfThread: new Map(),
 		_agentControlGeneration: new Map([['task', 0]]),
 		_parentRunTokenOfThread: new Map(),
+		_deferredExternalThreadKey: new Map(),
 		_workspaceContextService: { getWorkspace: () => ({ folders: context.owner ? [{ uri: URI.parse(context.owner) }] : [] }) },
 		_workspaceTrustManagementService: { isWorkspaceTrusted: () => context.trusted },
 		_storageService: {

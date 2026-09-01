@@ -93,7 +93,13 @@ suite('Void per-thread chat storage', () => {
 	test('applies an idle selected tombstone to a fresh local blank without leaving a dangling current id', () => {
 		const hub = new SharedApplicationStorageHub(); const client = hub.client(); const w = receiver(client, 'A'); w.state.allThreads = { A: thread('A') }; w._transientComposerDraftOfThread.set('A', 'draft'); w._instructionTurnOfThread.set('A', {}); w._pendingChatInputsOfThread.set('A', [{}]);
 		client.store(key('A'), JSON.stringify({ version: 1, revision: 2, deleted: true })); w._applyExternalThreadRecord(key('A'));
-		assert.ok(w.state.allThreads[w.state.currentThreadId]); assert.notStrictEqual(w.state.currentThreadId, 'A'); assert.strictEqual(w.state.allThreads.A, undefined); assert.strictEqual(w._transientComposerDraftOfThread.has('A'), false); assert.strictEqual(w._instructionTurnOfThread.has('A'), false); assert.strictEqual(w._pendingChatInputsOfThread.has('A'), false); assert.strictEqual(JSON.parse(client.get(key('A'))!).deleted, true); assert.strictEqual(w.notifications.length, 1);
+		assert.ok(w.state.allThreads[w.state.currentThreadId]); assert.notStrictEqual(w.state.currentThreadId, 'A'); assert.strictEqual(w.getCurrentThread().id, w.state.currentThreadId); assert.strictEqual(w.state.allThreads.A, undefined); assert.strictEqual(w._transientComposerDraftOfThread.has('A'), false); assert.strictEqual(w._instructionTurnOfThread.has('A'), false); assert.strictEqual(w._pendingChatInputsOfThread.has('A'), false); assert.strictEqual(JSON.parse(client.get(key('A'))!).deleted, true); assert.strictEqual(w.notifications.length, 1);
+	});
+
+	test('reuses its existing unmaterialized local blank after selected external delete', () => {
+		const hub = new SharedApplicationStorageHub(); const client = hub.client(); const w = receiver(client, 'A'); const blank = thread('local-blank'); w._localEmptyThreadId = blank.id; w.state.allThreads = { A: thread('A'), [blank.id]: blank };
+		client.store(key('A'), JSON.stringify({ version: 1, revision: 1, deleted: true })); w._applyExternalThreadRecord(key('A'));
+		assert.strictEqual(w.state.currentThreadId, blank.id); assert.deepStrictEqual(Object.keys(w.state.allThreads), [blank.id]);
 	});
 
 	test('defers an active tombstone until quiescence, then clears local metadata exactly once', () => {
