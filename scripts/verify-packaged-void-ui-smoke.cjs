@@ -241,6 +241,7 @@ function launchEnvironment(mode, home, fakeEndpoint, developmentAppRoot) {
 	return env;
 }
 async function waitVisible(locator, label) { await locator.waitFor({ state: 'visible', timeout: timeoutMs }); if (!(await locator.isVisible())) throw new Error(`${label} was not visible.`); }
+function getChatComposer(page) { return page.getByRole('combobox', { name: 'Chat message', exact: true }); }
 async function waitForCurrentRunToSettle(page) {
 	await page.locator('#void-chat-current-stop:visible').waitFor({ state: 'hidden', timeout: timeoutMs });
 }
@@ -284,7 +285,7 @@ async function selectFixtureAgent(page, chat) {
 async function runFakeAcceptance(page, evidence, fakeServer) {
 	await assertNoOnboarding(page); evidence.assertions.push('fixed-start-without-onboarding');
 	const luna = page.getByTestId('void-corporate-model-display'); await waitVisible(luna, 'Fixed Luna model label'); if ((await luna.innerText()).trim() !== 'gpt-5.6-luna') throw new Error('Fixed model label was not gpt-5.6-luna.'); await assertFixedAgentOnlyComposer(luna); evidence.assertions.push('fixed-visible-luna-model');
-	const chat = page.getByRole('textbox', { name: 'Chat message' }); const send = page.getByRole('button', { name: 'Send message', exact: true }); await waitVisible(chat, 'Chat composer'); await waitVisible(send, 'Chat send'); if (!(await send.isDisabled())) throw new Error('Empty Chat Send control was enabled.'); evidence.assertions.push('chat-empty-send-disabled');
+	const chat = getChatComposer(page); const send = page.getByRole('button', { name: 'Send message', exact: true }); await waitVisible(chat, 'Chat composer'); await waitVisible(send, 'Chat send'); if (!(await send.isDisabled())) throw new Error('Empty Chat Send control was enabled.'); evidence.assertions.push('chat-empty-send-disabled');
 	await assertSettings(page); evidence.assertions.push('settings-project-delegation-and-defaults');
 	await waitVisible(chat, 'Chat composer after Settings'); await selectFixtureAgent(page, chat); await chat.fill('Inspect the fixture with the selected Agent.'); await send.click(); await fakeServer.waitForChild();
 	if (!evidence.transport.pathExact || !evidence.transport.wireModelGpt41 || !evidence.transport.parentAgentsMarker || !evidence.transport.parentConfigMarker || !evidence.transport.parentSpawnAgentControlTool || evidence.transport.childRequests !== 1 || !evidence.transport.childRoleMarker || !evidence.transport.childReadOnlyToolsExact || !evidence.transport.childControlToolsAbsent) throw new Error('Fixed route, project instructions, parent control, or read-only child tool contract did not reach fake provider.');
@@ -306,7 +307,7 @@ async function runFakeAcceptance(page, evidence, fakeServer) {
 async function runProductionAcceptance(page, electronApp, evidence) {
 	await assertNoOnboarding(page); evidence.assertions.push('fixed-start-without-onboarding');
 	const luna = page.getByTestId('void-corporate-model-display'); await waitVisible(luna, 'Fixed Luna model label'); if ((await luna.innerText()).trim() !== 'gpt-5.6-luna') throw new Error('Fixed model label was not gpt-5.6-luna.'); await assertFixedAgentOnlyComposer(luna);
-	const chat = page.getByRole('textbox', { name: 'Chat message' }); const send = page.getByRole('button', { name: 'Send message', exact: true }); await waitVisible(chat, 'Chat composer'); await chat.fill('Reply with exactly OK. Do not use tools.'); await send.click();
+	const chat = getChatComposer(page); const send = page.getByRole('button', { name: 'Send message', exact: true }); await waitVisible(chat, 'Chat composer'); await chat.fill('Reply with exactly OK. Do not use tools.'); await send.click();
 	let counters;
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
