@@ -190,7 +190,7 @@ Exact prompt:
 fixture-writer child에게 먼저 undo-fixture.txt를 읽고 beta를 gamma로 바꾸는 write_file modify 하나만 준비하게 하세요. Approval이 필요하면 제가 승인할 때까지 실행하지 말고, 완료 뒤 file bytes와 Undo availability만 보고하세요.
 ```
 
-Expected: Exact selected role이 `spawn_agent.agent_type = fixture-writer`를 pin하고 durable Child Activity card의 frozen parent tool snapshot에 실제 available tools, required approval categories와 Undo가 표시됩니다. Child는 live tool lookup이나 terminal 우회 없이 parent broker를 사용하며 captured parent approval policy가 적용됩니다. Manual approval policy이면 composer-adjacent Approve/Reject card settlement 전에 mutation하지 않습니다. 승인 또는 captured auto-approval 뒤 file은 `alpha\ngamma\n`, 한 Undo 뒤 `alpha\nbeta\n`로 복원돼야 합니다. 동시에 다른 mutation-capable child를 시작하면 lease를 공유해 mutation이 겹치지 않습니다. Parent history/stream에 child tool request가 일반 parent request로 나타나면 `FAIL`입니다.
+Expected: Exact selected role이 `spawn_agent.agent_type = fixture-writer`를 pin합니다. Durable Child Activity card shows role/description when present, coarse capability, status, timing, and bounded summary/truncation/nesting/retention notices. Only the separate pending approval card shows title, category, parameters, and Approve/Reject. Frozen tool names and Undo availability are not shown on either card; verify them separately in the broker/tool trace and actual file state. Child는 live tool lookup이나 terminal 우회 없이 parent broker를 사용하며 captured parent approval policy가 적용됩니다. Manual approval policy이면 pending approval card settlement 전에 mutation하지 않습니다. 승인 또는 captured auto-approval 뒤 file은 `alpha\ngamma\n`, 한 Undo 뒤 `alpha\nbeta\n`로 복원돼야 합니다. 동시에 다른 mutation-capable child를 시작하면 lease를 공유해 mutation이 겹치지 않습니다. Parent history/stream에 child tool request가 일반 parent request로 나타나면 `FAIL`입니다.
 
 승인 UI, inherited write tool 또는 Undo가 현재 route에서 없으면 mutation을 시도하지 말고 `BLOCKED`로 기록합니다. Test가 끝나면 fixture와 role을 제거하세요.
 
@@ -204,7 +204,8 @@ Expected:
 
 - composer-adjacent approval card에 pending child tool의 title, category, parameters와 Approve/Reject가 보입니다;
 - child capacity, status, timing, diagnostics, technical metadata와 frozen profile details는 composer에 나타나지 않습니다;
-- spawn receipt에 묶인 durable Child Activity card는 active/terminal status와 timing을 계속 표시합니다;
+- spawn receipt에 묶인 durable Child Activity card는 role/description, coarse capability, active/terminal status, timing과 bounded summary/truncation/nesting/retention notice만 표시합니다;
+- frozen tool names, approval category와 Undo availability를 durable card에서 찾지 말고 approval card, broker/tool trace와 실제 file state를 각각 확인합니다;
 - approval 전에는 mutation하지 않고, Reject 뒤에도 durable card/history가 사라지지 않습니다.
 
 Local trace의 first `128 events`, dropped count와 provider `Usage unavailable`은 SOURCE/FOCUSED contract이며 이 composer UI 관찰에서 직접 요구하지 않습니다. prompt, transcript, tool arguments, path, raw error와 child summary가 diagnostic event body로 노출된다고 가정하지 마세요.

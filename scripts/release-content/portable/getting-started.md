@@ -42,7 +42,7 @@ max_depth = 1
 
 `max_accepted_children`와 `max_concurrent_threads_per_session`은 양의 정수이고 concurrent는 accepted 이하이어야 합니다. `max_depth`는 0 이상 정수입니다. 이 값에는 별도 고정 상한이 없으며, 잘못된 값이나 unknown key는 bounded diagnostic을 만들고 authority를 확대하지 않습니다.
 
-Custom role은 `capability_profile = "read_only"` 또는 `capability_profile = "inherit_parent_write"`를 사용할 수 있습니다. 먼저 `read_only`와 작은 read task로 role을 확인하세요. Inherited profile을 확인할 때에는 폐기 가능한 fixture file 하나만 사용하고, durable Child Activity card의 frozen tool list·Undo와 composer-adjacent manual approval Approve/Reject를 확인한 뒤 원래 bytes로 되돌리세요. 중요한 workspace에서 permission 경계를 처음 시험하지 마세요.
+Custom role은 `capability_profile = "read_only"` 또는 `capability_profile = "inherit_parent_write"`를 사용할 수 있습니다. 먼저 `read_only`와 작은 read task로 role을 확인하세요. Inherited profile을 확인할 때에는 폐기 가능한 fixture file 하나만 사용하세요. manual approval policy에서도 다음 UI 경계를 유지합니다. Durable Child Activity card shows role/description when present, coarse capability, status, timing, and bounded summary/truncation/nesting/retention notices. Only the separate pending approval card shows title, category, parameters, and Approve/Reject. Frozen tool names and Undo availability are not shown on either card; verify them separately in the broker/tool trace and actual file state. 승인 뒤 실제 bytes와 editor Undo를 직접 확인하고 원래 bytes로 되돌리세요. 중요한 workspace에서 permission 경계를 처음 시험하지 마세요.
 
 지원 경로와 precedence, top-level turn reload, `$`/`@` Skill selector, optional `@Agent`, custom role, default/override limits와 shared nested group budget은 [Agent instructions 안내](guides/agent-instructions-guide.md)를 먼저 읽으세요. 이어 [직접 테스트 프롬프트](prompts/agent-instructions-test-prompts.md)에서 named role, targeted `wait_agent`/`interrupt_agent`, read-only와 inherited profile, current Chat layout을 작은 fixture로 관찰하세요.
 

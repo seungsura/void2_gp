@@ -127,6 +127,88 @@ const buildChildActivityHistoryRuntime = async (sidebarPath: string, servicesPat
 	catch (error) { fs.rmSync(temporaryRoot, { recursive: true, force: true }); throw error; }
 };
 
+/** Bundles the exported production SidebarChat unchanged while replacing only its
+ * external dependencies with a deterministic browser fixture. This exercises the
+ * real landing/current branches and their real child approval/activity call sites. */
+const buildMountedSidebarRuntime = async (sidebarPath: string) => {
+	const sourceRoot = path.resolve(process.cwd()); const temporaryRoot = fs.mkdtempSync(path.join(sourceRoot, '.mounted-sidebar-chat-'));
+	assert.ok(temporaryRoot.startsWith(`${sourceRoot}${path.sep}`));
+	const entry = path.join(temporaryRoot, 'entry.tsx'); const outDir = path.join(temporaryRoot, 'out');
+	const relativeSidebar = path.relative(temporaryRoot, sidebarPath).replaceAll('\\', '/'); const importPath = relativeSidebar.startsWith('.') ? relativeSidebar : `./${relativeSidebar}`;
+	let sidebarLoads = 0; const dependencyLoads = new Map<string, number>();
+	fs.writeFileSync(entry, `
+		import React from 'react'; import { createRoot } from 'react-dom/client'; import { flushSync } from 'react-dom'; import { SidebarChat } from ${JSON.stringify(importPath)};
+		const approvals: unknown[] = []; const rejections: unknown[] = [];
+		const approvalKey = Object.freeze({ parentId: 'thread-current', generation: 7, childId: 'child-root', batchId: 'batch-1', batchOrdinal: 0, toolId: 'write-tool-1', snapshotRevision: 'snapshot-r1' });
+		const approval = Object.freeze({ key: approvalKey, structuralKey: JSON.stringify(['thread-current', 7, 'child-root', 'batch-1', 0, 'write-tool-1', 'snapshot-r1']), title: 'write_file', childShortId: 'child-ro', toolKind: 'builtin', category: 'edits', parameters: '{"uri":"fixture.txt"}', toolName: 'write_file', status: 'awaiting' });
+		const mountedInfo = { mountedIsResolvedRef: { current: true } };
+		const landingThread: any = { id: 'thread-landing', messages: [], state: { stagingSelections: [], mountedInfo }, childActivities: { version: 1, records: [], omitted: 0, retentionSaturated: false } };
+		const receipt: any = { role: 'tool', type: 'success', name: 'spawn_agent', id: 'spawn-receipt', batchId: 'batch-1', batchOrdinal: 0, params: {}, rawParams: {}, result: { id: 'child-root' }, content: 'spawn receipt' };
+		const durable: any = { generation: 7, childId: 'child-root', depth: 1, status: 'completed', capabilityProfile: 'read_only', queuedMs: 5, runningMs: 85, totalMs: 90, summary: 'DURABLE_DONE', role: { name: 'reader', description: 'Reads the workspace' }, anchor: { toolId: 'spawn-receipt', batchId: 'batch-1', batchOrdinal: 0 } };
+		const currentThread: any = { id: 'thread-current', messages: [receipt], state: { stagingSelections: [], mountedInfo }, childActivities: { version: 1, records: [durable], omitted: 0, retentionSaturated: false } };
+		const activeRun: any = { id: 'child-root', generation: 7, depth: 1, status: 'running', queuedMs: 10, runningMs: 1240, totalMs: 1250, summary: 'LIVE_OVERLAY', shortId: 'child-ro', statusLabel: 'Running', capabilityProfile: 'read_only', authority: { runtimeRevision: 'r', instructionsRevision: 'i', catalogRevision: 'c', selectedSkills: [] } };
+		const fixture: any = { mode: 'landing', approval, approvals, rejections, landingThread, currentThread, activeRun };
+		const service: any = { state: { currentThreadId: 'thread-landing' }, getCurrentThread: () => fixture.mode === 'landing' ? landingThread : currentThread, getTransientComposerDraft: () => '', setCurrentThreadState() {}, setTransientComposerDraft() {}, setCurrentlyFocusedMessageIdx() {}, clearSubmittedComposerState() {}, submitPendingInput: () => false, beginUserMessageAndStreamResponse: () => Promise.resolve(), abortRunning: () => Promise.resolve(), dismissStreamError() {}, editPendingInput: () => false, deletePendingInput: () => false, reorderPendingInput: () => false, resumePendingInput: () => false, approveChildToolApproval: (key: unknown) => approvals.push(key), rejectChildToolApproval: (key: unknown) => rejections.push(key) };
+		fixture.service = service; (globalThis as any).__sidebarChatFixtureState = fixture;
+		let root: ReturnType<typeof createRoot> | undefined; const render = () => { service.state.currentThreadId = fixture.mode === 'landing' ? landingThread.id : currentThread.id; flushSync(() => root!.render(<SidebarChat key={fixture.mode} />)); };
+		(window as any).__mountedSidebarChat = { approvals, rejections, approvalKey, approvalIdentity: () => approvals[0] === approvalKey, rejectionIdentity: () => rejections[0] === approvalKey, keyFrozen: () => Object.isFrozen(approvalKey), mount(node: HTMLElement) { root = createRoot(node); render(); }, setMode(mode: 'landing' | 'current') { fixture.mode = mode; render(); }, dispose() { flushSync(() => root?.unmount()); } };
+	`, 'utf8');
+	const modules: Record<string, string> = {
+		'../util/services.js': `
+			const state = () => (globalThis as any).__sidebarChatFixtureState;
+			const generic = new Proxy({}, { get: (_target, key) => typeof key === 'string' && key.startsWith('onDidChange') ? () => ({ dispose() {} }) : () => undefined });
+			export const useAccessor = () => ({ get(id: string) { if (id === 'IChatThreadService') return state().service; if (id === 'ICommandService') return { executeCommand: () => Promise.resolve() }; if (id === 'IKeybindingService') return { lookupKeybinding: () => undefined }; if (id === 'IEditCodeService') return { acceptOrRejectAllDiffAreas() {} }; if (id === 'IVoidSettingsService') return { setOptionsOfModelSelection() {} }; return generic; } });
+			export const useChatThreadsState = () => { const thread = state().mode === 'landing' ? state().landingThread : state().currentThread; return { currentThreadId: thread.id, allThreads: { [thread.id]: thread } }; };
+			export const useChatThreadsStreamState = () => undefined; export const usePendingChatInputs = () => []; export const usePendingChatSubmission = () => undefined;
+			export const useSettingsState = () => ({ modelSelectionOfFeature: { Chat: undefined }, optionsOfModelSelection: { Chat: {} }, overridesOfModel: {} }); export const useActiveURI = () => ({});
+			export const useAgentSubagentLiveSnapshot = () => ({ runs: [state().activeRun], budget: undefined, diagnostics: undefined }); export const useChildToolApprovals = () => [state().approval]; export const useCommandBarState = () => ({ stateOfURI: {}, sortedURIs: [] });
+		`,
+		'../../../../../../../editor/common/editorCommon.js': `export const ScrollType = { Immediate: 0 };`,
+		'../markdown/ChatMarkdownRender.js': `import React from 'react'; export const ChatMarkdownRender = ({ markdown }: any) => <span>{markdown}</span>; export const ChatMessageLocation = {}; export const getApplyBoxId = () => 'apply-box';`,
+		'../../../../../../../base/common/uri.js': `export class URI { fsPath = ''; static file(value: string) { const uri = new URI(); uri.fsPath = value; return uri; } }`,
+		'../../../../../../../base/common/lifecycle.js': `export type IDisposable = { dispose(): void };`,
+		'./ErrorDisplay.js': `import React from 'react'; export const ErrorDisplay = ({ message }: any) => <div>{message}</div>;`,
+		'../util/inputs.js': `import React from 'react'; export type TextAreaFns = { setValue(value: string): void }; export const VoidInputBox2 = React.forwardRef<HTMLTextAreaElement, any>(({ initValue, ariaLabel, ariaDescribedBy, onChangeText, onKeyDown, onFocus }: any, ref) => <textarea ref={ref} defaultValue={initValue} aria-label={ariaLabel} aria-describedby={ariaDescribedBy} onChange={event => onChangeText?.(event.currentTarget.value)} onKeyDown={onKeyDown} onFocus={onFocus} />); export const BlockCode = ({ children }: any) => <pre>{children}</pre>; export const VoidSlider = () => null; export const VoidSwitch = () => null;`,
+		'../void-settings-tsx/ModelDropdown.js': `import React from 'react'; export const ModelDropdown = () => <span data-testid='model-dropdown'>gpt-5.6-luna</span>;`,
+		'./SidebarThreadSelector.js': `import React from 'react'; export const PastThreadsList = () => <div>Past threads</div>;`,
+		'../../../actionIDs.js': `export const VOID_CTRL_L_ACTION_ID = 'void.ctrl-l';`,
+		'../../../voidSettingsPane.js': `export const VOID_OPEN_SETTINGS_ACTION_ID = 'void.open-settings';`,
+		'../../../../../../../workbench/contrib/void/common/voidSettingsTypes.js': `export type FeatureName = string; export const displayInfoOfProviderName = () => ({ title: 'OpenAI Compatible' }); export const isFeatureNameDisabled = () => false;`,
+		'../../../../../../../platform/commands/common/commands.js': `export type ICommandService = any;`,
+		'../void-settings-tsx/WarningBox.js': `import React from 'react'; export const WarningBox = ({ text }: any) => <div>{text}</div>;`,
+		'../../../../common/modelCapabilities.js': `export const getModelCapabilities = () => ({ reasoningCapabilities: undefined }); export const getIsReasoningEnabledState = () => false;`,
+		'lucide-react': `import React from 'react'; const Icon = ({ size: _size, ...props }: any) => <span aria-hidden='true' {...props} />; export { Icon as AlertTriangle, Icon as File, Icon as Ban, Icon as Check, Icon as ChevronRight, Icon as Dot, Icon as FileIcon, Icon as Pencil, Icon as Undo, Icon as Undo2, Icon as X, Icon as Flag, Icon as Copy, Icon as Info, Icon as CirclePlus, Icon as Ellipsis, Icon as CircleEllipsis, Icon as Folder, Icon as ALargeSmall, Icon as TypeOutline, Icon as Text };`,
+		'../../../../common/chatThreadServiceTypes.js': `export type ChatMessage = any; export type StagingSelectionItem = any; export type ToolMessage<T = any> = any;`,
+		'../../../../common/agentSubagents.js': `export type AgentSubagentRunView = any; export type ChildActivitiesLedger = any; export type ChildActivityRecord = any; export type ChildToolApprovalView = any; export const isActiveChildRun = (run: any) => run.status === 'queued' || run.status === 'running';`,
+		'../../../../common/chatCurrentStatusPresentation.js': `export type ChatCurrentStatusPresentation = any; export const canSubmitChatCurrent = () => false; export const getChatCurrentStatusPresentation = ({ childActive }: any) => ({ kind: childActive ? 'running' : 'idle', liveLabel: childActive ? 'Running' : undefined, detail: childActive ? 'Esc to stop' : 'Enter to send', announcement: childActive ? 'Running · Esc to stop' : 'Enter to send', showStop: childActive, sendDisabled: childActive, textarea: { ariaLabel: 'Chat message', ariaDescribedBy: 'status-help' }, statusHelp: { id: 'status-help' }, controls: { send: { id: 'send', ariaLabel: 'Send message', title: 'Send message' }, stop: { id: 'stop', ariaLabel: 'Stop active child run', title: 'Stop active child run' } } });`,
+		'../../../../common/chatComposerSubmission.js': `export const submitChatComposer = async ({ submit }: any) => submit();`,
+		'../../../chatThreadService.js': `export type PendingChatInput = any; export type PendingInputMode = 'queue' | 'steer' | 'stop_and_send';`,
+		'../../../../common/toolsServiceTypes.js': `export type BuiltinToolCallParams = any; export type BuiltinToolName = string; export type ToolName = string; export type LintErrorItem = any; export type ToolApprovalType = string; export const approvalTypeOfBuiltinToolName = () => undefined; export const toolApprovalTypes: string[] = [];`,
+		'../markdown/ApplyBlockHoverButtons.js': `import React from 'react'; export const CopyButton = () => null; export const JumpToFileButton = () => null; export const JumpToTerminalButton = () => null; export const StatusIndicator = ({ title }: any) => <span>{title}</span>; export const IconShell1 = ({ Icon, ...props }: any) => <button type='button' {...props}>{Icon ? <Icon /> : null}</button>; export const useApplyStreamState = () => undefined;`,
+		'../../../../common/helpers/colors.js': `export const acceptAllBg = ''; export const acceptBorder = ''; export const buttonFontSize = ''; export const buttonTextColor = ''; export const rejectAllBg = ''; export const rejectBg = ''; export const rejectBorder = '';`,
+		'../../../../common/prompt/prompts.js': `export const builtinToolNames: string[] = []; export const isABuiltinToolName = () => false; export const MAX_TERMINAL_INACTIVE_TIME = 1000;`,
+		'./ErrorBoundary.js': `import React from 'react'; export default function ErrorBoundary({ children }: any) { return <>{children}</>; }`,
+		'../void-settings-tsx/Settings.js': `import React from 'react'; export const ToolApprovalTypeSwitch = () => null;`,
+		'../../../terminalToolService.js': `export const persistentTerminalNameOfId = (id: string) => id;`,
+		'../../../../common/mcpServiceTypes.js': `export const removeMCPToolNamePrefix = (name: string) => name;`,
+		'../../../../common/applicationToolPresentation.js': `export const applicationToolRoute = (name: string) => name === 'spawn_agent' ? 'application' : 'mcp'; export const applicationToolPresentation = (name: string) => name === 'spawn_agent' ? { title: 'Start child Agent', status: 'Completed', resultDetail: 'spawn receipt' } : undefined; export const shouldOfferGenericToolApproval = () => false;`,
+		'../../../../common/assistantMessagePresentation.js': `export const assistantMessagePresentation = () => ({ displayContent: '', reasoning: undefined });`,
+		'../../../../common/chatHistoryPresentation.js': `export const shouldShowPersistentChatHistory = () => false;`,
+	};
+	try {
+		await build({
+			entry: { runtime: entry }, outDir, format: ['iife'], globalName: 'MountedSidebarChatRuntime', splitting: false, clean: true, platform: 'browser', target: 'es2022', silent: true, noExternal: [/^(?!\.).*$/], treeshake: true,
+			esbuildPlugins: [{ name: 'mounted-sidebar-chat-dependencies', setup(buildContext) {
+				buildContext.onLoad({ filter: /[\\/]src2[\\/]sidebar-tsx[\\/]SidebarChat\.tsx$/ }, args => { assert.strictEqual(path.resolve(args.path), path.resolve(sidebarPath)); sidebarLoads += 1; return undefined; });
+				buildContext.onResolve({ filter: /.*/ }, args => { if (path.resolve(args.importer) !== path.resolve(sidebarPath) || args.path === 'react' || args.path === 'react/jsx-runtime') return undefined; assert.ok(Object.hasOwn(modules, args.path), `Missing mounted SidebarChat dependency shim: ${args.path}`); return { path: args.path, namespace: 'mounted-sidebar-dependency' }; });
+				buildContext.onLoad({ filter: /.*/, namespace: 'mounted-sidebar-dependency' }, args => { dependencyLoads.set(args.path, (dependencyLoads.get(args.path) ?? 0) + 1); return { contents: modules[args.path], loader: 'tsx', resolveDir: sourceRoot }; });
+			} }], esbuildOptions(options) { options.outbase = temporaryRoot; },
+		});
+		assert.strictEqual(sidebarLoads, 1, 'Expected the actual exported generated SidebarChat module exactly once.'); assert.ok(dependencyLoads.size >= 20, `Expected broad dependency isolation for SidebarChat, got ${dependencyLoads.size}.`);
+		const outputs = findJavaScriptFiles(outDir); assert.strictEqual(outputs.length, 1); return { script: read(outputs[0]), dispose: () => fs.rmSync(temporaryRoot, { recursive: true, force: true }) };
+	} catch (error) { fs.rmSync(temporaryRoot, { recursive: true, force: true }); throw error; }
+};
+
 suite('Child Run live timing', function () {
 	this.timeout(20_000);
 	test('refreshes the three views together while active and clears its only timer', async () => {
@@ -170,18 +252,29 @@ suite('Child Run live timing', function () {
 		} finally { await browser?.close(); runtime.dispose(); skippedRuntime.dispose(); }
 	});
 	test('keeps a durable child card beside its exact spawn receipt without changing transcript indices', async function () {
-		this.timeout(40_000);
+		this.timeout(60_000);
 		const sidebarPath = path.join(process.cwd(), 'src', 'vs', 'workbench', 'contrib', 'void', 'browser', 'react', 'src2', 'sidebar-tsx', 'SidebarChat.tsx');
 		const servicesPath = path.join(process.cwd(), 'src', 'vs', 'workbench', 'contrib', 'void', 'browser', 'react', 'src2', 'util', 'services.tsx');
 		const source = read(sidebarPath); assert.ok(source.includes('childActivityInterleavePlan')); assert.ok(source.includes('messageIdx={previousMessages.length}')); assert.ok(source.includes('streamingChatIdx = previousMessages.length'));
-		const runtime = await buildChildActivityHistoryRuntime(sidebarPath, servicesPath); let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
+		const mountedSidebarRuntime = await buildMountedSidebarRuntime(sidebarPath); const runtime = await buildChildActivityHistoryRuntime(sidebarPath, servicesPath); let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
 		try {
 			browser = await chromium.launch({ headless: true }); const page = await browser.newPage(); const errors: string[] = []; const consoleErrors: string[] = []; page.on('pageerror', error => errors.push(error.message)); page.on('console', message => { if (message.type() === 'error') consoleErrors.push(message.text()); });
+			await page.setContent('<!doctype html><div id="sidebar-root"></div>'); await page.addScriptTag({ content: mountedSidebarRuntime.script }); assert.strictEqual(await page.evaluate(() => typeof (window as any).__mountedSidebarChat?.mount), 'function', `mounted SidebarChat runtime failed before registration: ${errors.join('\n')}`); await page.locator('#sidebar-root').evaluate(node => (window as any).__mountedSidebarChat.mount(node));
+			const staleComposerDetails = ['Child Run', 'Provider requests:', 'Result retention:', 'Child diagnostics', 'frozen profile', 'technical metadata'];
+			const landingApproval = page.locator('[aria-label="Child tool approvals"]'); assert.strictEqual(await landingApproval.count(), 1); assert.strictEqual(await landingApproval.evaluate(node => node.parentElement?.children.length), 1, 'Landing composer ancillary area must contain only the pending approval surface.');
+			for (const stale of staleComposerDetails) assert.strictEqual(await page.getByText(stale, { exact: false }).count(), 0, `Landing SidebarChat leaked composer child progress: ${stale}`);
+			const exactApprovalKey = { parentId: 'thread-current', generation: 7, childId: 'child-root', batchId: 'batch-1', batchOrdinal: 0, toolId: 'write-tool-1', snapshotRevision: 'snapshot-r1' };
+			await page.getByRole('button', { name: 'Approve write_file for child child-ro' }).click(); assert.deepStrictEqual(await page.evaluate(() => (window as any).__mountedSidebarChat.approvals), [exactApprovalKey]); assert.deepStrictEqual(await page.evaluate(() => (window as any).__mountedSidebarChat.rejections), []); assert.strictEqual(await page.evaluate(() => (window as any).__mountedSidebarChat.approvalIdentity()), true); assert.strictEqual(await page.evaluate(() => (window as any).__mountedSidebarChat.keyFrozen()), true);
+			await page.evaluate(() => (window as any).__mountedSidebarChat.setMode('current'));
+			const currentApproval = page.locator('[aria-label="Child tool approvals"]'); assert.strictEqual(await currentApproval.count(), 1); for (const stale of staleComposerDetails) assert.strictEqual(await page.getByText(stale, { exact: false }).count(), 0, `Current SidebarChat leaked composer child progress: ${stale}`);
+			const mountedCard = page.locator('[data-testid=child-activity-card]'); assert.strictEqual(await mountedCard.count(), 1); assert.ok((await mountedCard.evaluate(node => node.previousElementSibling?.textContent))?.includes('Start child Agent'), 'Durable card must be the next transcript element after the exact spawn receipt.');
+			const mountedSummary = mountedCard.locator('summary'); assert.strictEqual(await mountedSummary.getAttribute('aria-label'), 'Child Activity child-ro running'); assert.ok((await mountedSummary.textContent())?.includes('1250ms')); await mountedSummary.click(); assert.ok((await mountedCard.textContent())?.includes('LIVE_OVERLAY')); assert.ok((await mountedCard.textContent())?.includes('1240ms running')); assert.strictEqual((await mountedCard.textContent())?.includes('DURABLE_DONE'), false); assert.strictEqual((await mountedCard.textContent())?.includes('90ms total'), false);
+			await page.getByRole('button', { name: 'Reject write_file for child child-ro' }).click(); assert.deepStrictEqual(await page.evaluate(() => (window as any).__mountedSidebarChat.rejections), [exactApprovalKey]); assert.strictEqual(await page.evaluate(() => (window as any).__mountedSidebarChat.rejectionIdentity()), true); await page.evaluate(() => (window as any).__mountedSidebarChat.dispose());
 			await page.setContent('<!doctype html><div id="root"></div>'); await page.addScriptTag({ content: runtime.script }); assert.strictEqual(await page.evaluate(() => typeof (window as any).__childActivityHistory?.mount), 'function', `history runtime failed before registration: ${errors.join('\n')}`); await page.locator('#root').evaluate(node => (window as any).__childActivityHistory.mount(node));
 			assert.deepStrictEqual(await page.locator('main > *').evaluateAll(nodes => nodes.map(node => node.getAttribute('data-message') ?? node.getAttribute('data-testid'))), ['0', '1', 'child-activity-card', '2']); assert.strictEqual(await page.locator('[data-testid=child-activity-card]').count(), 1); assert.strictEqual(await page.locator('text=RAW_TRANSCRIPT').count(), 0); const approvals = page.locator('[aria-label="Child tool approvals"]'); assert.strictEqual(await approvals.count(), 1); assert.strictEqual(await page.getByRole('button', { name: 'Approve write_file for child root' }).count(), 1); assert.strictEqual(await page.locator('text=Child Run').count(), 0); assert.strictEqual(await approvals.getByText('LIVE_PROGRESS').count(), 0); assert.strictEqual(await page.locator('[aria-live=polite]').count(), 0); assert.strictEqual(await page.locator('[data-testid=child-activity-card] [aria-live]').count(), 0);
 			const card = page.locator('[data-testid=child-activity-card]'); const summary = card.locator('summary'); assert.strictEqual(await page.evaluate(() => (window as any).__childActivityHistory.timers()), 1); assert.deepStrictEqual(await page.evaluate(() => (window as any).__childActivityHistory.listeners()), { run: 2, diagnostics: 1, persistence: 1 }); assert.strictEqual(await card.evaluate(node => (node as HTMLDetailsElement).open), false); await summary.focus(); await summary.click(); assert.strictEqual(await card.evaluate(node => (node as HTMLDetailsElement).open), true); await summary.press('Enter'); assert.strictEqual(await card.evaluate(node => (node as HTMLDetailsElement).open), false); await summary.press(' '); assert.strictEqual(await card.evaluate(node => (node as HTMLDetailsElement).open), true); assert.strictEqual(await summary.evaluate(node => document.activeElement === node), true); assert.ok((await card.textContent())?.includes('LIVE_PROGRESS')); assert.ok((await card.textContent())?.includes('NESTED_LIVE'));
 			await page.evaluate(() => (window as any).__childActivityHistory.advance(1_000)); assert.ok((await card.textContent())?.includes('1010ms')); assert.strictEqual(await page.evaluate(() => (window as any).__childActivityHistory.storageWrites()), 0);
 			await page.evaluate(() => (window as any).__childActivityHistory.settle()); assert.strictEqual(await page.evaluate(() => (window as any).__childActivityHistory.sameCard()), true); assert.ok((await card.textContent())?.includes('DURABLE_TERMINAL')); assert.strictEqual(await page.locator('text=LIVE_PROGRESS').count(), 0); assert.strictEqual(await page.evaluate(() => (window as any).__childActivityHistory.storageWrites()), 1); assert.strictEqual(await page.evaluate(() => (window as any).__childActivityHistory.timers()), 0); await page.evaluate(() => (window as any).__childActivityHistory.dispose()); assert.strictEqual(await page.evaluate(() => (window as any).__childActivityHistory.timers()), 0); assert.deepStrictEqual(await page.evaluate(() => (window as any).__childActivityHistory.listeners()), { run: 0, diagnostics: 0, persistence: 0 }); assert.deepStrictEqual(errors, []); assert.deepStrictEqual(consoleErrors, []);
-		} finally { await browser?.close(); runtime.dispose(); }
+		} finally { await browser?.close(); runtime.dispose(); mountedSidebarRuntime.dispose(); }
 	});
 });

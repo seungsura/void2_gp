@@ -19,6 +19,11 @@ $PolarityExactPositive=$PolarityExactPrefix+([string][char]0xC788+[char]0xACE0)
 $PolarityExactGuidePositive=$PolarityExactPrefix+([string][char]0xC788+[char]0xC2B5+[char]0xB2C8+[char]0xB2E4)
 $PolarityExactNegative=$PolarityExactPrefix+([string][char]0xC5C6+[char]0xACE0)
 $PolarityExactGuideNegative=$PolarityExactPrefix+([string][char]0xC5C6+[char]0xC2B5+[char]0xB2C8+[char]0xB2E4)
+$ChildActivityVisible='Durable Child Activity card shows role/description when present, coarse capability, status, timing, and bounded summary/truncation/nesting/retention notices.'
+$ChildApprovalVisible='Only the separate pending approval card shows title, category, parameters, and Approve/Reject.'
+$ChildCardHidden='Frozen tool names and Undo availability are not shown on either card; verify them separately in the broker/tool trace and actual file state.'
+$ChildActivityOverclaim='Durable Child Activity card shows capacity, failure details, frozen tool names, approval category, and Undo availability.'
+$ChildApprovalOverclaim='Durable Child Activity card shows title, category, parameters, and Approve/Reject.'
 
 function Write-FixtureText {
     param([string]$Path,[string]$Text,[switch]$Bom,[switch]$Empty)
@@ -67,14 +72,16 @@ function Assert-Throws {
 
 function Assert-ProductionReleaseContentSemanticPolarity {
     param([hashtable]$SourceTexts)
+    $childSurfaceClauses=@($ChildActivityVisible,$ChildApprovalVisible,$ChildCardHidden)
     $requiredBySource=[ordered]@{
-        'README.md'=@($PolarityPerCardPositive,$PolarityFinitePositive,$PolarityExactPositive)
-        'guides/agent-instructions-guide.md'=@($PolarityPerCardPositive,$PolarityFinitePositive,$PolarityExactGuidePositive)
-        'portable/README.md'=@($PolarityPerCardPositive,$PolarityFinitePositive,$PolarityExactPositive)
-        'portable/release-notes.md'=@($PolarityPerCardPositive,$PolarityFinitePositive,$PolarityExactPositive)
-        'prompts/agent-instructions-test-prompts.md'=@($PolarityPerCardPositive,$PolarityFinitePositive,$PolarityExactPositive,'visible root card count','nested activity-row count','activities omitted.','Retention is saturated.')
+        'README.md'=@($PolarityPerCardPositive,$PolarityFinitePositive,$PolarityExactPositive)+$childSurfaceClauses
+        'guides/agent-instructions-guide.md'=@($PolarityPerCardPositive,$PolarityFinitePositive,$PolarityExactGuidePositive)+$childSurfaceClauses
+        'portable/getting-started.md'=$childSurfaceClauses
+        'portable/README.md'=@($PolarityPerCardPositive,$PolarityFinitePositive,$PolarityExactPositive)+$childSurfaceClauses
+        'portable/release-notes.md'=@($PolarityPerCardPositive,$PolarityFinitePositive,$PolarityExactPositive)+$childSurfaceClauses
+        'prompts/agent-instructions-test-prompts.md'=@($PolarityPerCardPositive,$PolarityFinitePositive,$PolarityExactPositive,'visible root card count','nested activity-row count','activities omitted.','Retention is saturated.')+$childSurfaceClauses
     }
-    $staleNegative=@($PolarityPerCardNegative,$PolarityFiniteNegative,$PolarityExactNegative,$PolarityExactGuideNegative,'Child Run panel','Child Run UI')
+    $staleNegative=@($PolarityPerCardNegative,$PolarityFiniteNegative,$PolarityExactNegative,$PolarityExactGuideNegative,'Child Run panel','Child Run UI',$ChildActivityOverclaim,$ChildApprovalOverclaim)
     foreach($source in $requiredBySource.Keys){
         if(-not $SourceTexts.ContainsKey($source)){throw "Production semantic source is missing: $source"}
         $text=[string]$SourceTexts[$source]
@@ -189,6 +196,8 @@ try {
     $productionUserText=(@($productionPlans|ForEach-Object{$Utf8NoBom.GetString([byte[]]$_.Bytes)})) -join "`n"
     $productionSourceTexts=@{};foreach($entry in $production.Entries){$productionSourceTexts[[string]$entry.Source]=[string]$entry.SourceText};Assert-ProductionReleaseContentSemanticPolarity $productionSourceTexts;Add-Pass 'production per-source semantic polarity clauses'
     foreach($source in @('README.md','guides/agent-instructions-guide.md','portable/README.md','portable/release-notes.md','prompts/agent-instructions-test-prompts.md')){$mutated=@{};foreach($key in $productionSourceTexts.Keys){$mutated[$key]=[string]$productionSourceTexts[$key]};$mutated[$source]=$mutated[$source].Replace($PolarityPerCardPositive,$PolarityPerCardNegative);Assert-Throws "per-source semantic helper rejects per-card inversion: $source" {Assert-ProductionReleaseContentSemanticPolarity $mutated}}
+    foreach($source in @('README.md','guides/agent-instructions-guide.md','portable/getting-started.md','portable/README.md','portable/release-notes.md','prompts/agent-instructions-test-prompts.md')){$mutated=@{};foreach($key in $productionSourceTexts.Keys){$mutated[$key]=[string]$productionSourceTexts[$key]};$mutated[$source]+="`n$ChildActivityOverclaim`n";Assert-Throws "per-source semantic helper rejects disconnected Child Activity overclaim: $source" {Assert-ProductionReleaseContentSemanticPolarity $mutated}}
+    $approvalOverclaim=@{};foreach($key in $productionSourceTexts.Keys){$approvalOverclaim[$key]=[string]$productionSourceTexts[$key]};$approvalOverclaim['prompts/agent-instructions-test-prompts.md']+="`n$ChildApprovalOverclaim`n";Assert-Throws 'semantic helper rejects approval controls on durable activity card' {Assert-ProductionReleaseContentSemanticPolarity $approvalOverclaim}
     foreach($mutation in @(
         [pscustomobject]@{Name='per-card ledger scope inversion';Source='README.md';From=$PolarityPerCardPositive;To=$PolarityPerCardNegative},
         [pscustomobject]@{Name='finite manual run evidence inversion';Source='guides/agent-instructions-guide.md';From=$PolarityFinitePositive;To=$PolarityFiniteNegative},
@@ -246,6 +255,7 @@ try {
         [pscustomobject]@{Name='exact-safe-read execution inversion';From=$PolarityExactPositive;To=$PolarityExactNegative}
     )){if(-not $productionReadme.Contains($mutation.From)){throw "Outer mutation fixture source clause is missing: $($mutation.Name)"};$mutatedOuterPath=Join-Path $currentRoot ("semantic-$($mutation.Name.Replace(' ','-')).zip");New-CurrentOuterFixtureZip $mutatedOuterPath $currentPortablePath $production -ReadmeOverride $productionReadme.Replace($mutation.From,$mutation.To);Assert-Throws "outer semantic mutation rejected: $($mutation.Name)" {Assert-OuterArchive $mutatedOuterPath|Out-Null}}
     $productionGuide=[string](@($production.Entries|Where-Object{$_.Source -ceq 'guides/agent-instructions-guide.md'})[0].SourceText);if(-not $productionGuide.Contains($PolarityExactGuidePositive)){throw 'Outer guide mutation fixture source clause is missing.'};$mutatedGuideOuterPath=Join-Path $currentRoot 'semantic-guide-exact-safe-read-execution-inversion.zip';New-CurrentOuterFixtureZip $mutatedGuideOuterPath $currentPortablePath $production -TextOverridesByPath @{'guides/agent-instructions-guide.md'=$productionGuide.Replace($PolarityExactGuidePositive,$PolarityExactGuideNegative)};Assert-Throws 'outer semantic mutation rejected: guide exact-safe-read execution inversion' {Assert-OuterArchive $mutatedGuideOuterPath|Out-Null}
+    $mutatedChildSurfaceOuterPath=Join-Path $currentRoot 'semantic-child-surface-overclaim.zip';New-CurrentOuterFixtureZip $mutatedChildSurfaceOuterPath $currentPortablePath $production -ReadmeOverride ($productionReadme+"`n$ChildActivityOverclaim`n$ChildApprovalOverclaim`n");Assert-Throws 'outer semantic mutation rejected: disconnected Child card overclaims' {Assert-OuterArchive $mutatedChildSurfaceOuterPath|Out-Null}
     $priorCurrentOuterPath=Join-Path $currentRoot 'Void-9.9.9-prior-current-win32-x64-distribution-bundle.zip';New-CurrentOuterFixtureZip $priorCurrentOuterPath $currentPortablePath $production -ReadmeOverride "# prior current snapshot`n4 accepted`n";$priorCurrentHistorical=Assert-OuterArchive $priorCurrentOuterPath $currentPortableMeta -HistoricalArchive;if($priorCurrentHistorical.DocsLayout -cne 'current' -or $priorCurrentHistorical.Entries -ne 11 -or $priorCurrentHistorical.OuterDocsCount -ne 9 -or $priorCurrentHistorical.ChecksumRecordCount -ne 10 -or $priorCurrentHistorical.SharedDocsCount -ne 8 -or $priorCurrentHistorical.InnerSha256 -cne $currentPortableMeta.Sha256){throw 'Historical prior-current outer did not preserve current-layout structure, checksums, shared bytes, and inner identity.'};Add-Pass 'historical prior-current semantic drift preserves structural pair validation';$strictPriorCurrentError=$null;try{Assert-OuterArchive $priorCurrentOuterPath $currentPortableMeta|Out-Null}catch{$strictPriorCurrentError=$_.Exception.Message};$expectedPriorError='Outer current release content is missing required semantic polarity clause: README.md / '+$PolarityPerCardPositive;if($strictPriorCurrentError -cne $expectedPriorError){throw "Strict prior-current semantic failure mismatch: $strictPriorCurrentError"};Add-Pass 'strict current rejects prior-current stale semantics'
 
     $partialZip=Join-Path $positive.Root 'partial.zip';New-DocsFixtureZip $partialZip $positiveManifest partial;Assert-Throws 'partial docs rejected' {Test-DocsFixtureZip $partialZip $positiveManifest|Out-Null}

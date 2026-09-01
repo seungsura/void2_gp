@@ -158,7 +158,7 @@ Terminal, file write/edit/delete, MCP와 app tool은 제공하지 않으며 runt
 
 이 role은 admission 때 parent가 가진 current authority, owner/root/CWD/trust와 frozen parent tool snapshot을 capture합니다. Child는 그 exact snapshot의 unique built-in/MCP entry만 parent broker를 통해 호출할 수 있습니다. Live settings, catalog 또는 tool lookup으로 새 tool을 얻거나 parent보다 높은 approval/permission으로 elevation하지 않습니다.
 
-Frozen available tool names, required approval categories, Undo availability와 no-OS-sandbox application boundary는 spawn receipt에 묶인 durable Child Activity card에서 확인합니다. Captured parent approval policy가 적용되며 manual approval policy인 built-in/MCP mutation은 composer-adjacent approval card의 Approve/Reject를 통과해야 합니다. `write_file`은 child-owned read receipt와 editor Undo transaction을 유지합니다. 동시에 lease를 갖는 one mutation-capable child만 허용됩니다. Cancellation은 provider/broker/underlying result settlement와 stale-result fence를 통과한 뒤 lease를 놓으며 nested child도 같은 mutation/concurrency/group budget을 사용합니다. Parent history와 parent stream tool request는 child broker가 수정하지 않습니다.
+Captured parent approval policy가 적용되며 manual approval policy인 built-in/MCP mutation은 composer-adjacent approval card의 Approve/Reject를 통과해야 합니다. `write_file`은 child-owned read receipt와 editor Undo transaction을 유지합니다. 동시에 lease를 갖는 one mutation-capable child만 허용됩니다. Cancellation은 provider/broker/underlying result settlement와 stale-result fence를 통과한 뒤 lease를 놓으며 nested child도 같은 mutation/concurrency/group budget을 사용합니다. Parent history와 parent stream tool request는 child broker가 수정하지 않습니다. Durable Child Activity card shows role/description when present, coarse capability, status, timing, and bounded summary/truncation/nesting/retention notices. Only the separate pending approval card shows title, category, parameters, and Approve/Reject. Frozen tool names and Undo availability are not shown on either card; verify them separately in the broker/tool trace and actual file state.
 
 ## Search backend fallback
 
@@ -176,7 +176,7 @@ Direct/nested child의 accepted/concurrent state와 result characters는 root gr
 
 ## Child, Chat history와 composer UI
 
-Composer에는 pending child tool의 composer-adjacent approval card만 남습니다. transient child status `queued`, `running`, `completed`, `failed`, `cancelled`, capacity, timing, diagnostics와 technical metadata는 composer에 표시하지 않습니다. Child progress와 terminal details는 spawn receipt에 묶인 durable Child Activity card에서 확인합니다; cancellation은 action-required로 표시하지 않습니다.
+Composer에는 pending child tool의 composer-adjacent approval card만 남습니다. transient child status `queued`, `running`, `completed`, `failed`, `cancelled`, capacity, timing, diagnostics와 technical metadata는 composer progress panel로 표시하지 않습니다. Child Activity card는 compact status/timing/summary와 위에 열거한 activity 정보만 표시하며 scheduler capacity나 detailed failure/frozen authority/Undo surface가 아닙니다; cancellation은 action-required로 표시하지 않습니다.
 
 Local diagnostics는 parent generation마다 처음 **128 events**만 insertion order로 보존하고 이후 event는 `droppedEvents` count로만 남깁니다. prompt, transcript, tool argument, path, resource body, raw error와 child summary는 trace event에 저장하지 않습니다. Provider usage channel이 없으므로 synthetic token 또는 cost를 만들지 않고 UI에는 정확히 **Usage unavailable**로 표시합니다.
 
