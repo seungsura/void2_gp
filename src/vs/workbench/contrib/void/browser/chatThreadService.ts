@@ -520,7 +520,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const allThreads = readThreads
 		// Keep the empty initial state while importing legacy records so each
 		// imported thread is written as its own record rather than as a map.
-		if (this._didReadLegacyThreadStorage) { this._storeAllThreads(allThreads); this._completeLegacyThreadStorageMigration() }
+		if (this._didReadLegacyThreadStorage) this._migrateLegacyThreadStorage(allThreads)
 		this.state = { allThreads, currentThreadId: null as unknown as string }
 		this._restoreInstructionTurns(allThreads)
 		this._restorePendingChatInputs()
@@ -567,6 +567,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	private readonly _runQuiescenceOfThread = new Map<string, ParentRunQuiescence>();
 	/** Closes the receipt-success event seam before a real parent lease exists. */
 	private readonly _startingParentRunOfThread = new Map<string, StartingParentRun>();
+	/** Latest external record held while this window still owns a live turn. */
+	private readonly _deferredExternalThreadKey = new Map<string, string>();
 	private readonly _deletingPendingInputThreads = new Set<string>();
 	/** One Stop-and-Send flight may own a parent run. A later queued input must not
 	 * abort a replacement parent which happens to use the same thread. */
@@ -594,6 +596,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	private _settlePendingChatSubmission(pending: PendingChatSubmissionRecord, accepted: boolean): boolean {
 		if (this._pendingChatSubmissionOfThread.get(pending.threadId) !== pending) return false
 		this._pendingChatSubmissionOfThread.delete(pending.threadId)
+		this._applyDeferredExternalThreadRecordIfQuiescent(pending.threadId)
 		if (!accepted && pending.composerCleared && this.state.allThreads[pending.threadId] && !this.getTransientComposerDraft(pending.threadId) && this.state.allThreads[pending.threadId]!.state.stagingSelections.length === 0) {
 			this._transientComposerDraftOfThread.set(pending.threadId, pending.draft)
 			this._setThreadState(pending.threadId, { stagingSelections: [...pending.selections] }, true, true)
@@ -919,6 +922,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		this._activeToolCardReceiptsOfThread?.clear()
 		this._agentInstructionSessionOfThread.clear()
 		this._transientComposerDraftOfThread.clear()
+		this._deferredExternalThreadKey.clear()
 		for (const quiescence of this._runQuiescenceOfThread.values()) quiescence.releaseAwaitingApproval?.()
 		this._pendingChatInputsOfThread.clear(); this._drainingPendingChatInputs.clear(); this._runQuiescenceOfThread.clear(); this._startingParentRunOfThread?.clear(); this._stopAndSendFlights.clear(); this._storePendingChatInputs()
 		for (const thread of Object.values(newState.allThreads)) if (thread) thread.childActivities = normalizeChildActivities((thread as { childActivities?: unknown }).childActivities, true)
@@ -938,6 +942,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		this._agentInstructionSessionOfThread.clear()
 		this._instructionTurnOfThread.clear()
 		this._transientComposerDraftOfThread.clear()
+		this._deferredExternalThreadKey.clear()
 		for (const quiescence of this._runQuiescenceOfThread.values()) quiescence.releaseAwaitingApproval?.()
 		this._pendingChatInputsOfThread.clear(); this._drainingPendingChatInputs.clear(); this._runQuiescenceOfThread.clear(); this._startingParentRunOfThread?.clear(); this._stopAndSendFlights.clear(); this._storePendingChatInputs()
 		// Tombstone the exact former records before dropping this window's map.
@@ -1008,6 +1013,10 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	private _completeLegacyThreadStorageMigration(): void {
 		this._storageService.store(THREAD_STORAGE_MIGRATION_COMPLETE_KEY, '1', StorageScope.APPLICATION, StorageTarget.USER)
 	}
+	private _migrateLegacyThreadStorage(threads: ChatThreads): void {
+		this._storeAllThreads(threads)
+		this._completeLegacyThreadStorageMigration()
+	}
 	private _registerExternalThreadStorageListener(): void {
 		this._register(this._storageService.onDidChangeValue(StorageScope.APPLICATION, undefined, this._store)(event => {
 			if (event.external && event.key.startsWith(THREAD_STORAGE_RECORD_PREFIX)) this._applyExternalThreadRecord(event.key)
@@ -1049,7 +1058,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		} catch { return undefined }
 	}
 	private _nextThreadRevision(key: string): number {
-		const id = this._threadIdFromStorageKey(key); const current = id && this._readThreadEnvelope(key, id)
+		const id = this._threadIdFromStorageKey(key); const current = id ? this._readThreadEnvelope(key, id) : undefined
 		return (current?.revision ?? 0) + 1
 	}
 	private _storeThreadRecord(id: string, thread: ThreadType): void {
@@ -1077,11 +1086,32 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	}
 	private _applyExternalThreadRecord(key: string): void {
 		const id = this._threadIdFromStorageKey(key); if (!id) return
+		if (this._isThreadLocallyActive(id)) { this._deferredExternalThreadKey.set(id, key); return }
+		this._consumeExternalThreadRecord(key, id)
+	}
+	private _isThreadLocallyActive(id: string): boolean {
+		return !!this.streamState[id]?.isRunning || this._pendingChatSubmissionOfThread?.has(id) || this._runQuiescenceOfThread?.has(id) || this._startingParentRunOfThread?.has(id) || this._parentRunTokenOfThread?.has(id)
+	}
+	private _applyDeferredExternalThreadRecordIfQuiescent(id: string): void {
+		const key = this._deferredExternalThreadKey.get(id)
+		if (!key || this._isThreadLocallyActive(id)) return
+		this._deferredExternalThreadKey.delete(id)
+		this._consumeExternalThreadRecord(key, id, true)
+	}
+	private _consumeExternalThreadRecord(key: string, id: string, wasActiveConflict = false): void {
 		const envelope = this._readThreadEnvelope(key, id); if (!envelope) return
-		const locallyActive = !!this.streamState[id]?.isRunning || this._pendingChatSubmissionOfThread?.has(id) || this._runQuiescenceOfThread?.has(id) || this._startingParentRunOfThread?.has(id) || this._parentRunTokenOfThread?.has(id)
-		if (locallyActive) return
 		const allThreads = { ...this.state.allThreads }
-		if (envelope.deleted) delete allThreads[id]
+		if (envelope.deleted) {
+			delete allThreads[id]
+			this._clearExternallyDeletedThreadMetadata(id)
+			if (this.state.currentThreadId === id) {
+				const blank = newThreadObject(); this._localEmptyThreadId = blank.id
+				this.state = { allThreads: { ...allThreads, [blank.id]: blank }, currentThreadId: blank.id }
+				this._notificationService.info('This chat was deleted in another window.')
+				this._onDidChangeCurrentThread.fire(); return
+			}
+			if (wasActiveConflict) this._notificationService.info('This chat was deleted in another window.')
+		}
 		else if (envelope.thread) {
 			const local = allThreads[id]
 			// History is shared; mounted controls and composer ownership are not.
@@ -1091,6 +1121,15 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		// Do not use _setState: it rebuilds mount data and settles interrupted runs.
 		this.state = { ...this.state, allThreads }
 		this._onDidChangeCurrentThread.fire()
+	}
+	private _clearExternallyDeletedThreadMetadata(threadId: string): void {
+		this.clearTransientComposerDraft(threadId)
+		this._pendingChatSubmissionOfThread.delete(threadId)
+		this._setPendingChatInputs(threadId, [])
+		this._drainingPendingChatInputs.delete(threadId); this._startingParentRunOfThread.delete(threadId); this._runQuiescenceOfThread.delete(threadId); this._parentRunTokenOfThread.delete(threadId); this._deferredExternalThreadKey.delete(threadId)
+		for (const key of this._stopAndSendFlights.keys()) if (key.startsWith(`${threadId}\u0000`)) this._stopAndSendFlights.delete(key)
+		this._agentInstructionSessionOfThread.delete(threadId); this._instructionTurnOfThread.delete(threadId); this._revokeAgentDelegation(threadId, true); this._agentControlGeneration.delete(threadId)
+		this._cancellingToolReceiptsOfThread.delete(threadId); this._activeToolCardReceiptsOfThread?.delete(threadId)
 	}
 
 
@@ -2676,6 +2715,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			if (current?.runId === parentRun.runId) {
 				this._runQuiescenceOfThread.delete(threadId)
 			}
+			this._applyDeferredExternalThreadRecordIfQuiescent(threadId)
 			void this._drainPendingChatInputs(threadId)
 		})
 		this._runQuiescenceOfThread.set(threadId, { runId: parentRun.runId, generation: parentRun.generation, settled })
@@ -2686,7 +2726,10 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		this._runQuiescenceOfThread.delete(threadId)
 		current.releaseAwaitingApproval()
 		this._releaseUndeliveredSteers(threadId, current)
-		if (drain) void this._drainPendingChatInputs(threadId)
+		// `drain=false` immediately continues the same logical turn with a
+		// replacement parent run. Keep a deferred remote delete fenced until that
+		// continuation reaches a final quiescence boundary.
+		if (drain) { this._applyDeferredExternalThreadRecordIfQuiescent(threadId); void this._drainPendingChatInputs(threadId) }
 	}
 	/**
 	 * Unit tests that bind an individual public approval method to a minimal
@@ -3427,6 +3470,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			this._activeToolCardReceiptsOfThread?.delete(threadId)
 			this._agentControlGeneration.delete(threadId)
 			this.clearTransientComposerDraft(threadId)
+			this._deferredExternalThreadKey.delete(threadId)
 			const { allThreads: currentThreads } = this.state
 
 			// delete the thread
@@ -3447,7 +3491,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		// claims so a restart presents every item as an explicitly resumable draft.
 		for (const [threadId, records] of this._pendingChatInputsOfThread) this._pendingChatInputsOfThread.set(threadId, records.map(record => this._freezePendingInput({ ...record, phase: 'dormant', claimId: undefined, runId: undefined })))
 		for (const quiescence of this._runQuiescenceOfThread.values()) quiescence.releaseAwaitingApproval?.()
-		this._agentDelegationAuthorityOfThread.clear(); this._agentControlGeneration.clear(); this._parentRunTokenOfThread.clear(); this._cancellingToolReceiptsOfThread.clear(); this._activeToolCardReceiptsOfThread?.clear(); this._transientComposerDraftOfThread.clear(); this._drainingPendingChatInputs.clear(); this._runQuiescenceOfThread.clear(); this._startingParentRunOfThread?.clear(); this._stopAndSendFlights.clear(); this._deletingPendingInputThreads.clear(); this._storePendingChatInputs(); super.dispose();
+		this._agentDelegationAuthorityOfThread.clear(); this._agentControlGeneration.clear(); this._parentRunTokenOfThread.clear(); this._cancellingToolReceiptsOfThread.clear(); this._activeToolCardReceiptsOfThread?.clear(); this._transientComposerDraftOfThread.clear(); this._deferredExternalThreadKey.clear(); this._drainingPendingChatInputs.clear(); this._runQuiescenceOfThread.clear(); this._startingParentRunOfThread?.clear(); this._stopAndSendFlights.clear(); this._deletingPendingInputThreads.clear(); this._storePendingChatInputs(); super.dispose();
 	}
 
 	duplicateThread(threadId: string) {

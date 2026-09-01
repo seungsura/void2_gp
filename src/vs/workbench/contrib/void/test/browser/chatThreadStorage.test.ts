@@ -36,7 +36,8 @@ const receiver = (client: HubClient, currentThreadId = 'A') => {
 	value._pendingChatSubmissionOfThread = new Map(); value._pendingChatInputsOfThread = new Map(); value._drainingPendingChatInputs = new Set(); value._runQuiescenceOfThread = new Map(); value._startingParentRunOfThread = new Map(); value._stopAndSendFlights = new Map(); value._deletingPendingInputThreads = new Set();
 	value._agentDelegationAuthorityOfThread = new Map(); value._agentControlGeneration = new Map(); value._parentRunTokenOfThread = new Map(); value._cancellingToolReceiptsOfThread = new Map(); value._activeToolCardReceiptsOfThread = new Map(); value._agentInstructionSessionOfThread = new Map(); value._instructionTurnOfThread = new Map(); value._transientComposerDraftOfThread = new Map();
 	value._childToolApprovals = new Map(); value._onDidChangeChildToolApprovals = { fire() { } };
-	value._storePendingChatInputs = () => { }; value._agentSubagentService = { cancelParent() { }, forgetParent() { } }; value._toolsService = { invalidateReadReceipts() { } };
+	value._onDidChangePendingChatInputs = { fire() { } }; value._onDidChangePendingChatSubmission = { fire() { } }; value._notificationService = { info(message: string) { value.notifications.push(message); } }; value.notifications = [];
+	value._storePendingChatInputs = () => { }; value.forgotParents = []; value._agentSubagentService = { cancelParent() { }, forgetParent(id: string) { value.forgotParents.push(id); } }; value._toolsService = { invalidateReadReceipts() { } };
 	value._onDidChangeCurrentThread = { fire() { value.externalEvents++; } };
 	value.externalEvents = 0;
 	value._storageService = {
@@ -89,6 +90,18 @@ suite('Void per-thread chat storage', () => {
 		client.store(key('bad'), JSON.stringify({ version: 2, revision: 1, thread: thread('bad') })); assert.doesNotThrow(() => w._applyExternalThreadRecord(key('bad'))); assert.strictEqual(w.state.allThreads.bad, undefined);
 	});
 
+	test('applies an idle selected tombstone to a fresh local blank without leaving a dangling current id', () => {
+		const hub = new SharedApplicationStorageHub(); const client = hub.client(); const w = receiver(client, 'A'); w.state.allThreads = { A: thread('A') }; w._transientComposerDraftOfThread.set('A', 'draft'); w._instructionTurnOfThread.set('A', {}); w._pendingChatInputsOfThread.set('A', [{}]);
+		client.store(key('A'), JSON.stringify({ version: 1, revision: 2, deleted: true })); w._applyExternalThreadRecord(key('A'));
+		assert.ok(w.state.allThreads[w.state.currentThreadId]); assert.notStrictEqual(w.state.currentThreadId, 'A'); assert.strictEqual(w.state.allThreads.A, undefined); assert.strictEqual(w._transientComposerDraftOfThread.has('A'), false); assert.strictEqual(w._instructionTurnOfThread.has('A'), false); assert.strictEqual(w._pendingChatInputsOfThread.has('A'), false); assert.strictEqual(JSON.parse(client.get(key('A'))!).deleted, true); assert.strictEqual(w.notifications.length, 1);
+	});
+
+	test('defers an active tombstone until quiescence, then clears local metadata exactly once', () => {
+		const hub = new SharedApplicationStorageHub(); const client = hub.client(); const w = receiver(client, 'A'); w.state.allThreads = { A: thread('A') }; w.streamState = { A: { isRunning: 'tool' } }; w._transientComposerDraftOfThread.set('A', 'draft'); w._instructionTurnOfThread.set('A', {}); w._pendingChatInputsOfThread.set('A', [{}]);
+		client.store(key('A'), JSON.stringify({ version: 1, revision: 2, deleted: true })); w._applyExternalThreadRecord(key('A')); assert.ok(w.state.allThreads.A); assert.strictEqual(w._deferredExternalThreadKey.get('A'), key('A'));
+		w.streamState = {}; w._applyDeferredExternalThreadRecordIfQuiescent('A'); assert.strictEqual(w.state.allThreads.A, undefined); assert.ok(w.state.allThreads[w.state.currentThreadId]); assert.strictEqual(w._deferredExternalThreadKey.has('A'), false); assert.strictEqual(w._pendingChatInputsOfThread.has('A'), false); assert.strictEqual(w._instructionTurnOfThread.has('A'), false); assert.deepStrictEqual(w.forgotParents, ['A']); assert.strictEqual(w.notifications.length, 1);
+	});
+
 	test('registers only external per-thread storage events', () => {
 		const hub = new SharedApplicationStorageHub(); const client = hub.client(); const w = receiver(client, 'A'); let listener: ((event: any) => void) | undefined;
 		w._storageService.onDidChangeValue = () => (next: (event: any) => void) => { listener = next; return { dispose() { } }; };
@@ -113,7 +126,7 @@ suite('Void per-thread chat storage', () => {
 	});
 
 	test('imports the legacy aggregate without dropping URI, message, or child fields', () => {
-		const hub = new SharedApplicationStorageHub(); const client = hub.client(); const legacy = thread('legacy', [{ role: 'user', content: 'keep', state: { uri: URI.parse('file:///legacy.ts') } }]); legacy.childActivities = { version: 1, records: [] }; client.store(THREAD_STORAGE_KEY, JSON.stringify({ legacy }));
+		const hub = new SharedApplicationStorageHub(); const client = hub.client(); const legacy = thread('legacy', [{ role: 'user', content: 'keep', state: { uri: URI.parse('file:///legacy.ts') } }]); client.store(THREAD_STORAGE_KEY, JSON.stringify({ legacy }));
 		const w = receiver(client); const restored = w._readAllThreads(); assert.strictEqual(restored.legacy.messages[0].content, 'keep'); assert.strictEqual(restored.legacy.messages[0].state.uri.scheme, 'file'); assert.deepStrictEqual(restored.legacy.childActivities.records, []);
 	});
 
@@ -122,6 +135,19 @@ suite('Void per-thread chat storage', () => {
 		const crashed = receiver(client); crashed._storeThreadRecord('A', thread('A', [{ role: 'user', content: 'v3 A' }]));
 		const resumed = receiver(client); const merged = resumed._readAllThreads(); assert.strictEqual(merged.A.messages[0].content, 'v3 A'); assert.strictEqual(merged.B.messages[0].content, 'legacy B');
 		resumed._storeAllThreads(merged); resumed._completeLegacyThreadStorageMigration(); assert.strictEqual(client.get(THREAD_STORAGE_MIGRATION_COMPLETE_KEY), '1');
+	});
+
+	test('does not write the migration marker when a later per-thread import fails', () => {
+		const hub = new SharedApplicationStorageHub(); const client = hub.client(); client.store(THREAD_STORAGE_KEY, JSON.stringify({ A: thread('A'), B: thread('B') })); const w = receiver(client); const merged = w._readAllThreads(); const original = w._storeThreadRecord; let writes = 0;
+		w._storeThreadRecord = (id: string, value: any) => { if (++writes === 2) throw new Error('B write failed'); return original.call(w, id, value); };
+		assert.throws(() => w._migrateLegacyThreadStorage(merged), /B write failed/); assert.strictEqual(client.get(THREAD_STORAGE_MIGRATION_COMPLETE_KEY), undefined);
+		const resumed = receiver(client); const restored = resumed._readAllThreads(); assert.ok(restored.A); assert.ok(restored.B); resumed._migrateLegacyThreadStorage(restored); assert.strictEqual(client.get(THREAD_STORAGE_MIGRATION_COMPLETE_KEY), '1');
+	});
+
+	test('keeps an approval-held deferred record until the approval lease releases, then reads latest bytes', () => {
+		const hub = new SharedApplicationStorageHub(); const client = hub.client(); const w = receiver(client, 'A'); w.state.allThreads = { A: thread('A', [{ role: 'user', content: 'local' }]) }; const release = () => { }; w._runQuiescenceOfThread.set('A', { runId: 'run', generation: 1, settled: Promise.resolve(), releaseAwaitingApproval: release });
+		client.store(key('A'), JSON.stringify({ version: 1, revision: 1, thread: thread('A', [{ role: 'user', content: 'first' }]) })); w._applyExternalThreadRecord(key('A')); client.store(key('A'), JSON.stringify({ version: 1, revision: 2, thread: thread('A', [{ role: 'user', content: 'latest' }]) })); w._releaseAwaitingApprovalQuiescence('A', false); assert.ok(w.state.allThreads.A); assert.ok(w._deferredExternalThreadKey.has('A')); w._runQuiescenceOfThread.set('A', { runId: 'replacement', generation: 2, settled: Promise.resolve(), releaseAwaitingApproval: release }); w._releaseAwaitingApprovalQuiescence('A');
+		assert.strictEqual(w.state.allThreads.A.messages[0].content, 'latest'); assert.strictEqual(w._deferredExternalThreadKey.has('A'), false);
 	});
 
 	test('uses a live v3 record and matching v3 tombstone over the incomplete legacy baseline', () => {
@@ -135,10 +161,11 @@ suite('Void per-thread chat storage', () => {
 		const restored = receiver(client)._readAllThreads(); assert.deepStrictEqual(Object.keys(restored), ['A']);
 	});
 
-	test('malformed v3-looking keys do not suppress legacy, but a valid tombstone does', () => {
+	test('malformed and unrelated v3 tombstones do not suppress legacy, but a matching tombstone does', () => {
 		const hub = new SharedApplicationStorageHub(); const client = hub.client(); const legacy = thread('legacy'); client.store(THREAD_STORAGE_KEY, JSON.stringify({ legacy })); client.store(`${THREAD_STORAGE_RECORD_PREFIX}%`, '{broken');
 		const malformedOnly = receiver(client); assert.ok(malformedOnly._readAllThreads().legacy);
-		client.store(key('gone'), JSON.stringify({ version: 1, revision: 1, deleted: true })); const tombstoned = receiver(client); assert.deepStrictEqual(tombstoned._readAllThreads(), {});
+		client.store(key('gone'), JSON.stringify({ version: 1, revision: 1, deleted: true })); const unrelated = receiver(client); assert.ok(unrelated._readAllThreads().legacy);
+		client.store(key('legacy'), JSON.stringify({ version: 1, revision: 1, deleted: true })); const tombstoned = receiver(client); assert.deepStrictEqual(tombstoned._readAllThreads(), {});
 	});
 
 	test('instruction snapshot upsert and purge change only its serialized thread record', () => {
