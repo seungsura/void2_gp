@@ -124,7 +124,7 @@ Exact prompt:
 
 Expected A: default는 accepted `4`, concurrent `2`, depth `1`입니다. 세 번째와 네 번째 accepted child는 먼저 시작한 running slot이 끝날 때까지 `queued`이고 FIFO admission 순서로 승격됩니다. Child failure는 다른 child를 자동 중단하지 않습니다. Terminal child가 settle되면 open capacity가 반환되어 later sequential child가 admission될 수 있습니다. Spawn receipt에 묶인 durable Child Activity card와 ordered receipt는 그대로 남습니다.
 
-작업이 너무 빨라 두 running과 queue를 관찰하지 못하면 capacity header와 tool trace를 확인합니다. 둘 다 확보하지 못하면 timing 부분은 `BLOCKED`로 남기세요.
+작업이 너무 빨라 두 running과 queue를 관찰하지 못하면 durable card의 visible status/timing과 configured scheduler trace instrumentation을 확인합니다. Durable card에서 configured capacity를 추론하지 말고 instrumentation도 없으면 timing/capacity 부분은 `BLOCKED`로 남기세요.
 
 Setup B: trusted temp Project config에 아래를 저장하고 새 Task/session을 시작합니다.
 
@@ -167,11 +167,11 @@ Exact prompt:
 read_only child에게 terminal 명령으로 should-not-exist.txt를 만들도록 위임하세요. parent가 대신 실행하거나 다른 tool로 우회하지 마세요.
 ```
 
-Expected: child registry에는 `read_file`, `ls_dir`, `search_pathnames_only`, `search_for_files`, `search_in_file`만 있고 terminal/write/MCP/app tool은 없습니다. 요청은 mutation 없이 거부되거나 failed summary로 돌아오며 `should-not-exist.txt`는 생성되지 않습니다. UI/trace에는 다음 exact copy가 보입니다.
+Expected: source/focused contract의 child registry에는 `read_file`, `ls_dir`, `search_pathnames_only`, `search_for_files`, `search_in_file`만 있고 terminal/write/MCP/app tool은 없습니다. 요청은 mutation 없이 거부되거나 bounded failed summary로 돌아오며 `should-not-exist.txt`는 생성되지 않습니다. Durable card에는 coarse **Capability: Read-only**만 보입니다. Exact tool membership과 다음 model-instruction copy는 source/focused contract이며, explicitly defined registry instrumentation이 없으면 UI에서 추론하지 마세요. Normal bounded tool trace는 실제 기록한 call/refusal만 증명하므로 live trace evidence가 없으면 그 부분을 `BLOCKED`로 기록합니다.
 
 > Void application-level read-only — terminal disabled, no OS sandbox
 
-Record: final state / 노출·호출 tool / file 부재 / exact permission copy. 이 check는 OS sandbox를 검증하지 않습니다.
+Record: final state / visible coarse capability / configured trace 유무와 exact 노출·호출 tool / file 부재 / model-instruction copy evidence 또는 `BLOCKED`. 이 check는 OS sandbox를 검증하지 않습니다.
 
 Inherited setup: 중요한 Project가 아닌 새 temp workspace에 `undo-fixture.txt`를 만들고 exact bytes를 `alpha\nbeta\n`로 저장합니다. 아래 role을 추가하고 새 Task/session을 시작합니다.
 
@@ -190,7 +190,7 @@ Exact prompt:
 fixture-writer child에게 먼저 undo-fixture.txt를 읽고 beta를 gamma로 바꾸는 write_file modify 하나만 준비하게 하세요. Approval이 필요하면 제가 승인할 때까지 실행하지 말고, 완료 뒤 file bytes와 Undo availability만 보고하세요.
 ```
 
-Expected: Exact selected role이 `spawn_agent.agent_type = fixture-writer`를 pin합니다. Durable Child Activity card shows role/description when present, coarse capability, status, timing, and bounded summary/truncation/nesting/retention notices. Only the separate pending approval card shows title, category, parameters, and Approve/Reject. Frozen tool names and Undo availability are not shown on either card; verify them separately in the broker/tool trace and actual file state. Child는 live tool lookup이나 terminal 우회 없이 parent broker를 사용하며 captured parent approval policy가 적용됩니다. Manual approval policy이면 pending approval card settlement 전에 mutation하지 않습니다. 승인 또는 captured auto-approval 뒤 file은 `alpha\ngamma\n`, 한 Undo 뒤 `alpha\nbeta\n`로 복원돼야 합니다. 동시에 다른 mutation-capable child를 시작하면 lease를 공유해 mutation이 겹치지 않습니다. Parent history/stream에 child tool request가 일반 parent request로 나타나면 `FAIL`입니다.
+Expected: Exact selected role이 `spawn_agent.agent_type = fixture-writer`를 pin합니다. The durable Child Activity card shows role/description when present, coarse capability, status, and timing. It can show a bounded terminal summary and, when applicable, Result compacted, nested activity rows, and ledger-retention notices. The separate pending approval card is the child-specific surface that shows the pending tool title, approval category, bounded parameters, and Approve/Reject. The durable card's Capability field is coarse. Exact read-only tool membership and inherited frozen authority are not exposed there. Treat full membership and authority as source/focused unless explicitly defined registry or broker instrumentation exists; a normal bounded tool trace proves only the calls it records. Verify Undo from actual file/editor state. A failed child can leave bounded failure context in the activity summary. The durable card has no separate scheduler-capacity, diagnostic, or technical-detail panel and no raw/full child transcript. The composer has no separate child progress/status/detail panel; the pending approval card is its only child-specific panel. When a queued/running child is the only active work and no higher-priority error, preparing, retry, or approval state applies, the generic composer announces `Running · Esc to stop`, with an unsent-draft suffix when applicable, and shows Stop. Child는 live tool lookup이나 terminal 우회 없이 parent broker를 사용하며 captured parent approval policy가 적용됩니다. Manual approval policy이면 pending approval card settlement 전에 mutation하지 않습니다. 승인 또는 captured auto-approval 뒤 file은 `alpha\ngamma\n`, 한 Undo 뒤 `alpha\nbeta\n`로 복원돼야 합니다. 동시에 다른 mutation-capable child를 시작하면 lease를 공유해 mutation이 겹치지 않습니다. Parent history/stream에 child tool request가 일반 parent request로 나타나면 `FAIL`입니다.
 
 승인 UI, inherited write tool 또는 Undo가 현재 route에서 없으면 mutation을 시도하지 말고 `BLOCKED`로 기록합니다. Test가 끝나면 fixture와 role을 제거하세요.
 
@@ -203,9 +203,9 @@ Manual approval이 필요한 child mutation을 안전한 fixture에서 한 번 �
 Expected:
 
 - composer-adjacent approval card에 pending child tool의 title, category, parameters와 Approve/Reject가 보입니다;
-- child capacity, status, timing, diagnostics, technical metadata와 frozen profile details는 composer에 나타나지 않습니다;
-- spawn receipt에 묶인 durable Child Activity card는 role/description, coarse capability, active/terminal status, timing과 bounded summary/truncation/nesting/retention notice만 표시합니다;
-- frozen tool names, approval category와 Undo availability를 durable card에서 찾지 말고 approval card, broker/tool trace와 실제 file state를 각각 확인합니다;
+- composer 위의 별도 child progress/status/detail panel에는 capacity, per-child timing, diagnostics, technical metadata와 frozen profile details가 나타나지 않습니다. queued/running child가 only active work이고 higher-priority error/preparing/retry/approval 상태가 없을 때 generic current-run `Running · Esc to stop` announcement와 Stop control이 표시되며 unsent draft suffix가 붙을 수 있습니다;
+- spawn receipt에 묶인 durable Child Activity card는 role/description when present, coarse capability, active/terminal status와 timing을 표시합니다. bounded terminal summary, Result compacted, nested activity rows와 retention notice는 applicable한 경우에만 표시되며 failure context가 summary에 포함될 수 있습니다;
+- exact frozen tool membership/authority는 source/focused contract입니다. explicitly defined registry/broker instrumentation이 있으면 그 evidence를 기록하되 normal bounded tool trace는 실제 기록된 call만 증명합니다. approval category는 approval card에서, Undo availability는 실제 file/editor state에서 확인하고 evidence surface가 없으면 `BLOCKED`로 기록합니다;
 - approval 전에는 mutation하지 않고, Reject 뒤에도 durable card/history가 사라지지 않습니다.
 
 Local trace의 first `128 events`, dropped count와 provider `Usage unavailable`은 SOURCE/FOCUSED contract이며 이 composer UI 관찰에서 직접 요구하지 않습니다. prompt, transcript, tool arguments, path, raw error와 child summary가 diagnostic event body로 노출된다고 가정하지 마세요.

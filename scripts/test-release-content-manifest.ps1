@@ -10,6 +10,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 $Utf8NoBom = New-Object Text.UTF8Encoding($false, $true)
 $Utf8Bom = New-Object Text.UTF8Encoding($true, $true)
 $Results = New-Object Collections.ArrayList
+$DecodeUnicode={param([string]$value) return [regex]::Unescape($value)}
 $PolarityPerCardPositive='per-card '+([string][char]0xC0C1+[char]0xD55C+[char]0xC774+[char]0x0020+[char]0xC544+[char]0xB2D9+[char]0xB2C8+[char]0xB2E4)
 $PolarityPerCardNegative='per-card '+([string][char]0xC0C1+[char]0xD55C+[char]0xC785+[char]0xB2C8+[char]0xB2E4)
 $PolarityFinitePositive='finite manual run'+([string][char]0xC740)+' whole-run child/group quota '+([string][char]0xBD80+[char]0xC7AC+[char]0xB97C)+' '+([string][char]0xC99D+[char]0xBA85+[char]0xD558+[char]0xC9C0)+' '+([string][char]0xC54A+[char]0xC73C+[char]0xBA70)
@@ -19,11 +20,51 @@ $PolarityExactPositive=$PolarityExactPrefix+([string][char]0xC788+[char]0xACE0)
 $PolarityExactGuidePositive=$PolarityExactPrefix+([string][char]0xC788+[char]0xC2B5+[char]0xB2C8+[char]0xB2E4)
 $PolarityExactNegative=$PolarityExactPrefix+([string][char]0xC5C6+[char]0xACE0)
 $PolarityExactGuideNegative=$PolarityExactPrefix+([string][char]0xC5C6+[char]0xC2B5+[char]0xB2C8+[char]0xB2E4)
-$ChildActivityVisible='Durable Child Activity card shows role/description when present, coarse capability, status, timing, and bounded summary/truncation/nesting/retention notices.'
-$ChildApprovalVisible='Only the separate pending approval card shows title, category, parameters, and Approve/Reject.'
-$ChildCardHidden='Frozen tool names and Undo availability are not shown on either card; verify them separately in the broker/tool trace and actual file state.'
+$ChildActivityVisible='The durable Child Activity card shows role/description when present, coarse capability, status, and timing. It can show a bounded terminal summary and, when applicable, Result compacted, nested activity rows, and ledger-retention notices.'
+$ChildApprovalVisible='The separate pending approval card is the child-specific surface that shows the pending tool title, approval category, bounded parameters, and Approve/Reject.'
+$ChildExactBoundary="The durable card's Capability field is coarse. Exact read-only tool membership and inherited frozen authority are not exposed there. Treat full membership and authority as source/focused unless explicitly defined registry or broker instrumentation exists; a normal bounded tool trace proves only the calls it records. Verify Undo from actual file/editor state."
+$ChildFailureBoundary='A failed child can leave bounded failure context in the activity summary. The durable card has no separate scheduler-capacity, diagnostic, or technical-detail panel and no raw/full child transcript.'
+$ChildComposerBoundary=& $DecodeUnicode 'The composer has no separate child progress/status/detail panel; the pending approval card is its only child-specific panel. When a queued/running child is the only active work and no higher-priority error, preparing, retry, or approval state applies, the generic composer announces `Running \u00B7 Esc to stop`, with an unsent-draft suffix when applicable, and shows Stop.'
 $ChildActivityOverclaim='Durable Child Activity card shows capacity, failure details, frozen tool names, approval category, and Undo availability.'
 $ChildApprovalOverclaim='Durable Child Activity card shows title, category, parameters, and Approve/Reject.'
+$ChildExactBoundaryOverclaim="The durable card's Capability field exposes exact read-only tools and frozen authority in the UI."
+$ChildFailureBoundaryOverclaim='The durable card never includes failure context.'
+$ChildComposerBoundaryOverclaim=& $DecodeUnicode 'Removing the separate child progress/status/detail panel also removes the generic current-run `Running \u00B7 Esc to stop` announcement and Stop control.'
+$ChildUnconditionalActivityOverclaim='Durable Child Activity card shows role/description when present, coarse capability, status, timing, and bounded summary/truncation/nesting/retention notices.'
+$ChildApprovalScopeOverclaim='Only the separate pending approval card shows title, category, parameters, and Approve/Reject.'
+$ChildUnconditionalComposerOverclaim=& $DecodeUnicode 'Removing the separate child progress/status/detail panel above the composer preserves the generic current-run `Running \u00B7 Esc to stop` announcement and Stop control.'
+$PriorKoreanOverclaimsBySource=[ordered]@{
+    'README.md'=@(
+        (& $DecodeUnicode 'Child progress, frozen profile details\uC640 timing\uC740 spawn receipt\uC5D0 \uBB36\uC778 durable Child Activity card\uC5D0\uC11C \uD655\uC778\uD569\uB2C8\uB2E4.'),
+        (& $DecodeUnicode 'Composer\uC5D0\uB294 pending child tool\uC758 composer-adjacent approval card\uB9CC \uD45C\uC2DC\uD569\uB2C8\uB2E4.'),
+        (& $DecodeUnicode 'Child status, failure, capacity, timing, timeline\uC640 frozen profile details\uB294 spawn receipt\uC5D0 \uBB36\uC778 bounded expandable Child activity card\uC5D0\uC11C durable \uC0C1\uD0DC \uAE30\uB85D\uC73C\uB85C \uBCF4\uBA70 full child transcript/session\uC740 \uC544\uB2D9\uB2C8\uB2E4.')
+    )
+    'guides/agent-instructions-guide.md'=@(
+        (& $DecodeUnicode 'UI\uC640 trace\uC758 \uC815\uD655\uD55C \uC124\uBA85\uC740 \uB2E4\uC74C\uACFC \uAC19\uC2B5\uB2C8\uB2E4.'),
+        (& $DecodeUnicode 'Frozen available tool names, required approval categories, Undo availability\uC640 no-OS-sandbox application boundary\uB294 spawn receipt\uC5D0 \uBB36\uC778 durable Child Activity card\uC5D0\uC11C \uD655\uC778\uD569\uB2C8\uB2E4.'),
+        (& $DecodeUnicode 'Composer\uC5D0\uB294 pending child tool\uC758 composer-adjacent approval card\uB9CC \uB0A8\uC2B5\uB2C8\uB2E4.'),
+        (& $DecodeUnicode 'transient child status `queued`, `running`, `completed`, `failed`, `cancelled`, capacity, timing, diagnostics\uC640 technical metadata\uB294 composer\uC5D0 \uD45C\uC2DC\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4.')
+    )
+    'portable/README.md'=@((& $DecodeUnicode 'Composer\uC5D0\uB294 pending child tool\uC758 composer-adjacent Approve/Reject card\uB9CC \uD45C\uC2DC\uD569\uB2C8\uB2E4.'))
+    'portable/getting-started.md'=@((& $DecodeUnicode 'durable Child Activity card\uC758 frozen tool list\u00B7Undo\uC640 composer-adjacent manual approval Approve/Reject\uB97C \uD655\uC778\uD55C \uB4A4 \uC6D0\uB798 bytes\uB85C \uB418\uB3CC\uB9AC\uC138\uC694.'))
+    'portable/release-notes.md'=@(
+        (& $DecodeUnicode 'Frozen tools\uC640 Undo availability\uB294 durable Child Activity card\uC5D0\uC11C \uBCF4\uBA70'),
+        (& $DecodeUnicode 'Composer\uC5D0\uB294 pending child tool\uC758 composer-adjacent approval card\uB9CC \uD45C\uC2DC\uD569\uB2C8\uB2E4.'),
+        (& $DecodeUnicode 'Child capacity, state, timing, failure\uC640 frozen profile details\uB294 spawn receipt\uC5D0 \uBB36\uC778 bounded expandable Child activity card\uC5D0\uC11C durable \uC0C1\uD0DC \uAE30\uB85D\uC73C\uB85C \uBCF4\uBA70 full child transcript/session\uC740 \uC544\uB2D9\uB2C8\uB2E4.')
+    )
+    'prompts/agent-instructions-test-prompts.md'=@(
+        (& $DecodeUnicode '\uC791\uC5C5\uC774 \uB108\uBB34 \uBE68\uB77C \uB450 running\uACFC queue\uB97C \uAD00\uCC30\uD558\uC9C0 \uBABB\uD558\uBA74 capacity header\uC640 tool trace\uB97C \uD655\uC778\uD569\uB2C8\uB2E4.'),
+        (& $DecodeUnicode 'UI/trace\uC5D0\uB294 \uB2E4\uC74C exact copy\uAC00 \uBCF4\uC785\uB2C8\uB2E4.'),
+        (& $DecodeUnicode 'durable Child Activity card\uC758 frozen parent tool snapshot\uC5D0 \uC2E4\uC81C available tools, required approval categories\uC640 Undo\uAC00 \uD45C\uC2DC\uB429\uB2C8\uB2E4.'),
+        (& $DecodeUnicode 'child capacity, status, timing, diagnostics, technical metadata\uC640 frozen profile details\uB294 composer\uC5D0 \uB098\uD0C0\uB098\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4;')
+    )
+}
+$AuditBlockedOverclaimsBySource=[ordered]@{
+    'README.md'=@((& $DecodeUnicode 'failure detail, frozen tool list, approval category, Undo availability\uB97C \uD45C\uC2DC\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4.'))
+    'guides/agent-instructions-guide.md'=@((& $DecodeUnicode 'scheduler capacity\uB098 detailed failure/frozen authority/Undo surface\uAC00 \uC544\uB2D9\uB2C8\uB2E4'))
+    'portable/release-notes.md'=@((& $DecodeUnicode 'scheduler capacity, detailed failure, frozen tool list\uB098 Undo surface\uAC00 \uC544\uB2D9\uB2C8\uB2E4.'))
+}
+$SemanticUniversalStaleOverclaims=@($ChildActivityOverclaim,$ChildApprovalOverclaim,$ChildExactBoundaryOverclaim,$ChildFailureBoundaryOverclaim,$ChildComposerBoundaryOverclaim,$ChildUnconditionalActivityOverclaim,$ChildApprovalScopeOverclaim,$ChildUnconditionalComposerOverclaim)
 
 function Write-FixtureText {
     param([string]$Path,[string]$Text,[switch]$Bom,[switch]$Empty)
@@ -72,7 +113,7 @@ function Assert-Throws {
 
 function Assert-ProductionReleaseContentSemanticPolarity {
     param([hashtable]$SourceTexts)
-    $childSurfaceClauses=@($ChildActivityVisible,$ChildApprovalVisible,$ChildCardHidden)
+    $childSurfaceClauses=@($ChildActivityVisible,$ChildApprovalVisible,$ChildExactBoundary,$ChildFailureBoundary,$ChildComposerBoundary)
     $requiredBySource=[ordered]@{
         'README.md'=@($PolarityPerCardPositive,$PolarityFinitePositive,$PolarityExactPositive)+$childSurfaceClauses
         'guides/agent-instructions-guide.md'=@($PolarityPerCardPositive,$PolarityFinitePositive,$PolarityExactGuidePositive)+$childSurfaceClauses
@@ -81,12 +122,12 @@ function Assert-ProductionReleaseContentSemanticPolarity {
         'portable/release-notes.md'=@($PolarityPerCardPositive,$PolarityFinitePositive,$PolarityExactPositive)+$childSurfaceClauses
         'prompts/agent-instructions-test-prompts.md'=@($PolarityPerCardPositive,$PolarityFinitePositive,$PolarityExactPositive,'visible root card count','nested activity-row count','activities omitted.','Retention is saturated.')+$childSurfaceClauses
     }
-    $staleNegative=@($PolarityPerCardNegative,$PolarityFiniteNegative,$PolarityExactNegative,$PolarityExactGuideNegative,'Child Run panel','Child Run UI',$ChildActivityOverclaim,$ChildApprovalOverclaim)
+    $staleUniversal=@($PolarityPerCardNegative,$PolarityFiniteNegative,$PolarityExactNegative,$PolarityExactGuideNegative,'Child Run panel','Child Run UI')+$SemanticUniversalStaleOverclaims
     foreach($source in $requiredBySource.Keys){
         if(-not $SourceTexts.ContainsKey($source)){throw "Production semantic source is missing: $source"}
         $text=[string]$SourceTexts[$source]
         foreach($clause in @($requiredBySource[$source])){if(-not $text.Contains($clause)){throw "Production semantic positive clause is missing: $source / $clause"}}
-        foreach($clause in $staleNegative){if($text.Contains($clause)){throw "Production semantic polarity is inverted: $source / $clause"}}
+        $staleForSource=@($staleUniversal);if($PriorKoreanOverclaimsBySource.Contains($source)){$staleForSource+=@($PriorKoreanOverclaimsBySource[$source])};if($AuditBlockedOverclaimsBySource.Contains($source)){$staleForSource+=@($AuditBlockedOverclaimsBySource[$source])};foreach($clause in $staleForSource){if($text.Contains($clause)){throw "Production semantic polarity is inverted: $source / $clause"}}
         if($source -ceq 'prompts/agent-instructions-test-prompts.md' -and $text.Contains('retentionSaturated')){throw "Production prompt retains internal Child activity metadata wording: $source"}
     }
 }
@@ -194,10 +235,23 @@ try {
     $productionTokens=@{'{{PORTABLE_SIZE}}'='1 byte';'{{PORTABLE_SHA256}}'=('a'*64);'{{PORTABLE_ENTRIES}}'='1';'{{SOURCE_HEAD}}'=('b'*40);'{{BUILD_DATE_KST}}'='2026-08-06 KST'}
     $productionPlans=@(Get-ReleaseContentPlan $production Portable -ProductVersion '9.9.9')+@(Get-ReleaseContentPlan $production Outer -OuterTokens $productionTokens)
     $productionUserText=(@($productionPlans|ForEach-Object{$Utf8NoBom.GetString([byte[]]$_.Bytes)})) -join "`n"
-    $productionSourceTexts=@{};foreach($entry in $production.Entries){$productionSourceTexts[[string]$entry.Source]=[string]$entry.SourceText};Assert-ProductionReleaseContentSemanticPolarity $productionSourceTexts;Add-Pass 'production per-source semantic polarity clauses'
+    $productionSourceTexts=@{};foreach($entry in $production.Entries){$productionSourceTexts[[string]$entry.Source]=[string]$entry.SourceText};Assert-ProductionReleaseContentSemanticPolarity $productionSourceTexts;Assert-CurrentReleaseContentPolarityByPath $productionSourceTexts 'Production release content' -Scope All;Add-Pass 'production per-source semantic polarity clauses'
     foreach($source in @('README.md','guides/agent-instructions-guide.md','portable/README.md','portable/release-notes.md','prompts/agent-instructions-test-prompts.md')){$mutated=@{};foreach($key in $productionSourceTexts.Keys){$mutated[$key]=[string]$productionSourceTexts[$key]};$mutated[$source]=$mutated[$source].Replace($PolarityPerCardPositive,$PolarityPerCardNegative);Assert-Throws "per-source semantic helper rejects per-card inversion: $source" {Assert-ProductionReleaseContentSemanticPolarity $mutated}}
     foreach($source in @('README.md','guides/agent-instructions-guide.md','portable/getting-started.md','portable/README.md','portable/release-notes.md','prompts/agent-instructions-test-prompts.md')){$mutated=@{};foreach($key in $productionSourceTexts.Keys){$mutated[$key]=[string]$productionSourceTexts[$key]};$mutated[$source]+="`n$ChildActivityOverclaim`n";Assert-Throws "per-source semantic helper rejects disconnected Child Activity overclaim: $source" {Assert-ProductionReleaseContentSemanticPolarity $mutated}}
     $approvalOverclaim=@{};foreach($key in $productionSourceTexts.Keys){$approvalOverclaim[$key]=[string]$productionSourceTexts[$key]};$approvalOverclaim['prompts/agent-instructions-test-prompts.md']+="`n$ChildApprovalOverclaim`n";Assert-Throws 'semantic helper rejects approval controls on durable activity card' {Assert-ProductionReleaseContentSemanticPolarity $approvalOverclaim}
+    foreach($source in $PriorKoreanOverclaimsBySource.Keys){$ordinal=0;foreach($phrase in @($PriorKoreanOverclaimsBySource[$source])){$ordinal++;$mutated=@{};foreach($key in $productionSourceTexts.Keys){$mutated[$key]=[string]$productionSourceTexts[$key]};$mutated[$source]+="`n$phrase`n";Assert-Throws "prior 1392 Korean Child UI overclaim rejected: $source #$ordinal" {Assert-ProductionReleaseContentSemanticPolarity $mutated};Assert-Throws "release validator rejects prior 1392 Korean Child UI overclaim: $source #$ordinal" {Assert-CurrentReleaseContentPolarityByPath $mutated 'Mutated production release content' -Scope All}}}
+    foreach($source in $AuditBlockedOverclaimsBySource.Keys){$ordinal=0;foreach($phrase in @($AuditBlockedOverclaimsBySource[$source])){$ordinal++;$mutated=@{};foreach($key in $productionSourceTexts.Keys){$mutated[$key]=[string]$productionSourceTexts[$key]};$mutated[$source]+="`n$phrase`n";Assert-Throws "audit-blocked absolute failure-detail denial rejected: $source #$ordinal" {Assert-ProductionReleaseContentSemanticPolarity $mutated};Assert-Throws "release validator rejects audit-blocked absolute failure-detail denial: $source #$ordinal" {Assert-CurrentReleaseContentPolarityByPath $mutated 'Mutated production release content' -Scope All}}}
+    $crossPathAllowed=@{};foreach($key in $productionSourceTexts.Keys){$crossPathAllowed[$key]=[string]$productionSourceTexts[$key]};$crossPathAllowed['portable/README.md']+="`n$($PriorKoreanOverclaimsBySource['guides/agent-instructions-guide.md'][0])`n";Assert-ProductionReleaseContentSemanticPolarity $crossPathAllowed;Assert-CurrentReleaseContentPolarityByPath $crossPathAllowed 'Cross-path release content' -Scope All;Add-Pass 'path-local semantic guards allow a guide-only phrase in portable README'
+    foreach($mutation in @(
+        [pscustomobject]@{Name='unconditional Child activity detail';Source='README.md';Overclaim=$ChildUnconditionalActivityOverclaim},
+        [pscustomobject]@{Name='approval controls exclusively scoped without child qualifier';Source='prompts/agent-instructions-test-prompts.md';Overclaim=$ChildApprovalScopeOverclaim},
+        [pscustomobject]@{Name='unconditional generic composer status preservation';Source='prompts/agent-instructions-test-prompts.md';Overclaim=$ChildUnconditionalComposerOverclaim}
+    )){$mutated=@{};foreach($key in $productionSourceTexts.Keys){$mutated[$key]=[string]$productionSourceTexts[$key]};$mutated[$mutation.Source]+="`n$($mutation.Overclaim)`n";Assert-Throws "semantic scope mutation rejected: $($mutation.Name)" {Assert-ProductionReleaseContentSemanticPolarity $mutated};Assert-Throws "release validator rejects semantic scope mutation: $($mutation.Name)" {Assert-CurrentReleaseContentPolarityByPath $mutated 'Mutated production release content' -Scope All}}
+    foreach($mutation in @(
+        [pscustomobject]@{Name='coarse capability versus exact read-only UI boundary';Source='guides/agent-instructions-guide.md';Overclaim=$ChildExactBoundaryOverclaim},
+        [pscustomobject]@{Name='bounded failure summary versus absolute denial';Source='README.md';Overclaim=$ChildFailureBoundaryOverclaim},
+        [pscustomobject]@{Name='separate Child panel versus generic composer status';Source='prompts/agent-instructions-test-prompts.md';Overclaim=$ChildComposerBoundaryOverclaim}
+    )){$mutated=@{};foreach($key in $productionSourceTexts.Keys){$mutated[$key]=[string]$productionSourceTexts[$key]};$mutated[$mutation.Source]+="`n$($mutation.Overclaim)`n";Assert-Throws "semantic relational mutation rejected: $($mutation.Name)" {Assert-ProductionReleaseContentSemanticPolarity $mutated}}
     foreach($mutation in @(
         [pscustomobject]@{Name='per-card ledger scope inversion';Source='README.md';From=$PolarityPerCardPositive;To=$PolarityPerCardNegative},
         [pscustomobject]@{Name='finite manual run evidence inversion';Source='guides/agent-instructions-guide.md';From=$PolarityFinitePositive;To=$PolarityFiniteNegative},
@@ -256,6 +310,9 @@ try {
     )){if(-not $productionReadme.Contains($mutation.From)){throw "Outer mutation fixture source clause is missing: $($mutation.Name)"};$mutatedOuterPath=Join-Path $currentRoot ("semantic-$($mutation.Name.Replace(' ','-')).zip");New-CurrentOuterFixtureZip $mutatedOuterPath $currentPortablePath $production -ReadmeOverride $productionReadme.Replace($mutation.From,$mutation.To);Assert-Throws "outer semantic mutation rejected: $($mutation.Name)" {Assert-OuterArchive $mutatedOuterPath|Out-Null}}
     $productionGuide=[string](@($production.Entries|Where-Object{$_.Source -ceq 'guides/agent-instructions-guide.md'})[0].SourceText);if(-not $productionGuide.Contains($PolarityExactGuidePositive)){throw 'Outer guide mutation fixture source clause is missing.'};$mutatedGuideOuterPath=Join-Path $currentRoot 'semantic-guide-exact-safe-read-execution-inversion.zip';New-CurrentOuterFixtureZip $mutatedGuideOuterPath $currentPortablePath $production -TextOverridesByPath @{'guides/agent-instructions-guide.md'=$productionGuide.Replace($PolarityExactGuidePositive,$PolarityExactGuideNegative)};Assert-Throws 'outer semantic mutation rejected: guide exact-safe-read execution inversion' {Assert-OuterArchive $mutatedGuideOuterPath|Out-Null}
     $mutatedChildSurfaceOuterPath=Join-Path $currentRoot 'semantic-child-surface-overclaim.zip';New-CurrentOuterFixtureZip $mutatedChildSurfaceOuterPath $currentPortablePath $production -ReadmeOverride ($productionReadme+"`n$ChildActivityOverclaim`n$ChildApprovalOverclaim`n");Assert-Throws 'outer semantic mutation rejected: disconnected Child card overclaims' {Assert-OuterArchive $mutatedChildSurfaceOuterPath|Out-Null}
+    $outerExactBoundaryPath=Join-Path $currentRoot 'semantic-child-exact-boundary-overclaim.zip';New-CurrentOuterFixtureZip $outerExactBoundaryPath $currentPortablePath $production -TextOverridesByPath @{'guides/agent-instructions-guide.md'=($productionGuide+"`n$ChildExactBoundaryOverclaim`n")};Assert-Throws 'outer semantic mutation rejected: exact read-only tools inferred from UI' {Assert-OuterArchive $outerExactBoundaryPath|Out-Null}
+    $outerFailureDenialPath=Join-Path $currentRoot 'semantic-child-failure-denial-overclaim.zip';New-CurrentOuterFixtureZip $outerFailureDenialPath $currentPortablePath $production -ReadmeOverride ($productionReadme+"`n$ChildFailureBoundaryOverclaim`n");Assert-Throws 'outer semantic mutation rejected: bounded failure summary absolutely denied' {Assert-OuterArchive $outerFailureDenialPath|Out-Null}
+    $productionPrompt=[string](@($production.Entries|Where-Object{$_.Source -ceq 'prompts/agent-instructions-test-prompts.md'})[0].SourceText);$outerComposerDenialPath=Join-Path $currentRoot 'semantic-child-composer-status-denial.zip';New-CurrentOuterFixtureZip $outerComposerDenialPath $currentPortablePath $production -TextOverridesByPath @{'prompts/agent-instructions-test-prompts.md'=($productionPrompt+"`n$ChildComposerBoundaryOverclaim`n")};Assert-Throws 'outer semantic mutation rejected: generic composer status and Stop denied' {Assert-OuterArchive $outerComposerDenialPath|Out-Null}
     $priorCurrentOuterPath=Join-Path $currentRoot 'Void-9.9.9-prior-current-win32-x64-distribution-bundle.zip';New-CurrentOuterFixtureZip $priorCurrentOuterPath $currentPortablePath $production -ReadmeOverride "# prior current snapshot`n4 accepted`n";$priorCurrentHistorical=Assert-OuterArchive $priorCurrentOuterPath $currentPortableMeta -HistoricalArchive;if($priorCurrentHistorical.DocsLayout -cne 'current' -or $priorCurrentHistorical.Entries -ne 11 -or $priorCurrentHistorical.OuterDocsCount -ne 9 -or $priorCurrentHistorical.ChecksumRecordCount -ne 10 -or $priorCurrentHistorical.SharedDocsCount -ne 8 -or $priorCurrentHistorical.InnerSha256 -cne $currentPortableMeta.Sha256){throw 'Historical prior-current outer did not preserve current-layout structure, checksums, shared bytes, and inner identity.'};Add-Pass 'historical prior-current semantic drift preserves structural pair validation';$strictPriorCurrentError=$null;try{Assert-OuterArchive $priorCurrentOuterPath $currentPortableMeta|Out-Null}catch{$strictPriorCurrentError=$_.Exception.Message};$expectedPriorError='Outer current release content is missing required semantic polarity clause: README.md / '+$PolarityPerCardPositive;if($strictPriorCurrentError -cne $expectedPriorError){throw "Strict prior-current semantic failure mismatch: $strictPriorCurrentError"};Add-Pass 'strict current rejects prior-current stale semantics'
 
     $partialZip=Join-Path $positive.Root 'partial.zip';New-DocsFixtureZip $partialZip $positiveManifest partial;Assert-Throws 'partial docs rejected' {Test-DocsFixtureZip $partialZip $positiveManifest|Out-Null}

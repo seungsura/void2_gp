@@ -141,6 +141,7 @@ function Get-TemplateFiles { @($ReleaseContentManifest.OuterEntries | ForEach-Ob
 function Assert-CurrentReleaseContentPolarityByPath {
     param([hashtable]$TextsByPath,[string]$Context,[ValidateSet('All','Outer','Portable')][string]$Scope='All')
     $u={param([int[]]$codePoints) return [string]::Concat([char[]]$codePoints)}
+    $decode={param([string]$value) return [regex]::Unescape($value)}
     $perCardPositive='per-card '+(& $u @(0xC0C1,0xD55C,0xC774,0x0020,0xC544,0xB2D9,0xB2C8,0xB2E4))
     $perCardNegative='per-card '+(& $u @(0xC0C1,0xD55C,0xC785,0xB2C8,0xB2E4))
     $finitePositive='finite manual run'+(& $u @(0xC740))+' whole-run child/group quota '+(& $u @(0xBD80,0xC7AC,0xB97C))+' '+(& $u @(0xC99D,0xBA85,0xD558,0xC9C0))+' '+(& $u @(0xC54A,0xC73C,0xBA70))
@@ -150,16 +151,55 @@ function Assert-CurrentReleaseContentPolarityByPath {
     $exactGuidePositive=$exactPrefix+(& $u @(0xC788,0xC2B5,0xB2C8,0xB2E4))
     $exactNegative=$exactPrefix+(& $u @(0xC5C6,0xACE0))
     $exactGuideNegative=$exactPrefix+(& $u @(0xC5C6,0xC2B5,0xB2C8,0xB2E4))
-    $activityVisible='Durable Child Activity card shows role/description when present, coarse capability, status, timing, and bounded summary/truncation/nesting/retention notices.'
-    $approvalVisible='Only the separate pending approval card shows title, category, parameters, and Approve/Reject.'
-    $cardHidden='Frozen tool names and Undo availability are not shown on either card; verify them separately in the broker/tool trace and actual file state.'
+    $activityVisible='The durable Child Activity card shows role/description when present, coarse capability, status, and timing. It can show a bounded terminal summary and, when applicable, Result compacted, nested activity rows, and ledger-retention notices.'
+    $approvalVisible='The separate pending approval card is the child-specific surface that shows the pending tool title, approval category, bounded parameters, and Approve/Reject.'
+    $exactBoundary="The durable card's Capability field is coarse. Exact read-only tool membership and inherited frozen authority are not exposed there. Treat full membership and authority as source/focused unless explicitly defined registry or broker instrumentation exists; a normal bounded tool trace proves only the calls it records. Verify Undo from actual file/editor state."
+    $failureBoundary='A failed child can leave bounded failure context in the activity summary. The durable card has no separate scheduler-capacity, diagnostic, or technical-detail panel and no raw/full child transcript.'
+    $composerBoundary=& $decode 'The composer has no separate child progress/status/detail panel; the pending approval card is its only child-specific panel. When a queued/running child is the only active work and no higher-priority error, preparing, retry, or approval state applies, the generic composer announces `Running \u00B7 Esc to stop`, with an unsent-draft suffix when applicable, and shows Stop.'
     $activityOverclaim='Durable Child Activity card shows capacity, failure details, frozen tool names, approval category, and Undo availability.'
     $approvalOverclaim='Durable Child Activity card shows title, category, parameters, and Approve/Reject.'
-    $staleNegative=@($perCardNegative,$finiteNegative,$exactNegative,$exactGuideNegative,'Child Run panel','Child Run UI',$activityOverclaim,$approvalOverclaim)
-    $childSurfaceClauses=@($activityVisible,$approvalVisible,$cardHidden)
+    $exactBoundaryOverclaim="The durable card's Capability field exposes exact read-only tools and frozen authority in the UI."
+    $failureBoundaryOverclaim='The durable card never includes failure context.'
+    $composerBoundaryOverclaim=& $decode 'Removing the separate child progress/status/detail panel also removes the generic current-run `Running \u00B7 Esc to stop` announcement and Stop control.'
+    $unconditionalActivityOverclaim='Durable Child Activity card shows role/description when present, coarse capability, status, timing, and bounded summary/truncation/nesting/retention notices.'
+    $approvalScopeOverclaim='Only the separate pending approval card shows title, category, parameters, and Approve/Reject.'
+    $unconditionalComposerOverclaim=& $decode 'Removing the separate child progress/status/detail panel above the composer preserves the generic current-run `Running \u00B7 Esc to stop` announcement and Stop control.'
+    $priorKoreanOverclaimsByPath=[ordered]@{
+        'README.md'=@(
+            (& $decode 'Child progress, frozen profile details\uC640 timing\uC740 spawn receipt\uC5D0 \uBB36\uC778 durable Child Activity card\uC5D0\uC11C \uD655\uC778\uD569\uB2C8\uB2E4.'),
+            (& $decode 'Composer\uC5D0\uB294 pending child tool\uC758 composer-adjacent approval card\uB9CC \uD45C\uC2DC\uD569\uB2C8\uB2E4.'),
+            (& $decode 'Child status, failure, capacity, timing, timeline\uC640 frozen profile details\uB294 spawn receipt\uC5D0 \uBB36\uC778 bounded expandable Child activity card\uC5D0\uC11C durable \uC0C1\uD0DC \uAE30\uB85D\uC73C\uB85C \uBCF4\uBA70 full child transcript/session\uC740 \uC544\uB2D9\uB2C8\uB2E4.')
+        )
+        'guides/agent-instructions-guide.md'=@(
+            (& $decode 'UI\uC640 trace\uC758 \uC815\uD655\uD55C \uC124\uBA85\uC740 \uB2E4\uC74C\uACFC \uAC19\uC2B5\uB2C8\uB2E4.'),
+            (& $decode 'Frozen available tool names, required approval categories, Undo availability\uC640 no-OS-sandbox application boundary\uB294 spawn receipt\uC5D0 \uBB36\uC778 durable Child Activity card\uC5D0\uC11C \uD655\uC778\uD569\uB2C8\uB2E4.'),
+            (& $decode 'Composer\uC5D0\uB294 pending child tool\uC758 composer-adjacent approval card\uB9CC \uB0A8\uC2B5\uB2C8\uB2E4.'),
+            (& $decode 'transient child status `queued`, `running`, `completed`, `failed`, `cancelled`, capacity, timing, diagnostics\uC640 technical metadata\uB294 composer\uC5D0 \uD45C\uC2DC\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4.')
+        )
+        'portable/README.md'=@((& $decode 'Composer\uC5D0\uB294 pending child tool\uC758 composer-adjacent Approve/Reject card\uB9CC \uD45C\uC2DC\uD569\uB2C8\uB2E4.'))
+        'portable/getting-started.md'=@((& $decode 'durable Child Activity card\uC758 frozen tool list\u00B7Undo\uC640 composer-adjacent manual approval Approve/Reject\uB97C \uD655\uC778\uD55C \uB4A4 \uC6D0\uB798 bytes\uB85C \uB418\uB3CC\uB9AC\uC138\uC694.'))
+        'portable/release-notes.md'=@(
+            (& $decode 'Frozen tools\uC640 Undo availability\uB294 durable Child Activity card\uC5D0\uC11C \uBCF4\uBA70'),
+            (& $decode 'Composer\uC5D0\uB294 pending child tool\uC758 composer-adjacent approval card\uB9CC \uD45C\uC2DC\uD569\uB2C8\uB2E4.'),
+            (& $decode 'Child capacity, state, timing, failure\uC640 frozen profile details\uB294 spawn receipt\uC5D0 \uBB36\uC778 bounded expandable Child activity card\uC5D0\uC11C durable \uC0C1\uD0DC \uAE30\uB85D\uC73C\uB85C \uBCF4\uBA70 full child transcript/session\uC740 \uC544\uB2D9\uB2C8\uB2E4.')
+        )
+        'prompts/agent-instructions-test-prompts.md'=@(
+            (& $decode '\uC791\uC5C5\uC774 \uB108\uBB34 \uBE68\uB77C \uB450 running\uACFC queue\uB97C \uAD00\uCC30\uD558\uC9C0 \uBABB\uD558\uBA74 capacity header\uC640 tool trace\uB97C \uD655\uC778\uD569\uB2C8\uB2E4.'),
+            (& $decode 'UI/trace\uC5D0\uB294 \uB2E4\uC74C exact copy\uAC00 \uBCF4\uC785\uB2C8\uB2E4.'),
+            (& $decode 'durable Child Activity card\uC758 frozen parent tool snapshot\uC5D0 \uC2E4\uC81C available tools, required approval categories\uC640 Undo\uAC00 \uD45C\uC2DC\uB429\uB2C8\uB2E4.'),
+            (& $decode 'child capacity, status, timing, diagnostics, technical metadata\uC640 frozen profile details\uB294 composer\uC5D0 \uB098\uD0C0\uB098\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4;')
+        )
+    }
+    $auditBlockedOverclaimsByPath=[ordered]@{
+        'README.md'=@((& $decode 'failure detail, frozen tool list, approval category, Undo availability\uB97C \uD45C\uC2DC\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4.'))
+        'guides/agent-instructions-guide.md'=@((& $decode 'scheduler capacity\uB098 detailed failure/frozen authority/Undo surface\uAC00 \uC544\uB2D9\uB2C8\uB2E4'))
+        'portable/release-notes.md'=@((& $decode 'scheduler capacity, detailed failure, frozen tool list\uB098 Undo surface\uAC00 \uC544\uB2D9\uB2C8\uB2E4.'))
+    }
+    $staleUniversal=@($perCardNegative,$finiteNegative,$exactNegative,$exactGuideNegative,'Child Run panel','Child Run UI',$activityOverclaim,$approvalOverclaim,$exactBoundaryOverclaim,$failureBoundaryOverclaim,$composerBoundaryOverclaim,$unconditionalActivityOverclaim,$approvalScopeOverclaim,$unconditionalComposerOverclaim)
+    $childSurfaceClauses=@($activityVisible,$approvalVisible,$exactBoundary,$failureBoundary,$composerBoundary)
     $requiredByPath=[ordered]@{'README.md'=@($perCardPositive,$finitePositive,$exactPositive)+$childSurfaceClauses;'guides/agent-instructions-guide.md'=@($perCardPositive,$finitePositive,$exactGuidePositive)+$childSurfaceClauses;'portable/getting-started.md'=$childSurfaceClauses;'portable/README.md'=@($perCardPositive,$finitePositive,$exactPositive)+$childSurfaceClauses;'portable/release-notes.md'=@($perCardPositive,$finitePositive,$exactPositive)+$childSurfaceClauses;'prompts/agent-instructions-test-prompts.md'=@($perCardPositive,$finitePositive,$exactPositive,'visible root card count','nested activity-row count','activities omitted.','Retention is saturated.')+$childSurfaceClauses}
     $selectedPaths=if($Scope -ceq 'Outer'){@('README.md','guides/agent-instructions-guide.md','prompts/agent-instructions-test-prompts.md')}elseif($Scope -ceq 'Portable'){@('portable/getting-started.md','portable/README.md','portable/release-notes.md','guides/agent-instructions-guide.md','prompts/agent-instructions-test-prompts.md')}else{@($requiredByPath.Keys)}
-    foreach($path in $selectedPaths){if(-not $TextsByPath.ContainsKey($path)){throw "$Context is missing semantic source: $path"};$text=[string]$TextsByPath[$path];foreach($clause in @($requiredByPath[$path])){if(-not $text.Contains($clause)){throw "$Context is missing required semantic polarity clause: $path / $clause"}};foreach($clause in $staleNegative){if($text.Contains($clause)){throw "$Context retains inverted semantic polarity clause: $path / $clause"}};if($path -ceq 'prompts/agent-instructions-test-prompts.md' -and $text.Contains('retentionSaturated')){throw "$Context retains internal Child activity metadata wording: $path"}}
+    foreach($path in $selectedPaths){if(-not $TextsByPath.ContainsKey($path)){throw "$Context is missing semantic source: $path"};$text=[string]$TextsByPath[$path];foreach($clause in @($requiredByPath[$path])){if(-not $text.Contains($clause)){throw "$Context is missing required semantic polarity clause: $path / $clause"}};$staleForPath=@($staleUniversal);if($priorKoreanOverclaimsByPath.Contains($path)){$staleForPath+=@($priorKoreanOverclaimsByPath[$path])};if($auditBlockedOverclaimsByPath.Contains($path)){$staleForPath+=@($auditBlockedOverclaimsByPath[$path])};foreach($clause in $staleForPath){if($text.Contains($clause)){throw "$Context retains inverted semantic polarity clause: $path / $clause"}};if($path -ceq 'prompts/agent-instructions-test-prompts.md' -and $text.Contains('retentionSaturated')){throw "$Context retains internal Child activity metadata wording: $path"}}
 }
 function New-MaterializedContent {
     param([string]$Stage,[psobject]$Portable,[string]$Head)
