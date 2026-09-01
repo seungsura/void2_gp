@@ -436,6 +436,8 @@ suite('Assistant message lifecycle', () => {
 			_metricsService: { capture() { } },
 			_setStreamState(threadId: string, value: any) { streamState[threadId] = value; if (value?.llmInfo) streamDisplays.push(value.llmInfo.displayContentSoFar); },
 			_storageService: { get() { return undefined; }, keys() { return []; }, store(key: string, value: string) { assert.strictEqual(key, `${THREAD_STORAGE_RECORD_PREFIX}task`); serializedThreads = value; } },
+			_isUnmaterializedEmptyThread() { return false; },
+			_threadStorageKey: (ChatThreadService.prototype as any)._threadStorageKey, _readThreadEnvelope: (ChatThreadService.prototype as any)._readThreadEnvelope, _storeThreadRecord: (ChatThreadService.prototype as any)._storeThreadRecord,
 			_storeAllThreads(threads: any) { return (ChatThreadService.prototype as any)._storeAllThreads.call(this, threads); },
 			_setState(value: any) { this.state = { ...this.state, ...value }; },
 			_addMessageToThread(threadId: string, message: any) {
@@ -626,7 +628,9 @@ suite('Assistant message lifecycle', () => {
 			state: { allThreads: { task: thread }, currentThreadId: 'task' },
 			streamState: { task: { isRunning: 'LLM', llmInfo: { displayContentSoFar: INTERNAL_EMPTY_MESSAGE_SENTINEL, reasoningSoFar: 'abort reasoning', toolCallSoFar: null }, interrupt: Promise.resolve(() => { }) } },
 			_revokeAgentDelegation() { },
-			_storageService: { store(_key: string, value: string) { serializedThreads = value; } },
+			_storageService: { get() { return undefined; }, keys() { return []; }, store(_key: string, value: string) { serializedThreads = value; } },
+			_isUnmaterializedEmptyThread() { return false; },
+			_threadStorageKey: (ChatThreadService.prototype as any)._threadStorageKey, _readThreadEnvelope: (ChatThreadService.prototype as any)._readThreadEnvelope, _storeThreadRecord: (ChatThreadService.prototype as any)._storeThreadRecord,
 			_storeAllThreads(threads: any) { return (ChatThreadService.prototype as any)._storeAllThreads.call(this, threads); },
 			_setState(value: any) { this.state = { ...this.state, ...value }; },
 			_setStreamState(threadId: string, value: any) { this.streamState[threadId] = value; },
@@ -635,9 +639,9 @@ suite('Assistant message lifecycle', () => {
 		await ChatThreadService.prototype.abortRunning.call(receiver, 'task');
 		const aborted = receiver.state.allThreads.task.messages.at(-1);
 		assert.deepStrictEqual({ display: aborted.displayContent, reasoning: aborted.reasoning, visible: assistantMessagePresentation(aborted).renderDisplay }, { display: '', reasoning: 'abort reasoning', visible: '' });
-		assert.strictEqual(JSON.parse(serializedThreads).task.messages.at(-1).displayContent, '');
-		assert.strictEqual(JSON.parse(serializedThreads).task.messages[0].pendingInputId, 'persisted-pending-provenance');
-		const restoredWithProvenance = (ChatThreadService.prototype as any)._convertThreadDataFromStorage.call({}, serializedThreads);
+			assert.strictEqual(JSON.parse(serializedThreads).thread.messages.at(-1).displayContent, '');
+			assert.strictEqual(JSON.parse(serializedThreads).thread.messages[0].pendingInputId, 'persisted-pending-provenance');
+			const restoredWithProvenance = (ChatThreadService.prototype as any)._convertThreadDataFromStorage.call({}, JSON.stringify({ task: JSON.parse(serializedThreads).thread }));
 		assert.strictEqual(restoredWithProvenance.task.messages[0].pendingInputId, 'persisted-pending-provenance');
 
 		const legacy = JSON.stringify({ task: { id: 'task', messages: [{ role: 'assistant', displayContent: INTERNAL_EMPTY_MESSAGE_SENTINEL, reasoning: 'legacy reasoning', anthropicReasoning: null }, { role: 'assistant', displayContent: `keep ${INTERNAL_EMPTY_MESSAGE_SENTINEL}`, reasoning: '', anthropicReasoning: null }], state: {} } });
@@ -1584,7 +1588,7 @@ suite('Assistant message lifecycle', () => {
 			_mcpService: { getMCPTools: () => [] }, _notificationService: { notify() { } }, _toolsService: { invalidateReadReceipts() { } },
 			_agentSubagentService: { cancelParent() { }, forgetParent() { } }, _childToolApprovals: new Map(), _onDidChangeChildToolApprovals: { fire() { } },
 			_agentControlGeneration: new Map([['task', 0]]), _agentDelegationAuthorityOfThread: new Map(), _parentRunTokenOfThread: new Map(),
-			_pendingChatSubmissionOfThread: new Map(), _pendingChatInputsOfThread: new Map(), _drainingPendingChatInputs: new Set(), _runQuiescenceOfThread: new Map(), _startingParentRunOfThread: new Map(), _deletingPendingInputThreads: new Set(), _stopAndSendFlights: new Map(), _transientComposerDraftOfThread: new Map(),
+			_pendingChatSubmissionOfThread: new Map(), _pendingChatInputsOfThread: new Map(), _drainingPendingChatInputs: new Set(), _runQuiescenceOfThread: new Map(), _startingParentRunOfThread: new Map(), _deferredExternalThreadKey: new Map(), _deletingPendingInputThreads: new Set(), _stopAndSendFlights: new Map(), _transientComposerDraftOfThread: new Map(),
 			_onDidChangePendingChatInputs: { fire() { } }, _storePendingChatInputs() { }, _onDidChangePendingChatSubmission: { fire() { } },
 			_setStreamState(threadId: string, value: any) { this.streamState[threadId] = value; }, _addMessageToThread(_threadId: string, message: any) { thread.messages.push(message); },
 			_runChatAgent() { providerStarts++; return runGate.promise; }, _wrapRunAgentToNotify: (run: Promise<void>) => run,

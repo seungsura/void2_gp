@@ -20,11 +20,11 @@ const draftReceiver = () => {
 	value._drainingPendingChatInputs = new Set<string>();
 	value._runQuiescenceOfThread = new Map<string, unknown>();
 	value._startingParentRunOfThread = new Map<string, unknown>(); value._deferredExternalThreadKey = new Map<string, string>();
-	value._startingParentRunOfThread = new Map<string, unknown>();
 	value._deletingPendingInputThreads = new Set<string>();
 	value._stopAndSendFlights = new Map<string, Promise<void>>();
 	value._onDidChangePendingChatInputs = { fire() { } };
 	value._storePendingChatInputs = () => { };
+	value._storageService = { get() { return undefined; }, keys() { return []; }, store() { } };
 	value.streamState = {};
 	value._parentRunTokenOfThread = new Map<string, symbol>();
 	value._cancellingToolReceiptsOfThread = new Map<string, unknown>();

@@ -1102,6 +1102,9 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const envelope = this._readThreadEnvelope(key, id); if (!envelope) return
 		const allThreads = { ...this.state.allThreads }
 		if (envelope.deleted) {
+			// A delivered tombstone is terminal. Replaying the same storage event must
+			// not repeatedly clear state, fire stream listeners, or notify the user.
+			if (!allThreads[id] && this.state.currentThreadId !== id) return
 			delete allThreads[id]
 			this._clearExternallyDeletedThreadMetadata(id)
 			if (this.state.currentThreadId === id) {

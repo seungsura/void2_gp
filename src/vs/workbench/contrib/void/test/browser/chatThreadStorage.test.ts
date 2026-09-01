@@ -33,10 +33,10 @@ const receiver = (client: HubClient, currentThreadId = 'A') => {
 	value.state = { allThreads: {}, currentThreadId };
 	value.streamState = {};
 	value._localEmptyThreadId = undefined;
-	value._pendingChatSubmissionOfThread = new Map(); value._pendingChatInputsOfThread = new Map(); value._drainingPendingChatInputs = new Set(); value._runQuiescenceOfThread = new Map(); value._startingParentRunOfThread = new Map(); value._stopAndSendFlights = new Map(); value._deletingPendingInputThreads = new Set();
+	value._pendingChatSubmissionOfThread = new Map(); value._pendingChatInputsOfThread = new Map(); value._drainingPendingChatInputs = new Set(); value._runQuiescenceOfThread = new Map(); value._startingParentRunOfThread = new Map(); value._deferredExternalThreadKey = new Map(); value._stopAndSendFlights = new Map(); value._deletingPendingInputThreads = new Set();
 	value._agentDelegationAuthorityOfThread = new Map(); value._agentControlGeneration = new Map(); value._parentRunTokenOfThread = new Map(); value._cancellingToolReceiptsOfThread = new Map(); value._activeToolCardReceiptsOfThread = new Map(); value._agentInstructionSessionOfThread = new Map(); value._instructionTurnOfThread = new Map(); value._transientComposerDraftOfThread = new Map();
 	value._childToolApprovals = new Map(); value._onDidChangeChildToolApprovals = { fire() { } };
-	value._onDidChangePendingChatInputs = { fire() { } }; value._onDidChangePendingChatSubmission = { fire() { } }; value._notificationService = { info(message: string) { value.notifications.push(message); } }; value.notifications = [];
+	value._onDidChangePendingChatInputs = { fire() { } }; value._onDidChangePendingChatSubmission = { fire() { } }; value._onDidChangeStreamState = { fire() { value.streamEvents++; } }; value.streamEvents = 0; value._notificationService = { info(message: string) { value.notifications.push(message); } }; value.notifications = [];
 	value._storePendingChatInputs = () => { }; value.forgotParents = []; value._agentSubagentService = { cancelParent() { }, forgetParent(id: string) { value.forgotParents.push(id); } }; value._toolsService = { invalidateReadReceipts() { } };
 	value._onDidChangeCurrentThread = { fire() { value.externalEvents++; } };
 	value.externalEvents = 0;
@@ -91,9 +91,10 @@ suite('Void per-thread chat storage', () => {
 	});
 
 	test('applies an idle selected tombstone to a fresh local blank without leaving a dangling current id', () => {
-		const hub = new SharedApplicationStorageHub(); const client = hub.client(); const w = receiver(client, 'A'); w.state.allThreads = { A: thread('A') }; w._transientComposerDraftOfThread.set('A', 'draft'); w._instructionTurnOfThread.set('A', {}); w._pendingChatInputsOfThread.set('A', [{}]);
+		const hub = new SharedApplicationStorageHub(); const client = hub.client(); const w = receiver(client, 'A'); w.state.allThreads = { A: thread('A') }; w.streamState.A = { error: new Error('stale') }; w._transientComposerDraftOfThread.set('A', 'draft'); w._instructionTurnOfThread.set('A', {}); w._pendingChatInputsOfThread.set('A', [{}]);
 		client.store(key('A'), JSON.stringify({ version: 1, revision: 2, deleted: true })); w._applyExternalThreadRecord(key('A'));
-		assert.ok(w.state.allThreads[w.state.currentThreadId]); assert.notStrictEqual(w.state.currentThreadId, 'A'); assert.strictEqual(w.getCurrentThread().id, w.state.currentThreadId); assert.strictEqual(w.state.allThreads.A, undefined); assert.strictEqual(w._transientComposerDraftOfThread.has('A'), false); assert.strictEqual(w._instructionTurnOfThread.has('A'), false); assert.strictEqual(w._pendingChatInputsOfThread.has('A'), false); assert.strictEqual(JSON.parse(client.get(key('A'))!).deleted, true); assert.strictEqual(w.notifications.length, 1);
+		assert.ok(w.state.allThreads[w.state.currentThreadId]); assert.notStrictEqual(w.state.currentThreadId, 'A'); assert.strictEqual(w.getCurrentThread().id, w.state.currentThreadId); assert.strictEqual(w.state.allThreads.A, undefined); assert.strictEqual(w.streamState.A, undefined); assert.strictEqual(w.streamEvents, 1); assert.strictEqual(w._transientComposerDraftOfThread.has('A'), false); assert.strictEqual(w._instructionTurnOfThread.has('A'), false); assert.strictEqual(w._pendingChatInputsOfThread.has('A'), false); assert.strictEqual(JSON.parse(client.get(key('A'))!).deleted, true); assert.strictEqual(w.notifications.length, 1);
+		w._applyExternalThreadRecord(key('A')); assert.strictEqual(w.streamEvents, 1); assert.strictEqual(w.notifications.length, 1);
 	});
 
 	test('reuses its existing unmaterialized local blank after selected external delete', () => {
@@ -106,6 +107,17 @@ suite('Void per-thread chat storage', () => {
 		const hub = new SharedApplicationStorageHub(); const client = hub.client(); const w = receiver(client, 'A'); w.state.allThreads = { A: thread('A') }; w.streamState = { A: { isRunning: 'tool' } }; w._transientComposerDraftOfThread.set('A', 'draft'); w._instructionTurnOfThread.set('A', {}); w._pendingChatInputsOfThread.set('A', [{}]);
 		client.store(key('A'), JSON.stringify({ version: 1, revision: 2, deleted: true })); w._applyExternalThreadRecord(key('A')); assert.ok(w.state.allThreads.A); assert.strictEqual(w._deferredExternalThreadKey.get('A'), key('A'));
 		w.streamState = {}; w._applyDeferredExternalThreadRecordIfQuiescent('A'); assert.strictEqual(w.state.allThreads.A, undefined); assert.ok(w.state.allThreads[w.state.currentThreadId]); assert.strictEqual(w._deferredExternalThreadKey.has('A'), false); assert.strictEqual(w._pendingChatInputsOfThread.has('A'), false); assert.strictEqual(w._instructionTurnOfThread.has('A'), false); assert.deepStrictEqual(w.forgotParents, ['A']); assert.strictEqual(w.notifications.length, 1);
+	});
+
+	test('restored approval without a live lease reconciles the latest deferred record before any Queue drain', () => {
+		const hub = new SharedApplicationStorageHub(); const client = hub.client(); const w = receiver(client, 'A'); w.state.allThreads = { A: thread('A', [{ role: 'user', content: 'local' }]) };
+		let drains = 0; w._drainPendingChatInputs = () => { drains++; return Promise.resolve(); };
+		client.store(key('A'), JSON.stringify({ version: 1, revision: 2, thread: thread('A', [{ role: 'user', content: 'latest' }]) })); w._deferredExternalThreadKey.set('A', key('A'));
+		(ChatThreadService.prototype as any)._releaseAwaitingApprovalQuiescence.call(w, 'A');
+		assert.strictEqual(w.state.allThreads.A.messages[0].content, 'latest'); assert.strictEqual(drains, 1);
+		client.store(key('A'), JSON.stringify({ version: 1, revision: 3, deleted: true })); w._deferredExternalThreadKey.set('A', key('A'));
+		(ChatThreadService.prototype as any)._releaseAwaitingApprovalQuiescence.call(w, 'A');
+		assert.strictEqual(w.state.allThreads.A, undefined); assert.strictEqual(drains, 1); assert.strictEqual(w.notifications.length, 1);
 	});
 
 	test('registers only external per-thread storage events', () => {
