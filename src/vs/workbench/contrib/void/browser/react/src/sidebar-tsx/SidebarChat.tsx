@@ -25,7 +25,6 @@ import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../co
 import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, CircleEllipsis, Folder, ALargeSmall, TypeOutline, Text } from 'lucide-react';
 import { ChatMessage, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
 import { AgentSubagentRunView, ChildActivitiesLedger, ChildActivityRecord, ChildToolApprovalView, isActiveChildRun } from '../../../../common/agentSubagents.js';
-import { AgentSubagentPresentation, getAgentSubagentPresentation } from '../../../../common/agentSubagentPresentation.js';
 import { canSubmitChatCurrent, ChatCurrentStatusPresentation, getChatCurrentStatusPresentation } from '../../../../common/chatCurrentStatusPresentation.js';
 import { submitChatComposer } from '../../../../common/chatComposerSubmission.js';
 import { PendingChatInput, PendingInputMode } from '../../../chatThreadService.js';
@@ -2793,10 +2792,10 @@ const CommandBarInChat = () => {
 
 
 
-const ChildRunPanel = ({ presentation, approvals }: { presentation: AgentSubagentPresentation | undefined; approvals: readonly ChildToolApprovalView[] }) => {
+const ChildToolApprovalPanel = ({ approvals }: { approvals: readonly ChildToolApprovalView[] }) => {
 	const chatThreadsService = useAccessor().get('IChatThreadService')
-	if (!presentation && approvals.length === 0) return null;
-	return <section className='text-xs mb-1' aria-label='Child runs'>
+	if (approvals.length === 0) return null;
+	return <section className='text-xs mb-1' aria-label='Child tool approvals'>
 		{approvals.map(approval => {
 			const key = approval.key
 			const title = approval.title
@@ -2811,23 +2810,6 @@ const ChildRunPanel = ({ presentation, approvals }: { presentation: AgentSubagen
 				</div>
 			</div>
 		})}
-		{presentation ? <><div className='text-void-fg-3' role='status' aria-live='polite' aria-atomic='true'>{presentation.summary}</div>
-		{presentation.actionRequired ? <div className='text-void-warning'>{presentation.actionRequiredLabel}. Open details for the recorded status.</div> : null}
-		{presentation.runs.map(view => <details key={view.id} className='border border-void-border-1 rounded-sm px-2 py-1 mt-1'>
-			<summary className='focus-ring cursor-pointer select-none' aria-label={`Child Run${view.roleName ? ` ${view.roleName}` : ''} ${view.shortId} ${view.statusLabel}${view.resultTruncated ? ' result truncated' : ''}`}>Child Run{view.roleName ? ` · ${view.roleName}` : ''} · {view.shortId} · {view.statusLabel}{view.resultTruncated ? ' · result truncated' : ''} · {view.totalMs}ms</summary>
-			<div className='pt-1 text-void-fg-3'>
-				{view.toolPresentation ? <div>Void application-level inherited parent profile: {view.toolPresentation.toolNames.join(', ') || 'no captured tools'}; approvals: {view.toolPresentation.approvals.join(', ') || 'none'}; Undo for successful write_file modify {view.toolPresentation.undoAvailable ? 'available' : 'not available'}; no OS sandbox</div> : <div>Void application-level read-only — terminal disabled, no OS sandbox</div>}
-				{view.roleDescription ? <div>{view.roleDescription}</div> : null}
-				<div>Timing: {view.queuedMs}ms queued, {view.runningMs}ms running, {view.totalMs}ms total</div>
-				{view.summary ? <div className='pt-1 whitespace-pre-wrap break-words'>{view.summary}</div> : null}
-				{view.resultTruncated ? <div className='pt-1 text-void-warning' role='status'>Result compacted to the group retention budget.</div> : null}
-				<details className='mt-1'><summary className='focus-ring cursor-pointer select-none' aria-label={`Technical details for child run ${view.shortId}`}>Technical details</summary><div className='pt-1'>Authority revisions: runtime {view.authority.runtimeRevision.slice(0, 8)}, instructions {view.authority.instructionsRevision.slice(0, 8)}, skills {view.authority.catalogRevision.slice(0, 8)}{view.authority.modelFingerprint ? `, model ${view.authority.modelFingerprint}` : ''}{view.authority.selectedSkills.length ? `; selected skills: ${view.authority.selectedSkills.map(skill => skill.identity).join(', ')}` : ''}</div></details>
-			</div>
-		</details>)}
-		{presentation.budget || presentation.diagnostics ? <details className='border border-void-border-1 rounded-sm px-2 py-1 mt-1'><summary className='focus-ring cursor-pointer select-none' aria-label='Child diagnostics'>Diagnostics and technical details</summary><div className='pt-1 text-void-fg-3'>
-			{presentation.budget ? <div>Capacity: {presentation.budget.accepted}/{presentation.budget.maxAccepted} open, {presentation.budget.running}/{presentation.budget.maxConcurrent} concurrent. Provider requests: {presentation.budget.activeProviderSends}/{presentation.budget.maxProviderSends} in flight ({presentation.budget.providerSends} historical). Result retention: {presentation.budget.retainedResultChars}/{presentation.budget.maxResultChars} chars; up to {presentation.budget.maxChildSummaryChars} chars per child{presentation.budget.truncatedResultCount ? `; ${presentation.budget.truncatedResultCount} terminal result${presentation.budget.truncatedResultCount === 1 ? '' : 's'} compacted` : ''}.</div> : <div>{presentation.usageLabel}</div>}
-			{presentation.diagnostics ? <><div>Timeline: {presentation.diagnostics.events.length} events, {presentation.diagnostics.elapsedMs}ms</div>{presentation.diagnostics.droppedEvents ? <div>{presentation.diagnostics.droppedEvents} later events omitted</div> : null}{presentation.diagnostics.events.map(event => <div key={event.sequence}>#{event.sequence} +{event.elapsedMs}ms · {event.kind}{event.childId ? ` · ${event.childId.slice(0, 8)}` : ''}{event.diagnostic ? ` · ${event.diagnostic}` : ''} · {event.budget.running} running/{event.budget.queued} queued</div>)}</> : null}
-		</div></details> : null}</> : null}
 	</section>;
 };
 
@@ -2968,9 +2950,8 @@ export const SidebarChat = () => {
 	const pendingSubmission = usePendingChatSubmission(threadId)
 	const pendingInputs = usePendingChatInputs(threadId)
 	const isRunning = currThreadStreamState?.isRunning
-	const { runs: childRuns, budget: childBudget, diagnostics: childDiagnostics } = useAgentSubagentLiveSnapshot(currentThread.id)
+	const { runs: childRuns } = useAgentSubagentLiveSnapshot(currentThread.id)
 	const childToolApprovals = useChildToolApprovals(currentThread.id)
-	const childPresentation = getAgentSubagentPresentation(childBudget, childRuns, childDiagnostics)
 	// One live overlay is shared by every history card; cards never subscribe or tick.
 	const liveChildRunById = useMemo(() => new Map(childRuns.map(run => [JSON.stringify([run.generation, run.id]), run])), [childRuns])
 	const childActivityPlan = useMemo(() => childActivityInterleavePlan(previousMessages, currentThread.childActivities), [previousMessages, currentThread.childActivities])
@@ -3275,7 +3256,7 @@ export const SidebarChat = () => {
 
 	const threadPageInput = <div key={'input' + chatThreadsState.currentThreadId}>
 		<div className='px-4'>
-			<ChildRunPanel presentation={childPresentation} approvals={childToolApprovals} />
+			<ChildToolApprovalPanel approvals={childToolApprovals} />
 			<CommandBarInChat />
 			{pendingInputPanel}
 		</div>
@@ -3286,7 +3267,7 @@ export const SidebarChat = () => {
 
 	const landingPageInput = <div>
 		<div className='pt-8'>
-			<div className='px-4'><ChildRunPanel presentation={childPresentation} approvals={childToolApprovals} />{pendingInputPanel}</div>
+			<div className='px-4'><ChildToolApprovalPanel approvals={childToolApprovals} />{pendingInputPanel}</div>
 			{inputChatArea}
 		</div>
 	</div>

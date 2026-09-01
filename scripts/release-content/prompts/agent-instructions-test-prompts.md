@@ -1,6 +1,6 @@
 # Agent instructions, Skills, custom agents와 bounded subagent 직접 테스트 프롬프트
 
-모든 항목은 실제 제품 관찰용입니다. 예상 결과를 미리 PASS로 기록하지 마세요. 별도 임시 workspace에서 Chat을 사용하세요. Chat은 항상 Agent로 동작합니다. `PASS`/`FAIL`/`BLOCKED`/`EXPLORATORY`, provider/model, top-level turn, selector, bounded tool trace, Child Run·Chat UI와 실제 file state를 함께 기록하세요. Source fixture, build와 artifact smoke는 actual provider/network E2E를 대체하지 않습니다.
+모든 항목은 실제 제품 관찰용입니다. 예상 결과를 미리 PASS로 기록하지 마세요. 별도 임시 workspace에서 Chat을 사용하세요. Chat은 항상 Agent로 동작합니다. `PASS`/`FAIL`/`BLOCKED`/`EXPLORATORY`, provider/model, top-level turn, selector, bounded tool trace, durable Child Activity·composer approval UI와 실제 file state를 함께 기록하세요. Source fixture, build와 artifact smoke는 actual provider/network E2E를 대체하지 않습니다.
 
 ## 1. `AGENTS.md` next-turn reload와 same-turn revision
 
@@ -96,7 +96,7 @@ developer_instructions = "Inspect only. Separate facts from remaining risks."
 capability_profile = "read_only"
 ```
 
-Chat은 항상 Agent로 동작합니다. marker 없이 다음 prompt를 먼저 실행하고, 이어 입력창의 `@` menu에서 generic Agent와 exact `reviewer` role을 각각 선택해 비교합니다. Selection만 한 시점에는 Child Run이 생기지 않는지 먼저 봅니다.
+Chat은 항상 Agent로 동작합니다. marker 없이 다음 prompt를 먼저 실행하고, 이어 입력창의 `@` menu에서 generic Agent와 exact `reviewer` role을 각각 선택해 비교합니다. Selection만 한 시점에는 Child Activity card나 mutation이 생기지 않는지 먼저 봅니다.
 
 Exact prompt:
 
@@ -104,13 +104,13 @@ Exact prompt:
 reviewer custom agent에게 현재 workspace의 최상위 file 이름을 읽기 전용으로 조사하도록 위임하세요. parent가 직접 대신 조사하지 말고 child 결과의 짧은 summary만 알려 주세요.
 ```
 
-Expected: supported native Agent route는 marker 없이 generic controls를 제공하고 parent의 `spawn_agent` call만 child를 시작합니다. Named picker selection을 사용한 turn에서는 `agent_type`이 exact `reviewer`입니다. Child Run에는 role name, `read_only`와 short identity가 표시됩니다. Parent에는 bounded terminal receipt가 한 번 전달되고 raw child transcript는 복사되지 않습니다. `spawn_agent` UI title은 **Start child Agent**이며 generic approval 또는 MCP card가 아닙니다.
+Expected: supported native Agent route는 marker 없이 generic controls를 제공하고 parent의 `spawn_agent` call만 child를 시작합니다. Named picker selection을 사용한 turn에서는 `agent_type`이 exact `reviewer`입니다. Spawn receipt 뒤 durable Child Activity card에는 role name, `read_only`와 short identity가 표시됩니다. Parent에는 bounded terminal receipt가 한 번 전달되고 raw child transcript는 복사되지 않습니다. `spawn_agent` UI title은 **Start child Agent**이며 generic approval 또는 MCP card가 아닙니다.
 
 Negative variation: 같은 scope에 `name = "reviewer"`인 두 file을 두거나 `sandbox_mode = "workspace-write"`로 바꿉니다. Expected: disabled bounded diagnostic이 보이고 해당 scope identity가 provider dispatch 전에 거부되며 filename으로 name을 보정하거나 permission을 확대하지 않습니다. Valid role을 select한 뒤 file revision을 바꾸고 send하면 stale role reselect diagnostic이 나며 old authority가 재사용되지 않아야 합니다.
 
 Unsupported variation: native Agent tool format이 없는 provider/model route 또는 usable model이 없는 상태에서 같은 prompt를 보냅니다. Expected: history/provider send 전에 unsupported/no-model diagnostic이며 child와 tool side effect는 0입니다. 해당 환경을 안전하게 만들 수 없으면 `BLOCKED`입니다.
 
-Record: source scope / `agent_type` / Child Run role·status / diagnostic / provider call 발생 여부 / parent가 받은 receipt 수.
+Record: source scope / `agent_type` / durable Child Activity role·status / provider call 발생 여부 / parent가 받은 receipt 수.
 
 ## 4. Default limits, Project override, FIFO와 depth 2
 
@@ -122,7 +122,7 @@ Exact prompt:
 서로 다른 네 child를 sequential spawn_agent call로 시작하세요. 각 child는 temp workspace의 서로 다른 최상위 항목 하나를 읽기 전용으로 조사해야 합니다. 시작 뒤 wait_agent로 전체 상태와 완료 receipt를 수집하세요.
 ```
 
-Expected A: default는 accepted `4`, concurrent `2`, depth `1`입니다. 세 번째와 네 번째 accepted child는 먼저 시작한 running slot이 끝날 때까지 `queued`이고 FIFO admission 순서로 승격됩니다. Child failure는 다른 child를 자동 중단하지 않습니다. Terminal child가 settle되면 open capacity가 반환되어 later sequential child가 admission될 수 있습니다. Child Run row와 ordered receipt는 그대로 남습니다.
+Expected A: default는 accepted `4`, concurrent `2`, depth `1`입니다. 세 번째와 네 번째 accepted child는 먼저 시작한 running slot이 끝날 때까지 `queued`이고 FIFO admission 순서로 승격됩니다. Child failure는 다른 child를 자동 중단하지 않습니다. Terminal child가 settle되면 open capacity가 반환되어 later sequential child가 admission될 수 있습니다. Spawn receipt에 묶인 durable Child Activity card와 ordered receipt는 그대로 남습니다.
 
 작업이 너무 빨라 두 running과 queue를 관찰하지 못하면 capacity header와 tool trace를 확인합니다. 둘 다 확보하지 못하면 timing 부분은 `BLOCKED`로 남기세요.
 
@@ -182,7 +182,7 @@ developer_instructions = "Touch only undo-fixture.txt and stop after one approve
 capability_profile = "inherit_parent_write"
 ```
 
-Composer의 `@` menu에서 Agent → exact `fixture-writer` role을 이 top-level turn에 선택합니다. Selection만으로 Child Run이나 mutation이 생기지 않는지 먼저 확인하세요.
+Composer의 `@` menu에서 Agent → exact `fixture-writer` role을 이 top-level turn에 선택합니다. Selection만으로 Child Activity card나 mutation이 생기지 않는지 먼저 확인하세요.
 
 Exact prompt:
 
@@ -190,26 +190,24 @@ Exact prompt:
 fixture-writer child에게 먼저 undo-fixture.txt를 읽고 beta를 gamma로 바꾸는 write_file modify 하나만 준비하게 하세요. Approval이 필요하면 제가 승인할 때까지 실행하지 말고, 완료 뒤 file bytes와 Undo availability만 보고하세요.
 ```
 
-Expected: Exact selected role이 `spawn_agent.agent_type = fixture-writer`를 pin하고 Child Run의 frozen parent tool snapshot에 실제 available tools, required approval categories와 Undo가 표시됩니다. Child는 live tool lookup이나 terminal 우회 없이 parent broker를 사용하며 captured parent approval policy가 적용됩니다. Manual approval policy이면 card settlement 전에 mutation하지 않습니다. 승인 또는 captured auto-approval 뒤 file은 `alpha\ngamma\n`, 한 Undo 뒤 `alpha\nbeta\n`로 복원돼야 합니다. 동시에 다른 mutation-capable child를 시작하면 lease를 공유해 mutation이 겹치지 않습니다. Parent history/stream에 child tool request가 일반 parent request로 나타나면 `FAIL`입니다.
+Expected: Exact selected role이 `spawn_agent.agent_type = fixture-writer`를 pin하고 durable Child Activity card의 frozen parent tool snapshot에 실제 available tools, required approval categories와 Undo가 표시됩니다. Child는 live tool lookup이나 terminal 우회 없이 parent broker를 사용하며 captured parent approval policy가 적용됩니다. Manual approval policy이면 composer-adjacent Approve/Reject card settlement 전에 mutation하지 않습니다. 승인 또는 captured auto-approval 뒤 file은 `alpha\ngamma\n`, 한 Undo 뒤 `alpha\nbeta\n`로 복원돼야 합니다. 동시에 다른 mutation-capable child를 시작하면 lease를 공유해 mutation이 겹치지 않습니다. Parent history/stream에 child tool request가 일반 parent request로 나타나면 `FAIL`입니다.
 
 승인 UI, inherited write tool 또는 Undo가 현재 route에서 없으면 mutation을 시도하지 말고 `BLOCKED`로 기록합니다. Test가 끝나면 fixture와 role을 제거하세요.
 
 Record: captured tool list / approval title·category / pre-approval bytes / post-write bytes / Undo count·restored bytes / concurrent mutation state / parent history·stream 변화.
 
-## 7. Bounded diagnostics와 child UI
+## 7. Composer approval과 durable child UI
 
-앞선 four-child run의 Child Run panel을 엽니다.
+Manual approval이 필요한 child mutation을 안전한 fixture에서 한 번 요청합니다.
 
 Expected:
 
-- compact header에 accepted/running/queued capacity와 truthful status가 보입니다;
-- failed child와 setup failure만 `Action required`이고 cancellation은 아닙니다;
-- child, technical metadata와 diagnostic detail은 처음에는 접혀 있습니다;
-- local trace는 first `128 events`까지만 보여 주고 이후에는 `droppedEvents` count를 사용합니다;
-- provider usage를 받지 못하면 0으로 만들지 않고 exact `Usage unavailable`을 표시합니다;
-- prompt, transcript, tool arguments, path, raw error와 child summary가 diagnostic event body로 노출되지 않습니다.
+- composer-adjacent approval card에 pending child tool의 title, category, parameters와 Approve/Reject가 보입니다;
+- child capacity, status, timing, diagnostics, technical metadata와 frozen profile details는 composer에 나타나지 않습니다;
+- spawn receipt에 묶인 durable Child Activity card는 active/terminal status와 timing을 계속 표시합니다;
+- approval 전에는 mutation하지 않고, Reject 뒤에도 durable card/history가 사라지지 않습니다.
 
-128개를 넘는 event를 안전하게 만들 수 없다면 cap 자체는 `BLOCKED`로 남기고 현재 count와 dropped 표시만 기록하세요.
+Local trace의 first `128 events`, dropped count와 provider `Usage unavailable`은 SOURCE/FOCUSED contract이며 이 composer UI 관찰에서 직접 요구하지 않습니다. prompt, transcript, tool arguments, path, raw error와 child summary가 diagnostic event body로 노출된다고 가정하지 마세요.
 
 ## 8. Child activity와 native batch 직접 관찰
 

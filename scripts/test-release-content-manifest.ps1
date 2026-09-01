@@ -74,7 +74,7 @@ function Assert-ProductionReleaseContentSemanticPolarity {
         'portable/release-notes.md'=@($PolarityPerCardPositive,$PolarityFinitePositive,$PolarityExactPositive)
         'prompts/agent-instructions-test-prompts.md'=@($PolarityPerCardPositive,$PolarityFinitePositive,$PolarityExactPositive,'visible root card count','nested activity-row count','activities omitted.','Retention is saturated.')
     }
-    $staleNegative=@($PolarityPerCardNegative,$PolarityFiniteNegative,$PolarityExactNegative,$PolarityExactGuideNegative)
+    $staleNegative=@($PolarityPerCardNegative,$PolarityFiniteNegative,$PolarityExactNegative,$PolarityExactGuideNegative,'Child Run panel','Child Run UI')
     foreach($source in $requiredBySource.Keys){
         if(-not $SourceTexts.ContainsKey($source)){throw "Production semantic source is missing: $source"}
         $text=[string]$SourceTexts[$source]

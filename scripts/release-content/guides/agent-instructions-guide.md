@@ -158,7 +158,7 @@ Terminal, file write/edit/delete, MCP와 app tool은 제공하지 않으며 runt
 
 이 role은 admission 때 parent가 가진 current authority, owner/root/CWD/trust와 frozen parent tool snapshot을 capture합니다. Child는 그 exact snapshot의 unique built-in/MCP entry만 parent broker를 통해 호출할 수 있습니다. Live settings, catalog 또는 tool lookup으로 새 tool을 얻거나 parent보다 높은 approval/permission으로 elevation하지 않습니다.
 
-Child Run은 frozen available tool names, required approval categories, Undo availability와 동일한 no-OS-sandbox application boundary를 표시합니다. Captured parent approval policy가 적용되며 manual approval policy인 built-in/MCP mutation은 parent approval card를 통과해야 합니다. `write_file`은 child-owned read receipt와 editor Undo transaction을 유지합니다. 동시에 lease를 갖는 one mutation-capable child만 허용됩니다. Cancellation은 provider/broker/underlying result settlement와 stale-result fence를 통과한 뒤 lease를 놓으며 nested child도 같은 mutation/concurrency/group budget을 사용합니다. Parent history와 parent stream tool request는 child broker가 수정하지 않습니다.
+Frozen available tool names, required approval categories, Undo availability와 no-OS-sandbox application boundary는 spawn receipt에 묶인 durable Child Activity card에서 확인합니다. Captured parent approval policy가 적용되며 manual approval policy인 built-in/MCP mutation은 composer-adjacent approval card의 Approve/Reject를 통과해야 합니다. `write_file`은 child-owned read receipt와 editor Undo transaction을 유지합니다. 동시에 lease를 갖는 one mutation-capable child만 허용됩니다. Cancellation은 provider/broker/underlying result settlement와 stale-result fence를 통과한 뒤 lease를 놓으며 nested child도 같은 mutation/concurrency/group budget을 사용합니다. Parent history와 parent stream tool request는 child broker가 수정하지 않습니다.
 
 ## Search backend fallback
 
@@ -176,7 +176,7 @@ Direct/nested child의 accepted/concurrent state와 result characters는 root gr
 
 ## Child, Chat history와 composer UI
 
-Child Run panel은 transient 상태 `queued`, `running`, `completed`, `failed`, `cancelled`, accepted/running/queued capacity와 timing을 표시합니다. Failed child와 setup failure는 접힌 detail 밖에서도 `Action required`로 보이고, cancellation은 action-required로 표시하지 않습니다. Child, technical metadata와 diagnostics detail은 기본적으로 접혀 있습니다.
+Composer에는 pending child tool의 composer-adjacent approval card만 남습니다. transient child status `queued`, `running`, `completed`, `failed`, `cancelled`, capacity, timing, diagnostics와 technical metadata는 composer에 표시하지 않습니다. Child progress와 terminal details는 spawn receipt에 묶인 durable Child Activity card에서 확인합니다; cancellation은 action-required로 표시하지 않습니다.
 
 Local diagnostics는 parent generation마다 처음 **128 events**만 insertion order로 보존하고 이후 event는 `droppedEvents` count로만 남깁니다. prompt, transcript, tool argument, path, resource body, raw error와 child summary는 trace event에 저장하지 않습니다. Provider usage channel이 없으므로 synthetic token 또는 cost를 만들지 않고 UI에는 정확히 **Usage unavailable**로 표시합니다.
 
@@ -186,7 +186,7 @@ Current Chat composer는 `Error > Needs approval > Running > unavailable > idle`
 
 Provider-native batch는 durable declaration/provider ordinal을 보존합니다. approved contiguous exact-safe-read calls만 physical cap-two waves로 실행할 수 있습니다. physical completion order는 durable tool/provider row settlement를 바꾸지 않으며 non-safe calls는 declaration-order barriers입니다. mutation, terminal, MCP는 serialized/exclusive이고 next provider continuation은 batch terminal or paused까지 기다립니다. literal `multi_tool_use.parallel`은 제공하지 않습니다. Plan과 orchestration은 main parent의 책임입니다. 새 Plan API/UI/storage와 same-child follow-up은 제공하지 않습니다.
 
-Child Run의 transient panel과 별도로 spawn receipt에 묶인 bounded expandable Child activity card가 Chat history에 남을 수 있습니다. 이는 full child transcript/session이 아니며 raw child transcript를 parent history로 복사하지 않습니다. thread-level `ChildActivitiesLedger`는 그 thread의 retained root cards가 공유하며 combined total 32 records / UTF-8 64 KiB projection retention을 적용합니다. 이는 separate Queue/Steer inbox envelope의 32/64 상한과 독립적이고 per-card 상한이 아닙니다.
+Spawn receipt에 묶인 bounded expandable Child activity card가 durable 상태 기록으로 Chat history에 남고 active child는 same card의 live overlay로 갱신됩니다. 이는 full child transcript/session이 아니며 raw child transcript를 parent history로 복사하지 않습니다. thread-level `ChildActivitiesLedger`는 그 thread의 retained root cards가 공유하며 combined total 32 records / UTF-8 64 KiB projection retention을 적용합니다. 이는 separate Queue/Steer inbox envelope의 32/64 상한과 독립적이고 per-card 상한이 아닙니다.
 
 ## Assistant message와 native tool-only history
 
@@ -206,4 +206,4 @@ Exact `(empty message)` sentinel은 parent storage, child history/summary, conve
 
 ## 관찰 결과 기록
 
-동봉 `prompts/agent-instructions-test-prompts.md`는 작은 수동 관찰 절차이지 합격 증명서가 아닙니다. 실제 실행에서는 `PASS`/`FAIL`/`BLOCKED`/`EXPLORATORY`, provider/model, top-level turn, selector, bounded tool trace, Child Run과 Chat UI 상태, 실제 file state를 함께 기록하세요. Source fixture, build 또는 artifact smoke 성공만으로 actual provider 동작, token usage나 performance를 주장하지 마세요.
+동봉 `prompts/agent-instructions-test-prompts.md`는 작은 수동 관찰 절차이지 합격 증명서가 아닙니다. 실제 실행에서는 `PASS`/`FAIL`/`BLOCKED`/`EXPLORATORY`, provider/model, top-level turn, selector, bounded tool trace, durable Child Activity와 composer approval UI 상태, 실제 file state를 함께 기록하세요. Source fixture, build 또는 artifact smoke 성공만으로 actual provider 동작, token usage나 performance를 주장하지 마세요.
