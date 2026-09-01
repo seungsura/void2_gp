@@ -101,7 +101,7 @@ suite('Void per-thread chat storage', () => {
 	test('merges a selected idle thread while retaining its local composer and mount ownership', () => {
 		const hub = new SharedApplicationStorageHub(); const client = hub.client(); const w = receiver(client, 'A'); const mountedInfo: any = { local: true };
 		w._transientComposerDraftOfThread.set('A', 'transient draft');
-		w.state.allThreads = { A: { ...thread('A', [{ role: 'user', content: 'old' }]), state: { ...thread('A').state, stagingSelections: ['local-draft'], focusedMessageIdx: 0, mountedInfo } };
+		w.state.allThreads = { A: { ...thread('A', [{ role: 'user', content: 'old' }]), state: { ...thread('A').state, stagingSelections: ['local-draft'], focusedMessageIdx: 0, mountedInfo } } };
 		client.store(key('A'), JSON.stringify({ version: 1, revision: 2, thread: thread('A', [{ role: 'user', content: 'remote' }]) })); w._applyExternalThreadRecord(key('A'));
 		assert.strictEqual(w.state.currentThreadId, 'A'); assert.strictEqual(w.state.allThreads.A.messages[0].content, 'remote'); assert.deepStrictEqual(w.state.allThreads.A.state.stagingSelections, ['local-draft']); assert.strictEqual(w.state.allThreads.A.state.focusedMessageIdx, 0); assert.strictEqual(w.state.allThreads.A.state.mountedInfo, mountedInfo); assert.strictEqual(w._transientComposerDraftOfThread.get('A'), 'transient draft'); assert.strictEqual(w.setStateCalls, 0);
 	});
