@@ -6,7 +6,7 @@
 import * as assert from 'assert';
 import { ChatThreadService } from '../../browser/chatThreadService.js';
 import { EMPTY_CHILD_ACTIVITIES } from '../../common/agentSubagents.js';
-import { THREAD_STORAGE_KEY, THREAD_STORAGE_RECORD_PREFIX } from '../../common/storageKeys.js';
+import { THREAD_STORAGE_KEY, THREAD_STORAGE_MIGRATION_COMPLETE_KEY, THREAD_STORAGE_RECORD_PREFIX } from '../../common/storageKeys.js';
 import { URI } from '../../../../../base/common/uri.js';
 
 /** An application-storage hub deliberately gives every window its own cache. */
@@ -117,6 +117,24 @@ suite('Void per-thread chat storage', () => {
 		const w = receiver(client); const restored = w._readAllThreads(); assert.strictEqual(restored.legacy.messages[0].content, 'keep'); assert.strictEqual(restored.legacy.messages[0].state.uri.scheme, 'file'); assert.deepStrictEqual(restored.legacy.childActivities.records, []);
 	});
 
+	test('resumes a crashed partial migration by retaining untouched legacy threads', () => {
+		const hub = new SharedApplicationStorageHub(); const client = hub.client(); client.store(THREAD_STORAGE_KEY, JSON.stringify({ A: thread('A', [{ role: 'user', content: 'legacy A' }]), B: thread('B', [{ role: 'user', content: 'legacy B' }]) }));
+		const crashed = receiver(client); crashed._storeThreadRecord('A', thread('A', [{ role: 'user', content: 'v3 A' }]));
+		const resumed = receiver(client); const merged = resumed._readAllThreads(); assert.strictEqual(merged.A.messages[0].content, 'v3 A'); assert.strictEqual(merged.B.messages[0].content, 'legacy B');
+		resumed._storeAllThreads(merged); resumed._completeLegacyThreadStorageMigration(); assert.strictEqual(client.get(THREAD_STORAGE_MIGRATION_COMPLETE_KEY), '1');
+	});
+
+	test('uses a live v3 record and matching v3 tombstone over the incomplete legacy baseline', () => {
+		const hub = new SharedApplicationStorageHub(); const client = hub.client(); client.store(THREAD_STORAGE_KEY, JSON.stringify({ A: thread('A', [{ role: 'user', content: 'legacy A' }]), B: thread('B', [{ role: 'user', content: 'legacy B' }]) }));
+		const w = receiver(client); w._storeThreadRecord('A', thread('A', [{ role: 'user', content: 'override A' }])); w._storeThreadTombstone('B');
+		const restored = receiver(client)._readAllThreads(); assert.strictEqual(restored.A.messages[0].content, 'override A'); assert.strictEqual(restored.B, undefined);
+	});
+
+	test('uses only v3 records after the migration marker is complete', () => {
+		const hub = new SharedApplicationStorageHub(); const client = hub.client(); client.store(THREAD_STORAGE_KEY, JSON.stringify({ legacyOnly: thread('legacyOnly') })); const w = receiver(client); w._storeThreadRecord('A', thread('A')); client.store(THREAD_STORAGE_MIGRATION_COMPLETE_KEY, '1');
+		const restored = receiver(client)._readAllThreads(); assert.deepStrictEqual(Object.keys(restored), ['A']);
+	});
+
 	test('malformed v3-looking keys do not suppress legacy, but a valid tombstone does', () => {
 		const hub = new SharedApplicationStorageHub(); const client = hub.client(); const legacy = thread('legacy'); client.store(THREAD_STORAGE_KEY, JSON.stringify({ legacy })); client.store(`${THREAD_STORAGE_RECORD_PREFIX}%`, '{broken');
 		const malformedOnly = receiver(client); assert.ok(malformedOnly._readAllThreads().legacy);
@@ -132,7 +150,7 @@ suite('Void per-thread chat storage', () => {
 
 	test('reset writes tombstones before its new blank view and a delivered tombstone fences stale resurrection', () => {
 		const hub = new SharedApplicationStorageHub(); const c1 = hub.client(); const c2 = hub.client(); const w1 = receiver(c1, 'A'); const w2 = receiver(c2, 'A');
-		w1.state.allThreads = { A: thread('A', [{ role: 'user', content: 'old' }]) }; w1._storeAllThreads(w1.state.allThreads);
+		c1.store(THREAD_STORAGE_KEY, JSON.stringify({ A: thread('A', [{ role: 'user', content: 'old' }]), B: thread('B', [{ role: 'user', content: 'legacy unseen' }]) })); w1._didReadLegacyThreadStorage = true; w1.state.allThreads = { A: thread('A', [{ role: 'user', content: 'old' }]) }; w1._storeAllThreads(w1.state.allThreads);
 		for (const storageKey of hub.keys()) c2.catchUp(storageKey); w2.state.allThreads = { A: thread('A', [{ role: 'user', content: 'stale' }]) };
 		w1.resetState(); c2.catchUp(key('A')); w2._storeAllThreads({ A: thread('A', [{ role: 'user', content: 'stale later' }]) });
 		const c3 = hub.client(); for (const storageKey of hub.keys()) c3.catchUp(storageKey); const w3 = receiver(c3); assert.deepStrictEqual(w3._readAllThreads(), {});

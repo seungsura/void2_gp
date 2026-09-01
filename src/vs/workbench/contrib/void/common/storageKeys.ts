@@ -20,6 +20,8 @@ export const THREAD_STORAGE_KEY = 'void.chatThreadStorageII'
 
 // 1.0.4. Individual records avoid a stale window replacing unrelated history.
 export const THREAD_STORAGE_RECORD_PREFIX = 'void.chatThreadStorageIII.'
+// Written only after every legacy aggregate entry has a v3 record or tombstone.
+export const THREAD_STORAGE_MIGRATION_COMPLETE_KEY = 'void.chatThreadStorageIII.migrationComplete'
 
 // Deliberately separate from model-visible chat history. Pending busy-composer input
 // survives a restart as dormant work and is never replayed automatically.

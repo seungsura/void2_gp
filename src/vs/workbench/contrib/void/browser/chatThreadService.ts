@@ -31,7 +31,7 @@ import { IVoidModelService } from '../common/voidModelService.js';
 import { findLast } from '../../../../base/common/arraysFind.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { truncate } from '../../../../base/common/strings.js';
-import { PENDING_CHAT_INPUT_STORAGE_KEY, THREAD_STORAGE_KEY, THREAD_STORAGE_RECORD_PREFIX } from '../common/storageKeys.js';
+import { PENDING_CHAT_INPUT_STORAGE_KEY, THREAD_STORAGE_KEY, THREAD_STORAGE_MIGRATION_COMPLETE_KEY, THREAD_STORAGE_RECORD_PREFIX } from '../common/storageKeys.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { timeout } from '../../../../base/common/async.js';
 import { deepClone } from '../../../../base/common/objects.js';
@@ -520,7 +520,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const allThreads = readThreads
 		// Keep the empty initial state while importing legacy records so each
 		// imported thread is written as its own record rather than as a map.
-		if (this._didReadLegacyThreadStorage) this._storeAllThreads(allThreads)
+		if (this._didReadLegacyThreadStorage) { this._storeAllThreads(allThreads); this._completeLegacyThreadStorageMigration() }
 		this.state = { allThreads, currentThreadId: null as unknown as string }
 		this._restoreInstructionTurns(allThreads)
 		this._restorePendingChatInputs()
@@ -978,21 +978,35 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	}
 
 	private _readAllThreads(): ChatThreads | null {
-		const threads: ChatThreads = {}
-		let foundRecords = false
+		const records = new Map<string, ThreadStorageEnvelope>()
 		for (const key of this._storageService.keys(StorageScope.APPLICATION, StorageTarget.USER)) {
 			if (!key.startsWith(THREAD_STORAGE_RECORD_PREFIX)) continue
 			const id = this._threadIdFromStorageKey(key)
 			const envelope = id && this._readThreadEnvelope(key, id)
 			if (!id || !envelope) continue
-			foundRecords = true
-			if (envelope.thread && !envelope.deleted) threads[id] = envelope.thread
+			records.set(id, envelope)
 		}
-		if (foundRecords) return threads
 		const legacy = this._storageService.get(THREAD_STORAGE_KEY, StorageScope.APPLICATION)
-		if (!legacy) return null
+		const migrationComplete = this._storageService.get(THREAD_STORAGE_MIGRATION_COMPLETE_KEY, StorageScope.APPLICATION) === '1'
+		if (migrationComplete || !legacy) return this._threadsFromStorageRecords(records)
 		this._didReadLegacyThreadStorage = true
-		return this._convertThreadDataFromStorage(legacy)
+		const threads = this._convertThreadDataFromStorage(legacy)
+		// Before the marker is durable, a crash may have written only a prefix of
+		// the migration. Overlay those records so they win, while untouched legacy
+		// ids remain visible and can be imported on this restart.
+		for (const [id, envelope] of records) {
+			if (envelope.deleted) delete threads[id]
+			else if (envelope.thread) threads[id] = envelope.thread
+		}
+		return threads
+	}
+	private _threadsFromStorageRecords(records: ReadonlyMap<string, ThreadStorageEnvelope>): ChatThreads {
+		const threads: ChatThreads = {}
+		for (const [id, envelope] of records) if (!envelope.deleted && envelope.thread) threads[id] = envelope.thread
+		return threads
+	}
+	private _completeLegacyThreadStorageMigration(): void {
+		this._storageService.store(THREAD_STORAGE_MIGRATION_COMPLETE_KEY, '1', StorageScope.APPLICATION, StorageTarget.USER)
 	}
 	private _registerExternalThreadStorageListener(): void {
 		this._register(this._storageService.onDidChangeValue(StorageScope.APPLICATION, undefined, this._store)(event => {
@@ -1056,6 +1070,10 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			if (!id || !this._readThreadEnvelope(key, id)) continue
 			this._storeThreadTombstone(id)
 		}
+		if (!this._didReadLegacyThreadStorage) return
+		const legacy = this._storageService.get(THREAD_STORAGE_KEY, StorageScope.APPLICATION)
+		if (!legacy) return
+		try { for (const id of Object.keys(this._convertThreadDataFromStorage(legacy))) this._storeThreadTombstone(id) } catch { /* malformed legacy is not a deletion target */ }
 	}
 	private _applyExternalThreadRecord(key: string): void {
 		const id = this._threadIdFromStorageKey(key); if (!id) return
