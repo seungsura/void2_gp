@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------*/
 
 import * as assert from 'assert';
-import { ChatHistoryChildOverview, ChatHistoryParentActivity, ChatHistoryThreadMetadata, getChatHistoryPresentation, hasActionRequiredChild, shouldShowPersistentChatHistory } from '../../common/chatHistoryPresentation.js';
+import { ChatHistoryChildOverview, ChatHistoryParentActivity, ChatHistoryPendingOverview, ChatHistoryThreadMetadata, getChatHistoryPresentation, hasActionRequiredChild, shouldShowPersistentChatHistory } from '../../common/chatHistoryPresentation.js';
 
 const thread = (id: string, overrides: Partial<ChatHistoryThreadMetadata> = {}): ChatHistoryThreadMetadata => ({ id, title: `Chat ${id}`, messageCount: 1, lastModified: '2026-08-12T00:00:00.000Z', ...overrides });
 const parent = (overrides: ChatHistoryParentActivity = {}): Readonly<Record<string, ChatHistoryParentActivity | undefined>> => ({ a: overrides });
@@ -18,6 +18,22 @@ suite('Void ChatHistoryPresentation', () => {
 	test('returns an empty frozen list for no visible chats', () => assert.ok(Object.isFrozen(getChatHistoryPresentation([], '', {}, {}))));
 	test('filters zero-message chats and sorts descending by modification time', () => {
 		const value = getChatHistoryPresentation([thread('old', { lastModified: '2026-08-10T00:00:00.000Z' }), thread('empty', { messageCount: 0 }), thread('new', { lastModified: '2026-08-11T00:00:00.000Z' })], '', {}, {});
+		assert.deepStrictEqual(value.map(row => row.id), ['new', 'old']);
+	});
+	test('shows only pending zero-message anchors with truthful recency and removes them after settlement', () => {
+		const pending: Readonly<Record<string, ChatHistoryPendingOverview>> = {
+			dormant: { count: 1, latestCreatedAt: Date.parse('2026-08-14T00:00:00.000Z'), dormant: true, active: false },
+			queued: { count: 2, latestCreatedAt: Date.parse('2026-08-15T00:00:00.000Z'), dormant: true, active: true },
+		};
+		const threads = [thread('unused', { messageCount: 0 }), thread('dormant', { messageCount: 0, lastModified: '2020-01-01T00:00:00.000Z' }), thread('queued', { messageCount: 0, lastModified: '2020-01-01T00:00:00.000Z' }), thread('history', { lastModified: '2026-08-13T00:00:00.000Z' })];
+		const value = getChatHistoryPresentation(threads, '', {}, {}, pending);
+		assert.deepStrictEqual(value.map(row => row.id), ['queued', 'dormant', 'history']); assert.deepStrictEqual(value.map(row => row.status), ['Queued', 'Pending', undefined]); assert.strictEqual(value[0].canDelete, false); assert.strictEqual(value[1].canDelete, false); assert.strictEqual(value[0].lastModified, '2026-08-15T00:00:00.000Z');
+		assert.deepStrictEqual(getChatHistoryPresentation(threads, '', {}, {}, {}).map(row => row.id), ['history'], 'the zero-message entries disappear when the final authoritative pending row settles');
+		assert.strictEqual(JSON.stringify(value).includes('secret pending text'), false, 'history projection must not expose pending content or child details');
+	});
+	test('pending recency never reorders normal message history', () => {
+		const pending = { old: { count: 1, latestCreatedAt: Date.parse('2030-01-01T00:00:00.000Z'), dormant: true, active: false } };
+		const value = getChatHistoryPresentation([thread('new', { lastModified: '2026-08-13T00:00:00.000Z' }), thread('old', { lastModified: '2026-08-12T00:00:00.000Z' })], '', {}, {}, pending);
 		assert.deepStrictEqual(value.map(row => row.id), ['new', 'old']);
 	});
 	test('marks the current chat independently from its status', () => {

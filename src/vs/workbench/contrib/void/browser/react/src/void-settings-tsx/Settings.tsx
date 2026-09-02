@@ -200,8 +200,9 @@ const AddButton = ({ disabled, text = 'Add', ...props }: { disabled?: boolean, t
 }
 
 // ConfirmButton prompts for a second click to confirm an action, cancels if clicking outside
-const ConfirmButton = ({ children, onConfirm, className }: { children: React.ReactNode, onConfirm: () => void, className?: string }) => {
+const ConfirmButton = ({ children, onConfirm, className }: { children: React.ReactNode, onConfirm: () => void | boolean | Promise<void | boolean>, className?: string }) => {
 	const [confirm, setConfirm] = useState(false);
+	const [busy, setBusy] = useState(false);
 	const ref = useRef<HTMLDivElement>(null);
 	useEffect(() => {
 		if (!confirm) return;
@@ -215,12 +216,13 @@ const ConfirmButton = ({ children, onConfirm, className }: { children: React.Rea
 	}, [confirm]);
 	return (
 		<div ref={ref} className={`inline-block`}>
-			<VoidButtonBgDarken className={className} onClick={() => {
+			<VoidButtonBgDarken disabled={busy} className={className} onClick={() => {
 				if (!confirm) {
 					setConfirm(true);
 				} else {
-					onConfirm();
-					setConfirm(false);
+					if (busy) return;
+					setBusy(true);
+					void Promise.resolve().then(onConfirm).then(result => { if (result !== false) setConfirm(false); }, () => undefined).finally(() => setBusy(false));
 				}
 			}}>
 				{confirm ? `Confirm Reset` : children}
@@ -1171,12 +1173,12 @@ export const Settings = () => {
 		if (!file) return
 
 		const reader = new FileReader();
-		reader.onload = () => {
+		reader.onload = async () => {
 			try {
 				const json = JSON.parse(reader.result as string);
 
 				if (t === 'Chats') {
-					chatThreadsService.dangerousSetState(json as any)
+					if (!await chatThreadsService.dangerousSetState(json as any)) return
 				}
 				else if (t === 'Settings') {
 					voidSettingsService.dangerousSetState(json as any)
@@ -1444,7 +1446,7 @@ export const Settings = () => {
 											<VoidButtonBgDarken className='px-4 py-1 w-full' onClick={() => onDownload('Chats')}>
 												Export Chats
 											</VoidButtonBgDarken>
-											<ConfirmButton className='px-4 py-1 w-full' onConfirm={() => { chatThreadsService.resetState(); }}>
+											<ConfirmButton className='px-4 py-1 w-full' onConfirm={() => chatThreadsService.resetState()}>
 												Reset Chats
 											</ConfirmButton>
 										</div>

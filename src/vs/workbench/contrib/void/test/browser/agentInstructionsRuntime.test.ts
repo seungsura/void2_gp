@@ -31,6 +31,25 @@ const beginInstructionTurn = runtimeHelpers._beginInstructionTurn;
 const purgeInstructionTurn = runtimeHelpers._purgeInstructionTurn;
 const rememberInstructionTurn = runtimeHelpers._rememberInstructionTurn;
 const revokeAgentDelegation = (ChatThreadService.prototype as unknown as { _revokeAgentDelegation: (threadId: string, forget?: boolean) => void })._revokeAgentDelegation;
+const brokerSnapshot = Object.freeze({ namespace: Object.freeze({ profileId: 'fixture-profile', workspaceIdentity: 'fixture-workspace' }), revision: 0, records: Object.freeze([]) });
+const brokerSuccess = <T>(value: T) => Object.freeze({ ok: true as const, snapshot: brokerSnapshot, value });
+const withApprovalBroker = <T extends Record<string, unknown>>(receiver: T): T => {
+	const broker = {
+		holdApproval: async () => brokerSuccess(undefined),
+		closeRunAndReleaseSteers: async () => brokerSuccess(undefined),
+	};
+	return Object.assign(receiver, {
+		_runQuiescenceOfThread: new Map<string, unknown>(),
+		_approvalActionFlights: new Set<string>(),
+		_pendingBroker: () => broker,
+		_awaitThreadStorageWrites: async () => true,
+		_releaseUndeliveredSteers: async () => (await broker.closeRunAndReleaseSteers()).ok,
+		_warnPendingMutation: () => false,
+		_applyDeferredExternalThreadRecordIfQuiescent() { },
+		_drainPendingChatInputs: async () => { },
+		_startTrackedParentRun(_threadId: string, _parentRun: unknown, start: () => Promise<void>) { void start(); },
+	});
+};
 const delegationLifecycleFixture = () => ({
 	_revokeAgentDelegation: revokeAgentDelegation,
 	_cancelChildToolApprovalsForParent() { },
@@ -43,11 +62,11 @@ const delegationLifecycleFixture = () => ({
 const nonAgentSettingsFixture = () => ({ state: { overridesOfModel: {}, globalSettings: { chatMode: 'chat' } } });
 
 suite('AGENTS instruction runtime paths', () => {
-	test('restores a persisted snapshot and resumes approval with that exact revived turn', () => {
+	test('restores a persisted snapshot and resumes approval with that exact revived turn', async () => {
 		const persisted = JSON.parse(JSON.stringify(approvalRuntimeSnapshot()));
 		const thread = { messages: [pendingTool()], state: { stagingSelections: [], focusedMessageIdx: undefined, linksOfMessageIdx: {}, agentInstructionTurnSnapshot: persisted }, filesWithUserChanges: new Set<string>() };
 		let resumed: unknown;
-		const receiver = {
+		const receiver = withApprovalBroker({
 			...delegationLifecycleFixture(),
 			_purgeInstructionTurn: purgeInstructionTurn,
 			_instructionTurnOfThread: new Map<string, unknown>(),
@@ -60,23 +79,23 @@ suite('AGENTS instruction runtime paths', () => {
 			_wrapRunAgentToNotify() { },
 			_settingsService: { state: { overridesOfModel: approvalOverrides } },
 			_currentModelSelectionProps() { return { modelSelection: approvalModel, modelSelectionOptions: approvalOptions }; },
-		};
+		});
 		const restore = (ChatThreadService.prototype as unknown as { _restoreInstructionTurns: (threads: unknown) => void })._restoreInstructionTurns;
 		restore.call(receiver, receiver.state.allThreads);
 		const revived = receiver._instructionTurnOfThread.get('task');
-		ChatThreadService.prototype.approveLatestToolRequest.call(receiver as never, 'task');
+		await ChatThreadService.prototype.approveLatestToolRequest.call(receiver as never, 'task');
 		assert.notStrictEqual(revived, persisted);
 		assert.strictEqual((resumed as { instructionSnapshot: unknown }).instructionSnapshot, revived);
 		assert.strictEqual(((resumed as { instructionSnapshot: { revision: string } }).instructionSnapshot).revision, approvalRuntimeSnapshot().revision);
 	});
 
-	test('fails closed when a pending approval lacks or has a corrupt persisted snapshot', () => {
+	test('fails closed when a pending approval lacks or has a corrupt persisted snapshot', async () => {
 		for (const persisted of [undefined, { revision: '' }]) {
 			const thread = { messages: [pendingTool()], state: { stagingSelections: [], focusedMessageIdx: undefined, linksOfMessageIdx: {}, agentInstructionTurnSnapshot: persisted }, filesWithUserChanges: new Set<string>() };
 			let runCalls = 0;
 			let rejected: unknown;
 			let cleared = false;
-			const receiver = {
+			const receiver = withApprovalBroker({
 				...delegationLifecycleFixture(),
 				_purgeInstructionTurn: purgeInstructionTurn,
 				_instructionTurnOfThread: new Map<string, unknown>(),
@@ -88,22 +107,22 @@ suite('AGENTS instruction runtime paths', () => {
 				_currentModelSelectionProps() { return {}; },
 				_updateLatestTool(_threadId: string, tool: unknown) { rejected = tool; },
 				_setStreamState(_threadId: string, state: unknown) { cleared = state === undefined; },
-			};
+			});
 			const restore = (ChatThreadService.prototype as unknown as { _restoreInstructionTurns: (threads: unknown) => void })._restoreInstructionTurns;
 			restore.call(receiver, receiver.state.allThreads);
-			ChatThreadService.prototype.approveLatestToolRequest.call(receiver as never, 'task');
+			await ChatThreadService.prototype.approveLatestToolRequest.call(receiver as never, 'task');
 			assert.strictEqual(runCalls, 0);
 			assert.strictEqual((rejected as { type: string }).type, 'rejected');
 			assert.strictEqual(cleared, true);
 		}
 	});
 
-	test('purges a cross-workspace snapshot and fails its pending approval closed', () => {
+	test('purges a cross-workspace snapshot and fails its pending approval closed', async () => {
 		const thread = { messages: [pendingTool()], state: { stagingSelections: [], focusedMessageIdx: undefined, linksOfMessageIdx: {}, agentInstructionTurnSnapshot: JSON.parse(JSON.stringify(runtimeSnapshot(false))) }, filesWithUserChanges: new Set<string>() };
 		let runs = 0;
 		let rejected: unknown;
 		let cleared = false;
-		const receiver = {
+		const receiver = withApprovalBroker({
 			...delegationLifecycleFixture(),
 			_purgeInstructionTurn: purgeInstructionTurn,
 			_instructionTurnOfThread: new Map<string, unknown>(),
@@ -115,37 +134,37 @@ suite('AGENTS instruction runtime paths', () => {
 			_currentModelSelectionProps() { return {}; },
 			_updateLatestTool(_threadId: string, tool: unknown) { rejected = tool; },
 			_setStreamState(_threadId: string, state: unknown) { cleared = state === undefined; },
-		};
+		});
 		const restore = (ChatThreadService.prototype as unknown as { _restoreInstructionTurns: (threads: unknown) => void })._restoreInstructionTurns;
 		restore.call(receiver, receiver.state.allThreads);
 		assert.strictEqual(thread.state.agentInstructionTurnSnapshot, undefined);
 		assert.strictEqual(thread.messages.length, 1);
 		assert.strictEqual(receiver._instructionTurnOfThread.has('task'), false);
-		ChatThreadService.prototype.approveLatestToolRequest.call(receiver as never, 'task');
+		await ChatThreadService.prototype.approveLatestToolRequest.call(receiver as never, 'task');
 		assert.strictEqual(runs, 0);
 		assert.strictEqual((rejected as { type: string }).type, 'rejected');
 		assert.strictEqual(cleared, true);
 	});
 
-	test('purges trusted project snapshot after workspace trust is downgraded and rejects its approval', () => {
+	test('purges trusted project snapshot after workspace trust is downgraded and rejects its approval', async () => {
 		const persisted = JSON.parse(JSON.stringify(projectRuntimeSnapshot()));
 		const thread = { messages: [pendingTool()], state: { stagingSelections: [], focusedMessageIdx: undefined, linksOfMessageIdx: {}, agentInstructionTurnSnapshot: persisted }, filesWithUserChanges: new Set<string>() };
 		let runCalls = 0;
 		let rejected: unknown;
 		let cleared = false;
-		const receiver = {
+		const receiver = withApprovalBroker({
 			...delegationLifecycleFixture(),
 			_purgeInstructionTurn: purgeInstructionTurn,
 			_agentInstructionSessionOfThread: new Map<string, unknown>(), _instructionTurnOfThread: new Map<string, unknown>(),
 			_workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: { toString: () => 'file:///workspace' } }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => false },
 			state: { allThreads: { task: thread } }, _runChatAgent() { runCalls++; return Promise.resolve(); }, _wrapRunAgentToNotify() { }, _currentModelSelectionProps() { return {}; },
 			_updateLatestTool(_threadId: string, tool: unknown) { rejected = tool; }, _setStreamState(_threadId: string, state: unknown) { cleared = state === undefined; },
-		};
+		});
 		const restore = (ChatThreadService.prototype as unknown as { _restoreInstructionTurns: (threads: unknown) => void })._restoreInstructionTurns;
 		restore.call(receiver, { task: thread });
 		assert.strictEqual(thread.state.agentInstructionTurnSnapshot, undefined);
 		assert.strictEqual(receiver._instructionTurnOfThread.has('task'), false);
-		ChatThreadService.prototype.approveLatestToolRequest.call(receiver as never, 'task');
+		await ChatThreadService.prototype.approveLatestToolRequest.call(receiver as never, 'task');
 		assert.strictEqual(runCalls, 0);
 		assert.strictEqual((rejected as { type: string }).type, 'rejected');
 		assert.strictEqual(cleared, true);
@@ -334,9 +353,12 @@ suite('AGENTS instruction runtime paths', () => {
 			async _runToolCall() { legacyToolCalls++; return { awaitingUserApproval: false, interrupted: false }; },
 			_addMessageToThread(_threadId: string, message: unknown) { thread.messages.push(message); },
 			_metricsService: { capture: (...args: unknown[]) => metrics.push(args) },
+			_promoteSteerAtSafeBoundary: async () => false,
+			_awaitThreadStorageWrites: async () => true,
+			_pendingBroker: () => ({ validateHistoryRun: async () => brokerSuccess(undefined) }),
 		};
 
-		const token = Symbol('instruction-runtime-parent-run'); let active = true; receiver._parentRunTokenOfThread.set('task', token); const isLatest = () => receiver._parentRunTokenOfThread.get('task') === token && (receiver._agentControlGeneration.get('task') ?? 0) === 0; const parentRun = { token, generation: 0, isLatest, isActive: () => active && isLatest(), deactivate: () => { active = false; }, releaseLatest: () => { if (isLatest()) receiver._parentRunTokenOfThread.delete('task'); } };
+		const token = Symbol('instruction-runtime-parent-run'); let active = true; receiver._parentRunTokenOfThread.set('task', token); const isLatest = () => receiver._parentRunTokenOfThread.get('task') === token && (receiver._agentControlGeneration.get('task') ?? 0) === 0; const parentRun = { token, runId: 'instruction-runtime-parent-run', generation: 0, isLatest, isActive: () => active && isLatest(), deactivate: () => { active = false; }, releaseLatest: () => { if (isLatest()) receiver._parentRunTokenOfThread.delete('task'); } };
 		const run = (ChatThreadService.prototype as unknown as { _runChatAgent: (options: unknown) => Promise<void> })._runChatAgent;
 		await run.call(receiver, { threadId: 'task', modelSelection: null, modelSelectionOptions: undefined, instructionSnapshot, parentRun });
 

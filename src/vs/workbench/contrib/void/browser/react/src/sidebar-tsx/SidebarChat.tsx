@@ -25,8 +25,8 @@ import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../co
 import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, CircleEllipsis, Folder, ALargeSmall, TypeOutline, Text } from 'lucide-react';
 import { ChatMessage, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
 import { AgentSubagentRunView, ChildActivitiesLedger, ChildActivityRecord, ChildToolApprovalView, isActiveChildRun } from '../../../../common/agentSubagents.js';
-import { canSubmitChatCurrent, ChatCurrentStatusPresentation, getChatCurrentStatusPresentation } from '../../../../common/chatCurrentStatusPresentation.js';
-import { submitChatComposer } from '../../../../common/chatComposerSubmission.js';
+import { ChatCurrentStatusPresentation, getChatCurrentStatusPresentation } from '../../../../common/chatCurrentStatusPresentation.js';
+import { beginChatComposerSubmissionFlight, submitChatComposer, submitInlineChatEdit } from '../../../../common/chatComposerSubmission.js';
 import { PendingChatInput, PendingInputMode } from '../../../chatThreadService.js';
 import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, ToolName, LintErrorItem, ToolApprovalType, toolApprovalTypes } from '../../../../common/toolsServiceTypes.js';
 import { CopyButton, IconShell1, JumpToFileButton, JumpToTerminalButton, StatusIndicator, useApplyStreamState } from '../markdown/ApplyBlockHoverButtons.js';
@@ -40,6 +40,7 @@ import { removeMCPToolNamePrefix } from '../../../../common/mcpServiceTypes.js';
 import { applicationToolPresentation, applicationToolRoute, shouldOfferGenericToolApproval } from '../../../../common/applicationToolPresentation.js';
 import { assistantMessagePresentation } from '../../../../common/assistantMessagePresentation.js';
 import { shouldShowPersistentChatHistory } from '../../../../common/chatHistoryPresentation.js';
+import { pendingChatInputFingerprint, pendingChatInputThreadFingerprint } from '../../../../common/pendingChatInputBroker.js';
 
 
 
@@ -280,6 +281,8 @@ interface VoidChatAreaProps {
 
 	selections?: StagingSelectionItem[]
 	setSelections?: (s: StagingSelectionItem[]) => void
+	/** Locks only this area's selection editor while an exact async submission owns it. */
+	selectionsDisabled?: boolean
 	// selections?: any[];
 	// onSelectionsChange?: (selections: any[]) => void;
 
@@ -305,6 +308,7 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 	showProspectiveSelections = false,
 	selections,
 	setSelections,
+	selectionsDisabled = false,
 	featureName,
 	loadingIcon,
 	statusHelp,
@@ -333,12 +337,14 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 		>
 			{/* Selections section */}
 			{showSelections && selections && setSelections && (
-				<SelectedFiles
-					type='staging'
-					selections={selections}
-					setSelections={setSelections}
-					showProspectiveSelections={showProspectiveSelections}
-				/>
+				<div aria-disabled={selectionsDisabled} className={selectionsDisabled ? 'pointer-events-none opacity-70' : undefined}>
+					<SelectedFiles
+						type='staging'
+						selections={selections}
+						setSelections={selectionsDisabled ? () => { } : setSelections}
+						showProspectiveSelections={showProspectiveSelections}
+					/>
+				</div>
 			)}
 
 			{/* Input section */}
@@ -1003,8 +1009,10 @@ const UserMessageComponent = ({ chatMessage, messageIdx, _scrollToBottom, editab
 	const [isFocused, setIsFocused] = useState(false)
 	const [isHovered, setIsHovered] = useState(false)
 	const [isDisabled, setIsDisabled] = useState(false)
+	const [isEditSubmissionInFlight, setIsEditSubmissionInFlight] = useState(false)
 	const [textAreaRefState, setTextAreaRef] = useState<HTMLTextAreaElement | null>(null)
 	const textAreaFnsRef = useRef<TextAreaFns | null>(null)
+	const editSubmissionFlight = useRef(false)
 	// initialize on first render, and when edit was just enabled
 	const _mustInitialize = useRef(true)
 	const _justEnabledEdit = useRef(false)
@@ -1057,28 +1065,35 @@ const UserMessageComponent = ({ chatMessage, messageIdx, _scrollToBottom, editab
 
 		const onSubmit = async () => {
 
-			if (isDisabled) return;
+			if (isDisabled || editSubmissionFlight.current) return;
 			if (!textAreaRefState) return;
 			if (messageIdx === undefined) return;
-
 			// cancel any streams on this thread
 			const threadId = chatThreadsService.state.currentThreadId
-
-			await chatThreadsService.abortRunning(threadId)
-
-			// update state
-			setIsBeingEdited(false)
-			chatThreadsService.setCurrentlyFocusedMessageIdx(undefined)
-
-			// stream the edit
-			const userMessage = textAreaRefState.value;
+			const userMessage = textAreaRefState.value
 			try {
-				await chatThreadsService.editUserMessageAndStreamResponse({ userMessage, messageIdx, threadId })
+				await submitInlineChatEdit({
+					flight: editSubmissionFlight,
+					threadId,
+					submit: async () => {
+						await chatThreadsService.abortRunning(threadId)
+						return chatThreadsService.editUserMessageAndStreamResponse({ userMessage, messageIdx, threadId })
+					},
+					getCurrentThreadId: () => chatThreadsService.state.currentThreadId,
+					setInputLocked: locked => {
+						setIsEditSubmissionInFlight(locked)
+						if (locked) textAreaFnsRef.current?.disable()
+						else textAreaFnsRef.current?.enable()
+					},
+					onAcceptedCurrentThread: async () => {
+						await chatThreadsService.focusCurrentChat()
+						requestAnimationFrame(() => _scrollToBottom?.())
+					},
+				})
 			} catch (e) {
 				console.error('Error while editing message:', e)
+				return
 			}
-			await chatThreadsService.focusCurrentChat()
-			requestAnimationFrame(() => _scrollToBottom?.())
 		}
 
 		const onAbort = async () => {
@@ -1087,6 +1102,7 @@ const UserMessageComponent = ({ chatMessage, messageIdx, _scrollToBottom, editab
 		}
 
 		const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+			if (editSubmissionFlight.current) return
 			if (e.key === 'Escape') {
 				onCloseEdit()
 			}
@@ -1104,18 +1120,19 @@ const UserMessageComponent = ({ chatMessage, messageIdx, _scrollToBottom, editab
 			onSubmit={onSubmit}
 			onAbort={onAbort}
 			isStreaming={false}
-			isDisabled={isDisabled}
+			isDisabled={isDisabled || isEditSubmissionInFlight}
 			showSelections={true}
 			showProspectiveSelections={false}
 			selections={stagingSelections}
 			setSelections={setStagingSelections}
+			selectionsDisabled={isEditSubmissionInFlight}
 		>
 			<VoidInputBox2
 				enableAtToMention
 				ref={setTextAreaRef}
 				className='min-h-[81px] max-h-[500px] px-0.5'
 				placeholder="Edit your message..."
-				onChangeText={(text) => setIsDisabled(!text)}
+				onChangeText={(text) => { if (!editSubmissionFlight.current) setIsDisabled(!text) }}
 				onFocus={() => {
 					setIsFocused(true)
 					chatThreadsService.setCurrentlyFocusedMessageIdx(messageIdx);
@@ -1531,7 +1548,7 @@ const ToolRequestAcceptRejectButtons = ({ toolName }: { toolName: ToolName }) =>
 	const onAccept = useCallback(() => {
 		try { // this doesn't need to be wrapped in try/catch anymore
 			const threadId = chatThreadsService.state.currentThreadId
-			chatThreadsService.approveLatestToolRequest(threadId)
+			void chatThreadsService.approveLatestToolRequest(threadId).catch(() => undefined)
 			metricsService.capture('Tool Request Accepted', {})
 		} catch (e) { console.error('Error while approving message in chat:', e) }
 	}, [chatThreadsService, metricsService])
@@ -1539,7 +1556,7 @@ const ToolRequestAcceptRejectButtons = ({ toolName }: { toolName: ToolName }) =>
 	const onReject = useCallback(() => {
 		try {
 			const threadId = chatThreadsService.state.currentThreadId
-			chatThreadsService.rejectLatestToolRequest(threadId)
+			void chatThreadsService.rejectLatestToolRequest(threadId).catch(() => undefined)
 		} catch (e) { console.error('Error while approving message in chat:', e) }
 		metricsService.capture('Tool Request Rejected', {})
 	}, [chatThreadsService, metricsService])
@@ -2867,18 +2884,30 @@ const PendingChatInputsPanel = ({
 }: {
 	threadId: string;
 	inputs: readonly PendingChatInput[];
-	onEdit: (threadId: string, id: string, text: string) => boolean;
-	onDelete: (threadId: string, id: string) => boolean;
-	onReorder: (threadId: string, id: string, beforeId?: string) => boolean;
-	onResume: (threadId: string, id: string) => boolean;
+	onEdit: (threadId: string, id: string, expectedFingerprint: string, text: string) => Promise<boolean>;
+	onDelete: (threadId: string, id: string, expectedFingerprint: string) => Promise<boolean>;
+	onReorder: (threadId: string, id: string, expectedFingerprint: string, expectedThreadFingerprint: string, beforeId?: string) => Promise<boolean>;
+	onResume: (threadId: string, id: string, expectedFingerprint: string) => Promise<boolean>;
 }) => {
-	const [editing, setEditing] = useState<{ id: string; text: string } | undefined>()
+	const [editing, setEditing] = useState<{ id: string; text: string; fingerprint: string } | undefined>()
+	const actionFlights = useRef(new Set<string>())
+	const [, setActionRevision] = useState(0)
+	const runAction = async (id: string, action: () => Promise<boolean>, accepted?: () => void) => {
+		if (actionFlights.current.has(id)) return
+		actionFlights.current.add(id); setActionRevision(value => value + 1)
+		try { if (await action()) accepted?.() }
+		catch { /* the service owns the single user-facing backend warning */ }
+		finally { actionFlights.current.delete(id); setActionRevision(value => value + 1) }
+	}
 	if (!inputs.length) return null
+	const threadFingerprint = pendingChatInputThreadFingerprint(inputs)
 	return <section id='void-chat-pending-inputs' aria-label='Queued messages' className='mb-2 border border-void-border-2 rounded px-2 py-1 text-xs text-void-fg-3' onClick={event => event.stopPropagation()}>
 		<div className='font-medium text-void-fg-2 pb-1'>Queued messages</div>
 		<div role='list' className='flex flex-col gap-1'>
 			{inputs.map((input, index) => {
-				const locked = input.phase === 'claiming'
+				const fingerprint = pendingChatInputFingerprint(input)
+				const actionInFlight = actionFlights.current.has(input.id)
+				const locked = input.phase === 'claiming' || actionInFlight
 				const isEditing = editing?.id === input.id
 				return <div key={input.id} role='listitem' className='rounded border border-void-border-3 px-2 py-1'>
 					<div className='flex flex-wrap items-center gap-x-1 text-void-fg-2'>
@@ -2888,18 +2917,19 @@ const PendingChatInputsPanel = ({
 						aria-label='Edit queued message'
 						className='focus-ring mt-1 w-full rounded border border-void-border-2 bg-void-bg-1 px-1 py-0.5 text-void-fg-1'
 						value={editing.text}
-						onChange={event => setEditing({ id: input.id, text: event.currentTarget.value })}
+						disabled={actionInFlight}
+						onChange={event => { const text = event.currentTarget.value; setEditing(current => current?.id === input.id ? { ...current, text } : current) }}
 						onClick={event => event.stopPropagation()}
 					/> : <div className='mt-1 whitespace-pre-wrap break-words text-void-fg-1'>{input.text}</div>}
 					<div className='mt-1 flex flex-wrap gap-1'>
 						{isEditing ? <>
-							<button type='button' className='focus-ring rounded border border-void-border-2 px-1' onClick={() => { if (onEdit(threadId, input.id, editing.text)) setEditing(undefined) }}>Save</button>
-							<button type='button' className='focus-ring rounded border border-void-border-2 px-1' onClick={() => setEditing(undefined)}>Cancel</button>
-						</> : <button type='button' disabled={locked} className='focus-ring rounded border border-void-border-2 px-1 disabled:opacity-50' onClick={() => setEditing({ id: input.id, text: input.text })}>Edit</button>}
-						<button type='button' disabled={locked} className='focus-ring rounded border border-void-border-2 px-1 disabled:opacity-50' onClick={() => { onDelete(threadId, input.id); if (isEditing) setEditing(undefined) }}>Delete</button>
-						<button type='button' disabled={locked || index === 0} className='focus-ring rounded border border-void-border-2 px-1 disabled:opacity-50' onClick={() => onReorder(threadId, input.id, inputs[index - 1]?.id)}>Move up</button>
-						<button type='button' disabled={locked || index === inputs.length - 1} className='focus-ring rounded border border-void-border-2 px-1 disabled:opacity-50' onClick={() => onReorder(threadId, input.id, inputs[index + 2]?.id)}>Move down</button>
-						{input.phase === 'dormant' ? <button type='button' className='focus-ring rounded border border-void-border-2 px-1' onClick={() => onResume(threadId, input.id)}>Resume</button> : null}
+							<button type='button' disabled={actionInFlight} className='focus-ring rounded border border-void-border-2 px-1 disabled:opacity-50' onClick={() => void runAction(input.id, () => onEdit(threadId, input.id, editing.fingerprint, editing.text), () => setEditing(current => current?.id === input.id ? undefined : current))}>Save</button>
+							<button type='button' disabled={actionInFlight} className='focus-ring rounded border border-void-border-2 px-1 disabled:opacity-50' onClick={() => setEditing(undefined)}>Cancel</button>
+						</> : <button type='button' disabled={locked} className='focus-ring rounded border border-void-border-2 px-1 disabled:opacity-50' onClick={() => setEditing({ id: input.id, text: input.text, fingerprint })}>Edit</button>}
+						<button type='button' disabled={locked} className='focus-ring rounded border border-void-border-2 px-1 disabled:opacity-50' onClick={() => void runAction(input.id, () => onDelete(threadId, input.id, fingerprint), () => setEditing(current => current?.id === input.id ? undefined : current))}>Delete</button>
+						<button type='button' disabled={locked || index === 0} className='focus-ring rounded border border-void-border-2 px-1 disabled:opacity-50' onClick={() => void runAction(input.id, () => onReorder(threadId, input.id, fingerprint, threadFingerprint, inputs[index - 1]?.id))}>Move up</button>
+						<button type='button' disabled={locked || index === inputs.length - 1} className='focus-ring rounded border border-void-border-2 px-1 disabled:opacity-50' onClick={() => void runAction(input.id, () => onReorder(threadId, input.id, fingerprint, threadFingerprint, inputs[index + 2]?.id))}>Move down</button>
+						{input.phase === 'dormant' ? <button type='button' disabled={actionInFlight} className='focus-ring rounded border border-void-border-2 px-1 disabled:opacity-50' onClick={() => void runAction(input.id, () => onResume(threadId, input.id, fingerprint))}>Resume</button> : null}
 					</div>
 				</div>
 			})}
@@ -2986,52 +3016,43 @@ export const SidebarChat = () => {
 	const sidebarRef = useRef<HTMLDivElement>(null)
 	const scrollContainerRef = useRef<HTMLDivElement | null>(null)
 	const [pendingAction, setPendingAction] = useState<'' | PendingInputMode>('')
+	const pendingComposerFlight = useRef(false)
+	const [pendingComposerActionInFlight, setPendingComposerActionInFlight] = useState(false)
 	const submitPendingComposerInput = useCallback(async (mode: PendingInputMode, forcedText?: string): Promise<boolean> => {
+		const releaseFlight = beginChatComposerSubmissionFlight(pendingComposerFlight)
+		if (!releaseFlight) return false
 		const submissionThreadId = threadId
 		const userMessage = forcedText ?? textAreaRef.current?.value ?? chatThreadsService.getTransientComposerDraft(submissionThreadId)
-		if (!userMessage.trim() || chatModelUnavailable) return false
+		if (!userMessage.trim() || chatModelUnavailable) { releaseFlight(); return false }
 		const capturedSelections = [...selections]
-		return submitChatComposer({
-			threadId: submissionThreadId,
-			submit: async () => !!chatThreadsService.submitPendingInput({ threadId: submissionThreadId, text: userMessage, mode, selections: capturedSelections }),
-			clearSubmittedState: submittedThreadId => chatThreadsService.clearSubmittedComposerState(submittedThreadId),
-			getCurrentThreadId: () => chatThreadsService.state.currentThreadId,
-			clearCurrentInput: () => {
-				textAreaFnsRef.current?.setValue('')
-				textAreaRef.current?.focus()
-			},
-		})
-	}, [chatThreadsService, threadId, selections, chatModelUnavailable])
-	const onSubmit = useCallback(async (_forceSubmit?: string) => {
-		if (isAnyRunning) {
-			try {
-				await submitPendingComposerInput('queue', _forceSubmit)
-			} catch (e) {
-				console.error('Error while queueing message in chat:', e)
-			}
-			return
-		}
-
-		if (!canSubmitChatCurrent({ busy: isAnyRunning, hasDraft, chatModelUnavailable, forcedText: _forceSubmit })) return
-
-		const submissionThreadId = threadId
-
-		// send message to LLM
-		const userMessage = _forceSubmit || textAreaRef.current?.value || ''
-
+		setPendingComposerActionInFlight(true)
 		try {
-			await submitChatComposer({
+			return await submitChatComposer({
 				threadId: submissionThreadId,
-				submit: () => chatThreadsService.beginUserMessageAndStreamResponse({ userMessage, threadId: submissionThreadId }),
-				clearSubmittedState: submittedThreadId => chatThreadsService.clearSubmittedComposerState(submittedThreadId),
+				submit: async () => !!(await chatThreadsService.submitPendingInput({ threadId: submissionThreadId, text: userMessage, mode, selections: capturedSelections })),
+				clearSubmittedState: submittedThreadId => {
+					const currentSelections = chatThreadsService.state.allThreads[submittedThreadId]?.state.stagingSelections ?? []
+					if (chatThreadsService.getTransientComposerDraft(submittedThreadId) !== userMessage || JSON.stringify(currentSelections) !== JSON.stringify(capturedSelections)) return false
+					chatThreadsService.clearSubmittedComposerState(submittedThreadId); return true
+				},
 				getCurrentThreadId: () => chatThreadsService.state.currentThreadId,
 				clearCurrentInput: () => {
 					textAreaFnsRef.current?.setValue('')
 					textAreaRef.current?.focus()
 				},
 			})
+		} finally { releaseFlight(); setPendingComposerActionInFlight(false) }
+	}, [chatThreadsService, threadId, selections, chatModelUnavailable])
+	const onSubmit = useCallback(async (_forceSubmit?: string) => {
+		// Queue/Steer admission owns the ordering slot until its durable broker ACK.
+		// Editing remains enabled, but no newer direct send may overtake it.
+		if (pendingComposerFlight.current) return
+		try {
+			// Every UI Send is durable broker admission first. An idle Queue row drains
+			// immediately; a renderer closing during preparation leaves a resumable row.
+			await submitPendingComposerInput('queue', _forceSubmit)
 		} catch (e) {
-			console.error('Error while sending message in chat:', e)
+			console.error('Error while queueing message in chat:', e)
 			return
 		}
 
@@ -3173,7 +3194,7 @@ export const SidebarChat = () => {
 			id='void-chat-current-queue'
 			aria-label='Queue message'
 			title='Queue message'
-			disabled={!hasDraft || chatModelUnavailable}
+			disabled={!hasDraft || chatModelUnavailable || pendingComposerActionInFlight}
 			className='focus-ring rounded border border-void-border-2 px-2 py-0.5 text-xs disabled:cursor-default disabled:opacity-50'
 			onClick={() => submitSelectedPendingAction('queue')}
 		>Queue</button>
@@ -3182,7 +3203,7 @@ export const SidebarChat = () => {
 			aria-label='More message actions'
 			title='More message actions'
 			value={pendingAction}
-			disabled={!hasDraft || chatModelUnavailable}
+			disabled={!hasDraft || chatModelUnavailable || pendingComposerActionInFlight}
 			className='focus-ring rounded border border-void-border-2 bg-void-bg-1 px-1 py-0.5 text-xs disabled:cursor-default disabled:opacity-50'
 			onChange={event => {
 				const mode = event.currentTarget.value as '' | PendingInputMode
@@ -3207,10 +3228,10 @@ export const SidebarChat = () => {
 		key={`pending-inputs-${threadId}`}
 		threadId={threadId}
 		inputs={pendingInputs}
-		onEdit={(originThreadId, id, text) => chatThreadsService.editPendingInput(originThreadId, id, text)}
-		onDelete={(originThreadId, id) => chatThreadsService.deletePendingInput(originThreadId, id)}
-		onReorder={(originThreadId, id, beforeId) => chatThreadsService.reorderPendingInput(originThreadId, id, beforeId)}
-		onResume={(originThreadId, id) => chatThreadsService.resumePendingInput(originThreadId, id)}
+		onEdit={(originThreadId, id, fingerprint, text) => chatThreadsService.editPendingInput(originThreadId, id, fingerprint, text)}
+		onDelete={(originThreadId, id, fingerprint) => chatThreadsService.deletePendingInput(originThreadId, id, fingerprint)}
+		onReorder={(originThreadId, id, fingerprint, threadFingerprint, beforeId) => chatThreadsService.reorderPendingInput(originThreadId, id, fingerprint, threadFingerprint, beforeId)}
+		onResume={(originThreadId, id, fingerprint) => chatThreadsService.resumePendingInput(originThreadId, id, fingerprint)}
 	/>
 
 	const inputChatArea = <VoidChatArea
@@ -3219,7 +3240,7 @@ export const SidebarChat = () => {
 		onAbort={onAbort}
 		isStreaming={isAnyRunning}
 		showStop={currentStatusPresentation.showStop}
-		isDisabled={currentStatusPresentation.sendDisabled}
+		isDisabled={currentStatusPresentation.sendDisabled || pendingComposerActionInFlight}
 		statusHelp={currentStatusHelp}
 		controlSemantics={currentStatusPresentation.controls}
 		actionSlot={busyComposerActions}
@@ -3250,7 +3271,7 @@ export const SidebarChat = () => {
 	const isLandingPage = previousMessages.length === 0 && !pendingSubmission && pendingInputs.length === 0
 
 
-	const initiallySuggestedPromptsHTML = <LandingSuggestedPrompts onSubmit={onSubmit} disabled={chatModelUnavailable} />
+	const initiallySuggestedPromptsHTML = <LandingSuggestedPrompts onSubmit={onSubmit} disabled={chatModelUnavailable || pendingComposerActionInFlight} />
 
 
 

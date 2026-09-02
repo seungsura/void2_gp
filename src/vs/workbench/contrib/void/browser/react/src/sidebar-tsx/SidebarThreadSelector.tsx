@@ -18,6 +18,8 @@ export const PastThreadsList = ({ className = '' }: { className?: string }) => {
 	const listRef = useRef<HTMLDivElement>(null);
 	const accessor = useAccessor();
 	const chatThreadsService = accessor.get('IChatThreadService');
+	const [pendingRevision, setPendingRevision] = useState(0);
+	useEffect(() => { const disposable = chatThreadsService.onDidChangePendingChatInputs(() => setPendingRevision(revision => revision + 1)); return () => disposable.dispose(); }, [chatThreadsService]);
 
 	const threadsState = useChatThreadsState()
 	const streamState = useFullChatThreadsStreamState()
@@ -25,16 +27,21 @@ export const PastThreadsList = ({ className = '' }: { className?: string }) => {
 
 	const metadata = useMemo(() => Object.values(allThreads).filter((thread): thread is ThreadType => !!thread).map(toMetadata), [allThreads]);
 	const parentActivityById = useMemo(() => Object.fromEntries(Object.entries(streamState).map(([id, state]) => [id, { isRunning: state?.isRunning, hasError: !!state?.error }])), [streamState]);
-	const orderedRows = useMemo(() => getChatHistoryPresentation(metadata, currentThreadId, parentActivityById, {}), [metadata, currentThreadId, parentActivityById]);
+	const pendingOverviewById = useMemo(() => Object.fromEntries(metadata.flatMap(({ id }) => {
+		const records = chatThreadsService.getPendingChatInputs(id);
+		if (records.length === 0) return [];
+		return [[id, { count: records.length, latestCreatedAt: Math.max(...records.map(record => record.createdAt)), dormant: records.some(record => record.phase === 'dormant'), active: records.some(record => record.phase !== 'dormant') }]];
+	})), [chatThreadsService, metadata, pendingRevision]);
+	const orderedRows = useMemo(() => getChatHistoryPresentation(metadata, currentThreadId, parentActivityById, {}, pendingOverviewById), [metadata, currentThreadId, parentActivityById, pendingOverviewById]);
 	const visibleThreadIds = (showAll ? orderedRows : orderedRows.slice(0, numInitialThreads)).map(row => row.id);
 	const childOverviewById = useVisibleThreadChildOverviews(visibleThreadIds);
-	const rows = useMemo(() => getChatHistoryPresentation(metadata, currentThreadId, parentActivityById, childOverviewById), [metadata, currentThreadId, parentActivityById, childOverviewById]);
+	const rows = useMemo(() => getChatHistoryPresentation(metadata, currentThreadId, parentActivityById, childOverviewById, pendingOverviewById), [metadata, currentThreadId, parentActivityById, childOverviewById, pendingOverviewById]);
 	const displayRows = showAll ? rows : rows.slice(0, numInitialThreads);
 	const hasMoreThreads = rows.length > numInitialThreads;
-	const deleteThreadAndMoveFocus = (threadId: string) => {
+	const deleteThreadAndMoveFocus = async (threadId: string): Promise<boolean> => {
 		const deletedIndex = displayRows.findIndex(row => row.id === threadId);
 		const nextFocusId = displayRows[deletedIndex + 1]?.id ?? displayRows[deletedIndex - 1]?.id;
-		chatThreadsService.deleteThread(threadId);
+		if (!await chatThreadsService.deleteThread(threadId)) return false;
 		requestAnimationFrame(() => {
 			const list = listRef.current;
 			if (!list) return;
@@ -43,6 +50,7 @@ export const PastThreadsList = ({ className = '' }: { className?: string }) => {
 				: undefined;
 			(nextRow ?? list).focus();
 		});
+		return true;
 	};
 
 	return (
@@ -104,8 +112,9 @@ const DuplicateButton = ({ threadId, chatTitle, position }: { threadId: string; 
 
 }
 
-const TrashButton = ({ threadId, chatTitle, position, onConfirmDelete }: { threadId: string; chatTitle: string; position: number; onConfirmDelete: (threadId: string) => void }) => {
+const TrashButton = ({ threadId, chatTitle, position, onConfirmDelete }: { threadId: string; chatTitle: string; position: number; onConfirmDelete: (threadId: string) => Promise<boolean> }) => {
 	const [isTrashPressed, setIsTrashPressed] = useState(false)
+	const [isDeleting, setIsDeleting] = useState(false)
 	const controlsRef = useRef<HTMLDivElement>(null)
 	const focusAfterSwapRef = useRef(false)
 
@@ -137,7 +146,8 @@ const TrashButton = ({ threadId, chatTitle, position, onConfirmDelete }: { threa
 			<IconShell1
 				Icon={Check}
 				type='button' aria-label={confirmName} title={confirmName} className='focus-ring size-[11px]'
-				onClick={() => { onConfirmDelete(threadId); }}
+				disabled={isDeleting}
+				onClick={() => { if (isDeleting) return; setIsDeleting(true); void onConfirmDelete(threadId).then(deleted => { if (!deleted) setIsDeleting(false) }, () => setIsDeleting(false)); }}
 				data-tooltip-id='void-tooltip'
 				data-tooltip-place='top'
 				data-tooltip-content={confirmName}
@@ -154,7 +164,7 @@ const TrashButton = ({ threadId, chatTitle, position, onConfirmDelete }: { threa
 	</div>
 }
 
-const PastThreadElement = ({ row, position, onConfirmDelete }: { row: ReturnType<typeof getChatHistoryPresentation>[number]; position: number; onConfirmDelete: (threadId: string) => void }) => {
+const PastThreadElement = ({ row, position, onConfirmDelete }: { row: ReturnType<typeof getChatHistoryPresentation>[number]; position: number; onConfirmDelete: (threadId: string) => Promise<boolean> }) => {
 
 
 	const accessor = useAccessor()
@@ -191,6 +201,6 @@ const PastThreadElement = ({ row, position, onConfirmDelete }: { row: ReturnType
 			<span className='flex items-center gap-2 min-w-0 overflow-hidden'><span className='truncate overflow-hidden text-ellipsis'>{row.title}</span>{row.selected ? <span className='text-xs'>Current</span> : null}</span>
 			<span className='min-w-0 flex flex-wrap items-center gap-x-1 gap-y-0.5 whitespace-normal text-xs opacity-60'><span>{row.messageCount} {row.messageCount === 1 ? 'message' : 'messages'}</span><span>{formatDate(new Date(row.lastModified))}</span>{row.status ? <><span aria-hidden='true'>{statusIcon}</span><span>{row.status}</span></> : null}</span>
 		</button>
-		<div className='flex items-center gap-x-1'><DuplicateButton threadId={row.id} chatTitle={row.title} position={position} />{row.canDelete ? <TrashButton threadId={row.id} chatTitle={row.title} position={position} onConfirmDelete={onConfirmDelete} /> : null}</div>
+		<div className='flex items-center gap-x-1'>{row.messageCount > 0 ? <DuplicateButton threadId={row.id} chatTitle={row.title} position={position} /> : null}{row.canDelete ? <TrashButton threadId={row.id} chatTitle={row.title} position={position} onConfirmDelete={onConfirmDelete} /> : null}</div>
 	</div>
 }

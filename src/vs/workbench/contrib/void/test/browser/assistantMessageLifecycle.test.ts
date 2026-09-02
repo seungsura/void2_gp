@@ -3,13 +3,14 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
-import { ChatThreadService, PENDING_CHAT_INPUT_MAX_RECORDS, PENDING_CHAT_INPUT_MAX_SERIALIZED_BYTES } from '../../browser/chatThreadService.js';
+import { ChatThreadService } from '../../browser/chatThreadService.js';
 import { closeNativeToolBatchForProspectiveAdmission, ConvertToLLMMessageService } from '../../browser/convertToLLMMessageService.js';
 import { projectAgentConfig, resolveAgentInstructions, stableAgentInstructionRevision } from '../../common/agentInstructions.js';
 import { createSkillCatalog } from '../../common/agentSkills.js';
+import { EMPTY_CHILD_ACTIVITIES } from '../../common/agentSubagents.js';
 import { assistantMessagePresentation, INTERNAL_EMPTY_MESSAGE_SENTINEL, sanitizeAssistantDisplayContent } from '../../common/assistantMessagePresentation.js';
-import { PENDING_CHAT_INPUT_STORAGE_KEY, THREAD_STORAGE_RECORD_PREFIX } from '../../common/storageKeys.js';
-import { StorageScope } from '../../../../../platform/storage/common/storage.js';
+import { PendingChatInputBrokerCore, PendingChatInputBrokerStorage, PendingChatInputMutationResult, PendingChatInputNamespace, PendingChatInputSnapshot, pendingChatInputFingerprint, pendingChatInputSelectionsFingerprint, pendingChatInputThreadFingerprint, pendingChatInputThreadStorageKey } from '../../common/pendingChatInputBroker.js';
+import { THREAD_STORAGE_RECORD_PREFIX } from '../../common/storageKeys.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { Severity } from '../../../../../platform/notification/common/notification.js';
 import { TerminalToolService } from '../../browser/terminalToolService.js';
@@ -93,7 +94,33 @@ const beginTestParentRun = (receiver: ParentRunFixture, threadId: string): TestP
 
 const standaloneParentRun = (isLatest: () => boolean): TestParentRun => ({ token: Symbol('standalone-parent-run'), runId: 'standalone-parent-run', generation: 0, isLatest, isActive: isLatest, deactivate() { }, releaseLatest() { } });
 
+const prepareRunChatAgentReceiver = (receiver: ParentRunFixture) => {
+	const fixture = receiver as unknown as Record<string, any>;
+	fixture._pendingChatInputsOfThread ??= new Map();
+	fixture._pendingInputBrokerReady ??= Promise.resolve(true);
+	fixture._pendingNamespaceMutation ??= false;
+	fixture._deletingPendingInputThreads ??= new Set();
+	fixture._workspaceContextService ??= { getWorkspace: () => ({ folders: [] }) };
+	fixture._workspaceTrustManagementService ??= { isWorkspaceTrusted: () => true };
+	fixture._notificationService ??= { notify() { } };
+	fixture._onDidChangePendingChatInputs ??= { fire() { } };
+	fixture._pendingInputBrokerTestSeam ??= {
+		initializeNamespace: async () => ({ ok: true, snapshot: { namespace: { profileId: 'test', workspaceIdentity: 'test' }, revision: 0, records: [] }, value: { sessionId: 'test', removeLegacy: false } }),
+		claimSteerAtBoundary: async () => ({ ok: true, snapshot: { namespace: { profileId: 'test', workspaceIdentity: 'test' }, revision: 0, records: [] }, value: undefined }),
+		validateHistoryRun: async () => ({ ok: true, snapshot: { namespace: { profileId: 'test', workspaceIdentity: 'test' }, revision: 0, records: [] }, value: undefined }),
+		holdApproval: async () => ({ ok: true, snapshot: { namespace: { profileId: 'test', workspaceIdentity: 'test' }, revision: 0, records: [] }, value: undefined }),
+		closeRunAndReleaseSteers: async () => ({ ok: true, snapshot: { namespace: { profileId: 'test', workspaceIdentity: 'test' }, revision: 0, records: [] }, value: undefined }),
+		reconcileDeliveredPendingInputIds: async () => ({ ok: true, snapshot: { namespace: { profileId: 'test', workspaceIdentity: 'test' }, revision: 0, records: [] }, value: undefined }),
+	};
+	fixture._pendingBroker ??= () => fixture._pendingInputBrokerTestSeam;
+	fixture._promoteSteerAtSafeBoundary ??= async () => false;
+	fixture._awaitThreadStorageWrites ??= async () => true;
+	fixture._warnPendingMutation ??= () => false;
+	return fixture;
+};
+
 const runChatAgent = (receiver: ParentRunFixture, options: TestRunChatOptions) => {
+	prepareRunChatAgentReceiver(receiver);
 	const parentRun = beginTestParentRun(receiver, options.threadId);
 	return chatLifecycle._runChatAgent.call(receiver, { ...options, parentRun });
 };
@@ -110,52 +137,228 @@ const flushMicrotasks = async (): Promise<void> => {
 	await Promise.resolve();
 };
 
-const createPendingInboxReceiver = (options?: { storage?: Map<string, string>; owner?: string | undefined; trusted?: boolean; messages?: any[] }) => {
-	const storage = options?.storage ?? new Map<string, string>();
+class LifecycleBrokerStorage implements PendingChatInputBrokerStorage {
+	readonly whenReady = Promise.resolve();
+	readonly values = new Map<string, string>();
+	flushes = 0;
+	failFlushes = 0;
+	failMutationCommitFlushes = 0;
+	failUserStores = 0;
+	get(key: string) { return this.values.get(key); }
+	store(key: string, value: string) { this.values.set(key, value); }
+	storeUser(key: string, value: string) { if (this.failUserStores > 0) { this.failUserStores--; throw new Error('fixture user store failed'); } this.values.set(key, value); }
+	storeAll(entries: readonly Readonly<{ key: string; value: string }>[]) { for (const entry of entries) this.values.set(entry.key, entry.value); }
+	remove(key: string) { this.values.delete(key); }
+	removeUser(key: string) { this.values.delete(key); }
+	keys(_target: 'machine' | 'user') { return [...this.values.keys()]; }
+	async flush() { this.flushes++; if (this.failFlushes-- > 0) throw new Error('fixture flush failed'); if (this.failMutationCommitFlushes > 0 && [...this.values.keys()].some(key => key.startsWith('void.pendingChatInputBrokerV2.chatMutation.'))) { this.failMutationCommitFlushes--; throw new Error('fixture mutation commit flush failed'); } }
+}
+
+const lifecycleNamespace: PendingChatInputNamespace = Object.freeze({ profileId: 'profile', workspaceIdentity: 'workspace' });
+const lifecycleThread = (id = 'task') => ({
+	id,
+	createdAt: '2026-01-01T00:00:00.000Z',
+	lastModified: '2026-01-01T00:00:00.000Z',
+	messages: [] as any[],
+	childActivities: EMPTY_CHILD_ACTIVITIES,
+	state: { stagingSelections: [] as any[], focusedMessageIdx: undefined, linksOfMessageIdx: {} },
+	filesWithUserChanges: new Set<string>(),
+});
+
+const successfulSnapshotResult = <T>(snapshot: PendingChatInputSnapshot, value: T): PendingChatInputMutationResult<T> => Object.freeze({ ok: true, snapshot, value });
+
+const createLifecycleBrokerClient = ({ core, ctx, apply }: { core: PendingChatInputBrokerCore; ctx: string; apply: (snapshot: PendingChatInputSnapshot) => void }) => {
+	let sessionId: string | undefined;
+	let snapshot: PendingChatInputSnapshot | undefined;
+	const accept = <T>(result: PendingChatInputMutationResult<T>): PendingChatInputMutationResult<T> => { if (result.snapshot) { snapshot = result.snapshot; apply(result.snapshot); } return result; };
+	core.onDidChange(changed => { if (changed.namespace.profileId === lifecycleNamespace.profileId && changed.namespace.workspaceIdentity === lifecycleNamespace.workspaceIdentity) { snapshot = changed; apply(changed); } });
+	const sid = () => { if (!sessionId) throw new Error('lifecycle_broker_not_initialized'); return sessionId; };
+	const client: any = {
+		namespace: lifecycleNamespace,
+		get snapshot() { return snapshot; },
+		onDidChange: () => ({ dispose() { } }),
+		onDidChangeChildGroup: core.onDidChangeChildGroup,
+		async initializeNamespace(request: any) {
+			if (sessionId && snapshot) return successfulSnapshotResult(snapshot, { sessionId, removeLegacy: false });
+			const result = await core.initializeNamespace(ctx, { ...request, namespace: lifecycleNamespace });
+			if (result.ok) sessionId = result.value.sessionId;
+			return accept(result);
+		},
+		submit: async (request: any) => accept(await core.submit(ctx, { ...request, sessionId: sid() })),
+		syncActiveChildGroup: async (threadId: string, sourceRunId: string, sourceGeneration: number, sourceRevision: number, generation: number | undefined, childIds: readonly string[]) => accept(await core.syncActiveChildGroup(ctx, sid(), threadId, sourceRunId, sourceGeneration, sourceRevision, generation, childIds)),
+		edit: async (threadId: string, id: string, fingerprint: string, text: string, selections?: readonly any[]) => accept(await core.edit(ctx, sid(), threadId, id, fingerprint, text, selections)),
+		delete: async (threadId: string, id: string, fingerprint: string) => accept(await core.delete(ctx, sid(), threadId, id, fingerprint)),
+		reorder: async (threadId: string, id: string, fingerprint: string, threadFingerprint: string, beforeId?: string) => accept(await core.reorder(ctx, sid(), threadId, id, fingerprint, threadFingerprint, beforeId)),
+		resume: async (threadId: string, id: string, fingerprint: string, authority: any) => accept(await core.resume(ctx, sid(), threadId, id, fingerprint, authority)),
+		suspend: async (threadId: string, id: string, fingerprint: string) => accept(await core.suspend(ctx, sid(), threadId, id, fingerprint)),
+		claimNextQueued: async (threadId: string, authority: any, deliveredIds: readonly string[]) => accept(await core.claimNextQueued(ctx, sid(), threadId, authority, deliveredIds)),
+		claimSteerAtBoundary: async (threadId: string, runId: string, generation: number, authority: any, deliveredIds: readonly string[]) => accept(await core.claimSteerAtBoundary(ctx, sid(), threadId, runId, generation, authority, deliveredIds)),
+		authorizeAppend: async (threadId: string, id: string, claimId: string, fingerprint: string, authority: any, runId: string, generation: number) => accept(await core.authorizeAppend(ctx, sid(), threadId, id, claimId, fingerprint, authority, runId, generation)),
+		authorizeDirectHistoryAppend: async (threadId: string, text: string, selections: readonly any[], runId: string, generation: number) => accept(await core.authorizeDirectHistoryAppend(ctx, sid(), threadId, text, selections, runId, generation)),
+		verifyDirectHistoryAndRelease: async (threadId: string, leaseId: string) => accept(await core.verifyDirectHistoryAndRelease(ctx, sid(), threadId, leaseId)),
+		abandonDirectHistoryAppend: async (threadId: string, leaseId: string) => accept(await core.abandonDirectHistoryAppend(ctx, sid(), threadId, leaseId)),
+		inspectAppendHistory: async (threadId: string, id: string, claimId: string, leaseId?: string) => accept(await core.inspectAppendHistory(ctx, sid(), threadId, id, claimId, leaseId)),
+		verifyHistoryAndSettle: async (threadId: string, id: string, claimId: string, leaseId: string) => accept(await core.verifyHistoryAndSettle(ctx, sid(), threadId, id, claimId, leaseId)),
+		settleClaim: async (threadId: string, id: string, claimId: string, leaseId: string | undefined, result: 'queued' | 'dormant') => accept(await core.settleClaim(ctx, sid(), threadId, id, claimId, leaseId, result)),
+		validateHistoryRun: async (threadId: string, runId: string, generation: number) => accept(await core.validateHistoryRun(ctx, sid(), threadId, runId, generation)),
+		holdApproval: async (threadId: string, runId: string, generation: number, approval: any) => accept(await core.holdApproval(ctx, sid(), threadId, runId, generation, approval)),
+		closeRunAndReleaseSteers: async (threadId: string, runId: string, generation: number, authority: any, retainApproval = false, childGroup?: any) => accept(await core.closeRunAndReleaseSteers(ctx, sid(), threadId, runId, generation, authority, retainApproval, childGroup)),
+		reconcileDeliveredPendingInputIds: async (delivered: any) => accept(await core.reconcileDeliveredPendingInputIds(ctx, sid(), delivered)),
+		commitThreadRecord: async (threadId: string, expectedRaw: string | undefined, nextRaw: string) => accept(await core.commitThreadRecord(ctx, sid(), threadId, expectedRaw, nextRaw)),
+		authorizeThreadAnchor: async (threadId: string) => accept(await core.authorizeThreadAnchor(ctx, sid(), threadId)),
+		verifyThreadAnchorAndRelease: async (threadId: string, leaseId: string) => accept(await core.verifyThreadAnchorAndRelease(ctx, sid(), threadId, leaseId)),
+		abandonThreadAnchor: async (threadId: string, leaseId: string) => accept(await core.abandonThreadAnchor(ctx, sid(), threadId, leaseId)),
+		deleteThreadRecords: async (threadId: string, evidence: any) => accept(await core.deleteThreadRecords(ctx, sid(), threadId, evidence)),
+		finalizeThreadDeletion: async (threadId: string, leaseId: string) => accept(await core.finalizeThreadDeletion(ctx, sid(), threadId, leaseId)),
+		abortThreadDeletion: async (threadId: string, leaseId: string) => accept(await core.abortThreadDeletion(ctx, sid(), threadId, leaseId)),
+		clearNamespace: async (evidence: any) => accept(await core.clearNamespace(ctx, sid(), evidence)),
+		finalizeNamespaceClear: async (leaseId: string) => accept(await core.finalizeNamespaceClear(ctx, sid(), leaseId)),
+		abortNamespaceClear: async (leaseId: string) => accept(await core.abortNamespaceClear(ctx, sid(), leaseId)),
+		async release() { if (!sessionId) return; await core.releaseConnection(ctx); sessionId = undefined; },
+	};
+	return client;
+};
+
+const eventually = async (condition: () => boolean, message: string): Promise<void> => {
+	for (let index = 0; index < 100; index++) { if (condition()) return; await new Promise<void>(resolve => setTimeout(resolve, 0)); }
+	throw new Error(message);
+};
+
+const createPendingInboxReceiver = (options?: {
+	storage?: LifecycleBrokerStorage;
+	core?: PendingChatInputBrokerCore;
+	ctx?: string;
+	thread?: ReturnType<typeof lifecycleThread>;
+	blank?: boolean;
+	owner?: string | undefined;
+	trusted?: boolean;
+	instructionGate?: Promise<void>;
+	providerGate?: Promise<void>;
+}) => {
+	const storage = options?.storage ?? new LifecycleBrokerStorage();
+	let generated = 0;
+	const core = options?.core ?? new PendingChatInputBrokerCore(storage, () => 100, () => `lifecycle-${++generated}`);
 	const context = { owner: options?.owner ?? 'file:///workspace', trusted: options?.trusted ?? true };
-	const messages: any[] = options?.messages ?? [];
-	const deliveries: string[] = [];
-	const storageScopes: unknown[] = [];
-	const pendingEvents: string[] = [];
+	const thread = options?.thread ?? lifecycleThread();
+	const key = pendingChatInputThreadStorageKey(thread.id);
+	if (!options?.blank && !storage.get(key)) storage.storeUser(key, JSON.stringify({ version: 1, revision: 1, thread }));
 	const warnings: string[] = [];
-	const receiver: any = {
-		state: { allThreads: { task: { id: 'task', messages, state: { stagingSelections: [], linksOfMessageIdx: {} }, filesWithUserChanges: new Set<string>() } }, currentThreadId: 'task' },
+	const pendingEvents: string[] = [];
+	let providerStarts = 0;
+	const turnConfig = projectAgentConfig(
+		{ developerInstructions: 'pending lifecycle fixture' },
+		undefined,
+		[{ uri: 'file:///home/.codex/config.toml', scope: 'user', status: 'loaded', projectedKeys: ['developer_instructions'] }],
+		context.owner,
+		context.owner,
+	);
+	const candidates = [{ uri: `${context.owner}/AGENTS.md`, outcome: Object.freeze({ status: 'bytes' as const, bytes: bytes('agents') }) }];
+	const instructionTurn = resolveAgentInstructions(turnConfig, candidates, stableAgentInstructionRevision(turnConfig, candidates));
+	let receiver: any;
+	const client = createLifecycleBrokerClient({ core, ctx: options?.ctx ?? 'window:1', apply: snapshot => {
+		if (receiver) (ChatThreadService.prototype as any)._applyPendingChatInputSnapshot.call(receiver, snapshot.records);
+	} });
+	receiver = {
+		state: { allThreads: { [thread.id]: thread }, currentThreadId: thread.id },
 		streamState: {},
+		_pendingInputBrokerTestSeam: client,
+		_pendingInputBrokerReady: Promise.resolve(true),
 		_pendingChatInputsOfThread: new Map(),
+		_pendingDeliveredReconcileRequested: 0,
+		_pendingDeliveredReconcileFlight: undefined,
+		_pendingDeliveredReconcileRetry: undefined,
+		_pendingNamespaceMutation: false,
+		_pendingNamespaceFinalizeLeaseId: undefined,
 		_drainingPendingChatInputs: new Set(),
 		_runQuiescenceOfThread: new Map(),
+		_startingParentRunOfThread: new Map(),
 		_stopAndSendFlights: new Map(),
+		_approvalActionFlights: new Set(),
 		_deletingPendingInputThreads: new Set(),
 		_pendingChatSubmissionOfThread: new Map(),
 		_cancellingToolReceiptsOfThread: new Map(),
 		_agentInstructionSessionOfThread: new Map(),
 		_instructionTurnOfThread: new Map(),
 		_transientComposerDraftOfThread: new Map(),
-		_agentControlGeneration: new Map([['task', 0]]),
+		_agentControlGeneration: new Map([[thread.id, 0]]),
+		_childGroupSourceOfThread: new Map(),
+		_childGroupSyncRevisionOfThread: new Map(),
+		_childGroupSyncTailOfThread: new Map(),
+		_agentDelegationAuthorityOfThread: new Map(),
 		_parentRunTokenOfThread: new Map(),
 		_deferredExternalThreadKey: new Map(),
+		_threadStorageWriteTail: new Map(),
+		_threadStorageAuthoritativeRaw: new Map(),
+		_threadStorageWriteEpoch: new Map(),
+		_externalPendingDeleteRetries: new Map(),
+		_pendingThreadMutationRetries: new Map(),
+		_localEmptyThreadId: options?.blank ? thread.id : 'not-the-fixture-thread',
 		_workspaceContextService: { getWorkspace: () => ({ folders: context.owner ? [{ uri: URI.parse(context.owner) }] : [] }) },
 		_workspaceTrustManagementService: { isWorkspaceTrusted: () => context.trusted },
 		_storageService: {
-			store(key: string, value: string, scope: unknown) { storage.set(key, value); storageScopes.push(scope); },
-			get(key: string, _scope: unknown) { return storage.get(key); },
-			remove(key: string, _scope: unknown) { storage.delete(key); },
+			store(storageKey: string, value: string) { storage.storeUser(storageKey, value); },
+			get(storageKey: string) { return storage.get(storageKey); },
+			remove(storageKey: string) { storage.removeUser(storageKey); },
+			keys() { return storage.keys('user'); },
+			flush() { return storage.flush(); },
 		},
+		_settingsService: { state: { globalSettings: { chatMode: 'normal', autoApprove: {} }, overridesOfModel: { openAICompatible: { 'gpt-4.1': {} } } } },
+		_currentModelSelectionProps: () => ({ modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: {} }),
+		_beginInstructionTurn: async () => { if (options?.instructionGate) await options.instructionGate; return instructionTurn; },
+		_purgeInstructionTurn() { },
+		_rememberInstructionTurn() { },
+		_agentSkillsService: { getCatalog: async () => createSkillCatalog([]), readSkillBody: async () => ({}) },
+		_directoryStringService: {},
+		_fileService: {},
+		_mcpService: { getMCPTools: () => [] },
+		_llmMessageService: { captureSettingsOfProvider: () => ({}), abort() { } },
 		_notificationService: { notify(notification: { message: string }) { warnings.push(notification.message); } },
+		toolErrMsgs: { rejected: 'Tool call was rejected by the user.', interrupted: 'Tool call was interrupted by the user.' },
+		_toolsService: { invalidateReadReceipts() { } },
+		_agentSubagentService: { getRunViews: () => [], cancelParent() { }, forgetParent() { } },
+		_childToolApprovals: new Map(),
+		_onDidChangeChildToolApprovals: { fire() { } },
 		_onDidChangePendingChatSubmission: { fire() { } },
 		_onDidChangePendingChatInputs: { fire(event: { threadId: string }) { pendingEvents.push(event.threadId); } },
-		_addMessageToThread(_threadId: string, message: any) { messages.push(message); },
-		_updateLatestTool(_threadId: string, message: any) { if (messages.length) messages[messages.length - 1] = message; else messages.push(message); },
-		_addUserMessageAndStreamResponse: async ({ userMessage }: { userMessage: string }) => { deliveries.push(userMessage); return true; },
+		_onDidChangeCurrentThread: { fire() { } },
+		_onDidChangeStreamState: { fire() { } },
+		_scheduleDeliveredPendingReconcile() { },
 		_setStreamState(threadId: string, value: unknown) { this.streamState[threadId] = value; },
+		// `_updateLatestTool` is a constructor-installed arrow function in the real
+		// service, so this prototype receiver needs the same exact latest-receipt
+		// replacement seam for approval lifecycle tests.
+		_updateLatestTool(threadId: string, tool: any) {
+			const messages = this.state.allThreads[threadId]?.messages ?? [];
+			for (let index = messages.length - 1; index >= 0; index--) {
+				const message = messages[index];
+				if (message.role === 'tool' && message.id === tool.id && message.batchId === tool.batchId && message.batchOrdinal === tool.batchOrdinal && (message.type === 'running_now' || message.type === 'tool_request')) {
+					this._editMessageInThread(threadId, index, tool); return;
+				}
+			}
+			this._addMessageToThread(threadId, tool);
+		},
 		_revokeAgentDelegation() { },
-		_toolsService: { invalidateReadReceipts() { } },
-		toolErrMsgs: { rejected: 'Rejected', interrupted: 'Interrupted', errWhenStringifying: () => 'stringify failed' },
-		_storeAllThreads() { },
 		_setState(partial: unknown) { this.state = { ...this.state, ...(partial as object) }; },
+		_wrapRunAgentToNotify: (run: Promise<void>) => run,
+		_runChatAgent: async () => { providerStarts++; if (options?.providerGate) await options.providerGate; },
 	};
 	Object.setPrototypeOf(receiver, ChatThreadService.prototype);
-	return { receiver, context, storage, storageScopes, pendingEvents, warnings, messages, deliveries };
+	const addUserMessageAndStreamResponse = (ChatThreadService.prototype as any)._addUserMessageAndStreamResponse;
+	receiver._addUserMessageAndStreamResponse = async (...args: any[]) => {
+		try { return await addUserMessageAndStreamResponse.call(receiver, ...args); }
+		catch (error) { warnings.push(`delivery fixture error: ${error instanceof Error ? error.message : String(error)}`); throw error; }
+	};
+	return { receiver, client, core, context, storage, pendingEvents, warnings, get providerStarts() { return providerStarts; } };
+};
+
+/** Install the same main-owned history run boundary that a production user turn
+ * acquires after its durable user row. Child-group close tests must not bypass
+ * that ownership transition with a renderer-only quiescence fixture. */
+const establishLifecycleHistoryRun = async (fixture: ReturnType<typeof createPendingInboxReceiver>, runId: string, generation: number): Promise<void> => {
+	const direct = await fixture.client.authorizeDirectHistoryAppend('task', 'parent', [], runId, generation); assert.ok(direct.ok);
+	const thread = { ...fixture.receiver.state.allThreads.task, messages: [{ role: 'user', pendingInputId: direct.value.pendingInputId, pendingInputSelectionsFingerprint: direct.value.selectionsFingerprint, content: 'parent', displayContent: 'parent', selections: [], state: {} }] };
+	const raw = JSON.stringify({ version: 1, revision: 2, thread }); fixture.storage.storeUser(pendingChatInputThreadStorageKey('task'), raw); fixture.receiver._threadStorageAuthoritativeRaw.set('task', raw); fixture.receiver.state.allThreads.task = thread;
+	assert.ok((await fixture.client.verifyDirectHistoryAndRelease('task', direct.value.leaseId)).ok);
 };
 
 suite('Assistant message lifecycle', () => {
@@ -180,12 +383,10 @@ suite('Assistant message lifecycle', () => {
 		};
 		const run = () => runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot });
 		const runA = run();
-		await Promise.resolve();
-		assert.strictEqual(callbacks.length, 1);
+		await eventually(() => callbacks.length === 1, 'first provider send was not reached');
 		receiver._agentControlGeneration.set('task', 1);
 		const runB = run();
-		await Promise.resolve();
-		assert.strictEqual(callbacks.length, 2);
+		await eventually(() => callbacks.length === 2, 'replacement provider send was not reached');
 		callbacks[1].onText({ fullText: 'B partial', fullReasoning: 'B reasoning', toolCalls: undefined });
 		assert.strictEqual(llmInfoOf(streamState.task).displayContentSoFar, 'B partial');
 		callbacks[0].onText({ fullText: 'A stale partial', fullReasoning: 'A reasoning', toolCalls: undefined });
@@ -196,6 +397,55 @@ suite('Assistant message lifecycle', () => {
 		await callbacks[1].onFinalMessage({ fullText: 'B result', fullReasoning: '', anthropicReasoning: null });
 		await runB;
 		assert.deepStrictEqual(messages.map(message => message.displayContent), ['B result']);
+	});
+
+	test('rebuilds provider context when durable history changes during async conversion', async () => {
+		const conversionGate = deferred<void>();
+		const messages: any[] = [{ role: 'user', displayContent: 'original', content: 'original' }];
+		let raw = 'thread-revision-1'; let conversions = 0; let sends = 0; let sentMessages: any[] | undefined;
+		const receiver: any = {
+			state: { allThreads: { task: { messages, state: {}, filesWithUserChanges: new Set<string>() } }, currentThreadId: 'task' },
+			streamState: {}, _agentControlGeneration: new Map([['task', 0]]), _parentRunTokenOfThread: new Map(), _agentDelegationAuthorityOfThread: new Map(),
+			_settingsService: { state: { globalSettings: { chatMode: 'agent' } } },
+			_currentThreadStorageRaw: () => raw,
+			_convertToLLMMessagesService: { prepareLLMChatMessages: async ({ chatMessages }: any) => {
+				conversions++;
+				const projected = chatMessages.map((message: any) => ({ role: message.role, content: message.displayContent ?? message.content }));
+				if (conversions === 1) await conversionGate.promise;
+				return { messages: projected, separateSystemMessage: false };
+			} },
+			_llmMessageService: { sendLLMMessage: (options: any) => { sends++; sentMessages = options.messages; queueMicrotask(() => void options.onFinalMessage({ fullText: 'done', fullReasoning: '', anthropicReasoning: null })); return 'request'; }, abort() { } },
+			_mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } },
+			_setStreamState(threadId: string, value: any) { this.streamState[threadId] = value; },
+			_addMessageToThread(_threadId: string, message: any) { messages.push(message); },
+		};
+		const run = runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: {}, instructionSnapshot: instructionSnapshot() });
+		await eventually(() => conversions === 1, 'conversion did not start');
+		messages.push({ role: 'user', displayContent: 'new durable turn', content: 'new durable turn' }); raw = 'thread-revision-2'; conversionGate.resolve(undefined);
+		await run;
+		assert.strictEqual(conversions, 2); assert.strictEqual(sends, 1);
+		assert.deepStrictEqual(sentMessages?.map(message => message.content), ['original', 'new durable turn']);
+	});
+
+	test('holds native tool side effects behind the durable provider declaration', async () => {
+		for (const conflict of [false, true]) {
+			const declarationGate = deferred<void>(); const messages: any[] = []; let waits = 0; let sends = 0; let toolRuns = 0;
+			const receiver: any = {
+				state: { allThreads: { task: { messages, state: {}, filesWithUserChanges: new Set<string>() } }, currentThreadId: 'task' },
+				streamState: {}, _agentControlGeneration: new Map([['task', 0]]), _parentRunTokenOfThread: new Map(), _agentDelegationAuthorityOfThread: new Map(),
+				_settingsService: { state: { globalSettings: { chatMode: 'agent' } } },
+				_convertToLLMMessagesService: { prepareLLMChatMessages: async () => ({ messages: [], separateSystemMessage: false }) },
+				_awaitThreadStorageWrites: async () => { waits++; if (waits === 3) { await declarationGate.promise; return !conflict; } return true; },
+				_llmMessageService: { sendLLMMessage: (options: any) => { const send = ++sends; queueMicrotask(() => void options.onFinalMessage(send === 1 ? { fullText: '', fullReasoning: '', toolCalls: [{ name: 'run_command', id: `tool-${conflict}`, rawParams: { command: 'echo test', terminalId: 'terminal' } }], anthropicReasoning: null } : { fullText: 'done', fullReasoning: '', anthropicReasoning: null })); return `request-${send}`; }, abort() { } },
+				_mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } },
+				_setStreamState(threadId: string, value: any) { this.streamState[threadId] = value; }, _addMessageToThread(_threadId: string, message: any) { messages.push(message); },
+				_runToolCall: async () => { toolRuns++; return {}; },
+			};
+			const run = runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: {}, instructionSnapshot: instructionSnapshot() });
+			await eventually(() => waits === 3, 'declaration durability wait was not reached'); assert.strictEqual(toolRuns, 0);
+			declarationGate.resolve(undefined); await run;
+			assert.strictEqual(toolRuns, conflict ? 0 : 1); assert.strictEqual(sends, conflict ? 1 : 2);
+		}
 	});
 
 	test('a same-generation approval continuation owns a new parent-run token', async () => {
@@ -209,30 +459,30 @@ suite('Assistant message lifecycle', () => {
 			_runToolCall: async (_threadId: string, _name: string, id: string, _mcp: unknown, _options: unknown, _snapshot: unknown, _authority: unknown, _skill: boolean, _generation: number, _current: () => boolean, batchRef: { batchId: string; batchOrdinal: number }) => { executionOrder.push(id); if (id === 'batch-a') await firstTool.promise; messages.push({ role: 'tool', type: 'success', id, name: 'read_file', params: {}, rawParams: {}, content: id, result: id, ...batchRef }); return { interrupted: false }; },
 		};
 		const run = () => runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot });
-		const runA = run(); await Promise.resolve(); const runB = run(); await Promise.resolve(); assert.strictEqual(callbacks.length, 2);
+		const runA = run(); await eventually(() => callbacks.length === 1, 'first provider send was not reached'); const runB = run(); await eventually(() => callbacks.length === 2, 'continuation provider send was not reached');
 		callbacks[1].onText({ fullText: 'continuation partial', fullReasoning: '', toolCalls: undefined }); callbacks[0].onText({ fullText: 'stale A', fullReasoning: '', toolCalls: undefined });
 		await callbacks[0].onFinalMessage({ fullText: 'stale A', fullReasoning: '', anthropicReasoning: null }); await runA;
 		assert.strictEqual(llmInfoOf(streamState.task).displayContentSoFar, 'continuation partial'); assert.strictEqual(messages.length, 0);
 		const final = callbacks[1].onFinalMessage({ fullText: 'continuation complete', fullReasoning: '', toolCalls: [{ name: 'run_command', id: 'batch-a', rawParams: {} }, { name: 'run_command', id: 'batch-b', rawParams: {} }], anthropicReasoning: null });
 		await flushMicrotasks(); await flushMicrotasks(); assert.deepStrictEqual(executionOrder, ['batch-a']); assert.strictEqual(callbacks.length, 2);
-		firstTool.resolve(); await final; await flushMicrotasks(); await flushMicrotasks(); assert.deepStrictEqual(executionOrder, ['batch-a', 'batch-b']); assert.strictEqual(callbacks.length, 3);
+		firstTool.resolve(); await final; await eventually(() => callbacks.length === 3, 'post-batch provider continuation was not reached'); assert.deepStrictEqual(executionOrder, ['batch-a', 'batch-b']);
 		await callbacks[2].onFinalMessage({ fullText: 'continuation after batch', fullReasoning: '', anthropicReasoning: null }); await runB;
 		const declaration = messages.find(message => message.role === 'assistant' && message.toolBatch);
 		assert.deepStrictEqual({ calls: declaration.toolBatch.calls.map((call: any) => call.id), rows: messages.filter(message => message.role === 'tool').map(message => [message.id, message.batchId === declaration.toolBatch.batchId, message.batchOrdinal]) }, { calls: ['batch-a', 'batch-b'], rows: [['batch-a', true, 0], ['batch-b', true, 1]] });
 	});
 
 	test('a stale preapproved-tool continuation cannot clear its replacement run', async () => {
-		const snapshot = instructionSnapshot(); const callbacks: TestProviderCallbacks[] = []; const streamState: TestStreamRecord = {}; let releaseTool: () => void = () => { throw new Error('tool was not entered'); };
+		const snapshot = instructionSnapshot(); const callbacks: TestProviderCallbacks[] = []; const streamState: TestStreamRecord = {}; let toolEntered = false; let releaseTool: () => void = () => { throw new Error('tool was not entered'); };
 		const receiver = {
 			state: { allThreads: { task: { messages: [], state: {}, filesWithUserChanges: new Set<string>() } }, currentThreadId: 'task' }, streamState,
 			_agentControlGeneration: new Map([['task', 4]]), _parentRunTokenOfThread: new Map<string, symbol>(), _agentDelegationAuthorityOfThread: new Map(),
 			_settingsService: { state: { globalSettings: { chatMode: 'agent' } } }, _convertToLLMMessagesService: { prepareLLMChatMessages: async () => ({ messages: [], separateSystemMessage: false }) },
 			_llmMessageService: { sendLLMMessage: (options: TestProviderCallbacks) => { callbacks.push(options); return `request-${callbacks.length}`; }, abort() { } }, _mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } },
-			_runToolCall: async () => { await new Promise<void>(resolve => releaseTool = resolve); return { interrupted: false }; }, _setStreamState(threadId: string, value: TestStream | undefined) { streamState[threadId] = value; }, _addMessageToThread() { },
+			_runToolCall: async () => { toolEntered = true; await new Promise<void>(resolve => releaseTool = resolve); return { interrupted: false }; }, _setStreamState(threadId: string, value: TestStream | undefined) { streamState[threadId] = value; }, _addMessageToThread() { },
 		};
 		const runA = runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot, callThisToolFirst: { role: 'tool', type: 'tool_request', name: 'read_file', id: 'tool-a', params: {}, rawParams: {}, content: '', result: null, mcpServerName: undefined } });
-		await Promise.resolve(); const runB = runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot });
-		await Promise.resolve(); callbacks[0].onText({ fullText: 'B partial', fullReasoning: '', toolCalls: undefined }); releaseTool(); await runA;
+		await eventually(() => toolEntered, 'preapproved tool was not entered'); const runB = runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot });
+		await eventually(() => callbacks.length === 1, 'replacement provider send was not reached'); callbacks[0].onText({ fullText: 'B partial', fullReasoning: '', toolCalls: undefined }); releaseTool(); await runA;
 		assert.strictEqual(llmInfoOf(streamState.task).displayContentSoFar, 'B partial'); await callbacks[0].onFinalMessage({ fullText: 'B final', fullReasoning: '', anthropicReasoning: null }); await runB;
 	});
 
@@ -372,10 +622,10 @@ suite('Assistant message lifecycle', () => {
 			_metricsService: { capture: (name: string) => metrics.push(name) }, _toolsService: { invalidateReadReceipts: (threadId: string) => invalidations.push(threadId) }, _notificationService: { notify: (notification: TestNotification) => notifications.push(notification) },
 			_setStreamState(threadId: string, value: TestStream | undefined) { streamState[threadId] = value; }, _addMessageToThread(_threadId: string, message: TestMessage) { messages.push(message); },
 		};
-		const parentRun = beginTestParentRun(receiver, 'task');
+		prepareRunChatAgentReceiver(receiver); const parentRun = beginTestParentRun(receiver, 'task');
 		const running = chatLifecycle._runChatAgent.call(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot, parentRun });
 		const wrapped = chatLifecycle._wrapRunAgentToNotify.call(receiver, running, 'task', parentRun);
-		await Promise.resolve(); assert.strictEqual(callbacks.length, 1); callbacks[0].onText({ fullText: 'current partial', fullReasoning: 'current reasoning', toolCalls: undefined }); await callbacks[0].onFinalMessage({ fullText: 'current final', fullReasoning: 'current reasoning', anthropicReasoning: null }); await wrapped;
+		await eventually(() => callbacks.length === 1, 'provider send was not reached'); callbacks[0].onText({ fullText: 'current partial', fullReasoning: 'current reasoning', toolCalls: undefined }); await callbacks[0].onFinalMessage({ fullText: 'current final', fullReasoning: 'current reasoning', anthropicReasoning: null }); await wrapped;
 		const finalStream = streamState.task; const finalHistory = JSON.stringify(messages); const finalMetrics = [...metrics];
 		callbacks[0].onText({ fullText: 'late text', fullReasoning: 'late reasoning', toolCalls: undefined }); await callbacks[0].onFinalMessage({ fullText: 'duplicate final', fullReasoning: '', anthropicReasoning: null }); await callbacks[0].onError({ message: 'duplicate error', fullError: null }); callbacks[0].onAbort(); await Promise.resolve();
 		assert.strictEqual(streamState.task, finalStream); assert.strictEqual(JSON.stringify(messages), finalHistory); assert.deepStrictEqual(metrics, finalMetrics); assert.deepStrictEqual(metrics, ['Agent Loop Done']); assert.deepStrictEqual(invalidations, ['task']); assert.strictEqual(notifications.length, 1); assert.strictEqual(notifications[0].severity, Severity.Info); assert.strictEqual(receiver._parentRunTokenOfThread.has('task'), false);
@@ -438,6 +688,11 @@ suite('Assistant message lifecycle', () => {
 			_storageService: { get() { return undefined; }, keys() { return []; }, store(key: string, value: string) { assert.strictEqual(key, `${THREAD_STORAGE_RECORD_PREFIX}task`); serializedThreads = value; } },
 			_isUnmaterializedEmptyThread() { return false; },
 			_threadStorageKey: (ChatThreadService.prototype as any)._threadStorageKey, _readThreadEnvelope: (ChatThreadService.prototype as any)._readThreadEnvelope, _storeThreadRecord: (ChatThreadService.prototype as any)._storeThreadRecord,
+			_queueThreadStorageWrite(_threadId: string, nextThread: any) {
+				const nextRaw = JSON.stringify({ version: 1, revision: 1, thread: nextThread });
+				this._storageService.store(`${THREAD_STORAGE_RECORD_PREFIX}task`, nextRaw);
+				return Promise.resolve(true);
+			},
 			_storeAllThreads(threads: any) { return (ChatThreadService.prototype as any)._storeAllThreads.call(this, threads); },
 			_setState(value: any) { this.state = { ...this.state, ...value }; },
 			_addMessageToThread(threadId: string, message: any) {
@@ -630,6 +885,7 @@ suite('Assistant message lifecycle', () => {
 			_revokeAgentDelegation() { },
 			_storageService: { get() { return undefined; }, keys() { return []; }, store(_key: string, value: string) { serializedThreads = value; } },
 			_isUnmaterializedEmptyThread() { return false; },
+			_queueThreadStorageWrite(_id: string, nextThread: unknown) { serializedThreads = JSON.stringify({ version: 1, revision: 1, thread: nextThread }); return Promise.resolve(true); },
 			_threadStorageKey: (ChatThreadService.prototype as any)._threadStorageKey, _readThreadEnvelope: (ChatThreadService.prototype as any)._readThreadEnvelope, _storeThreadRecord: (ChatThreadService.prototype as any)._storeThreadRecord,
 			_storeAllThreads(threads: any) { return (ChatThreadService.prototype as any)._storeAllThreads.call(this, threads); },
 			_setState(value: any) { this.state = { ...this.state, ...value }; },
@@ -1355,446 +1611,422 @@ suite('Assistant message lifecycle', () => {
 		assert.strictEqual(sends, 2); assert.strictEqual(toolEffects, 0); assert.strictEqual(messages.filter(message => message.role === 'user').length, 1); assert.strictEqual(messages.at(-1).displayContent, 'recovered');
 	});
 
-	test('keeps queued input FIFO, atomically claims admission, and keeps it out of history until delivery', async () => {
-		const { receiver, deliveries, messages, storageScopes } = createPendingInboxReceiver();
-		const active = { runId: 'parent-a', generation: 0, settled: new Promise<void>(() => { }) };
-		receiver._runQuiescenceOfThread.set('task', active);
-		const first = receiver.submitPendingInput({ threadId: 'task', text: 'first', mode: 'queue' });
-		const second = receiver.submitPendingInput({ threadId: 'task', text: 'second', mode: 'queue' });
-		const third = receiver.submitPendingInput({ threadId: 'task', text: 'third', mode: 'queue' });
-		assert.ok(first && second && third);
-		assert.strictEqual(receiver.reorderPendingInput('task', third.id, first.id), true);
-		assert.strictEqual(receiver.editPendingInput('task', third.id, 'third edited'), true);
-		assert.deepStrictEqual(receiver.getPendingChatInputs('task').map((input: any) => input.text), ['third edited', 'first', 'second']);
-		assert.ok(storageScopes.length > 0 && storageScopes.every(scope => scope === StorageScope.WORKSPACE));
-		assert.deepStrictEqual(messages, []);
-		assert.deepStrictEqual(deliveries, []);
-
-		const admission = deferred<boolean>();
-		let deliveredPendingInputId: string | undefined;
-		receiver._addUserMessageAndStreamResponse = async (args: any) => { deliveredPendingInputId = args.pendingInputId; (deliveries as any).push(args.userMessage); return admission.promise; };
-		receiver._runQuiescenceOfThread.delete('task');
-		const draining = receiver._drainPendingChatInputs('task');
-		await flushMicrotasks();
-		assert.deepStrictEqual(deliveries, ['third edited']);
-		assert.strictEqual(deliveredPendingInputId, third.id);
-		assert.strictEqual(receiver.getPendingChatInputs('task')[0].phase, 'claiming');
-		assert.deepStrictEqual(messages, []);
-		admission.resolve(true);
-		await draining;
-		assert.deepStrictEqual(receiver.getPendingChatInputs('task').map((input: any) => input.text), ['first', 'second']);
-		await receiver._drainPendingChatInputs('task');
-		await receiver._drainPendingChatInputs('task');
-		assert.deepStrictEqual(deliveries, ['third edited', 'first', 'second']);
-		assert.deepStrictEqual(receiver.getPendingChatInputs('task'), []);
+	test('persists an idle blank-thread Send before preparation and exposes it dormant after the sending window closes', async () => {
+		const storage = new LifecycleBrokerStorage(); let ids = 0; const core = new PendingChatInputBrokerCore(storage, () => 100, () => `journey-${++ids}`);
+		const instructionGate = deferred<void>();
+		const second = createPendingInboxReceiver({ storage, core, ctx: 'window:2', blank: true, instructionGate: instructionGate.promise });
+		const accepted = await second.receiver.submitPendingInput({ threadId: 'task', text: 'survive second window', mode: 'queue', selections: [] });
+		assert.ok(accepted);
+		await eventually(() => second.receiver.getPendingChatInputs('task')[0]?.phase === 'claiming', 'second window did not claim its durable input');
+		assert.strictEqual(second.providerStarts, 0);
+		await second.client.release();
+		await eventually(() => second.receiver.getPendingChatInputs('task')[0]?.phase === 'dormant', 'disconnect did not demote the exact input');
+		const raw = storage.get(pendingChatInputThreadStorageKey('task'))!;
+		const restoredThread = JSON.parse(raw).thread;
+		const third = createPendingInboxReceiver({ storage, core, ctx: 'window:3', thread: restoredThread });
+		await third.receiver._ensurePendingInputBrokerReady();
+		assert.deepStrictEqual(third.receiver.getPendingChatInputs('task').map((row: any) => [row.text, row.phase]), [['survive second window', 'dormant']]);
+		assert.strictEqual(third.providerStarts, 0);
+		const dormant = third.receiver.getPendingChatInputs('task')[0]; assert.strictEqual(await third.receiver.resumePendingInput('task', accepted.id, pendingChatInputFingerprint(dormant)), true);
+		await eventually(() => third.providerStarts === 1 && third.receiver.getPendingChatInputs('task').length === 0, 'third window did not settle the resumed input').catch(error => { throw new Error(`${error instanceof Error ? error.message : String(error)}; ${third.warnings.join('; ')}`); });
+		assert.deepStrictEqual(third.receiver.state.allThreads.task.messages.filter((message: any) => message.role === 'user').map((message: any) => [message.displayContent, message.pendingInputId]), [['survive second window', accepted.id]]);
+		instructionGate.resolve(undefined); await flushMicrotasks(); await flushMicrotasks();
+		assert.strictEqual(second.providerStarts, 0);
 	});
 
-	test('restores workspace-scoped pending inputs dormant, safely revives selections, and fails closed on trust changes', async () => {
-		const persisted = new Map<string, string>();
-		const source = createPendingInboxReceiver({ storage: persisted });
-		source.receiver._runQuiescenceOfThread.set('task', { runId: 'parent-a', generation: 0, settled: new Promise<void>(() => { }) });
-		const pending = source.receiver.submitPendingInput({
-			threadId: 'task',
-			text: 'resume this',
-			mode: 'queue',
-			selections: [{ type: 'File', uri: URI.parse('file:///workspace/safe.txt'), language: 'typescript', state: { wasAddedAsCurrentFile: false } }],
-		});
-		assert.ok(pending);
-		const envelope = JSON.parse(persisted.get(PENDING_CHAT_INPUT_STORAGE_KEY)!);
-		assert.strictEqual(envelope.version, 1);
-		assert.strictEqual(envelope.records.length, 1);
-
-		const restarted = createPendingInboxReceiver({ storage: persisted });
-		restarted.receiver._restorePendingChatInputs();
-		const restored = restarted.receiver.getPendingChatInputs('task');
-		assert.strictEqual(restored.length, 1);
-		assert.strictEqual(restored[0].phase, 'dormant');
-		assert.ok(URI.isUri(restored[0].selections[0].uri));
-		assert.deepStrictEqual(restarted.deliveries, []);
-
-		const untrusted = createPendingInboxReceiver({ storage: persisted, trusted: false });
-		untrusted.receiver._restorePendingChatInputs();
-		assert.strictEqual(untrusted.receiver.getPendingChatInputs('task')[0].phase, 'dormant');
-		assert.strictEqual(untrusted.receiver.resumePendingInput('task', pending.id), false);
-		assert.deepStrictEqual(untrusted.deliveries, []);
-
-		restarted.receiver._addUserMessageAndStreamResponse = async (args: any) => { restarted.deliveries.push(args.userMessage); restarted.messages.push({ role: 'user', pendingInputId: args.pendingInputId }); return true; };
-		assert.strictEqual(restarted.receiver.resumePendingInput('task', pending.id), true);
-		assert.strictEqual(restarted.receiver.resumePendingInput('task', pending.id), false);
-		await flushMicrotasks();
-		assert.deepStrictEqual(restarted.deliveries, ['resume this']);
-		assert.deepStrictEqual(restarted.messages.filter(message => message.role === 'user').map(message => message.pendingInputId), [pending.id]);
-		assert.deepStrictEqual(restarted.receiver.getPendingChatInputs('task'), []);
-
-		const crashedEnvelope = JSON.parse(persisted.get(PENDING_CHAT_INPUT_STORAGE_KEY)!);
-		crashedEnvelope.records = [{ ...envelope.records[0], phase: 'claiming', claimId: 'claim-after-history' }];
-		persisted.set(PENDING_CHAT_INPUT_STORAGE_KEY, JSON.stringify(crashedEnvelope));
-		const crashRestart = createPendingInboxReceiver({ storage: persisted, messages: [{ role: 'user', pendingInputId: pending.id }] });
-		crashRestart.receiver._restorePendingChatInputs();
-		assert.deepStrictEqual(crashRestart.receiver.getPendingChatInputs('task'), []);
-		assert.deepStrictEqual(crashRestart.warnings, []);
-		await crashRestart.receiver._drainPendingChatInputs('task');
-		assert.deepStrictEqual(crashRestart.deliveries, []);
+	test('establishes the exact claimed generation for the first same-window idle Send', async () => {
+		const fixture = createPendingInboxReceiver({ blank: true });
+		fixture.receiver._agentControlGeneration.delete('task');
+		const accepted = await fixture.receiver.submitPendingInput({ threadId: 'task', text: 'first idle send', mode: 'queue', selections: [] });
+		assert.ok(accepted);
+		await eventually(() => fixture.providerStarts === 1 && fixture.receiver.getPendingChatInputs('task').length === 0, 'first idle Send did not settle and enter the provider once');
+		assert.strictEqual(fixture.receiver._agentControlGeneration.get('task'), accepted.generation);
+		assert.deepStrictEqual(fixture.receiver.state.allThreads.task.messages.filter((message: any) => message.role === 'user').map((message: any) => [message.displayContent, message.pendingInputId]), [['first idle send', accepted.id]]);
 	});
 
-	test('bounds live pending admission and edits by global count and UTF-8 envelope bytes', () => {
-		const { receiver, storage, warnings } = createPendingInboxReceiver();
-		receiver.state.allThreads.other = { id: 'other', messages: [], state: { stagingSelections: [], linksOfMessageIdx: {} }, filesWithUserChanges: new Set<string>() };
-		receiver._runQuiescenceOfThread.set('task', { runId: 'hold', generation: 0, settled: new Promise<void>(() => { }) });
-		receiver._runQuiescenceOfThread.set('other', { runId: 'hold-other', generation: 0, settled: new Promise<void>(() => { }) });
-		for (let index = 0; index < PENDING_CHAT_INPUT_MAX_RECORDS; index++) {
-			const threadId = index % 2 === 0 ? 'task' : 'other';
-			assert.ok(receiver.submitPendingInput({ threadId, text: `draft ${index}`, mode: 'queue' }));
+	test('recovers one authoritative history row without appending it twice before provider continuation', async () => {
+		const fixture = createPendingInboxReceiver();
+		fixture.receiver._runQuiescenceOfThread.set('task', { runId: 'hold', generation: 0, settled: new Promise<void>(() => { }) });
+		const accepted = await fixture.receiver.submitPendingInput({ threadId: 'task', text: 'already durable', mode: 'queue', selections: [] });
+		assert.ok(accepted);
+		const thread = { ...fixture.receiver.state.allThreads.task, messages: [{ role: 'user', content: 'already durable', displayContent: 'already durable', pendingInputId: accepted.id, pendingInputSelectionsFingerprint: pendingChatInputSelectionsFingerprint([]), state: { stagingSelections: [], isBeingEdited: false } }] };
+		fixture.storage.storeUser(pendingChatInputThreadStorageKey('task'), JSON.stringify({ version: 1, revision: 2, thread }));
+		fixture.receiver._runQuiescenceOfThread.delete('task');
+		await fixture.receiver._drainPendingChatInputs('task');
+		await eventually(() => fixture.providerStarts === 1, 'recovered row did not continue once');
+		assert.strictEqual(fixture.receiver.state.allThreads.task.messages.filter((message: any) => message.pendingInputId === accepted.id).length, 1);
+		assert.deepStrictEqual(fixture.receiver.getPendingChatInputs('task'), []);
+	});
+
+	test('fails closed on missing, tampered, or duplicate pending-input history provenance', async () => {
+		for (const kind of ['missing', 'tampered', 'duplicate'] as const) {
+			const fixture = createPendingInboxReceiver();
+			fixture.receiver._runQuiescenceOfThread.set('task', { runId: 'hold', generation: 0, settled: new Promise<void>(() => { }) });
+			const accepted = await fixture.receiver.submitPendingInput({ threadId: 'task', text: `corrupt ${kind}`, mode: 'queue', selections: [] }); assert.ok(accepted);
+			const base: any = { role: 'user', content: accepted.text, displayContent: accepted.text, pendingInputId: accepted.id, state: { stagingSelections: [], isBeingEdited: false } };
+			if (kind !== 'missing') base.pendingInputSelectionsFingerprint = kind === 'tampered' ? 'wrong' : pendingChatInputSelectionsFingerprint([]);
+			const messages = kind === 'duplicate' ? [base, { ...base }] : [base];
+			fixture.storage.storeUser(pendingChatInputThreadStorageKey('task'), JSON.stringify({ version: 1, revision: 2, thread: { ...fixture.receiver.state.allThreads.task, messages } }));
+			fixture.receiver._runQuiescenceOfThread.delete('task'); await fixture.receiver._drainPendingChatInputs('task');
+			assert.strictEqual(fixture.providerStarts, 0, kind);
+			await eventually(() => fixture.receiver.getPendingChatInputs('task')[0]?.phase === 'dormant', `${kind} corrupt history claim did not settle dormant`);
 		}
-		const before = storage.get(PENDING_CHAT_INPUT_STORAGE_KEY);
-		assert.strictEqual(receiver.submitPendingInput({ threadId: 'task', text: 'count overflow', mode: 'queue' }), undefined);
-		assert.strictEqual(storage.get(PENDING_CHAT_INPUT_STORAGE_KEY), before);
-		const first = receiver.getPendingChatInputs('task')[0];
-		assert.strictEqual(receiver.editPendingInput('task', first.id, '한'.repeat(30_000)), false);
-		assert.strictEqual(storage.get(PENDING_CHAT_INPUT_STORAGE_KEY), before);
-		assert.strictEqual(receiver.getPendingChatInputs('task')[0].text, 'draft 0');
-		assert.ok(new TextEncoder().encode(storage.get(PENDING_CHAT_INPUT_STORAGE_KEY)!).byteLength <= PENDING_CHAT_INPUT_MAX_SERIALIZED_BYTES);
-		assert.ok(warnings.length >= 2);
+	});
 
-		const fitsMultibyte = (length: number) => {
-			const probe = createPendingInboxReceiver();
-			probe.receiver._runQuiescenceOfThread.set('task', { runId: 'hold', generation: 0, settled: new Promise<void>(() => { }) });
-			return !!probe.receiver.submitPendingInput({ threadId: 'task', text: '한'.repeat(length), mode: 'queue' });
+	test('keeps broker FIFO authoritative through async edit and reorder before draining exactly once each', async () => {
+		const fixture = createPendingInboxReceiver();
+		fixture.receiver._runQuiescenceOfThread.set('task', { runId: 'hold', generation: 0, settled: new Promise<void>(() => { }) });
+		const first = await fixture.receiver.submitPendingInput({ threadId: 'task', text: 'first', mode: 'queue', selections: [] });
+		const second = await fixture.receiver.submitPendingInput({ threadId: 'task', text: 'second', mode: 'queue', selections: [] });
+		const third = await fixture.receiver.submitPendingInput({ threadId: 'task', text: 'third', mode: 'queue', selections: [] });
+		assert.ok(first && second && third);
+		const before = fixture.receiver.getPendingChatInputs('task'); const thirdFingerprint = pendingChatInputFingerprint(before.find((row: any) => row.id === third.id)); const threadFingerprint = pendingChatInputThreadFingerprint(before);
+		assert.strictEqual(await fixture.receiver.reorderPendingInput('task', third.id, thirdFingerprint, threadFingerprint, first.id), true);
+		const reorderedThird = fixture.receiver.getPendingChatInputs('task').find((row: any) => row.id === third.id); assert.strictEqual(await fixture.receiver.editPendingInput('task', third.id, pendingChatInputFingerprint(reorderedThird), 'third edited', []), true);
+		assert.deepStrictEqual(fixture.receiver.getPendingChatInputs('task').map((row: any) => row.text), ['third edited', 'first', 'second']);
+		fixture.receiver._runQuiescenceOfThread.delete('task'); await fixture.receiver._drainPendingChatInputs('task');
+		await eventually(() => fixture.providerStarts === 3 && fixture.receiver.getPendingChatInputs('task').length === 0, 'FIFO did not drain all rows');
+		assert.deepStrictEqual(fixture.receiver.state.allThreads.task.messages.filter((message: any) => message.role === 'user').map((message: any) => message.displayContent), ['third edited', 'first', 'second']);
+	});
+
+	test('restores a fenced message edit and lets the foreign Queue owner drain once', async () => {
+		const childActivities = { version: 1 as const, records: [{ generation: 0, childId: 'old-child', depth: 1, status: 'completed' as const, capabilityProfile: 'read_only' as const, summary: 'old child summary', queuedMs: 0, runningMs: 1, totalMs: 1, anchor: { toolId: 'old-spawn' } }], omitted: 0, retentionSaturated: false };
+		const thread = { ...lifecycleThread(), messages: [{ role: 'user', content: 'old question', displayContent: 'old question', selections: [], state: { stagingSelections: [] } }, { role: 'assistant', displayContent: 'old answer', reasoning: '', anthropicReasoning: null }] as any[], childActivities };
+		const storage = new LifecycleBrokerStorage(); let ids = 0; const core = new PendingChatInputBrokerCore(storage, () => 100, () => `edit-fence-${++ids}`);
+		const first = createPendingInboxReceiver({ storage, core, ctx: 'window:1', thread }); const second = createPendingInboxReceiver({ storage, core, ctx: 'window:2', thread });
+		await first.receiver._ensurePendingInputBrokerReady(); await second.receiver._ensurePendingInputBrokerReady();
+		second.receiver._wakePendingChatInputs = () => { }; second.receiver._drainPendingChatInputs = async () => { };
+		const submitted = await second.client.submit({ threadId: 'task', text: 'foreign FIFO', selections: [], mode: 'queue', phase: 'queued', ownerProjectRoot: 'file:///workspace', trustedAtSubmit: true, generation: 0 }); assert.ok(submitted.ok);
+		const beforeRaw = storage.get(pendingChatInputThreadStorageKey('task'))!; const messagesBefore = first.receiver.state.allThreads.task.messages; const childActivitiesBefore = first.receiver.state.allThreads.task.childActivities;
+		assert.strictEqual(await first.receiver.editUserMessageAndStreamResponse({ userMessage: 'edited retry text', messageIdx: 0, threadId: 'task' }), false);
+		assert.strictEqual(first.providerStarts, 0); const afterRejectedEdit = JSON.parse(storage.get(pendingChatInputThreadStorageKey('task'))!); const beforeRejectedEdit = JSON.parse(beforeRaw);
+		assert.deepStrictEqual(afterRejectedEdit.thread.messages, beforeRejectedEdit.thread.messages); assert.deepStrictEqual(afterRejectedEdit.thread.childActivities, beforeRejectedEdit.thread.childActivities);
+		assert.strictEqual(first.receiver.state.allThreads.task.messages, messagesBefore); assert.strictEqual(first.receiver.state.allThreads.task.childActivities, childActivitiesBefore);
+		assert.deepStrictEqual(first.receiver.state.allThreads.task.messages.map((message: any) => message.displayContent), ['old question', 'old answer']); assert.deepStrictEqual(first.receiver.state.allThreads.task.childActivities, childActivities);
+		assert.deepStrictEqual(first.receiver.getPendingChatInputs('task').map((row: any) => [row.text, row.phase]), [['foreign FIFO', 'queued']]);
+		await (ChatThreadService.prototype as any)._drainPendingChatInputs.call(second.receiver, 'task');
+		await eventually(() => second.providerStarts === 1 && second.receiver.getPendingChatInputs('task').length === 0, 'foreign Queue owner did not drain exactly once');
+		assert.deepStrictEqual(second.receiver.state.allThreads.task.messages.filter((message: any) => message.role === 'user').map((message: any) => message.displayContent), ['old question', 'foreign FIFO']);
+	});
+
+	test('commits one successful message edit only after its direct lease and prunes the old tail ledger', async () => {
+		const thread = { ...lifecycleThread(), messages: [{ role: 'user', content: 'old question', displayContent: 'old question', selections: [], state: { stagingSelections: [] } }, { role: 'assistant', displayContent: 'old answer', reasoning: '', anthropicReasoning: null }] as any[], childActivities: { version: 1 as const, records: [{ generation: 0, childId: 'old-child', depth: 1, status: 'completed' as const, capabilityProfile: 'read_only' as const, summary: 'old child summary', queuedMs: 0, runningMs: 1, totalMs: 1, anchor: { toolId: 'old-spawn' } }], omitted: 0, retentionSaturated: false }, state: { ...lifecycleThread().state, focusedMessageIdx: 0 } };
+		const fixture = createPendingInboxReceiver({ thread: thread as any }); await fixture.receiver._ensurePendingInputBrokerReady();
+		assert.strictEqual(await fixture.receiver.editUserMessageAndStreamResponse({ userMessage: 'edited question', messageIdx: 0, threadId: 'task' }), true);
+		await eventually(() => fixture.providerStarts === 1, 'edited turn did not start exactly one provider');
+		const durable = JSON.parse(fixture.storage.get(pendingChatInputThreadStorageKey('task'))!).thread;
+		assert.deepStrictEqual(durable.messages.map((message: any) => [message.role, message.displayContent]), [['user', 'edited question']]); assert.deepStrictEqual(durable.childActivities.records, []); assert.strictEqual(durable.state.focusedMessageIdx, undefined);
+		assert.deepStrictEqual(fixture.receiver.state.allThreads.task.messages.map((message: any) => [message.role, message.displayContent]), [['user', 'edited question']]); assert.strictEqual(fixture.providerStarts, 1);
+	});
+
+	test('adopts a deferred external winner after a rejected direct edit tears down its starting marker', async () => {
+		const fixture = createPendingInboxReceiver(); await fixture.receiver._ensurePendingInputBrokerReady(); const key = pendingChatInputThreadStorageKey('task');
+		fixture.receiver.state.allThreads.task.messages = [{ role: 'user', content: 'old', displayContent: 'old', selections: [], state: { stagingSelections: [] } }]; const baseline = JSON.stringify({ version: 1, revision: 2, thread: fixture.receiver.state.allThreads.task }); fixture.storage.storeUser(key, baseline); fixture.receiver._threadStorageAuthoritativeRaw.set('task', baseline);
+		const winner = { ...fixture.receiver.state.allThreads.task, messages: [{ role: 'user', content: 'winner', displayContent: 'winner', selections: [], state: { stagingSelections: [] } }] }; const winnerRaw = JSON.stringify({ version: 1, revision: 3, thread: winner });
+		fixture.client.authorizeDirectHistoryAppend = async () => {
+			fixture.storage.storeUser(key, winnerRaw); (ChatThreadService.prototype as any)._applyExternalThreadRecord.call(fixture.receiver, key);
+			return { ok: false, reason: 'append_in_progress', snapshot: fixture.client.snapshot };
 		};
-		let low = 1; let high = 30_000;
-		while (low < high) { const middle = Math.ceil((low + high) / 2); if (fitsMultibyte(middle)) low = middle; else high = middle - 1; }
-		const boundary = createPendingInboxReceiver();
-		boundary.receiver._runQuiescenceOfThread.set('task', { runId: 'hold', generation: 0, settled: new Promise<void>(() => { }) });
-		const boundaryInput = boundary.receiver.submitPendingInput({ threadId: 'task', text: '한'.repeat(low), mode: 'queue' });
-		assert.ok(boundaryInput);
-		const byteBoundary = boundary.storage.get(PENDING_CHAT_INPUT_STORAGE_KEY)!;
-		assert.strictEqual(boundary.receiver.editPendingInput('task', boundaryInput.id, '한'.repeat(low + 1)), false);
-		assert.strictEqual(boundary.storage.get(PENDING_CHAT_INPUT_STORAGE_KEY), byteBoundary);
+		assert.strictEqual(await fixture.receiver.editUserMessageAndStreamResponse({ userMessage: 'must stay in editor', messageIdx: 0, threadId: 'task' }), false);
+		assert.deepStrictEqual(fixture.receiver.state.allThreads.task.messages.map((message: any) => message.displayContent), ['winner']); assert.strictEqual(fixture.receiver._deferredExternalThreadKey.has('task'), false); assert.strictEqual(fixture.providerStarts, 0);
 	});
 
-	test('restores only deterministic dormant survivors that fit the global inbox limits', () => {
-		const storage = new Map<string, string>();
-		const source = createPendingInboxReceiver({ storage });
-		source.receiver._runQuiescenceOfThread.set('task', { runId: 'hold', generation: 0, settled: new Promise<void>(() => { }) });
-		assert.ok(source.receiver.submitPendingInput({ threadId: 'task', text: 'seed', mode: 'queue' }));
-		const seed = JSON.parse(storage.get(PENDING_CHAT_INPUT_STORAGE_KEY)!).records[0];
-		const records = Array.from({ length: PENDING_CHAT_INPUT_MAX_RECORDS + 2 }, (_, index) => ({ ...seed, id: `restore-${index}`, order: index, text: index === 0 ? '한'.repeat(30_000) : `restored ${index}`, draft: `restored ${index}`, phase: 'claiming', claimId: 'stale-claim' }));
-		// Public inbox identity is `(threadId, id)`, so a corrupt cross-thread UUID
-		// collision must not discard either thread's otherwise valid draft.
-		records[1] = { ...records[1], threadId: 'other', id: records[2].id, order: records[2].order };
-		storage.set(PENDING_CHAT_INPUT_STORAGE_KEY, JSON.stringify({ version: 1, records }));
-		const restarted = createPendingInboxReceiver({ storage });
-		restarted.receiver.state.allThreads.other = { id: 'other', messages: [], state: { stagingSelections: [], linksOfMessageIdx: {} }, filesWithUserChanges: new Set<string>() };
-		restarted.receiver._restorePendingChatInputs();
-		const restored = restarted.receiver.getPendingChatInputs('task');
-		assert.ok(restored.length <= PENDING_CHAT_INPUT_MAX_RECORDS);
-		assert.ok(restored.every((input: any) => input.phase === 'dormant'));
-		assert.strictEqual(restarted.receiver.getPendingChatInputs('other').length, 1);
-		assert.deepStrictEqual(restarted.deliveries, []);
-		assert.ok(new TextEncoder().encode(storage.get(PENDING_CHAT_INPUT_STORAGE_KEY)!).byteLength <= PENDING_CHAT_INPUT_MAX_SERIALIZED_BYTES);
-		assert.ok(restarted.warnings.length >= 1);
-
-		const oversizedStorage = new Map<string, string>([[PENDING_CHAT_INPUT_STORAGE_KEY, ' '.repeat(512 * 1024 + 1)]]);
-		const oversized = createPendingInboxReceiver({ storage: oversizedStorage });
-		oversized.receiver._restorePendingChatInputs();
-		assert.strictEqual(oversizedStorage.has(PENDING_CHAT_INPUT_STORAGE_KEY), false);
-		assert.deepStrictEqual(oversized.receiver.getPendingChatInputs('task'), []);
-		assert.strictEqual(oversized.warnings.length, 1);
+	test('fences a stale active tool on CAS conflict and adopts the winner without late history', async () => {
+		const storage = new LifecycleBrokerStorage(); let ids = 0; const core = new PendingChatInputBrokerCore(storage, () => 100, () => `cas-${++ids}`);
+		const first = createPendingInboxReceiver({ storage, core, ctx: 'window:1' }); const second = createPendingInboxReceiver({ storage, core, ctx: 'window:2' });
+		await first.receiver._ensurePendingInputBrokerReady(); await second.receiver._ensurePendingInputBrokerReady();
+		const baseline = storage.get(pendingChatInputThreadStorageKey('task'))!;
+		first.receiver._threadStorageAuthoritativeRaw.set('task', baseline); second.receiver._threadStorageAuthoritativeRaw.set('task', baseline);
+		let cancellations = 0; let interrupts = 0;
+		second.receiver._activeToolCardReceiptsOfThread = new Map([['task', new Map([['receipt', { cancelling: false, cancel: () => { cancellations++; } }]])]]);
+		second.receiver.streamState.task = { isRunning: 'tool', interrupt: Promise.resolve(() => { interrupts++; }) };
+		delete second.receiver._revokeAgentDelegation;
+		(ChatThreadService.prototype as any)._addMessageToThread.call(first.receiver, 'task', { role: 'assistant', displayContent: 'winner', reasoning: '', anthropicReasoning: null });
+		assert.strictEqual(await first.receiver._awaitThreadStorageWrites('task'), true);
+		(ChatThreadService.prototype as any)._addMessageToThread.call(second.receiver, 'task', { role: 'assistant', displayContent: 'stale', reasoning: '', anthropicReasoning: null });
+		assert.strictEqual(await second.receiver._awaitThreadStorageWrites('task'), false);
+		await eventually(() => interrupts === 1, 'CAS conflict did not interrupt the stale operation');
+		const durable = JSON.parse(storage.get(pendingChatInputThreadStorageKey('task'))!).thread;
+		assert.strictEqual(cancellations, 1); assert.strictEqual(second.receiver._agentControlGeneration.get('task'), 1);
+		assert.deepStrictEqual(durable.messages.map((message: any) => message.displayContent), ['winner']);
+		assert.deepStrictEqual(second.receiver.state.allThreads.task.messages.map((message: any) => message.displayContent), ['winner']);
 	});
 
-	test('keeps a failed queued admission as an explicit dormant draft without history or provider mutation', async () => {
-		const { receiver, messages, deliveries } = createPendingInboxReceiver();
-		let admissions = 0;
-		receiver._addUserMessageAndStreamResponse = async ({ userMessage }: { userMessage: string }) => { admissions++; deliveries.push(userMessage); return false; };
-		const pending = receiver.submitPendingInput({ threadId: 'task', text: 'needs correction', mode: 'queue' });
-		assert.ok(pending);
-		await flushMicrotasks();
-		assert.strictEqual(admissions, 1);
-		assert.deepStrictEqual(messages, []);
-		assert.deepStrictEqual(receiver.getPendingChatInputs('task').map((input: any) => ({ text: input.text, phase: input.phase })), [{ text: 'needs correction', phase: 'dormant' }]);
+	test('keeps rendered pending-action base tokens across async readiness and rejects stale mutations', async () => {
+		const fixture = createPendingInboxReceiver(); fixture.receiver._runQuiescenceOfThread.set('task', { runId: 'hold', generation: 0, settled: new Promise<void>(() => { }) });
+		const rows = [] as any[]; for (const text of ['edit', 'delete', 'move', 'resume']) { const row = await fixture.receiver.submitPendingInput({ threadId: 'task', text, mode: 'queue', selections: [] }); assert.ok(row); rows.push(row); }
+		const gateReady = () => { const gate = deferred<void>(); fixture.receiver._ensurePendingInputBrokerReady = async () => { await gate.promise; return true; }; return gate; };
+		let current = fixture.receiver.getPendingChatInputs('task').find((row: any) => row.id === rows[0].id); let gate = gateReady(); const staleEdit = fixture.receiver.editPendingInput('task', current.id, pendingChatInputFingerprint(current), 'stale edit', []); const remoteEdit = await fixture.client.edit('task', current.id, pendingChatInputFingerprint(current), 'remote edit', []); assert.ok(remoteEdit.ok); gate.resolve(undefined); assert.strictEqual(await staleEdit, false);
+		current = fixture.receiver.getPendingChatInputs('task').find((row: any) => row.id === rows[1].id); gate = gateReady(); const staleDelete = fixture.receiver.deletePendingInput('task', current.id, pendingChatInputFingerprint(current)); assert.ok((await fixture.client.edit('task', current.id, pendingChatInputFingerprint(current), 'remote before delete', [])).ok); gate.resolve(undefined); assert.strictEqual(await staleDelete, false);
+		current = fixture.receiver.getPendingChatInputs('task').find((row: any) => row.id === rows[2].id); const base = pendingChatInputThreadFingerprint(fixture.receiver.getPendingChatInputs('task')); gate = gateReady(); const staleMove = fixture.receiver.reorderPendingInput('task', current.id, pendingChatInputFingerprint(current), base, rows[0].id); const other = fixture.receiver.getPendingChatInputs('task').find((row: any) => row.id === rows[3].id); assert.ok((await fixture.client.edit('task', other.id, pendingChatInputFingerprint(other), 'remote invalidates order base', [])).ok); gate.resolve(undefined); assert.strictEqual(await staleMove, false);
+		current = fixture.receiver.getPendingChatInputs('task').find((row: any) => row.id === rows[3].id); assert.ok((await fixture.client.suspend('task', current.id, pendingChatInputFingerprint(current))).ok); current = fixture.receiver.getPendingChatInputs('task').find((row: any) => row.id === rows[3].id); gate = gateReady(); const staleResume = fixture.receiver.resumePendingInput('task', current.id, pendingChatInputFingerprint(current)); assert.ok((await fixture.client.edit('task', current.id, pendingChatInputFingerprint(current), 'remote dormant edit', [])).ok); gate.resolve(undefined); assert.strictEqual(await staleResume, false);
+		assert.strictEqual(fixture.providerStarts, 0); assert.ok(fixture.warnings.filter(message => message.includes('changed in another Void window')).length >= 4); assert.deepStrictEqual(fixture.receiver.getPendingChatInputs('task').map((row: any) => row.text), ['remote edit', 'remote before delete', 'move', 'remote dormant edit']);
 	});
 
-	test('holds queued input through an awaiting approval and drains only after that approval settles', async () => {
-		const { receiver, messages, deliveries } = createPendingInboxReceiver();
-		messages.push({ role: 'tool', type: 'tool_request', id: 'approval-a', name: 'run_command', params: { command: 'echo hold' }, rawParams: { command: 'echo hold' }, content: '(Awaiting user permission...)', result: null });
-		receiver.streamState.task = { isRunning: 'awaiting_user' };
-		const parentRun = beginTestParentRun(receiver, 'task');
-		(ChatThreadService.prototype as any)._trackParentRun.call(receiver, 'task', parentRun, Promise.resolve());
-		await new Promise<void>(resolve => setTimeout(resolve, 0));
-		assert.ok(receiver._runQuiescenceOfThread.get('task')?.releaseAwaitingApproval);
-
-		const queued = receiver.submitPendingInput({ threadId: 'task', text: 'after approval', mode: 'queue' });
-		assert.ok(queued);
-		await flushMicrotasks();
-		assert.deepStrictEqual(deliveries, []);
-		assert.strictEqual(receiver.streamState.task.isRunning, 'awaiting_user');
-		assert.strictEqual(messages.at(-1).type, 'tool_request');
-
-		receiver.rejectLatestToolRequest('task', false);
-		await flushMicrotasks(); await flushMicrotasks();
-		assert.deepStrictEqual(deliveries, ['after approval']);
-		assert.strictEqual(messages.at(-1).type, 'rejected');
-		assert.deepStrictEqual(receiver.getPendingChatInputs('task'), []);
+	test('promotes one exact Steer only at a live parent safe boundary and settles durable history first', async () => {
+		const fixture = createPendingInboxReceiver(); await fixture.receiver._ensurePendingInputBrokerReady();
+		const parentRun = beginTestParentRun(fixture.receiver, 'task'); fixture.receiver._runQuiescenceOfThread.set('task', { runId: parentRun.runId, generation: parentRun.generation, settled: new Promise<void>(() => { }) });
+		const steer = await fixture.receiver.submitPendingInput({ threadId: 'task', text: 'steer at boundary', mode: 'steer', selections: [] }); assert.ok(steer); assert.strictEqual(steer.phase, 'steering');
+		assert.strictEqual(await (ChatThreadService.prototype as any)._promoteSteerAtSafeBoundary.call(fixture.receiver, 'task', parentRun), true);
+		assert.deepStrictEqual(fixture.receiver.state.allThreads.task.messages.filter((message: any) => message.role === 'user').map((message: any) => message.displayContent), ['steer at boundary']);
+		assert.deepStrictEqual(fixture.receiver.getPendingChatInputs('task'), []);
 	});
 
-	test('holds Queue behind a restored awaiting approval with no live parent lease', async () => {
-		const { receiver, messages, deliveries } = createPendingInboxReceiver();
-		messages.push({ role: 'tool', type: 'tool_request', id: 'restored-approval', name: 'run_command', params: { command: 'echo hold' }, rawParams: { command: 'echo hold' }, content: '(Awaiting user permission...)', result: null });
-		receiver.streamState.task = { isRunning: 'awaiting_user' };
-		assert.strictEqual(receiver._runQuiescenceOfThread.has('task'), false);
-		const queued = receiver.submitPendingInput({ threadId: 'task', text: 'after restored approval', mode: 'queue' });
-		assert.ok(queued);
-		await flushMicrotasks();
-		assert.deepStrictEqual(deliveries, []);
-		assert.strictEqual(messages.at(-1).type, 'tool_request');
-
-		receiver.rejectLatestToolRequest('task', false);
-		await flushMicrotasks(); await flushMicrotasks();
-		assert.deepStrictEqual(deliveries, ['after restored approval']);
-		assert.strictEqual(messages.at(-1).type, 'rejected');
+	test('closes a terminal parent before ACK and converts its undelivered Steer to ordinary FIFO', async () => {
+		const fixture = createPendingInboxReceiver(); await fixture.receiver._ensurePendingInputBrokerReady();
+		const parentRun = beginTestParentRun(fixture.receiver, 'task'); await establishLifecycleHistoryRun(fixture, parentRun.runId, parentRun.generation); fixture.receiver._runQuiescenceOfThread.set('task', { runId: parentRun.runId, generation: parentRun.generation, settled: Promise.resolve() });
+		const steer = await fixture.receiver.submitPendingInput({ threadId: 'task', text: 'release after close', mode: 'steer', selections: [] }); assert.ok(steer);
+		fixture.receiver._runQuiescenceOfThread.delete('task'); await (ChatThreadService.prototype as any)._releaseUndeliveredSteers.call(fixture.receiver, 'task', parentRun);
+		assert.deepStrictEqual(fixture.receiver.getPendingChatInputs('task').map((row: any) => [row.mode, row.phase]), [['queue', 'queued']]);
+		await fixture.receiver._drainPendingChatInputs('task'); await eventually(() => fixture.providerStarts === 1, 'released Steer did not drain');
 	});
 
-	test('does not drain Queue around a pending direct submission before it settles', async () => {
-		const { receiver, deliveries } = createPendingInboxReceiver();
-		receiver._runQuiescenceOfThread.set('task', { runId: 'parent-a', generation: 0, settled: new Promise<void>(() => { }) });
-		const queued = receiver.submitPendingInput({ threadId: 'task', text: 'must wait for direct submit', mode: 'queue' });
-		assert.ok(queued);
-		const direct: any = { id: 'direct-b', threadId: 'task', generation: 1, displayContent: 'direct', selections: [], phase: 'preparing', draft: 'direct', composerCleared: false };
-		receiver._pendingChatSubmissionOfThread.set('task', direct);
-		receiver._runQuiescenceOfThread.delete('task');
-		await receiver._drainPendingChatInputs('task');
-		assert.deepStrictEqual(deliveries, []);
-
-		receiver._settlePendingChatSubmission(direct, false);
-		await flushMicrotasks();
-		assert.deepStrictEqual(deliveries, ['must wait for direct submit']);
-		assert.deepStrictEqual(receiver.getPendingChatInputs('task'), []);
+	test('retains terminal quiescence and retries an exact close after pre-execution failure or lost ACK', async () => {
+		for (const lostAfterExecution of [false, true]) {
+			const fixture = createPendingInboxReceiver(); await fixture.receiver._ensurePendingInputBrokerReady(); const runGate = deferred<void>(); const retryGate = deferred<void>();
+			const parentRun = beginTestParentRun(fixture.receiver, 'task'); await establishLifecycleHistoryRun(fixture, parentRun.runId, parentRun.generation); const originalClose = fixture.client.closeRunAndReleaseSteers.bind(fixture.client); let calls = 0; let effective = 0; const closeRunIds: string[] = [];
+			fixture.client.closeRunAndReleaseSteers = async (...args: any[]) => {
+				calls++; closeRunIds.push(args[1]);
+				if (calls === 1 && !lostAfterExecution) return { ok: false, reason: 'backend_unavailable' };
+				const result = await originalClose(...args); if (result.ok && effective === 0) effective++;
+				return calls === 1 ? { ok: false, reason: 'backend_unavailable', snapshot: result.snapshot } : result;
+			};
+			fixture.receiver._pendingRunCloseRetryDelay = async () => retryGate.promise;
+			(ChatThreadService.prototype as any)._trackParentRun.call(fixture.receiver, 'task', parentRun, runGate.promise);
+			const queued = await fixture.receiver.submitPendingInput({ threadId: 'task', text: `after ${lostAfterExecution ? 'lost' : 'pre'} close`, mode: 'queue', selections: [] }); assert.ok(queued); runGate.resolve(undefined);
+			await eventually(() => calls === 1, 'first close attempt did not occur'); assert.strictEqual(fixture.receiver._runQuiescenceOfThread.get('task')?.runId, parentRun.runId); assert.strictEqual(fixture.providerStarts, 0);
+			retryGate.resolve(undefined); await eventually(() => closeRunIds.filter(runId => runId === parentRun.runId).length === 2 && fixture.providerStarts === 1 && !fixture.receiver._runQuiescenceOfThread.has('task'), 'exact close retry did not release FIFO once');
+			assert.deepStrictEqual({ originalCloses: closeRunIds.filter(runId => runId === parentRun.runId).length, effective, rows: fixture.receiver.getPendingChatInputs('task').length, providers: fixture.providerStarts }, { originalCloses: 2, effective: 1, rows: 0, providers: 1 });
+		}
 	});
 
-	test('holds a reentrant Queue event until successful pending admission installs its parent lease', async () => {
-		const thread: any = { id: 'task', messages: [], state: { stagingSelections: [], linksOfMessageIdx: {} }, filesWithUserChanges: new Set<string>() };
-		const turnConfig = projectAgentConfig({ developerInstructions: 'queue receipt fixture' }, undefined, [{ uri: 'file:///home/.codex/config.toml', scope: 'user', status: 'loaded', projectedKeys: ['developer_instructions'] }], 'file:///workspace', 'file:///workspace');
-		const instructionTurn = resolveAgentInstructions(turnConfig, [{ uri: 'file:///workspace/AGENTS.md', outcome: Object.freeze({ status: 'bytes' as const, bytes: bytes('agents') }) }], stableAgentInstructionRevision(turnConfig, [{ uri: 'file:///workspace/AGENTS.md', outcome: Object.freeze({ status: 'bytes' as const, bytes: bytes('agents') }) }]));
-		const runGate = deferred<void>();
-		let providerStarts = 0;
-		const receiver: any = {
-			state: { allThreads: { task: thread }, currentThreadId: 'task' },
-			streamState: {},
-			_settingsService: { state: { globalSettings: { chatMode: 'normal' }, overridesOfModel: { openAICompatible: { 'gpt-4.1': {} } } } },
-			_currentModelSelectionProps: () => ({ modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: {} }),
-			_beginInstructionTurn: async () => instructionTurn, _purgeInstructionTurn() { }, _rememberInstructionTurn() { },
-			_workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: URI.parse('file:///workspace') }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => true },
-			_agentSkillsService: { getCatalog: async () => createSkillCatalog([]), readSkillBody: async () => ({}) }, _directoryStringService: {}, _fileService: {},
-			_mcpService: { getMCPTools: () => [] }, _notificationService: { notify() { } }, _toolsService: { invalidateReadReceipts() { } },
-			_agentSubagentService: { cancelParent() { }, forgetParent() { } }, _childToolApprovals: new Map(), _onDidChangeChildToolApprovals: { fire() { } },
-			_agentControlGeneration: new Map([['task', 0]]), _agentDelegationAuthorityOfThread: new Map(), _parentRunTokenOfThread: new Map(),
-			_pendingChatSubmissionOfThread: new Map(), _pendingChatInputsOfThread: new Map(), _drainingPendingChatInputs: new Set(), _runQuiescenceOfThread: new Map(), _startingParentRunOfThread: new Map(), _deferredExternalThreadKey: new Map(), _deletingPendingInputThreads: new Set(), _stopAndSendFlights: new Map(), _transientComposerDraftOfThread: new Map(),
-			_onDidChangePendingChatInputs: { fire() { } }, _storePendingChatInputs() { }, _onDidChangePendingChatSubmission: { fire() { } },
-			_setStreamState(threadId: string, value: any) { this.streamState[threadId] = value; }, _addMessageToThread(_threadId: string, message: any) { thread.messages.push(message); },
-			_runChatAgent() { providerStarts++; return runGate.promise; }, _wrapRunAgentToNotify: (run: Promise<void>) => run,
-		};
-		Object.setPrototypeOf(receiver, ChatThreadService.prototype);
-		const pending: any = { id: 'pending-b', threadId: 'task', generation: 0, displayContent: 'B', selections: [], phase: 'preparing', draft: 'B', composerCleared: false };
-		receiver._pendingChatSubmissionOfThread.set('task', pending);
-		let queued: any;
-		receiver._onDidChangePendingChatSubmission = { fire() {
-			if (!receiver._pendingChatSubmissionOfThread.has('task') && !queued) queued = receiver.submitPendingInput({ threadId: 'task', text: 'Q from receipt event', mode: 'queue' });
-		} };
-		const admitted = await (ChatThreadService.prototype as any)._addUserMessageAndStreamResponse.call(receiver, { userMessage: 'B', threadId: 'task', pending });
-		assert.strictEqual(admitted, true);
-		assert.strictEqual(providerStarts, 1);
-		assert.deepStrictEqual(thread.messages.filter((message: any) => message.role === 'user').map((message: any) => message.displayContent), ['B']);
-		assert.strictEqual(queued?.phase, 'queued');
-		assert.strictEqual(receiver._startingParentRunOfThread.has('task'), false);
-		assert.ok(receiver._runQuiescenceOfThread.has('task'));
-		assert.strictEqual(receiver.getPendingChatInputs('task')[0].text, 'Q from receipt event');
-		receiver.deletePendingInput('task', queued.id);
-		runGate.resolve();
-		await flushMicrotasks();
-
-		const providerStartsBeforeClaimFence = providerStarts;
-		const exactClaim = { id: 'queued-pending-id', threadId: 'task', claimId: 'queued-claim-id', phase: 'claiming', generation: 0, ownerProjectRoot: 'file:///workspace', trustedAtSubmit: true };
-		receiver._pendingChatInputsOfThread.set('task', [exactClaim]);
-		const fencedAdmission = (ChatThreadService.prototype as any)._addUserMessageAndStreamResponse.call(receiver, { userMessage: 'must not duplicate', threadId: 'task', pendingInputId: exactClaim.id, pendingInputClaim: exactClaim });
-		thread.messages.push({ role: 'user', pendingInputId: 'queued-pending-id', content: 'must not duplicate', displayContent: 'must not duplicate' });
-		assert.strictEqual(await fencedAdmission, false);
-		assert.strictEqual(providerStarts, providerStartsBeforeClaimFence);
-		assert.strictEqual(thread.messages.filter((message: any) => message.pendingInputId === 'queued-pending-id').length, 1);
-
-		const replacedClaim = { id: 'replaced-pending-id', threadId: 'task', claimId: 'original-claim-id', phase: 'claiming', generation: 0, ownerProjectRoot: 'file:///workspace', trustedAtSubmit: true };
-		receiver._pendingChatInputsOfThread.set('task', [replacedClaim]);
-		const replacedAdmission = (ChatThreadService.prototype as any)._addUserMessageAndStreamResponse.call(receiver, { userMessage: 'must preserve replacement', threadId: 'task', pendingInputId: replacedClaim.id, pendingInputClaim: replacedClaim });
-		const replacement = { ...replacedClaim, claimId: 'replacement-claim-id' };
-		receiver._pendingChatInputsOfThread.set('task', [replacement]);
-		assert.strictEqual(await replacedAdmission, false);
-		assert.strictEqual(providerStarts, providerStartsBeforeClaimFence);
-		assert.strictEqual(receiver._pendingChatInputsOfThread.get('task')[0], replacement);
-
-		const deletedClaim = { id: 'deleted-pending-id', threadId: 'task', claimId: 'deleted-claim-id', phase: 'claiming', generation: 0, ownerProjectRoot: 'file:///workspace', trustedAtSubmit: true };
-		receiver._pendingChatInputsOfThread.set('task', [deletedClaim]);
-		const deletedAdmission = (ChatThreadService.prototype as any)._addUserMessageAndStreamResponse.call(receiver, { userMessage: 'must stay deleted', threadId: 'task', pendingInputId: deletedClaim.id, pendingInputClaim: deletedClaim });
-		receiver._pendingChatInputsOfThread.delete('task');
-		assert.strictEqual(await deletedAdmission, false);
-		assert.strictEqual(providerStarts, providerStartsBeforeClaimFence);
-		assert.strictEqual(thread.messages.some((message: any) => message.pendingInputId === deletedClaim.id), false);
-
-		const reorderClaim: any = { id: 'reorder-pending-id', threadId: 'task', text: 'still deliver once', draft: 'still deliver once', selections: [], mode: 'queue', order: 0, createdAt: 1, generation: 0, ownerProjectRoot: 'file:///workspace', trustedAtSubmit: true, claimId: 'reorder-claim-id', phase: 'claiming' };
-		const queuedB: any = { ...reorderClaim, id: 'queued-b', text: 'B', draft: 'B', order: 1, claimId: undefined, phase: 'queued' };
-		const queuedC: any = { ...reorderClaim, id: 'queued-c', text: 'C', draft: 'C', order: 2, claimId: undefined, phase: 'queued' };
-		receiver._pendingChatInputsOfThread.set('task', [reorderClaim, queuedB, queuedC]);
-		const reorderedAdmission = (ChatThreadService.prototype as any)._addUserMessageAndStreamResponse.call(receiver, { userMessage: reorderClaim.text, threadId: 'task', pendingInputId: reorderClaim.id, pendingInputClaim: reorderClaim });
-		assert.strictEqual(receiver.reorderPendingInput('task', queuedB.id), true);
-		assert.strictEqual(await reorderedAdmission, true);
-		assert.strictEqual(providerStarts, providerStartsBeforeClaimFence + 1);
-		assert.strictEqual(thread.messages.filter((message: any) => message.pendingInputId === reorderClaim.id).length, 1);
-
-		let claimTrusted = true;
-		receiver._workspaceTrustManagementService = { isWorkspaceTrusted: () => claimTrusted };
-		const trustClaim = { ...reorderClaim, id: 'trust-pending-id', text: 'must not cross trust', draft: 'must not cross trust', claimId: 'trust-claim-id' };
-		receiver._pendingChatInputsOfThread.set('task', [trustClaim]);
-		const trustAdmission = (ChatThreadService.prototype as any)._addUserMessageAndStreamResponse.call(receiver, { userMessage: trustClaim.text, threadId: 'task', pendingInputId: trustClaim.id, pendingInputClaim: trustClaim });
-		claimTrusted = false;
-		assert.strictEqual(await trustAdmission, false);
-		assert.strictEqual(providerStarts, providerStartsBeforeClaimFence + 1);
-		assert.strictEqual(thread.messages.some((message: any) => message.pendingInputId === trustClaim.id), false);
+	test('keeps a disconnected dormant row blocked when workspace trust no longer matches', async () => {
+		const storage = new LifecycleBrokerStorage(); let ids = 0; const core = new PendingChatInputBrokerCore(storage, () => 100, () => `trust-${++ids}`);
+		const first = createPendingInboxReceiver({ storage, core, ctx: 'window:1' }); first.receiver._runQuiescenceOfThread.set('task', { runId: 'hold', generation: 0, settled: new Promise<void>(() => { }) });
+		const row = await first.receiver.submitPendingInput({ threadId: 'task', text: 'do not cross trust', mode: 'queue', selections: [] }); assert.ok(row); await first.client.release();
+		const second = createPendingInboxReceiver({ storage, core, ctx: 'window:2', trusted: false }); await second.receiver._ensurePendingInputBrokerReady();
+		assert.strictEqual(second.receiver.getPendingChatInputs('task')[0]?.phase, 'dormant');
+		assert.strictEqual(await second.receiver.resumePendingInput('task', row.id, pendingChatInputFingerprint(row)), false); assert.strictEqual(second.providerStarts, 0);
 	});
 
-	test('registers a parent lease before synchronous start events can submit Steer', async () => {
-		const { receiver, deliveries, messages } = createPendingInboxReceiver();
-		const parentRun = beginTestParentRun(receiver, 'task');
-		const started = deferred<void>();
-		let submitted: any;
-		const setStreamState = receiver._setStreamState.bind(receiver);
-		receiver._setStreamState = (threadId: string, value: any) => {
-			setStreamState(threadId, value);
-			if (value?.isRunning === 'idle' && !submitted) {
-				submitted = receiver.submitPendingInput({ threadId, text: 'steer at initial idle', mode: 'steer' });
+	test('rolls back a failed blank-thread anchor and keeps the unsent composer draft', async () => {
+		const storage = new LifecycleBrokerStorage(); const fixture = createPendingInboxReceiver({ storage, blank: true }); await fixture.receiver._ensurePendingInputBrokerReady();
+		fixture.receiver.setTransientComposerDraft('task', 'keep exact draft'); storage.failFlushes = 1;
+		assert.strictEqual(await fixture.receiver.submitPendingInput({ threadId: 'task', text: 'keep exact draft', mode: 'queue', selections: [] }), undefined);
+		assert.strictEqual(fixture.receiver.getTransientComposerDraft('task'), 'keep exact draft'); assert.deepStrictEqual(fixture.receiver.getPendingChatInputs('task'), []);
+		assert.strictEqual(storage.get(pendingChatInputThreadStorageKey('task')), undefined);
+	});
+
+	test('does not clear draft or create a local row when the broker persistence ACK fails', async () => {
+		const storage = new LifecycleBrokerStorage(); const fixture = createPendingInboxReceiver({ storage }); await fixture.receiver._ensurePendingInputBrokerReady();
+		fixture.receiver.setTransientComposerDraft('task', 'retry me'); storage.failFlushes = 1;
+		assert.strictEqual(await fixture.receiver.submitPendingInput({ threadId: 'task', text: 'retry me', mode: 'queue', selections: [] }), undefined);
+		assert.strictEqual(fixture.receiver.getTransientComposerDraft('task'), 'retry me'); assert.deepStrictEqual(fixture.receiver.getPendingChatInputs('task'), []); assert.strictEqual(fixture.providerStarts, 0);
+	});
+
+	test('persists assistant, tool, and child-activity mutations in one per-thread CAS order', async () => {
+		const fixture = createPendingInboxReceiver(); await fixture.receiver._ensurePendingInputBrokerReady();
+		(ChatThreadService.prototype as any)._addMessageToThread.call(fixture.receiver, 'task', { role: 'assistant', displayContent: 'assistant', reasoning: '', anthropicReasoning: null });
+		(ChatThreadService.prototype as any)._addMessageToThread.call(fixture.receiver, 'task', { role: 'tool', type: 'success', name: 'read_file', id: 'tool', params: {}, rawParams: {}, content: 'tool', result: 'tool', mcpServerName: undefined });
+		(ChatThreadService.prototype as any)._replaceChildActivities.call(fixture.receiver, 'task', Object.freeze({ version: 1, records: Object.freeze([]), omitted: 1, retentionSaturated: false }));
+		assert.strictEqual(await fixture.receiver._awaitThreadStorageWrites('task'), true);
+		const durable = JSON.parse(fixture.storage.get(pendingChatInputThreadStorageKey('task'))!).thread;
+		assert.deepStrictEqual(durable.messages.map((message: any) => [message.role, message.displayContent ?? message.content]), [['assistant', 'assistant'], ['tool', 'tool']]);
+		assert.deepStrictEqual({ omitted: durable.childActivities.omitted, saturated: durable.childActivities.retentionSaturated }, { omitted: 1, saturated: false });
+	});
+
+	test('coalesces a second delivered-history intersection that arrives during the first reconcile flight', async () => {
+		const first = deferred<void>(); let calls = 0;
+		const row = (id: string) => ({ id, threadId: 'task', text: id, draft: id, selections: [], mode: 'queue', order: id === 'a' ? 0 : 1, createdAt: 1, ownerProjectRoot: 'file:///workspace', trustedAtSubmit: true, generation: 0, phase: 'dormant' });
+		const receiver: any = Object.create(ChatThreadService.prototype); receiver.state = { allThreads: { task: { messages: [{ role: 'user', pendingInputId: 'a' }] } } }; receiver._pendingChatInputsOfThread = new Map([['task', [row('a'), row('b')]]]); receiver._pendingDeliveredReconcileRequested = 0; receiver._pendingDeliveredReconcileFlight = undefined; receiver._pendingDeliveredReconcileRetry = undefined; receiver._ensurePendingInputBrokerReady = async () => true;
+		receiver._pendingInputBrokerTestSeam = { reconcileDeliveredPendingInputIds: async () => { calls++; if (calls === 1) { await first.promise; receiver._pendingChatInputsOfThread.set('task', [row('b')]); } else receiver._pendingChatInputsOfThread.clear(); return { ok: true, value: undefined }; } };
+		(ChatThreadService.prototype as any)._scheduleDeliveredPendingReconcile.call(receiver); await flushMicrotasks();
+		receiver.state.allThreads.task.messages.push({ role: 'user', pendingInputId: 'b' }); (ChatThreadService.prototype as any)._scheduleDeliveredPendingReconcile.call(receiver); first.resolve(undefined);
+		await eventually(() => calls === 2 && receiver._pendingChatInputsOfThread.size === 0, 'coalesced intersection was lost');
+	});
+
+	test('holds Queue while approval is unresolved and drains once after the boundary clears', async () => {
+		const fixture = createPendingInboxReceiver(); fixture.receiver.streamState.task = { isRunning: 'awaiting_user' };
+		const row = await fixture.receiver.submitPendingInput({ threadId: 'task', text: 'after approval', mode: 'queue', selections: [] }); assert.ok(row); await flushMicrotasks(); assert.strictEqual(fixture.providerStarts, 0);
+		fixture.receiver.streamState.task = undefined; await fixture.receiver._drainPendingChatInputs('task'); await eventually(() => fixture.providerStarts === 1, 'Queue did not wake after approval');
+	});
+
+	test('Stop-and-Send advances after its captured run closes before ACK and drains once', async () => {
+		const fixture = createPendingInboxReceiver(); const old = { runId: 'old', generation: 0, settled: Promise.resolve() }; fixture.receiver._runQuiescenceOfThread.set('task', old); let aborts = 0; fixture.receiver.abortRunning = async () => { aborts++; };
+		const productionWake = (ChatThreadService.prototype as any)._wakePendingChatInputs; fixture.receiver._wakePendingChatInputs = () => { };
+		const row = await fixture.receiver.submitPendingInput({ threadId: 'task', text: 'after closed old run', mode: 'stop_and_send', selections: [] }); assert.ok(row); assert.deepStrictEqual([row.targetRunId, row.targetGeneration, row.generation], ['old', 0, 1]);
+		fixture.receiver._runQuiescenceOfThread.delete('task'); fixture.receiver._wakePendingChatInputs = productionWake; productionWake.call(fixture.receiver, 'task', row);
+		await eventually(() => fixture.providerStarts === 1 && fixture.receiver.getPendingChatInputs('task').length === 0, 'closed-target Stop row did not advance and drain'); assert.strictEqual(aborts, 0); assert.strictEqual(fixture.receiver._agentControlGeneration.get('task'), 1);
+	});
+
+	test('a delayed Stop-and-Send snapshot never retargets a replacement run', async () => {
+		const fixture = createPendingInboxReceiver(); fixture.receiver._runQuiescenceOfThread.set('task', { runId: 'old', generation: 0, settled: Promise.resolve() }); let aborts = 0; fixture.receiver.abortRunning = async () => { aborts++; };
+		const productionWake = (ChatThreadService.prototype as any)._wakePendingChatInputs; fixture.receiver._wakePendingChatInputs = () => { };
+		const row = await fixture.receiver.submitPendingInput({ threadId: 'task', text: 'do not abort replacement', mode: 'stop_and_send', selections: [] }); assert.ok(row);
+		fixture.receiver._runQuiescenceOfThread.set('task', { runId: 'replacement', generation: 1, settled: Promise.resolve() }); fixture.receiver._agentControlGeneration.set('task', 1); fixture.receiver._wakePendingChatInputs = productionWake;
+		(ChatThreadService.prototype as any)._applyPendingChatInputSnapshot.call(fixture.receiver, [row]); await new Promise(resolve => setTimeout(resolve, 0)); assert.strictEqual(aborts, 0); assert.strictEqual(fixture.providerStarts, 0);
+		fixture.receiver._runQuiescenceOfThread.delete('task'); productionWake.call(fixture.receiver, 'task', row); await eventually(() => fixture.providerStarts === 1 && fixture.receiver.getPendingChatInputs('task').length === 0, 'replacement-close Stop row did not drain'); assert.strictEqual(aborts, 0);
+	});
+
+	test('holds Queue and targetless Steer behind child-only work, then wakes on child terminal', async () => {
+		const fixture = createPendingInboxReceiver(); const childViews: any[] = [{ id: 'child-a', generation: 0, status: 'running' }];
+		fixture.receiver._agentSubagentService = { getRunViews: () => childViews, cancelParent() { }, forgetParent() { } };
+		const queued = await fixture.receiver.submitPendingInput({ threadId: 'task', text: 'after child queue', mode: 'queue', selections: [] });
+		const steer = await fixture.receiver.submitPendingInput({ threadId: 'task', text: 'after child steer', mode: 'steer', selections: [] });
+		assert.ok(queued && steer); assert.deepStrictEqual([steer.mode, steer.phase], ['queue', 'queued']); await flushMicrotasks(); assert.strictEqual(fixture.providerStarts, 0);
+		childViews[0].status = 'completed'; (ChatThreadService.prototype as any)._wakePendingChatInputs.call(fixture.receiver, 'task');
+		await eventually(() => fixture.providerStarts === 2 && fixture.receiver.getPendingChatInputs('task').length === 0, 'child terminal did not release queued FIFO');
+		assert.deepStrictEqual(fixture.receiver.state.allThreads.task.messages.filter((message: any) => message.role === 'user').map((message: any) => message.displayContent), ['after child queue', 'after child steer']);
+	});
+
+	test('child-only Stop-and-Send cancels only its captured group and never a later child', async () => {
+		for (const delayedReplacement of [false, true]) {
+			const fixture = createPendingInboxReceiver(); await fixture.receiver._ensurePendingInputBrokerReady(); let cancels = 0; let coordination: any[] = [{ id: 'old-child', generation: 0, released: false }];
+			const source = { runId: `child-parent-${delayedReplacement}`, generation: 0 }; await establishLifecycleHistoryRun(fixture, source.runId, source.generation); fixture.receiver._childGroupSourceOfThread.set('task', source);
+			fixture.receiver._agentSubagentService = { getCoordinationRunViews: () => coordination, getRunViews: () => coordination.map(view => ({ ...view, status: 'running' })), cancelParent() { cancels++; coordination = []; }, forgetParent() { } };
+			assert.strictEqual(await fixture.receiver._releaseUndeliveredSteers('task', source), true, 'the production child-only path starts from an atomically transferred main owner');
+			delete fixture.receiver._revokeAgentDelegation;
+			const originalSubmit = fixture.client.submit.bind(fixture.client); const gate = deferred<void>(); let entered = false;
+			if (delayedReplacement) fixture.client.submit = async (request: any) => { entered = true; await gate.promise; return originalSubmit(request); };
+			const submitted = fixture.receiver.submitPendingInput({ threadId: 'task', text: delayedReplacement ? 'after newer child' : 'replace child', mode: 'stop_and_send', selections: [] });
+			if (delayedReplacement) {
+				await eventually(() => entered, 'child Stop submit did not reach broker gate'); coordination = [{ id: 'new-child', generation: 1, released: false }]; fixture.receiver._agentControlGeneration.set('task', 1); gate.resolve(undefined);
 			}
-		};
-		// Keep the test focused on the starter/lease ordering rather than the
-		// notification bridge's unrelated UI side effects.
-		receiver._wrapRunAgentToNotify = (run: Promise<void>) => run;
-		(ChatThreadService.prototype as any)._startTrackedParentRun.call(receiver, 'task', parentRun, () => {
-			receiver._setStreamState('task', { isRunning: 'idle', interrupt: 'not_needed' });
-			return started.promise;
-		});
-		assert.ok(submitted);
-		assert.strictEqual(submitted.phase, 'steering');
-		assert.strictEqual(receiver._runQuiescenceOfThread.get('task')?.runId, parentRun.runId);
-		assert.deepStrictEqual(messages, []);
-		assert.deepStrictEqual(deliveries, []);
-
-		started.resolve();
-		await flushMicrotasks(); await flushMicrotasks();
-		assert.deepStrictEqual(deliveries, ['steer at initial idle']);
-	});
-
-	test('re-reads steer records after a synchronous pending-input listener changes their order', () => {
-		const { receiver, messages } = createPendingInboxReceiver();
-		const parentRun = beginTestParentRun(receiver, 'task');
-		receiver._runQuiescenceOfThread.set('task', { runId: parentRun.runId, generation: parentRun.generation, settled: new Promise<void>(() => { }) });
-		receiver.submitPendingInput({ threadId: 'task', text: 'attachment fallback', mode: 'steer', selections: [{ type: 'File', uri: URI.parse('file:///workspace/attached.ts'), language: 'typescript', state: { wasAddedAsCurrentFile: false } }] });
-		const stale = receiver.submitPendingInput({ threadId: 'task', text: 'stale steer', mode: 'steer' });
-		const delivered = receiver.submitPendingInput({ threadId: 'task', text: 'already delivered', mode: 'steer' });
-		messages.push({ role: 'user', pendingInputId: delivered.id, content: delivered.text, displayContent: delivered.text });
-		let reentered = false;
-		receiver._onDidChangePendingChatInputs = { fire() {
-			if (reentered) return;
-			reentered = true;
-			receiver.deletePendingInput('task', stale.id);
-			receiver.submitPendingInput({ threadId: 'task', text: 'replacement steer', mode: 'steer' });
-		} };
-		(ChatThreadService.prototype as any)._promoteSteerAtSafeBoundary.call(receiver, 'task', parentRun);
-		assert.deepStrictEqual(messages.filter(message => message.role === 'user').map(message => message.displayContent), ['already delivered', 'replacement steer']);
-		assert.strictEqual(receiver.getPendingChatInputs('task').some((input: any) => input.id === delivered.id || input.id === stale.id), false);
-	});
-
-	test('promotes plain steering only after a tool settles and falls attachment steering back to FIFO', async () => {
-		const { receiver, messages } = createPendingInboxReceiver();
-		const snapshot = instructionSnapshot();
-		const callbacks: any[] = [];
-		const toolEntered = deferred<void>();
-		const toolSettled = deferred<void>();
-		receiver._settingsService = { state: { globalSettings: { chatMode: 'agent' } } };
-		receiver._convertToLLMMessagesService = { prepareLLMChatMessages: async () => ({ messages: [], separateSystemMessage: false }) };
-		receiver._llmMessageService = {
-			sendLLMMessage(options: any) { callbacks.push(options); return `request-${callbacks.length}`; },
-			abort() { },
-		};
-		receiver._mcpService = { getMCPTools: () => [] };
-		receiver._metricsService = { capture() { } };
-		receiver._runToolCall = async () => { toolEntered.resolve(); await toolSettled.promise; return { interrupted: false }; };
-		const parentRun = beginTestParentRun(receiver, 'task');
-		receiver._runQuiescenceOfThread.set('task', { runId: parentRun.runId, generation: parentRun.generation, settled: new Promise<void>(() => { }) });
-		const run = chatLifecycle._runChatAgent.call(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot, parentRun });
-		await flushMicrotasks();
-		assert.strictEqual(callbacks.length, 1);
-		const plain = receiver.submitPendingInput({ threadId: 'task', text: 'steer after tool', mode: 'steer' });
-		const attached = receiver.submitPendingInput({ threadId: 'task', text: 'queue attachment safely', mode: 'steer', selections: [{ type: 'File', uri: URI.parse('file:///workspace/attached.ts'), language: 'typescript', state: { wasAddedAsCurrentFile: false } }] });
-		assert.strictEqual(plain.phase, 'steering');
-		assert.strictEqual(attached.phase, 'steering');
-		await callbacks[0].onFinalMessage({ fullText: '', fullReasoning: '', toolCalls: [{ name: 'run_command', id: 'tool-a', rawParams: {} }], anthropicReasoning: null });
-		await toolEntered.promise;
-		assert.strictEqual(messages.filter(message => message.role === 'user').length, 0);
-		toolSettled.resolve(undefined);
-		await flushMicrotasks(); await flushMicrotasks();
-		assert.strictEqual(callbacks.length, 2);
-		assert.deepStrictEqual(messages.filter(message => message.role === 'user').map(message => message.displayContent), ['steer after tool']);
-		const fallback = receiver.getPendingChatInputs('task').find((input: any) => input.id === attached.id);
-		assert.deepStrictEqual({ mode: fallback?.mode, phase: fallback?.phase }, { mode: 'queue', phase: 'queued' });
-		await callbacks[1].onFinalMessage({ fullText: 'done', fullReasoning: '', anthropicReasoning: null });
-		await run;
-	});
-
-	test('Stop-and-Send captures old quiescence and cannot abort or deliver across a replacement run', async () => {
-		const { receiver, deliveries } = createPendingInboxReceiver();
-		const oldSettled = deferred<void>();
-		const oldRun = { runId: 'parent-a', generation: 0, settled: oldSettled.promise };
-		receiver._runQuiescenceOfThread.set('task', oldRun);
-		let stops = 0;
-		receiver.abortRunning = async () => { stops++; };
-		const queued = receiver.submitPendingInput({ threadId: 'task', text: 'send only after old terminal settles', mode: 'stop_and_send' });
-		assert.ok(queued);
-		await flushMicrotasks();
-		assert.strictEqual(stops, 1);
-		assert.deepStrictEqual(deliveries, []);
-
-		receiver._runQuiescenceOfThread.set('task', { runId: 'parent-b', generation: 1, settled: new Promise<void>(() => { }) });
-		oldSettled.resolve(undefined);
-		await flushMicrotasks();
-		assert.strictEqual(stops, 1);
-		assert.deepStrictEqual(deliveries, []);
-		assert.strictEqual(receiver.getPendingChatInputs('task')[0].id, queued.id);
-
-		receiver._runQuiescenceOfThread.delete('task');
-		await receiver._drainPendingChatInputs('task');
-		assert.deepStrictEqual(deliveries, ['send only after old terminal settles']);
-	});
-
-	test('reentrant pending-input events cannot requeue a deleted thread or double-stop one parent lease', async () => {
-		const deleting = createPendingInboxReceiver();
-		deleting.receiver._runQuiescenceOfThread.set('task', { runId: 'parent-a', generation: 0, settled: new Promise<void>(() => { }) });
-		const original = deleting.receiver.submitPendingInput({ threadId: 'task', text: 'delete me', mode: 'queue' });
-		assert.ok(original);
-		let requeued: unknown;
-		deleting.receiver._onDidChangePendingChatInputs = { fire() { requeued = deleting.receiver.submitPendingInput({ threadId: 'task', text: 'must not survive delete', mode: 'queue' }); } };
-		deleting.receiver.deleteThread('task');
-		assert.strictEqual(requeued, undefined);
-		assert.strictEqual(deleting.receiver.state.allThreads.task, undefined);
-		assert.deepStrictEqual(deleting.receiver.getPendingChatInputs('task'), []);
-
-		const stopping = createPendingInboxReceiver();
-		stopping.receiver._runQuiescenceOfThread.set('task', { runId: 'parent-a', generation: 0, settled: new Promise<void>(() => { }) });
-		let aborts = 0; let reentered = false;
-		stopping.receiver.abortRunning = async () => { aborts++; };
-		stopping.receiver._onDidChangePendingChatInputs = { fire() {
-			if (!reentered) {
-				reentered = true;
-				stopping.receiver.submitPendingInput({ threadId: 'task', text: 'reentrant stop', mode: 'stop_and_send' });
+			const row = await submitted; assert.ok(row); assert.deepStrictEqual([row.targetChildGeneration, row.targetChildIds], [0, ['old-child']]);
+			if (delayedReplacement) {
+				await flushMicrotasks(); assert.deepStrictEqual({ cancels, providers: fixture.providerStarts }, { cancels: 0, providers: 0 }); coordination = []; (ChatThreadService.prototype as any)._wakePendingChatInputs.call(fixture.receiver, 'task');
 			}
-		} };
-		stopping.receiver.submitPendingInput({ threadId: 'task', text: 'initial stop', mode: 'stop_and_send' });
-		await flushMicrotasks();
-		assert.strictEqual(aborts, 1);
+			await eventually(() => fixture.providerStarts === 1 && fixture.receiver.getPendingChatInputs('task').length === 0, 'child Stop row did not drain exactly once');
+			assert.strictEqual(cancels, delayedReplacement ? 0 : 1);
+		}
 	});
+
+	test('holds a foreign-window Queue behind the transferred physical child owner and wakes once after release', async () => {
+		const storage = new LifecycleBrokerStorage(); let ids = 0; const core = new PendingChatInputBrokerCore(storage, () => 100, () => `cross-child-${++ids}`);
+		const first = createPendingInboxReceiver({ storage, core, ctx: 'window:1' }); const second = createPendingInboxReceiver({ storage, core, ctx: 'window:2' });
+		await first.receiver._ensurePendingInputBrokerReady(); await second.receiver._ensurePendingInputBrokerReady();
+		const direct = await first.client.authorizeDirectHistoryAppend('task', 'parent', [], 'parent-run', 0); assert.ok(direct.ok);
+		const parentThread = { ...first.receiver.state.allThreads.task, messages: [{ role: 'user', pendingInputId: direct.value.pendingInputId, pendingInputSelectionsFingerprint: direct.value.selectionsFingerprint, content: 'parent', displayContent: 'parent', selections: [], state: {} }] };
+		storage.storeUser(pendingChatInputThreadStorageKey('task'), JSON.stringify({ version: 1, revision: 2, thread: parentThread })); assert.ok((await first.client.verifyDirectHistoryAndRelease('task', direct.value.leaseId)).ok);
+		let coordination = [{ id: 'physical-child', generation: 0, released: false }];
+		first.receiver._agentSubagentService = { getCoordinationRunViews: () => coordination, getRunViews: () => [{ id: 'physical-child', generation: 0, status: 'running' }], cancelParent() { }, forgetParent() { } };
+		const source = { runId: 'parent-run', generation: 0 }; first.receiver._childGroupSourceOfThread.set('task', source);
+		assert.strictEqual(await first.receiver._releaseUndeliveredSteers('task', source), true, 'parent close must atomically transfer to the child owner');
+		const queued = await second.receiver.submitPendingInput({ threadId: 'task', text: 'after foreign child', mode: 'queue', selections: [] }); assert.ok(queued);
+		await flushMicrotasks(); await new Promise(resolve => setTimeout(resolve, 0)); assert.strictEqual(second.providerStarts, 0); assert.strictEqual(second.receiver.getPendingChatInputs('task')[0]?.phase, 'queued');
+		coordination = []; const released = await first.receiver._syncActiveChildGroup('task', source); assert.ok(released.ok); assert.strictEqual(released.identity.childIds.length, 0);
+		await eventually(() => second.providerStarts === 1 && second.receiver.getPendingChatInputs('task').length === 0, 'foreign Queue did not wake exactly once after physical child release');
+		assert.deepStrictEqual(second.receiver.state.allThreads.task.messages.filter((message: any) => message.role === 'user').map((message: any) => message.displayContent), ['parent', 'after foreign child']);
+	});
+
+	test('main-stamped foreign-window Stop cancels only the exact owner child group and never a later child id', async () => {
+		for (const replaceBeforeWake of [false, true]) {
+			const storage = new LifecycleBrokerStorage(); let ids = 0; const core = new PendingChatInputBrokerCore(storage, () => 100, () => `cross-stop-${replaceBeforeWake}-${++ids}`);
+			const first = createPendingInboxReceiver({ storage, core, ctx: 'window:1' }); const second = createPendingInboxReceiver({ storage, core, ctx: 'window:2' });
+			await first.receiver._ensurePendingInputBrokerReady(); await second.receiver._ensurePendingInputBrokerReady();
+			const direct = await first.client.authorizeDirectHistoryAppend('task', 'parent', [], 'parent-run', 0); assert.ok(direct.ok);
+			const parentThread = { ...first.receiver.state.allThreads.task, messages: [{ role: 'user', pendingInputId: direct.value.pendingInputId, pendingInputSelectionsFingerprint: direct.value.selectionsFingerprint, content: 'parent', displayContent: 'parent', selections: [], state: {} }] };
+			storage.storeUser(pendingChatInputThreadStorageKey('task'), JSON.stringify({ version: 1, revision: 2, thread: parentThread })); assert.ok((await first.client.verifyDirectHistoryAndRelease('task', direct.value.leaseId)).ok);
+			let coordination = [{ id: 'old-child', generation: 0, released: false }]; let cancels = 0;
+			const source = { runId: 'parent-run', generation: 0 }; first.receiver._childGroupSourceOfThread.set('task', source);
+			first.receiver._agentSubagentService = { getCoordinationRunViews: () => coordination, getRunViews: () => coordination.map(view => ({ ...view, status: 'running' })), cancelParent() { }, forgetParent() { } };
+			assert.strictEqual(await first.receiver._releaseUndeliveredSteers('task', source), true);
+			const productionWake = (ChatThreadService.prototype as any)._wakePendingChatInputs; if (replaceBeforeWake) first.receiver._wakePendingChatInputs = () => { };
+			first.receiver.abortRunning = async () => { cancels++; coordination = []; const empty = await first.receiver._syncActiveChildGroup('task', source); assert.ok(empty.ok); };
+			const stopped = await second.receiver.submitPendingInput({ threadId: 'task', text: 'replace physical child', mode: 'stop_and_send', selections: [] }); assert.ok(stopped); assert.deepStrictEqual([stopped.targetChildGeneration, stopped.targetChildIds], [0, ['old-child']]);
+			if (replaceBeforeWake) {
+				await new Promise(resolve => setTimeout(resolve, 0)); coordination = [{ id: 'new-child', generation: 0, released: false }]; const changed = await first.receiver._syncActiveChildGroup('task', source); assert.ok(changed.ok);
+				first.receiver._wakePendingChatInputs = productionWake; productionWake.call(first.receiver, 'task', stopped); await flushMicrotasks(); assert.deepStrictEqual({ cancels, providers: second.providerStarts }, { cancels: 0, providers: 0 });
+				coordination = []; assert.ok((await first.receiver._syncActiveChildGroup('task', source)).ok);
+			}
+			await eventually(() => second.providerStarts === 1 && second.receiver.getPendingChatInputs('task').length === 0, 'cross-window child Stop did not settle exactly once');
+			assert.strictEqual(cancels, replaceBeforeWake ? 0 : 1); assert.strictEqual(first.providerStarts, 0);
+		}
+	});
+
+	test('re-evaluates an edited or reordered Stop row after the captured abort flight and ignores deletion', async () => {
+		for (const deleted of [false, true]) {
+			const fixture = createPendingInboxReceiver(); const settled = deferred<void>(); const abortGate = deferred<void>(); const abortEntered = deferred<void>();
+			fixture.receiver._runQuiescenceOfThread.set('task', { runId: 'old', generation: 0, settled: settled.promise }); let aborts = 0;
+			fixture.receiver.abortRunning = async () => { aborts++; abortEntered.resolve(undefined); await abortGate.promise; fixture.receiver._runQuiescenceOfThread.delete('task'); fixture.receiver._agentControlGeneration.set('task', 1); settled.resolve(undefined); };
+			const other = deleted ? undefined : await fixture.receiver.submitPendingInput({ threadId: 'task', text: 'other queued', mode: 'queue', selections: [] }); const stop = await fixture.receiver.submitPendingInput({ threadId: 'task', text: 'old stop text', mode: 'stop_and_send', selections: [] }); assert.ok(stop && (deleted || other)); await abortEntered.promise;
+			if (deleted) { const removed = await fixture.client.delete('task', stop.id, pendingChatInputFingerprint(fixture.receiver.getPendingChatInputs('task').find((row: any) => row.id === stop.id))); assert.ok(removed.ok); }
+			else {
+				let latest = fixture.receiver.getPendingChatInputs('task').find((row: any) => row.id === stop.id); assert.ok((await fixture.client.edit('task', stop.id, pendingChatInputFingerprint(latest), 'latest stop text', [])).ok);
+				latest = fixture.receiver.getPendingChatInputs('task').find((row: any) => row.id === stop.id); const rows = fixture.receiver.getPendingChatInputs('task'); assert.ok((await fixture.client.reorder('task', stop.id, pendingChatInputFingerprint(latest), pendingChatInputThreadFingerprint(rows), other!.id)).ok);
+				const obsolete = fixture.receiver.getPendingChatInputs('task').find((row: any) => row.id === other!.id); assert.ok((await fixture.client.delete('task', other!.id, pendingChatInputFingerprint(obsolete))).ok);
+			}
+			abortGate.resolve(undefined);
+			await eventually(() => fixture.receiver.getPendingChatInputs('task').length === 0 && fixture.providerStarts === (deleted ? 0 : 1), 'changed Stop flight did not settle latest authoritative rows');
+			const delivered = fixture.receiver.state.allThreads.task.messages.filter((message: any) => message.role === 'user').map((message: any) => message.displayContent); assert.strictEqual(delivered.includes('old stop text'), false); if (!deleted) assert.strictEqual(delivered[0], 'latest stop text'); assert.strictEqual(aborts, 1);
+		}
+	});
+
+	test('Stop-and-Send terminalizes a paused approval before generation revocation and drains once', async () => {
+		const fixture = createPendingInboxReceiver(); await fixture.receiver._ensurePendingInputBrokerReady();
+		const approval = { role: 'tool', type: 'tool_request', name: 'read_file', params: { uri: URI.parse('file:///workspace/a.txt') }, content: '(Awaiting user permission...)', result: null, id: 'approval-tool', rawParams: { uri: 'file:///workspace/a.txt' }, mcpServerName: undefined };
+		fixture.receiver.state.allThreads.task.messages = [approval];
+		const approvalRaw = JSON.stringify({ version: 1, revision: 2, thread: fixture.receiver.state.allThreads.task });
+		fixture.storage.storeUser(pendingChatInputThreadStorageKey('task'), approvalRaw);
+		// This fixture injects the already-durable approval after broker startup. Keep
+		// the renderer CAS projection aligned with that authoritative B1 envelope so
+		// rejecting the approval tests Stop ordering rather than an artificial stale
+		// writer conflict.
+		fixture.receiver._threadStorageAuthoritativeRaw.set('task', approvalRaw);
+		// The common broker suite owns the cross-window approval barrier. This
+		// lifecycle fixture isolates renderer chronology while keeping every queue,
+		// claim, append and provider transition on the real core.
+		const approvalSnapshot = () => fixture.client.snapshot ?? { namespace: lifecycleNamespace, revision: 0, records: [] }; let holds = 0; const closedRunIds: string[] = [];
+		fixture.client.holdApproval = async () => { holds++; return { ok: true, snapshot: approvalSnapshot(), value: undefined }; };
+		fixture.client.closeRunAndReleaseSteers = async (_threadId: string, runId: string) => { closedRunIds.push(runId); return { ok: true, snapshot: approvalSnapshot(), value: undefined }; };
+		const paused = deferred<void>(); fixture.receiver.streamState.task = { isRunning: 'awaiting_user' };
+		fixture.receiver._runQuiescenceOfThread.set('task', { runId: 'paused-run', generation: 0, settled: paused.promise, releaseAwaitingApproval: () => paused.resolve(undefined) });
+		// Use the production generation fence rather than the general lifecycle fixture's
+		// no-op revocation seam: this is the ordering that formerly deadlocked.
+		delete fixture.receiver._revokeAgentDelegation;
+		const row = await fixture.receiver.submitPendingInput({ threadId: 'task', text: 'replace approval', mode: 'stop_and_send', selections: [] }); assert.ok(row); assert.strictEqual(row.generation, 1);
+		await eventually(() => fixture.providerStarts === 1 && fixture.receiver.getPendingChatInputs('task').length === 0, 'paused approval Stop-and-Send did not settle and drain');
+		const messages = fixture.receiver.state.allThreads.task.messages;
+		assert.strictEqual(messages.filter((message: any) => message.id === 'approval-tool' && message.type === 'rejected').length, 1);
+		assert.strictEqual(messages.filter((message: any) => message.pendingInputId === row.id).length, 1);
+		// The paused owner closes exactly once before the replacement generation is
+		// admitted. The replacement parent later closes its own distinct run normally.
+		assert.deepStrictEqual({ generation: fixture.receiver._agentControlGeneration.get('task'), holds, pausedCloses: closedRunIds.filter(id => id === 'paused-run').length, replacementCloses: closedRunIds.filter(id => id !== 'paused-run').length }, { generation: 1, holds: 1, pausedCloses: 1, replacementCloses: 1 });
+	});
+
+	test('restores the same approval identity after a failed continuation and rejects it once', async () => {
+		const fixture = createPendingInboxReceiver(); await fixture.receiver._ensurePendingInputBrokerReady();
+		const approval: any = { role: 'tool', type: 'tool_request', name: 'read_file', params: { uri: URI.parse('file:///workspace/retry.txt') }, content: '(Awaiting user permission...)', result: null, id: 'retry-approval', rawParams: { uri: 'file:///workspace/retry.txt' }, mcpServerName: undefined };
+		fixture.receiver.state.allThreads.task.messages = [approval];
+		const approvalRaw = JSON.stringify({ version: 1, revision: 2, thread: fixture.receiver.state.allThreads.task }); fixture.storage.storeUser(pendingChatInputThreadStorageKey('task'), approvalRaw); fixture.receiver._threadStorageAuthoritativeRaw.set('task', approvalRaw);
+		const snapshot = () => fixture.client.snapshot ?? { namespace: lifecycleNamespace, revision: 0, records: [] }; let holds = 0; let closes = 0;
+		fixture.client.holdApproval = async () => { holds++; return { ok: true, snapshot: snapshot(), value: undefined }; };
+		fixture.client.closeRunAndReleaseSteers = async (_threadId: string, _runId: string, _generation: number, _authority: any, retainApproval = false) => { if (!retainApproval) closes++; return { ok: true, snapshot: snapshot(), value: undefined }; };
+		const parentRun = beginTestParentRun(fixture.receiver, 'task');
+		(ChatThreadService.prototype as any)._trackParentRun.call(fixture.receiver, 'task', parentRun, Promise.resolve());
+		await eventually(() => !!fixture.receiver._runQuiescenceOfThread.get('task')?.releaseAwaitingApproval, 'approval identity was not restored');
+		const restored = fixture.receiver._runQuiescenceOfThread.get('task'); assert.deepStrictEqual([restored.runId, restored.generation], [parentRun.runId, parentRun.generation]);
+		await fixture.receiver.rejectLatestToolRequest('task');
+		await eventually(() => fixture.receiver.state.allThreads.task.messages[0]?.type === 'rejected', 'restored approval was not rejectable');
+		assert.deepStrictEqual({ holds, closes, quiescence: fixture.receiver._runQuiescenceOfThread.has('task') }, { holds: 2, closes: 1, quiescence: false });
+	});
+
+	test('classifies destructive flush uncertainty through the persisted main journal', async () => {
+		const committed = createPendingInboxReceiver(); await committed.receiver._ensurePendingInputBrokerReady(); committed.receiver._runQuiescenceOfThread.set('task', { runId: 'hold', generation: 0, settled: new Promise<void>(() => { }) });
+		const pending = await committed.receiver.submitPendingInput({ threadId: 'task', text: 'must clear only after commit', mode: 'queue', selections: [] }); assert.ok(pending); committed.receiver._runQuiescenceOfThread.delete('task'); committed.storage.failMutationCommitFlushes = 1;
+		const replacement = lifecycleThread('replacement'); assert.strictEqual(await committed.receiver.dangerousSetState({ allThreads: { replacement }, currentThreadId: 'replacement' }), true); assert.deepStrictEqual(Object.keys(committed.receiver.state.allThreads), ['replacement']); assert.deepStrictEqual(committed.receiver.getPendingChatInputs('task'), []);
+		const replacementAfterRecovery = { ...replacement, messages: [{ role: 'user', content: 'first post-recovery write', displayContent: 'first post-recovery write' }] }; committed.receiver._storeThreadRecord('replacement', replacementAfterRecovery); assert.strictEqual(await committed.receiver._awaitThreadStorageWrites('replacement'), true, 'committed classification must adopt the exact replacement raw before the next CAS'); assert.strictEqual(JSON.parse(committed.storage.get(pendingChatInputThreadStorageKey('replacement'))!).thread.messages[0].displayContent, 'first post-recovery write');
+
+		const aborted = createPendingInboxReceiver(); await aborted.receiver._ensurePendingInputBrokerReady(); aborted.receiver._runQuiescenceOfThread.set('task', { runId: 'hold', generation: 0, settled: new Promise<void>(() => { }) }); const preserved = await aborted.receiver.submitPendingInput({ threadId: 'task', text: 'preserve on baseline', mode: 'queue', selections: [] }); assert.ok(preserved); aborted.storage.failUserStores = 1;
+		assert.strictEqual(await aborted.receiver.dangerousSetState({ allThreads: { replacement: lifecycleThread('replacement') }, currentThreadId: 'replacement' }), false); assert.ok(aborted.receiver.state.allThreads.task); assert.strictEqual(aborted.receiver.getPendingChatInputs('task')[0]?.id, preserved.id); assert.strictEqual(aborted.receiver._pendingNamespaceMutation, false);
+
+		const ambiguous = createPendingInboxReceiver(); await ambiguous.receiver._ensurePendingInputBrokerReady(); const extra = lifecycleThread('extra'); ambiguous.receiver.state.allThreads.extra = extra; ambiguous.storage.storeUser(pendingChatInputThreadStorageKey('extra'), JSON.stringify({ version: 1, revision: 1, thread: extra })); let mutationWrites = 0; const originalStore = ambiguous.receiver._storageService.store.bind(ambiguous.receiver._storageService); ambiguous.receiver._storageService.store = (key: string, value: string, ...rest: any[]) => { if (key.startsWith('void.chatThreadStorageIII.') && ++mutationWrites === 2) throw new Error('partial replacement write'); return originalStore(key, value, ...rest); }; ambiguous.receiver._scheduleNamespaceFinalizeRetry = () => { };
+		assert.strictEqual(await ambiguous.receiver.resetState(), false); assert.strictEqual(ambiguous.receiver._pendingNamespaceMutation, true); assert.ok(ambiguous.receiver.state.allThreads.task);
+
+		const deleted = createPendingInboxReceiver(); await deleted.receiver._ensurePendingInputBrokerReady(); deleted.storage.failMutationCommitFlushes = 1; assert.strictEqual(await deleted.receiver.deleteThread('task'), true); assert.strictEqual(deleted.receiver.state.allThreads.task, undefined); assert.deepStrictEqual(deleted.receiver.getPendingChatInputs('task'), []);
+
+		const resetRecovered = createPendingInboxReceiver(); await resetRecovered.receiver._ensurePendingInputBrokerReady(); const exported = resetRecovered.receiver.state.allThreads.task; resetRecovered.storage.failMutationCommitFlushes = 1; assert.strictEqual(await resetRecovered.receiver.resetState(), true); assert.strictEqual(await resetRecovered.receiver.dangerousSetState({ allThreads: { task: exported }, currentThreadId: 'task' }), true, 'a journal-resolved reset tombstone must remain importable by the exact global transaction');
+		const afterImport = { ...exported, messages: [{ role: 'user', content: 'after import', displayContent: 'after import' }] }; resetRecovered.receiver._storeThreadRecord('task', afterImport); assert.strictEqual(await resetRecovered.receiver._awaitThreadStorageWrites('task'), true); assert.strictEqual(JSON.parse(resetRecovered.storage.get(pendingChatInputThreadStorageKey('task'))!).thread.messages[0].displayContent, 'after import');
+	});
+
 });

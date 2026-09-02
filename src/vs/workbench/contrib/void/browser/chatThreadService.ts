@@ -31,7 +31,7 @@ import { IVoidModelService } from '../common/voidModelService.js';
 import { findLast } from '../../../../base/common/arraysFind.js';
 import { INotificationService, Severity } from '../../../../platform/notification/common/notification.js';
 import { truncate } from '../../../../base/common/strings.js';
-import { PENDING_CHAT_INPUT_STORAGE_KEY, THREAD_STORAGE_KEY, THREAD_STORAGE_MIGRATION_COMPLETE_KEY, THREAD_STORAGE_RECORD_PREFIX } from '../common/storageKeys.js';
+import { THREAD_STORAGE_KEY, THREAD_STORAGE_MIGRATION_COMPLETE_KEY, THREAD_STORAGE_RECORD_PREFIX } from '../common/storageKeys.js';
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 import { timeout } from '../../../../base/common/async.js';
 import { deepClone } from '../../../../base/common/objects.js';
@@ -45,19 +45,17 @@ import { IAgentInstructionsService } from './agentInstructionsService.js';
 import { IAgentSkillsService } from './agentSkillsService.js';
 import { AgentDelegationLimits, AgentInstructionTaskSession, AgentInstructionTurnSnapshot } from '../common/agentInstructions.js';
 import { AgentRuntimeTurnSnapshot, admitProtectedAgentAuthority, admitSkillResourceContext, assembleProtectedAgentAuthority, createAgentRuntimeTurnSnapshot, isReadSkillResourceToolName, reviveAgentRuntimeTurnSnapshot, runtimeModelFingerprint, selectExplicitSkills, skillAdvertisement, validateReadSkillResourceToolParams } from '../common/agentSkills.js';
-import { AgentSubagentRunView, AgentSubagentToolBroker, AgentSubagentToolBrokerRequest, AgentSubagentToolSnapshot, ChildActivitiesLedger, ChildActivityRecord, EMPTY_CHILD_ACTIVITIES, ChildToolApprovalKey, ChildToolApprovalView, childToolApprovalStructuralKey, createChildToolApprovalView, isAgentSubagentControlName, isNativeAgentToolFormat, normalizeChildActivities, readOnlyChildToolNames, validateAgentSubagentControlParams } from '../common/agentSubagents.js';
+import { AgentSubagentRunView, AgentSubagentToolBroker, AgentSubagentToolBrokerRequest, AgentSubagentToolSnapshot, ChildActivitiesLedger, ChildActivityRecord, EMPTY_CHILD_ACTIVITIES, ChildToolApprovalKey, ChildToolApprovalView, childToolApprovalStructuralKey, createChildToolApprovalView, isActiveChildRun, isAgentSubagentControlName, isNativeAgentToolFormat, normalizeChildActivities, readOnlyChildToolNames, validateAgentSubagentControlParams } from '../common/agentSubagents.js';
 import { IAgentSubagentService } from './agentSubagentService.js';
 import { IAgentCustomAgentService } from './agentCustomAgentService.js';
 import { CustomAgentCatalog, customAgentAdvertisement } from '../common/agentCustomAgents.js';
 import { sanitizeAssistantDisplayContent } from '../common/assistantMessagePresentation.js';
 import { divideToolWaveOutputBudget, parentSafeReadToolNames, planToolBatchWaves } from '../common/toolBatchPlanner.js';
+import { comparePendingChatInputs, isPendingChatInputThreadStorageKey, PendingChatInput, PendingChatInputApprovalIdentity, PendingChatInputAuthority, PendingChatInputChildGroupIdentity, PendingChatInputClaim, PendingChatInputHistoryInspection, PendingChatInputMutationEvidence, PendingChatInputMutationResult, PendingInputMode, pendingChatInputChatStorageFingerprint, pendingChatInputFingerprint, pendingChatInputMutationReceiptKey, pendingChatInputThreadFingerprint, pendingChatInputThreadStorageKey, PENDING_CHAT_INPUT_THREAD_ANCHOR_FIELD } from '../common/pendingChatInputBroker.js';
+import { IPendingChatInputBrokerService } from './pendingChatInputBrokerService.js';
 
-/** Global durable-inbox limits, measured on the serialized v1 envelope. */
-export const PENDING_CHAT_INPUT_MAX_RECORDS = 32;
-export const PENDING_CHAT_INPUT_MAX_SERIALIZED_BYTES = 64 * 1024;
-const PENDING_CHAT_INPUT_LEGACY_IMPORT_MAX_RECORDS = 256;
-const PENDING_CHAT_INPUT_RAW_RESTORE_MAX_BYTES = 512 * 1024;
-const PENDING_CHAT_INPUT_CLAIM_ID_RESERVE = '00000000-0000-0000-0000-000000000000';
+export type { PendingChatInput, PendingInputMode } from '../common/pendingChatInputBroker.js';
+export { PENDING_CHAT_INPUT_MAX_RECORDS, PENDING_CHAT_INPUT_MAX_SERIALIZED_BYTES } from '../common/pendingChatInputBroker.js';
 
 
 // related to retrying when LLM message has error
@@ -99,6 +97,12 @@ const skippedPendingToolRow = (message: ToolMessage<ToolName> & { type: 'tool_re
 	...(message.batchId === undefined ? {} : { batchId: message.batchId }),
 	...(message.batchOrdinal === undefined ? {} : { batchOrdinal: message.batchOrdinal }),
 })
+const pendingApprovalIdentity = (message: ToolMessage<ToolName> & { type: 'tool_request' }): PendingChatInputApprovalIdentity => Object.freeze({
+	toolId: message.id,
+	name: message.name,
+	...(message.batchId === undefined ? {} : { batchId: message.batchId }),
+	...(message.batchOrdinal === undefined ? {} : { batchOrdinal: message.batchOrdinal }),
+})
 /** Ephemeral authority for a single live card. The provider tool id is not unique across
  * parent runs, so only this generated receipt may stop the operation. */
 type ActiveToolCardReceipt = {
@@ -137,6 +141,14 @@ const beginParentRunOwnership = (threadId: string, tokens: Map<string, symbol>, 
 		deactivate: () => { active = false },
 		releaseLatest: () => { if (isLatest()) tokens.delete(threadId) },
 	})
+}
+const resumeParentRunOwnership = (threadId: string, runId: string, generation: number, tokens: Map<string, symbol>, generations: Map<string, number>): ParentRunOwnership | undefined => {
+	if (!runId || generations.get(threadId) !== generation) return undefined
+	const token = Symbol('parent-run-resume')
+	let active = true
+	tokens.set(threadId, token)
+	const isLatest = () => tokens.get(threadId) === token && generations.get(threadId) === generation
+	return Object.freeze({ token, runId, generation, isLatest, isActive: () => active && isLatest(), deactivate: () => { active = false }, releaseLatest: () => { if (isLatest()) tokens.delete(threadId) } })
 }
 
 
@@ -195,43 +207,18 @@ type PendingChatSubmissionRecord = PendingChatSubmission & {
 	composerCleared: boolean;
 	priorRun?: Promise<void>;
 };
-export type PendingInputMode = 'queue' | 'steer' | 'stop_and_send';
-export type PendingChatInput = Readonly<{
-	id: string;
-	threadId: string;
-	text: string;
-	/** The original composer text is retained separately from delivery state. */
-	draft: string;
-	selections: readonly StagingSelectionItem[];
-	mode: PendingInputMode;
-	order: number;
-	createdAt: number;
-	ownerProjectRoot: string | undefined;
-	trustedAtSubmit: boolean;
-	generation: number;
-	runId?: string;
-	/** `claiming` is an in-process delivery lease and revives as dormant after restart. */
-	phase: 'queued' | 'steering' | 'claiming' | 'dormant';
-	claimId?: string;
-}>;
 type PendingChatInputRecord = PendingChatInput;
-type PendingChatInputStorageEnvelope = Readonly<{ version: 1; records: readonly unknown[] }>;
 type ParentRunQuiescence = {
 	runId: string;
 	generation: number;
 	settled: Promise<void>;
 	/** Present only while an approval-request row holds the logical turn open. */
 	releaseAwaitingApproval?: () => void;
+	/** Exact main-process close retry, shared by every local terminal observer. */
+	closing?: Promise<boolean>;
 };
 type StartingParentRun = Readonly<{ id: string; generation: number }>;
 
-const comparePendingChatInputs = (a: PendingChatInput, b: PendingChatInput): number =>
-	a.order - b.order || a.id.localeCompare(b.id);
-const comparePendingChatInputsGlobally = (a: PendingChatInput, b: PendingChatInput): number =>
-	comparePendingChatInputs(a, b) || a.threadId.localeCompare(b.threadId);
-
-const isPendingInputMode = (value: unknown): value is PendingInputMode =>
-	value === 'queue' || value === 'steer' || value === 'stop_and_send';
 type AgentInstructionTaskSessionRecord = {
 	ownerProjectRoot: string | undefined;
 	trustedAtStart: boolean;
@@ -293,7 +280,21 @@ type ThreadStorageEnvelope = {
 	revision: number;
 	deleted?: true;
 	thread?: ThreadType;
+	pendingInputAnchorLeaseId?: string;
 }
+
+type ThreadStorageMutationPlan = Readonly<{
+	writes: readonly Readonly<{ key: string; raw: string }>[];
+	evidence: PendingChatInputMutationEvidence;
+	fingerprintKeys?: readonly string[];
+}>;
+
+type UserMessageEditPlan = Readonly<{
+	messageIdx: number;
+	messages: readonly ChatMessage[];
+	childActivities: ChildActivitiesLedger;
+	target: ChatMessage & { role: 'user' };
+}>;
 
 
 export type ThreadsState = {
@@ -396,11 +397,11 @@ export interface IChatThreadService {
 	getPendingChatSubmission(threadId: string): PendingChatSubmission | undefined;
 	onDidChangePendingChatInputs: Event<{ threadId: string }>;
 	getPendingChatInputs(threadId: string): readonly PendingChatInput[];
-	submitPendingInput(input: { threadId: string; text: string; mode: PendingInputMode; selections?: readonly StagingSelectionItem[] }): PendingChatInput | undefined;
-	resumePendingInput(threadId: string, id: string): boolean;
-	deletePendingInput(threadId: string, id: string): boolean;
-	editPendingInput(threadId: string, id: string, text: string, selections?: readonly StagingSelectionItem[]): boolean;
-	reorderPendingInput(threadId: string, id: string, beforeId?: string): boolean;
+	submitPendingInput(input: { threadId: string; text: string; mode: PendingInputMode; selections?: readonly StagingSelectionItem[] }): Promise<PendingChatInput | undefined>;
+	resumePendingInput(threadId: string, id: string, expectedFingerprint: string): Promise<boolean>;
+	deletePendingInput(threadId: string, id: string, expectedFingerprint: string): Promise<boolean>;
+	editPendingInput(threadId: string, id: string, expectedFingerprint: string, text: string, selections?: readonly StagingSelectionItem[]): Promise<boolean>;
+	reorderPendingInput(threadId: string, id: string, expectedFingerprint: string, expectedThreadFingerprint: string, beforeId?: string): Promise<boolean>;
 	onDidChangeChildToolApprovals: Event<void>;
 	getChildToolApprovals(parentId: string): readonly ChildToolApprovalView[];
 	approveChildToolApproval(key: ChildToolApprovalKey): boolean;
@@ -411,7 +412,7 @@ export interface IChatThreadService {
 	switchToThread(threadId: string): void;
 
 	// thread selector
-	deleteThread(threadId: string): void;
+	deleteThread(threadId: string): Promise<boolean>;
 	duplicateThread(threadId: string): void;
 	getTransientComposerDraft(threadId: string): string;
 	setTransientComposerDraft(threadId: string, draft: string): void;
@@ -435,8 +436,8 @@ export interface IChatThreadService {
 	getSkillCatalog(threadId?: string): Promise<import('../common/agentSkills.js').AgentSkillCatalog>;
 	getCustomAgentCatalog(threadId?: string, token?: CancellationToken): Promise<CustomAgentCatalog>;
 
-	dangerousSetState: (newState: ThreadsState) => void;
-	resetState: () => void;
+	dangerousSetState: (newState: ThreadsState) => Promise<boolean>;
+	resetState: () => Promise<boolean>;
 
 	// // current thread's staging selections
 	// closeCurrentStagingSelectionsInMessage(opts: { messageIdx: number }): void;
@@ -455,15 +456,15 @@ export interface IChatThreadService {
 	dismissStreamError(threadId: string): void;
 
 	// call to edit a message
-	editUserMessageAndStreamResponse({ userMessage, messageIdx, threadId }: { userMessage: string, messageIdx: number, threadId: string }): Promise<void>;
+	editUserMessageAndStreamResponse({ userMessage, messageIdx, threadId }: { userMessage: string, messageIdx: number, threadId: string }): Promise<boolean>;
 
 	// call to add a message
 	addUserMessageAndStreamResponse({ userMessage, threadId }: { userMessage: string, threadId: string }): Promise<boolean>;
 	beginUserMessageAndStreamResponse({ userMessage, threadId }: { userMessage: string, threadId: string }): ChatSubmissionReceipt;
 
 	// approve/reject
-	approveLatestToolRequest(threadId: string): void;
-	rejectLatestToolRequest(threadId: string): void;
+	approveLatestToolRequest(threadId: string): Promise<void>;
+	rejectLatestToolRequest(threadId: string): Promise<void>;
 
 	focusCurrentChat: () => Promise<void>
 	blurCurrentChat: () => Promise<void>
@@ -511,6 +512,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		@IAgentSkillsService private readonly _agentSkillsService: IAgentSkillsService,
 		@IAgentCustomAgentService private readonly _agentCustomAgentService: IAgentCustomAgentService,
 		@IAgentSubagentService private readonly _agentSubagentService: IAgentSubagentService,
+		@IPendingChatInputBrokerService private readonly _pendingChatInputBrokerService: IPendingChatInputBrokerService,
 	) {
 		super()
 		this.state = { allThreads: {}, currentThreadId: null as unknown as string } // default state
@@ -523,12 +525,23 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		if (this._didReadLegacyThreadStorage) this._migrateLegacyThreadStorage(allThreads)
 		this.state = { allThreads, currentThreadId: null as unknown as string }
 		this._restoreInstructionTurns(allThreads)
-		this._restorePendingChatInputs()
+		this._register(this._pendingChatInputBrokerService.onDidChange(snapshot => this._applyPendingChatInputSnapshot(snapshot.records)))
+		this._register(this._pendingChatInputBrokerService.onDidChangeChildGroup(event => { setTimeout(() => this._wakePendingChatInputs(event.threadId), 0) }))
 		this._registerExternalThreadStorageListener()
-		this._register(this._agentSubagentService.onDidChangeRun(event => this._applyChildActivityEvent(event.parentId, event.generation, event.id)));
+		this._register(this._agentSubagentService.onDidChangeRun(event => {
+			this._applyChildActivityEvent(event.parentId, event.generation, event.id)
+			const source = this._childGroupSourceOfThread.get(event.parentId) ?? this._runQuiescenceOfThread.get(event.parentId)
+			if (!source) { setTimeout(() => this._wakePendingChatInputs(event.parentId), 0); return }
+			void this._syncActiveChildGroup(event.parentId, source).then(result => {
+				if (!result.ok) return
+				if (!result.identity.childIds.length && this._runQuiescenceOfThread.get(event.parentId)?.runId !== source.runId) this._childGroupSourceOfThread.delete(event.parentId)
+				this._wakePendingChatInputs(event.parentId)
+			})
+		}));
 
 		// always be in a thread
 		this.openNewThread()
+		this._pendingInputBrokerReady = this._initializePendingInputBroker()
 
 	}
 
@@ -563,13 +576,35 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	private readonly _transientComposerDraftOfThread = new Map<string, string>();
 	private readonly _pendingChatSubmissionOfThread = new Map<string, PendingChatSubmissionRecord>();
 	private readonly _pendingChatInputsOfThread = new Map<string, PendingChatInputRecord[]>();
+	/**
+	 * Every ordinary B1 thread-record write is serialized through Electron main.
+	 * The renderer map is still the immediate UI projection, but it is never the
+	 * compare-and-swap authority.  A conflict advances the epoch, invalidating all
+	 * already queued stale writes before the authoritative record is adopted.
+	 */
+	private readonly _threadStorageWriteTail = new Map<string, Promise<boolean>>();
+	private readonly _threadStorageAuthoritativeRaw = new Map<string, string | undefined>();
+	private readonly _threadStorageWriteEpoch = new Map<string, number>();
+	private _pendingInputBrokerReady: Promise<boolean> = Promise.resolve(false);
+	private _pendingDeliveredReconcileFlight: Promise<void> | undefined;
+	private _pendingDeliveredReconcileRetry: ReturnType<typeof setTimeout> | undefined;
+	private _pendingDeliveredReconcileRequested = 0;
+	private _pendingNamespaceFinalizeRetry: ReturnType<typeof setTimeout> | undefined;
+	private _pendingNamespaceFinalizeLeaseId: string | undefined;
 	private readonly _drainingPendingChatInputs = new Set<string>();
 	private readonly _runQuiescenceOfThread = new Map<string, ParentRunQuiescence>();
+	private readonly _childGroupSourceOfThread = new Map<string, Readonly<{ runId: string; generation: number }>>();
+	private readonly _childGroupSyncRevisionOfThread = new Map<string, number>();
+	private readonly _childGroupSyncTailOfThread = new Map<string, Promise<Readonly<{ ok: boolean; identity: PendingChatInputChildGroupIdentity }>>>();
 	/** Closes the receipt-success event seam before a real parent lease exists. */
 	private readonly _startingParentRunOfThread = new Map<string, StartingParentRun>();
+	private readonly _approvalActionFlights = new Set<string>();
 	/** Latest external record held while this window still owns a live turn. */
 	private readonly _deferredExternalThreadKey = new Map<string, string>();
 	private readonly _deletingPendingInputThreads = new Set<string>();
+	private readonly _externalPendingDeleteRetries = new Map<string, { handle: ReturnType<typeof setTimeout>; attempt: number }>();
+	private readonly _pendingThreadMutationRetries = new Map<string, ReturnType<typeof setTimeout>>();
+	private _pendingNamespaceMutation = false;
 	/** One Stop-and-Send flight may own a parent run. A later queued input must not
 	 * abort a replacement parent which happens to use the same thread. */
 	private readonly _stopAndSendFlights = new Map<string, Promise<void>>();
@@ -623,170 +658,245 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	getPendingChatInputs(threadId: string): readonly PendingChatInput[] {
 		return Object.freeze([...(this._pendingChatInputsOfThread.get(threadId) ?? [])].sort(comparePendingChatInputs))
 	}
-	private _clonePendingSelections(selections: readonly StagingSelectionItem[]): StagingSelectionItem[] {
-		return selections.map(selection => {
-			switch (selection.type) {
-				case 'File': return { ...selection, state: { ...selection.state } };
-				case 'CodeSelection': return { ...selection, range: [...selection.range] as [number, number], state: { ...selection.state } };
-				case 'Folder': return { ...selection };
-				case 'Agent': return { ...selection };
-				case 'Skill': return { ...selection };
+	private _pendingBroker(): IPendingChatInputBrokerService {
+		if (this._pendingChatInputBrokerService) return this._pendingChatInputBrokerService
+		// Explicit prototype-fixture seam. Production construction always injects the
+		// eager broker service; there is deliberately no renderer-local fallback.
+		const seam = (this as unknown as { _pendingInputBrokerTestSeam?: IPendingChatInputBrokerService })._pendingInputBrokerTestSeam
+		if (seam) return seam
+		throw new Error('pending_input_broker_unavailable')
+	}
+	private _applyPendingChatInputSnapshot(records: readonly PendingChatInput[]): void {
+		const previousThreads = new Set(this._pendingChatInputsOfThread.keys())
+		const next = new Map<string, PendingChatInputRecord[]>()
+		for (const record of records) { const items = next.get(record.threadId) ?? []; items.push(record); next.set(record.threadId, items) }
+		this._pendingChatInputsOfThread.clear()
+		for (const [threadId, items] of next) this._pendingChatInputsOfThread.set(threadId, items.sort(comparePendingChatInputs))
+		for (const threadId of new Set([...previousThreads, ...next.keys()])) {
+			this._onDidChangePendingChatInputs.fire({ threadId })
+			// Main broadcasts before the mutation promise resumes, so defer one task:
+			// submit can install its volatile owner first. A close-only revision then
+			// wakes the owning renderer's FIFO without a third user action.
+			setTimeout(() => this._wakePendingChatInputs(threadId), 0)
+		}
+		this._scheduleDeliveredPendingReconcile()
+	}
+	private _deliveredPendingInputIds(): Readonly<Record<string, readonly string[]>> {
+		return Object.freeze(Object.fromEntries(Object.entries(this.state.allThreads).map(([threadId, thread]) => [threadId, Object.freeze((thread?.messages ?? []).flatMap(message => message.role === 'user' && message.pendingInputId ? [message.pendingInputId] : []))])))
+	}
+	private async _initializePendingInputBroker(): Promise<boolean> {
+		const broker = this._pendingBroker()
+		const deliveredPendingInputIds = this._deliveredPendingInputIds()
+		const result = await broker.initializeNamespace({ knownThreadIds: Object.keys(this.state.allThreads), deliveredPendingInputIds })
+		if (!result.ok) { this._warnPendingMutation(result, 'initialize'); return false }
+		if (result.value.warning) this._warnPendingInbox(result.value.warning)
+		const reconciled = await broker.reconcileDeliveredPendingInputIds(deliveredPendingInputIds)
+		if (!reconciled.ok) { this._warnPendingMutation(reconciled, 'reconcile'); return false }
+		for (const [threadId, source] of this._childGroupSourceOfThread) if (!(await this._syncActiveChildGroup(threadId, source, true)).ok) return false
+		for (const threadId of Object.keys(this.state.allThreads)) void this._drainPendingChatInputs(threadId)
+		return true
+	}
+	private async _ensurePendingInputBrokerReady(warn = true): Promise<boolean> {
+		await this._pendingInputBrokerReady
+		const result = await this._pendingBroker().initializeNamespace({ knownThreadIds: Object.keys(this.state.allThreads), deliveredPendingInputIds: this._deliveredPendingInputIds() })
+		if (!result.ok) return warn ? this._warnPendingMutation(result, 'initialize') : false
+		return true
+	}
+	private _scheduleDeliveredPendingReconcile(attempt = 0): void {
+		this._pendingDeliveredReconcileRequested++
+		if (this._pendingDeliveredReconcileFlight) return
+		if (this._pendingDeliveredReconcileRetry) { clearTimeout(this._pendingDeliveredReconcileRetry); this._pendingDeliveredReconcileRetry = undefined }
+		let retry = false
+		let completedRequest = 0
+		const flight = (async () => {
+			while (true) {
+				const observedRequest = this._pendingDeliveredReconcileRequested
+				completedRequest = observedRequest
+				const delivered = this._deliveredPendingInputIds()
+				const intersects = [...this._pendingChatInputsOfThread.entries()].some(([threadId, records]) => {
+					const ids = new Set(delivered[threadId] ?? []); return records.some(record => ids.has(record.id))
+				})
+				if (intersects) {
+					if (!await this._ensurePendingInputBrokerReady()) { retry = true; return }
+					const result = await this._pendingBroker().reconcileDeliveredPendingInputIds(this._deliveredPendingInputIds())
+					if (!result.ok) { retry = true; return }
+				}
+				if (observedRequest === this._pendingDeliveredReconcileRequested) return
 			}
+		})().catch(() => { retry = true })
+		this._pendingDeliveredReconcileFlight = flight
+		void flight.finally(() => {
+			if (this._pendingDeliveredReconcileFlight === flight) this._pendingDeliveredReconcileFlight = undefined
+			if (retry && !this._pendingDeliveredReconcileRetry) this._pendingDeliveredReconcileRetry = setTimeout(() => { this._pendingDeliveredReconcileRetry = undefined; this._scheduleDeliveredPendingReconcile(attempt + 1) }, Math.min(2_000, 100 * 2 ** Math.min(attempt, 5)))
+			else if (!retry && completedRequest !== this._pendingDeliveredReconcileRequested) this._scheduleDeliveredPendingReconcile()
 		})
 	}
-	private _freezePendingInput(record: Omit<PendingChatInputRecord, 'selections'> & { selections: readonly StagingSelectionItem[] }): PendingChatInputRecord {
-		return Object.freeze({ ...record, selections: Object.freeze(this._clonePendingSelections(record.selections)) })
+	private _scheduleNamespaceFinalizeRetry(leaseId: string, attempt = 0, onCommitted?: () => void): void {
+		if (this._pendingNamespaceFinalizeLeaseId && this._pendingNamespaceFinalizeLeaseId !== leaseId) return
+		this._pendingNamespaceFinalizeLeaseId = leaseId
+		if (this._pendingNamespaceFinalizeRetry) return
+		this._pendingNamespaceFinalizeRetry = setTimeout(() => {
+			this._pendingNamespaceFinalizeRetry = undefined
+			void this._classifyNamespaceMutation(leaseId).then(outcome => {
+				if (outcome === 'ambiguous') { this._scheduleNamespaceFinalizeRetry(leaseId, attempt + 1, onCommitted); return }
+				if (this._pendingNamespaceFinalizeLeaseId !== leaseId) return
+				if (outcome === 'committed') onCommitted?.()
+				this._pendingNamespaceFinalizeLeaseId = undefined
+				this._pendingNamespaceMutation = false
+				this._scheduleDeliveredPendingReconcile()
+				for (const threadId of Object.keys(this.state.allThreads)) void this._drainPendingChatInputs(threadId)
+			}, () => this._scheduleNamespaceFinalizeRetry(leaseId, attempt + 1, onCommitted))
+		}, Math.min(2_000, 100 * 2 ** Math.min(attempt, 5)))
 	}
 	private _currentPendingInputOwner(): string | undefined { return this._workspaceContextService.getWorkspace().folders[0]?.uri.toString() }
 	private _isPendingInputOwnerCurrent(ownerProjectRoot: string | undefined, trustedAtSubmit: boolean): boolean {
 		return ownerProjectRoot === this._currentPendingInputOwner() && trustedAtSubmit === this._workspaceTrustManagementService.isWorkspaceTrusted()
 	}
-	private _storePendingChatInputs(): void {
-		const records = [...this._pendingChatInputsOfThread.values()].flat().sort(comparePendingChatInputsGlobally).map(record => ({ ...record, selections: this._clonePendingSelections(record.selections) }))
-		const envelope: PendingChatInputStorageEnvelope = { version: 1, records }
-		this._storageService.store(PENDING_CHAT_INPUT_STORAGE_KEY, JSON.stringify(envelope), StorageScope.WORKSPACE, StorageTarget.USER)
-	}
-	private _pendingInboxBytes(records: readonly PendingChatInputRecord[], reserveClaim = false): number {
-		const serialized = [...records].sort(comparePendingChatInputsGlobally).map(record => ({ ...record, selections: this._clonePendingSelections(record.selections), ...(reserveClaim ? { phase: 'claiming' as const, claimId: PENDING_CHAT_INPUT_CLAIM_ID_RESERVE } : {}) }))
-		return new TextEncoder().encode(JSON.stringify({ version: 1, records: serialized })).byteLength
-	}
-	private _fitsPendingInbox(records: readonly PendingChatInputRecord[]): boolean {
-		return records.length <= PENDING_CHAT_INPUT_MAX_RECORDS && this._pendingInboxBytes(records, true) <= PENDING_CHAT_INPUT_MAX_SERIALIZED_BYTES
+	private _pendingInputAuthority(threadId: string, generation = this._agentControlGeneration.get(threadId) ?? 0): PendingChatInputAuthority {
+		return Object.freeze({ threadExists: !!this.state.allThreads[threadId], ownerProjectRoot: this._currentPendingInputOwner(), workspaceTrusted: this._workspaceTrustManagementService.isWorkspaceTrusted(), generation })
 	}
 	private _warnPendingInbox(message: string): void { this._notificationService.notify({ severity: Severity.Warning, message }) }
-	private _hasPersistedPendingInputId(threadId: string, id: string): boolean {
-		return this.state.allThreads[threadId]?.messages.some(message => message.role === 'user' && message.pendingInputId === id) ?? false
-	}
-	private _revivePendingSelection(value: unknown): StagingSelectionItem | undefined {
-		if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
-		const record = value as Record<string, unknown>
-		const reviveUri = (candidate: unknown): URI | undefined => {
-			if (URI.isUri(candidate)) return candidate
-			if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return undefined
-			const components = candidate as Record<string, unknown>
-			if (components.$mid !== 1 || typeof components.scheme !== 'string' || typeof components.path !== 'string') return undefined
-			try {
-				const uri = URI.revive(components as never)
-				return URI.isUri(uri) ? uri : undefined
-			} catch { return undefined }
-		}
-		if (record.type === 'File') {
-			const uri = reviveUri(record.uri)
-			if (!uri || typeof record.language !== 'string' || !record.state || typeof record.state !== 'object' || (record.state as Record<string, unknown>).wasAddedAsCurrentFile === undefined || typeof (record.state as Record<string, unknown>).wasAddedAsCurrentFile !== 'boolean') return undefined
-			return { type: 'File', uri, language: record.language, state: { wasAddedAsCurrentFile: (record.state as Record<string, boolean>).wasAddedAsCurrentFile } }
-		}
-		if (record.type === 'CodeSelection') {
-			const uri = reviveUri(record.uri); const range = record.range
-			if (!uri || typeof record.language !== 'string' || !Array.isArray(range) || range.length !== 2 || !range.every(Number.isSafeInteger) || !record.state || typeof record.state !== 'object' || typeof (record.state as Record<string, unknown>).wasAddedAsCurrentFile !== 'boolean') return undefined
-			return { type: 'CodeSelection', uri, language: record.language, range: [range[0], range[1]], state: { wasAddedAsCurrentFile: (record.state as Record<string, boolean>).wasAddedAsCurrentFile } }
-		}
-		if (record.type === 'Folder') {
-			const uri = reviveUri(record.uri)
-			return uri ? { type: 'Folder', uri } : undefined
-		}
-		if (record.type === 'Agent') return isAgentDelegationSelection(record) ? { ...record } : undefined
-		if (record.type === 'Skill' && typeof record.identity === 'string' && !!record.identity && typeof record.catalogRevision === 'string' && !!record.catalogRevision && typeof record.bodyRevision === 'string' && !!record.bodyRevision && typeof record.skillRoot === 'string' && !!record.skillRoot && typeof record.description === 'string') {
-			return { type: 'Skill', identity: record.identity, catalogRevision: record.catalogRevision, bodyRevision: record.bodyRevision, skillRoot: record.skillRoot, description: record.description }
-		}
-		return undefined
-	}
-	private _revivePendingChatInput(value: unknown): PendingChatInputRecord | undefined {
-		if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
-		const record = value as Record<string, unknown>
-		const { id, threadId, text, draft, selections: storedSelections, mode, order, createdAt, ownerProjectRoot, trustedAtSubmit, generation, runId } = record
-		if (typeof id !== 'string' || !id || typeof threadId !== 'string' || !threadId || typeof text !== 'string' || !text.trim() || !Array.isArray(storedSelections) || !isPendingInputMode(mode) || typeof order !== 'number' || !Number.isSafeInteger(order) || order < 0 || typeof createdAt !== 'number' || !Number.isSafeInteger(createdAt) || createdAt < 0 || (ownerProjectRoot !== undefined && typeof ownerProjectRoot !== 'string') || typeof trustedAtSubmit !== 'boolean' || typeof generation !== 'number' || !Number.isSafeInteger(generation) || generation < 0 || (runId !== undefined && typeof runId !== 'string')) return undefined
-		const selections = storedSelections.map(selection => this._revivePendingSelection(selection))
-		if (selections.some(selection => !selection)) return undefined
-		// Workspace-scoped storage keeps another project from seeing this record. A
-		// trust/owner change still leaves this user-authored draft visible as dormant;
-		// `_canDeliverPendingChatInput` and `resumePendingInput` fail closed until it
-		// again matches the current workspace snapshot.
-		if (!this.state.allThreads[threadId]) return undefined
-		return this._freezePendingInput({ id, threadId, text, draft: typeof draft === 'string' ? draft : text, selections: selections as StagingSelectionItem[], mode, order, createdAt, ownerProjectRoot, trustedAtSubmit, generation, ...(typeof runId === 'string' ? { runId } : {}), phase: 'dormant' })
-	}
-	private _restorePendingChatInputs(): void {
-		const raw = this._storageService.get(PENDING_CHAT_INPUT_STORAGE_KEY, StorageScope.WORKSPACE)
-		if (!raw) return
-		try {
-			if (raw.length > PENDING_CHAT_INPUT_RAW_RESTORE_MAX_BYTES || new TextEncoder().encode(raw).byteLength > PENDING_CHAT_INPUT_RAW_RESTORE_MAX_BYTES) { this._storageService.remove(PENDING_CHAT_INPUT_STORAGE_KEY, StorageScope.WORKSPACE); this._warnPendingInbox('Pending inputs were discarded because stored inbox data was too large.'); return }
-			const parsed = JSON.parse(raw) as unknown
-			const records = Array.isArray(parsed) ? parsed : (parsed && typeof parsed === 'object' && (parsed as PendingChatInputStorageEnvelope).version === 1 && Array.isArray((parsed as PendingChatInputStorageEnvelope).records) ? (parsed as PendingChatInputStorageEnvelope).records : undefined)
-			if (!records) { this._storageService.remove(PENDING_CHAT_INPUT_STORAGE_KEY, StorageScope.WORKSPACE); this._warnPendingInbox('Pending inputs were discarded because stored inbox data was invalid.'); return }
-			let omitted = records.length > PENDING_CHAT_INPUT_LEGACY_IMPORT_MAX_RECORDS
-			const revived: PendingChatInputRecord[] = []
-			for (const value of records.slice(0, PENDING_CHAT_INPUT_LEGACY_IMPORT_MAX_RECORDS)) {
-				const record = this._revivePendingChatInput(value)
-				if (!record) { omitted = true; continue }
-				// A crash after durable history append but before inbox removal is a
-				// completed delivery, not corrupt or omitted user data.
-				if (this._hasPersistedPendingInputId(record.threadId, record.id)) continue
-				revived.push(record)
-			}
-			revived.sort(comparePendingChatInputsGlobally)
-			const seen = new Set<string>()
-			const accepted: PendingChatInputRecord[] = []
-			for (const record of revived) {
-				const identity = JSON.stringify([record.threadId, record.id])
-				if (seen.has(identity)) { omitted = true; continue }
-				seen.add(identity)
-				if (!this._fitsPendingInbox([...accepted, record])) { omitted = true; continue }
-				accepted.push(record)
-			}
-			for (const record of accepted) { const items = this._pendingChatInputsOfThread.get(record.threadId) ?? []; items.push(record); this._pendingChatInputsOfThread.set(record.threadId, items) }
-			this._storePendingChatInputs()
-			if (omitted) this._warnPendingInbox('Some pending inputs were discarded because the stored inbox was invalid or over its limit.')
-		} catch { this._storageService.remove(PENDING_CHAT_INPUT_STORAGE_KEY, StorageScope.WORKSPACE); this._warnPendingInbox('Pending inputs were discarded because stored inbox data was invalid.') }
-	}
-	private _setPendingChatInputs(threadId: string, records: readonly PendingChatInputRecord[]): void {
-		const seen = new Set<string>()
-		const normalized = records.filter(record => record.threadId === threadId && !seen.has(record.id) && (seen.add(record.id), true)).sort(comparePendingChatInputs)
-		if (normalized.length) this._pendingChatInputsOfThread.set(threadId, normalized)
-		else this._pendingChatInputsOfThread.delete(threadId)
-		this._storePendingChatInputs(); this._onDidChangePendingChatInputs.fire({ threadId })
+	private _warnPendingMutation(result: PendingChatInputMutationResult<unknown>, operation: 'initialize' | 'reconcile' | 'submit' | 'edit' | 'delete' | 'reorder' | 'resume' | 'clear'): false {
+		if (result.ok) return false
+		const message = result.reason === 'full'
+			? operation === 'edit' ? 'Pending inbox is full. The existing draft was unchanged.' : 'Pending inbox is full. Your draft was kept in the composer.'
+			: result.reason === 'owner_or_trust_changed' ? 'This pending input no longer matches the current task, workspace, or trust state. It was kept as a dormant draft.'
+				: result.reason === 'append_in_progress' ? 'A pending input is being saved to chat history. Wait for it to settle and try again.'
+					: result.reason === 'conflict' ? 'This pending input changed in another Void window. Review the latest row and try again.'
+						: 'The pending inbox backend is unavailable. Your current draft and chat were left unchanged.'
+		this._warnPendingInbox(message)
+		return false
 	}
 	private _findPendingChatInput(threadId: string, id: string): PendingChatInputRecord | undefined {
 		return this._pendingChatInputsOfThread.get(threadId)?.find(record => record.id === id)
 	}
-	private _claimPendingChatInput(threadId: string, id: string, phase: 'queued' | 'steering'): PendingChatInputRecord | undefined {
-		const items = this._pendingChatInputsOfThread.get(threadId) ?? []
-		const record = items.find(item => item.id === id && item.phase === phase)
-		if (!record) return undefined
-		const claimed = this._freezePendingInput({ ...record, phase: 'claiming', claimId: generateUuid() })
-		this._setPendingChatInputs(threadId, items.map(item => item.id === id ? claimed : item))
-		return claimed
+	private _activeChildRuns(threadId: string): readonly AgentSubagentRunView[] {
+		return this._agentSubagentService.getRunViews(threadId).filter(isActiveChildRun)
 	}
-	private _finishPendingChatInputClaim(threadId: string, record: PendingChatInputRecord, result: 'remove' | 'queued' | 'dormant'): boolean {
-		const items = this._pendingChatInputsOfThread.get(threadId) ?? []
-		const current = items.find(item => item.id === record.id)
-		if (!current || current.phase !== 'claiming' || current.claimId !== record.claimId) return false
-		if (result === 'remove') this._setPendingChatInputs(threadId, items.filter(item => item.id !== record.id))
-		else this._setPendingChatInputs(threadId, items.map(item => item.id === record.id ? this._freezePendingInput({ ...item, mode: result === 'queued' ? 'queue' : item.mode, phase: result, claimId: undefined, runId: result === 'queued' ? undefined : item.runId }) : item))
-		return true
+	private _coordinationChildRuns(threadId: string): readonly Readonly<{ id: string; generation: number; released: boolean }>[] {
+		const service = this._agentSubagentService as IAgentSubagentService & { getCoordinationRunViews?: (parentId: string) => readonly Readonly<{ id: string; generation: number; released: boolean }>[] }
+		if (service.getCoordinationRunViews) return service.getCoordinationRunViews(threadId).filter(view => !view.released)
+		// Production always exposes the physical coordination view. The fallback keeps
+		// focused prototype fixtures aligned without pretending terminal rows are live.
+		return this._activeChildRuns(threadId).map(view => Object.freeze({ id: view.id, generation: view.generation, released: false }))
 	}
-	submitPendingInput({ threadId, text, mode, selections }: { threadId: string; text: string; mode: PendingInputMode; selections?: readonly StagingSelectionItem[] }): PendingChatInput | undefined {
-		const thread = this.state.allThreads[threadId]; if (!thread || this._deletingPendingInputThreads.has(threadId) || !text.trim()) return undefined
-		const active = this._runQuiescenceOfThread.get(threadId)
-		const phase: PendingChatInput['phase'] = mode === 'steer' && active ? 'steering' : 'queued'
-		let items = [...(this._pendingChatInputsOfThread.get(threadId) ?? [])]
-		let maxOrder = items.reduce((largest, item) => Math.max(largest, item.order), -1)
-		if (maxOrder >= Number.MAX_SAFE_INTEGER) {
-			items = items.sort(comparePendingChatInputs).map((item, order) => this._freezePendingInput({ ...item, order }))
-			maxOrder = items.length - 1
+	private _syncActiveChildGroup(threadId: string, source: Pick<ParentRunQuiescence, 'runId' | 'generation'>, brokerAlreadyReady = false): Promise<Readonly<{ ok: boolean; identity: PendingChatInputChildGroupIdentity }>> {
+		const receiver = this as unknown as {
+			_childGroupSyncRevisionOfThread?: Map<string, number>;
+			_childGroupSyncTailOfThread?: Map<string, Promise<Readonly<{ ok: boolean; identity: PendingChatInputChildGroupIdentity }>>>;
 		}
-		const record = this._freezePendingInput({ id: generateUuid(), threadId, text, draft: text, selections: selections ?? thread.state.stagingSelections, mode, order: maxOrder + 1, createdAt: Date.now(), ownerProjectRoot: this._currentPendingInputOwner(), trustedAtSubmit: this._workspaceTrustManagementService.isWorkspaceTrusted(), generation: active?.generation ?? (this._agentControlGeneration.get(threadId) ?? 0), ...(active ? { runId: active.runId } : {}), phase })
-		if (!this._fitsPendingInbox([...this._pendingChatInputsOfThread.values()].flat().filter(item => item.threadId !== threadId).concat(items, record))) { this._warnPendingInbox('Pending inbox is full. Your draft was kept in the composer.'); return undefined }
-		items.push(record); this._setPendingChatInputs(threadId, items)
-		// The event is synchronous. A listener may delete this record before any
-		// privileged Stop side effect runs, so re-read the exact stored identity.
-		const current = this._findPendingChatInput(threadId, record.id)
-		if (mode === 'stop_and_send' && current === record && current.phase === 'queued' && this._canDeliverPendingChatInput(current)) void this._stopAndSendPendingInput(threadId, record, active)
+		const revisions = receiver._childGroupSyncRevisionOfThread ??= new Map<string, number>()
+		const tails = receiver._childGroupSyncTailOfThread ??= new Map<string, Promise<Readonly<{ ok: boolean; identity: PendingChatInputChildGroupIdentity }>>>()
+		const previous = tails.get(threadId) ?? Promise.resolve(Object.freeze({ ok: true, identity: Object.freeze({ sourceRevision: revisions.get(threadId) ?? 0, childIds: Object.freeze([] as string[]) }) }))
+		const run = previous.catch(() => Object.freeze({ ok: false, identity: Object.freeze({ sourceRevision: revisions.get(threadId) ?? 0, childIds: Object.freeze([] as string[]) }) })).then(async () => {
+			while (true) {
+				const views = this._coordinationChildRuns(threadId)
+				if (views.some(view => view.generation !== source.generation)) return Object.freeze({ ok: false, identity: Object.freeze({ sourceRevision: revisions.get(threadId) ?? 0, childIds: Object.freeze([] as string[]) }) })
+				const childIds = Object.freeze(views.map(view => view.id).sort((a, b) => a.localeCompare(b)))
+				if (new Set(childIds).size !== childIds.length) return Object.freeze({ ok: false, identity: Object.freeze({ sourceRevision: revisions.get(threadId) ?? 0, childIds: Object.freeze([] as string[]) }) })
+				const sourceRevision = (revisions.get(threadId) ?? 0) + 1
+				if (!Number.isSafeInteger(sourceRevision)) return Object.freeze({ ok: false, identity: Object.freeze({ sourceRevision: revisions.get(threadId) ?? 0, childIds: Object.freeze([] as string[]) }) })
+				const identity: PendingChatInputChildGroupIdentity = Object.freeze({ sourceRevision, ...(childIds.length ? { generation: source.generation } : {}), childIds })
+				if (!await this._awaitThreadStorageWrites(threadId) || (!brokerAlreadyReady && !await this._ensurePendingInputBrokerReady(false))) return Object.freeze({ ok: false, identity })
+				const broker = this._pendingBroker() as IPendingChatInputBrokerService & { syncActiveChildGroup?: IPendingChatInputBrokerService['syncActiveChildGroup'] }
+				if (typeof broker.syncActiveChildGroup !== 'function') { revisions.set(threadId, sourceRevision); return Object.freeze({ ok: true, identity }) }
+				const result = await broker.syncActiveChildGroup(threadId, source.runId, source.generation, sourceRevision, identity.generation, identity.childIds)
+				if (!result.ok) { this._warnPendingMutation(result, 'reconcile'); return Object.freeze({ ok: false, identity }) }
+				revisions.set(threadId, sourceRevision)
+				const current = this._coordinationChildRuns(threadId)
+				if (current.every(view => view.generation === source.generation)
+					&& current.length === childIds.length
+					&& current.map(view => view.id).sort((a, b) => a.localeCompare(b)).every((id, index) => id === childIds[index])) return Object.freeze({ ok: true, identity })
+				// A real child event advanced while this ACK was in flight. Publish the
+				// newer complete set before any close/drain boundary is allowed to pass.
+			}
+		})
+		tails.set(threadId, run)
+		const clearTail = () => { if (tails.get(threadId) === run) tails.delete(threadId) }
+		void run.then(clearTail, clearTail)
+		return run
+	}
+	async submitPendingInput({ threadId, text, mode, selections }: { threadId: string; text: string; mode: PendingInputMode; selections?: readonly StagingSelectionItem[] }): Promise<PendingChatInput | undefined> {
+		await this._ensurePendingInputBrokerReady()
+		const thread = this.state.allThreads[threadId]
+		if (this._pendingNamespaceMutation || !thread || this._deletingPendingInputThreads.has(threadId) || !text.trim()) return undefined
+		if (!await this._awaitThreadStorageWrites(threadId)) { this._warnPendingInbox('This chat changed in another Void window. Review it before sending again.'); return undefined }
+		const anchorLeaseId = await this._materializePendingInputThreadAnchor(threadId)
+		if (anchorLeaseId === null) return undefined
+		const active = this._runQuiescenceOfThread.get(threadId)
+		const activeChildren = active ? [] : this._coordinationChildRuns(threadId)
+		const childStopGeneration = activeChildren.length ? activeChildren[0].generation : undefined
+		const childStopIds = childStopGeneration === undefined || activeChildren.some(view => view.generation !== childStopGeneration)
+			? undefined
+			: [...new Set(activeChildren.map(view => view.id))].sort((left, right) => left.localeCompare(right))
+		const effectiveMode: PendingInputMode = mode === 'steer' && !active ? 'queue' : mode
+		const phase = effectiveMode === 'steer' && active ? 'steering' as const : 'queued' as const
+		// Stop-and-Send is the one admission that deliberately fences the captured
+		// parent generation before delivering its replacement turn. Queue and Steer
+		// retain the current generation; the replacement row must instead match the
+		// single generation bump performed by `abortRunning` after the old turn has
+		// terminalized. This keeps the exact same-window row deliverable without
+		// weakening the independent cross-window owner/generation checks.
+		const generation = effectiveMode === 'stop_and_send' && active ? active.generation + 1 : effectiveMode === 'stop_and_send' && childStopGeneration !== undefined && childStopIds?.length ? childStopGeneration + 1 : active?.generation ?? (this._agentControlGeneration.get(threadId) ?? 0)
+		if (!Number.isSafeInteger(generation)) { if (anchorLeaseId) await this._pendingBroker().abandonThreadAnchor(threadId, anchorLeaseId).catch(() => undefined); this._warnPendingInbox('This chat reached its run generation limit. Start a new task before sending again.'); return undefined }
+		const result = await this._pendingBroker().submit({ threadId, text, selections: selections ?? thread.state.stagingSelections, mode: effectiveMode, phase, ownerProjectRoot: this._currentPendingInputOwner(), trustedAtSubmit: this._workspaceTrustManagementService.isWorkspaceTrusted(), generation, ...(phase === 'steering' ? { runId: active!.runId } : {}), ...(effectiveMode === 'stop_and_send' && active ? { targetRunId: active.runId, targetGeneration: active.generation } : {}), ...(effectiveMode === 'stop_and_send' && !active && childStopGeneration !== undefined && childStopIds?.length ? { targetChildGeneration: childStopGeneration, targetChildIds: childStopIds } : {}) })
+		if (!result.ok) { if (anchorLeaseId) await this._pendingBroker().abandonThreadAnchor(threadId, anchorLeaseId).catch(() => undefined); return this._warnPendingMutation(result, 'submit') || undefined }
+		const record = result.value
+		if (phase === 'steering') {
+			const current = this._runQuiescenceOfThread.get(threadId)
+			if (!current || current.runId !== active!.runId || current.generation !== active!.generation) {
+				const released = await this._pendingBroker().closeRunAndReleaseSteers(threadId, active!.runId, active!.generation, this._pendingInputAuthority(threadId, active!.generation))
+				if (!released.ok) this._warnPendingMutation(released, 'reconcile')
+				void this._drainPendingChatInputs(threadId)
+				return record
+			}
+		}
+		if (effectiveMode === 'stop_and_send') {
+			this._wakePendingChatInputs(threadId, record)
+		}
 		else if (phase === 'queued') void this._drainPendingChatInputs(threadId)
 		return record
 	}
-	deletePendingInput(threadId: string, id: string): boolean { const items = this._pendingChatInputsOfThread.get(threadId) ?? []; if (!items.some(item => item.id === id)) return false; this._setPendingChatInputs(threadId, items.filter(item => item.id !== id)); return true }
-	editPendingInput(threadId: string, id: string, text: string, selections?: readonly StagingSelectionItem[]): boolean { if (!text.trim()) return false; const items = this._pendingChatInputsOfThread.get(threadId) ?? []; const index = items.findIndex(item => item.id === id); if (index < 0 || items[index].phase === 'claiming') return false; const replacement = this._freezePendingInput({ ...items[index], text, draft: text, ...(selections ? { selections } : {}) }); const next = [...items]; next[index] = replacement; if (!this._fitsPendingInbox([...this._pendingChatInputsOfThread.values()].flat().filter(item => item.threadId !== threadId).concat(next))) { this._warnPendingInbox('Pending inbox is full. The existing draft was unchanged.'); return false } this._setPendingChatInputs(threadId, next); return true }
-	reorderPendingInput(threadId: string, id: string, beforeId?: string): boolean { const items = [...(this._pendingChatInputsOfThread.get(threadId) ?? [])].sort(comparePendingChatInputs); const index = items.findIndex(item => item.id === id); if (index < 0 || items[index].phase === 'claiming') return false; const [item] = items.splice(index, 1); const target = beforeId === undefined ? items.length : items.findIndex(candidate => candidate.id === beforeId && candidate.phase !== 'claiming'); if (target < 0) return false; items.splice(target, 0, item); this._setPendingChatInputs(threadId, items.map((candidate, order) => this._freezePendingInput({ ...candidate, order }))); return true }
-	resumePendingInput(threadId: string, id: string): boolean { const items = this._pendingChatInputsOfThread.get(threadId) ?? []; const index = items.findIndex(item => item.id === id); if (this._deletingPendingInputThreads.has(threadId) || index < 0 || items[index].phase !== 'dormant' || !this._canDeliverPendingChatInput(items[index])) return false; items[index] = this._freezePendingInput({ ...items[index], mode: 'queue', phase: 'queued', runId: undefined, claimId: undefined }); this._setPendingChatInputs(threadId, items); void this._drainPendingChatInputs(threadId); return true }
+	async deletePendingInput(threadId: string, id: string, expectedFingerprint: string): Promise<boolean> {
+		await this._ensurePendingInputBrokerReady()
+		if (this._pendingNamespaceMutation) return false
+		const record = this._findPendingChatInput(threadId, id); if (!record || pendingChatInputFingerprint(record) !== expectedFingerprint) return this._warnPendingMutation({ ok: false, reason: 'conflict' }, 'delete')
+		const result = await this._pendingBroker().delete(threadId, id, expectedFingerprint); return result.ok || this._warnPendingMutation(result, 'delete')
+	}
+	async editPendingInput(threadId: string, id: string, expectedFingerprint: string, text: string, selections?: readonly StagingSelectionItem[]): Promise<boolean> {
+		await this._ensurePendingInputBrokerReady()
+		if (this._pendingNamespaceMutation) return false
+		const record = this._findPendingChatInput(threadId, id); if (!record || pendingChatInputFingerprint(record) !== expectedFingerprint) return this._warnPendingMutation({ ok: false, reason: 'conflict' }, 'edit')
+		if (!text.trim()) return false
+		const result = await this._pendingBroker().edit(threadId, id, expectedFingerprint, text, selections); return result.ok || this._warnPendingMutation(result, 'edit')
+	}
+	async reorderPendingInput(threadId: string, id: string, expectedFingerprint: string, expectedThreadFingerprint: string, beforeId?: string): Promise<boolean> {
+		await this._ensurePendingInputBrokerReady()
+		if (this._pendingNamespaceMutation) return false
+		const records = this.getPendingChatInputs(threadId); const record = records.find(candidate => candidate.id === id)
+		if (!record || pendingChatInputFingerprint(record) !== expectedFingerprint || pendingChatInputThreadFingerprint(records) !== expectedThreadFingerprint) return this._warnPendingMutation({ ok: false, reason: 'conflict' }, 'reorder')
+		const result = await this._pendingBroker().reorder(threadId, id, expectedFingerprint, expectedThreadFingerprint, beforeId); return result.ok || this._warnPendingMutation(result, 'reorder')
+	}
+	async resumePendingInput(threadId: string, id: string, expectedFingerprint: string): Promise<boolean> {
+		await this._ensurePendingInputBrokerReady()
+		if (this._pendingNamespaceMutation) return false
+		const record = this._findPendingChatInput(threadId, id)
+		if (!record || pendingChatInputFingerprint(record) !== expectedFingerprint) return this._warnPendingMutation({ ok: false, reason: 'conflict' }, 'resume')
+		if (record.phase !== 'dormant' || this._deletingPendingInputThreads.has(threadId)) return false
+		const currentGeneration = this._agentControlGeneration.get(threadId)
+		if (currentGeneration !== undefined && currentGeneration !== record.generation) return this._warnPendingMutation({ ok: false, reason: 'owner_or_trust_changed' }, 'resume')
+		const result = await this._pendingBroker().resume(threadId, id, expectedFingerprint, this._pendingInputAuthority(threadId, record.generation))
+		if (!result.ok) return this._warnPendingMutation(result, 'resume')
+		const latestGeneration = this._agentControlGeneration.get(threadId)
+		if (latestGeneration !== undefined && latestGeneration !== record.generation) {
+			const resumed = this._findPendingChatInput(threadId, id)
+			if (resumed?.phase === 'queued') { const suspended = await this._pendingBroker().suspend(threadId, id, pendingChatInputFingerprint(resumed)); if (!suspended.ok) this._warnPendingMutation(suspended, 'reconcile') }
+			return false
+		}
+		if (latestGeneration === undefined) this._agentControlGeneration.set(threadId, record.generation)
+		void this._drainPendingChatInputs(threadId)
+		return true
+	}
 	async getSkillCatalog(threadId = this.state.currentThreadId) {
 		const owner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString();
 		let record = this._agentInstructionSessionOfThread.get(threadId);
@@ -912,46 +1022,113 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 
 
-	dangerousSetState(newState: ThreadsState) {
+	private _adoptCommittedNamespaceState(newState: ThreadsState): void {
 		for (const threadId of Object.keys(this.state.allThreads)) this._deletingPendingInputThreads.add(threadId)
 		for (const threadId of this._pendingChatSubmissionOfThread.keys()) this._cancelPendingChatSubmission(threadId)
 		for (const threadId of Object.keys(this.state.allThreads)) this._revokeAgentDelegation(threadId, true)
-		this._agentControlGeneration.clear()
-		this._parentRunTokenOfThread.clear()
-		this._cancellingToolReceiptsOfThread.clear()
-		this._activeToolCardReceiptsOfThread?.clear()
-		this._agentInstructionSessionOfThread.clear()
-		this._transientComposerDraftOfThread.clear()
-		this._deferredExternalThreadKey.clear()
+		this._agentControlGeneration.clear(); this._parentRunTokenOfThread.clear(); this._cancellingToolReceiptsOfThread.clear(); this._activeToolCardReceiptsOfThread?.clear(); this._agentInstructionSessionOfThread.clear(); this._transientComposerDraftOfThread.clear(); this._deferredExternalThreadKey.clear(); this._childGroupSourceOfThread.clear(); this._childGroupSyncRevisionOfThread.clear(); this._childGroupSyncTailOfThread.clear()
 		for (const quiescence of this._runQuiescenceOfThread.values()) quiescence.releaseAwaitingApproval?.()
-		this._pendingChatInputsOfThread.clear(); this._drainingPendingChatInputs.clear(); this._runQuiescenceOfThread.clear(); this._startingParentRunOfThread?.clear(); this._stopAndSendFlights.clear(); this._storePendingChatInputs()
-		for (const thread of Object.values(newState.allThreads)) if (thread) thread.childActivities = normalizeChildActivities((thread as { childActivities?: unknown }).childActivities, true)
-		this._restoreInstructionTurns(newState.allThreads)
-		this.state = newState
-		this._deletingPendingInputThreads.clear()
-		this._onDidChangeCurrentThread.fire()
+		this._drainingPendingChatInputs.clear(); this._runQuiescenceOfThread.clear(); this._startingParentRunOfThread?.clear(); this._approvalActionFlights.clear(); this._stopAndSendFlights.clear()
+		this._restoreInstructionTurns(newState.allThreads); this.state = newState; this._deletingPendingInputThreads.clear(); this._onDidChangeCurrentThread.fire()
 	}
-	resetState() {
+	private _adoptCommittedResetState(): void {
 		for (const threadId of Object.keys(this.state.allThreads)) this._deletingPendingInputThreads.add(threadId)
 		for (const threadId of this._pendingChatSubmissionOfThread.keys()) this._cancelPendingChatSubmission(threadId)
 		for (const threadId of Object.keys(this.state.allThreads)) this._revokeAgentDelegation(threadId, true)
-		this._agentControlGeneration.clear()
-		this._parentRunTokenOfThread.clear()
-		this._cancellingToolReceiptsOfThread.clear()
-		this._activeToolCardReceiptsOfThread?.clear()
-		this._agentInstructionSessionOfThread.clear()
-		this._instructionTurnOfThread.clear()
-		this._transientComposerDraftOfThread.clear()
-		this._deferredExternalThreadKey.clear()
+		this._agentControlGeneration.clear(); this._parentRunTokenOfThread.clear(); this._cancellingToolReceiptsOfThread.clear(); this._activeToolCardReceiptsOfThread?.clear(); this._agentInstructionSessionOfThread.clear(); this._instructionTurnOfThread.clear(); this._transientComposerDraftOfThread.clear(); this._deferredExternalThreadKey.clear(); this._childGroupSourceOfThread.clear(); this._childGroupSyncRevisionOfThread.clear(); this._childGroupSyncTailOfThread.clear()
 		for (const quiescence of this._runQuiescenceOfThread.values()) quiescence.releaseAwaitingApproval?.()
-		this._pendingChatInputsOfThread.clear(); this._drainingPendingChatInputs.clear(); this._runQuiescenceOfThread.clear(); this._startingParentRunOfThread?.clear(); this._stopAndSendFlights.clear(); this._storePendingChatInputs()
-		// Tombstone the exact former records before dropping this window's map.
-		this._storeAllThreads({})
-		this._tombstoneAllStoredThreads()
-		this.state = { allThreads: {}, currentThreadId: null as unknown as string } // see constructor
-		this._deletingPendingInputThreads.clear()
-		this.openNewThread()
-		this._onDidChangeCurrentThread.fire()
+		this._drainingPendingChatInputs.clear(); this._runQuiescenceOfThread.clear(); this._startingParentRunOfThread?.clear(); this._approvalActionFlights.clear(); this._stopAndSendFlights.clear()
+		this.state = { allThreads: {}, currentThreadId: null as unknown as string }; this._deletingPendingInputThreads.clear(); this.openNewThread(); this._onDidChangeCurrentThread.fire()
+	}
+	private async _classifyNamespaceMutation(leaseId: string): Promise<'committed' | 'aborted' | 'ambiguous'> {
+		try { if ((await this._pendingBroker().finalizeNamespaceClear(leaseId)).ok) return 'committed' } catch { /* authoritative retry below */ }
+		try { if ((await this._pendingBroker().abortNamespaceClear(leaseId)).ok) return 'aborted' } catch { /* persisted intent remains fenced */ }
+		return 'ambiguous'
+	}
+	async dangerousSetState(newState: ThreadsState): Promise<boolean> {
+		if (this._pendingNamespaceMutation) return false
+		this._pendingNamespaceMutation = true
+		let brokerLeaseId: string | undefined
+		let storagePlan: ThreadStorageMutationPlan | undefined
+		let storageCommitted = false
+		let brokerFinalized = false
+		let recoveryPending = false
+		try {
+			await this._ensurePendingInputBrokerReady()
+			if (!await this._awaitAllThreadStorageWrites()) throw new Error('chat_import_pending_write_failed')
+			const before = this.state.allThreads
+			for (const thread of Object.values(newState.allThreads)) if (thread) thread.childActivities = normalizeChildActivities((thread as { childActivities?: unknown }).childActivities, true)
+			storagePlan = this._buildThreadReplacementPlan(newState.allThreads)
+			const cleared = await this._pendingBroker().clearNamespace(storagePlan.evidence)
+			if (!cleared.ok) return this._warnPendingMutation(cleared, 'clear')
+			brokerLeaseId = cleared.value.leaseId
+			await this._commitThreadStorageMutation(storagePlan, brokerLeaseId)
+			if (!this._isThreadReplacementDurable(before, newState.allThreads)) throw new Error('chat_import_storage_readback_failed')
+			storageCommitted = true
+			this._adoptCommittedNamespaceState(newState)
+			const finalized = await this._pendingBroker().finalizeNamespaceClear(brokerLeaseId)
+			if (!finalized.ok) { this._warnPendingMutation(finalized, 'reconcile'); this._scheduleNamespaceFinalizeRetry(brokerLeaseId); return false }
+			brokerFinalized = true
+			return true
+		} catch {
+			if (brokerLeaseId && !storageCommitted) {
+				const outcome = await this._classifyNamespaceMutation(brokerLeaseId)
+				if (outcome === 'committed') { storageCommitted = true; brokerFinalized = true; if (storagePlan) this._adoptThreadStorageMutationPlan(storagePlan); this._adoptCommittedNamespaceState(newState); return true }
+				if (outcome === 'ambiguous') { recoveryPending = true; this._scheduleNamespaceFinalizeRetry(brokerLeaseId, 0, () => { if (storagePlan) this._adoptThreadStorageMutationPlan(storagePlan); this._adoptCommittedNamespaceState(newState) }) }
+			}
+			else if (brokerLeaseId) { recoveryPending = true; this._scheduleNamespaceFinalizeRetry(brokerLeaseId) }
+			return this._warnPendingMutation({ ok: false, reason: 'backend_unavailable' }, 'clear')
+		}
+		finally {
+			this._deletingPendingInputThreads.clear()
+			if ((!storageCommitted && !recoveryPending) || brokerFinalized) {
+				this._pendingNamespaceMutation = false
+				this._scheduleDeliveredPendingReconcile()
+				for (const threadId of Object.keys(this.state.allThreads)) void this._drainPendingChatInputs(threadId)
+			}
+		}
+	}
+	async resetState(): Promise<boolean> {
+		if (this._pendingNamespaceMutation) return false
+		this._pendingNamespaceMutation = true
+		let brokerLeaseId: string | undefined
+		let storagePlan: ThreadStorageMutationPlan | undefined
+		let storageCommitted = false
+		let brokerFinalized = false
+		let recoveryPending = false
+		try {
+			await this._ensurePendingInputBrokerReady()
+			if (!await this._awaitAllThreadStorageWrites()) throw new Error('chat_reset_pending_write_failed')
+			storagePlan = this._buildThreadReplacementPlan({})
+			const cleared = await this._pendingBroker().clearNamespace(storagePlan.evidence)
+			if (!cleared.ok) return this._warnPendingMutation(cleared, 'clear')
+			brokerLeaseId = cleared.value.leaseId
+			// Commit the shared chat reset before removing any broker row or local draft.
+			await this._commitThreadStorageMutation(storagePlan, brokerLeaseId)
+			if (!this._areStoredThreadsTombstoned()) throw new Error('chat_reset_storage_readback_failed')
+			storageCommitted = true
+			this._adoptCommittedResetState()
+			const finalized = await this._pendingBroker().finalizeNamespaceClear(brokerLeaseId)
+			if (!finalized.ok) { this._warnPendingMutation(finalized, 'reconcile'); this._scheduleNamespaceFinalizeRetry(brokerLeaseId); return false }
+			brokerFinalized = true
+			return true
+		} catch {
+			if (brokerLeaseId && !storageCommitted) {
+				const outcome = await this._classifyNamespaceMutation(brokerLeaseId)
+				if (outcome === 'committed') { storageCommitted = true; brokerFinalized = true; if (storagePlan) this._adoptThreadStorageMutationPlan(storagePlan); this._adoptCommittedResetState(); return true }
+				if (outcome === 'ambiguous') { recoveryPending = true; this._scheduleNamespaceFinalizeRetry(brokerLeaseId, 0, () => { if (storagePlan) this._adoptThreadStorageMutationPlan(storagePlan); this._adoptCommittedResetState() }) }
+			}
+			else if (brokerLeaseId) { recoveryPending = true; this._scheduleNamespaceFinalizeRetry(brokerLeaseId) }
+			return this._warnPendingMutation({ ok: false, reason: 'backend_unavailable' }, 'clear')
+		}
+		finally {
+			this._deletingPendingInputThreads.clear()
+			if ((!storageCommitted && !recoveryPending) || brokerFinalized) {
+				this._pendingNamespaceMutation = false
+				this._scheduleDeliveredPendingReconcile()
+				for (const threadId of Object.keys(this.state.allThreads)) void this._drainPendingChatInputs(threadId)
+			}
+		}
 	}
 
 	// !!! this is important for properly restoring URIs from storage
@@ -1010,12 +1187,16 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		for (const [id, envelope] of records) if (!envelope.deleted && envelope.thread) threads[id] = envelope.thread
 		return threads
 	}
-	private _completeLegacyThreadStorageMigration(): void {
+	private async _completeLegacyThreadStorageMigration(): Promise<void> {
 		this._storageService.store(THREAD_STORAGE_MIGRATION_COMPLETE_KEY, '1', StorageScope.APPLICATION, StorageTarget.USER)
+		await this._storageService.flush()
 	}
 	private _migrateLegacyThreadStorage(threads: ChatThreads): void {
 		this._storeAllThreads(threads)
-		this._completeLegacyThreadStorageMigration()
+		// Never make the aggregate migration marker durable before every per-thread
+		// CAS has settled. A failed/stale record leaves the legacy aggregate available
+		// for the next startup instead of publishing a partial migration.
+		void this._awaitAllThreadStorageWrites().then(ok => ok ? this._completeLegacyThreadStorageMigration() : undefined).catch(() => undefined)
 	}
 	private _registerExternalThreadStorageListener(): void {
 		this._register(this._storageService.onDidChangeValue(StorageScope.APPLICATION, undefined, this._store)(event => {
@@ -1038,7 +1219,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		}
 	}
 
-	private _threadStorageKey(id: string): string { return `${THREAD_STORAGE_RECORD_PREFIX}${encodeURIComponent(id)}` }
+	private _threadStorageKey(id: string): string { return pendingChatInputThreadStorageKey(id) }
 	private _threadIdFromStorageKey(key: string): string | undefined {
 		if (!key.startsWith(THREAD_STORAGE_RECORD_PREFIX)) return undefined
 		try { const id = decodeURIComponent(key.slice(THREAD_STORAGE_RECORD_PREFIX.length)); return id && this._threadStorageKey(id) === key ? id : undefined } catch { return undefined }
@@ -1046,47 +1227,284 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	private _isUnmaterializedEmptyThread(thread: ThreadType): boolean {
 		return thread.id === this._localEmptyThreadId && thread.messages.length === 0 && thread.childActivities.records.length === 0 && thread.state.stagingSelections.length === 0 && Object.keys(thread.state.linksOfMessageIdx).length === 0 && !thread.state.agentInstructionTurnSnapshot
 	}
-	private _readThreadEnvelope(key: string, id: string): ThreadStorageEnvelope | undefined {
-		const raw = this._storageService.get(key, StorageScope.APPLICATION)
+	private _isPendingInputAnchorCandidate(thread: ThreadType): boolean {
+		// `_localEmptyThreadId` is only the UI's preferred reusable blank. More than
+		// one window-local blank can legitimately carry an unsent draft. Admission
+		// is therefore structural and the authoritative B1 absence/tombstone check in
+		// `_materializePendingInputThreadAnchor` decides whether this exact thread may
+		// be materialized.
+		return thread.messages.length === 0 && thread.childActivities.records.length === 0 && Object.keys(thread.state.linksOfMessageIdx).length === 0 && !thread.state.agentInstructionTurnSnapshot
+	}
+	private async _materializePendingInputThreadAnchor(threadId: string): Promise<string | undefined | null> {
+		const thread = this.state.allThreads[threadId]
+		if (!thread) return null
+		const knownRaw = this._currentThreadStorageRaw(threadId)
+		const known = this._parseThreadEnvelopeRaw(knownRaw, threadId)
+		if (known && !known.deleted) return undefined
+		if (!this._isPendingInputAnchorCandidate(thread)) return undefined
+		const authorized = await this._pendingBroker().authorizeThreadAnchor(threadId)
+		if (!authorized.ok) { this._warnPendingMutation(authorized, 'submit'); return null }
+		if (authorized.value.existing) return undefined
+		const leaseId = authorized.value.leaseId
+		if (!leaseId) { this._warnPendingMutation({ ok: false, reason: 'backend_unavailable' }, 'submit'); return null }
+		try {
+			const key = this._threadStorageKey(threadId)
+			const current = this._readThreadEnvelope(key, threadId)
+			if (current?.deleted) throw new Error('pending_input_anchor_tombstoned')
+			// The broker row owns the submitted File/Skill/@Agent selections.  The
+			// temporary B1 anchor deliberately strips renderer-only composer state so a
+			// reload cannot duplicate those selections into the next unsent draft.
+			const anchorThread: ThreadType = { ...thread, state: { ...thread.state, stagingSelections: [], focusedMessageIdx: undefined, mountedInfo: undefined } }
+			const envelope: ThreadStorageEnvelope = { version: 1, revision: (current?.revision ?? 0) + 1, thread: anchorThread, [PENDING_CHAT_INPUT_THREAD_ANCHOR_FIELD]: leaseId }
+			const raw = JSON.stringify(envelope)
+			this._storageService.store(key, raw, StorageScope.APPLICATION, StorageTarget.USER)
+			await this._storageService.flush()
+			const verified = await this._pendingBroker().verifyThreadAnchorAndRelease(threadId, leaseId)
+			if (!verified.ok) throw new Error('pending_input_anchor_verification_failed')
+			this._threadStorageAuthoritativeRaw.set(threadId, raw)
+			return leaseId
+		} catch {
+			await this._pendingBroker().abandonThreadAnchor(threadId, leaseId).catch(() => undefined)
+			this._warnPendingMutation({ ok: false, reason: 'backend_unavailable' }, 'submit')
+			return null
+		}
+	}
+	private _parseThreadEnvelopeRaw(raw: string | undefined, id: string): ThreadStorageEnvelope | undefined {
 		if (!raw) return undefined
 		try {
 			const parsed = JSON.parse(raw) as ThreadStorageEnvelope
 			if (!parsed || parsed.version !== 1 || !Number.isSafeInteger(parsed.revision) || parsed.revision < 1 || (parsed.deleted !== true && !parsed.thread)) return undefined
 			if (parsed.deleted) return { version: 1, revision: parsed.revision, deleted: true }
 			const thread = this._convertThreadDataFromStorage(JSON.stringify({ [id]: parsed.thread }))[id]
-			return thread?.id === id ? { version: 1, revision: parsed.revision, thread } : undefined
+			return thread?.id === id ? { version: 1, revision: parsed.revision, thread, ...(typeof parsed.pendingInputAnchorLeaseId === 'string' ? { pendingInputAnchorLeaseId: parsed.pendingInputAnchorLeaseId } : {}) } : undefined
 		} catch { return undefined }
 	}
-	private _nextThreadRevision(key: string): number {
-		const id = this._threadIdFromStorageKey(key); const current = id ? this._readThreadEnvelope(key, id) : undefined
-		return (current?.revision ?? 0) + 1
+	private _readThreadEnvelope(key: string, id: string): ThreadStorageEnvelope | undefined {
+		const raw = this._threadStorageAuthoritativeRaw.has(id) ? this._threadStorageAuthoritativeRaw.get(id) : this._storageService.get(key, StorageScope.APPLICATION)
+		return this._parseThreadEnvelopeRaw(raw, id)
 	}
-	private _storeThreadRecord(id: string, thread: ThreadType): void {
+	private _threadStorageRawEntries(includeLastCas = true): ReadonlyMap<string, string> {
+		const entries = new Map<string, string>()
+		for (const key of this._storageService.keys(StorageScope.APPLICATION, StorageTarget.USER)) {
+			if (!isPendingChatInputThreadStorageKey(key)) continue
+			const raw = this._storageService.get(key, StorageScope.APPLICATION)
+			if (raw !== undefined) entries.set(key, raw)
+		}
+		if (includeLastCas) for (const [id, raw] of this._threadStorageAuthoritativeRaw) {
+			const key = this._threadStorageKey(id)
+			if (raw === undefined) entries.delete(key); else entries.set(key, raw)
+		}
+		return entries
+	}
+	private _storageFingerprint(entries: ReadonlyMap<string, string>, keys?: readonly string[]): string {
+		const selected = keys ?? [...entries.keys()]
+		return pendingChatInputChatStorageFingerprint(selected.map(key => ({ key, value: entries.get(key) })))
+	}
+	private _buildThreadReplacementPlan(after: ChatThreads): ThreadStorageMutationPlan {
+		const beforeEntries = this._threadStorageRawEntries()
+		const expected = new Map(beforeEntries)
+		const writes: { key: string; raw: string }[] = []
+		const ids = new Set<string>([...Object.keys(this.state.allThreads), ...Object.keys(after)])
+		const legacyIds = new Set<string>()
+		for (const key of beforeEntries.keys()) { const id = this._threadIdFromStorageKey(key); if (id) ids.add(id) }
+		// A reset/import can race the one-time aggregate migration. Include every
+		// still-live legacy id in the replacement transaction so an unseen legacy
+		// thread cannot reappear after the new state has committed.
+		if (this._storageService.get(THREAD_STORAGE_MIGRATION_COMPLETE_KEY, StorageScope.APPLICATION) !== '1') {
+			const legacyRaw = this._storageService.get(THREAD_STORAGE_KEY, StorageScope.APPLICATION)
+			if (legacyRaw) {
+				try { for (const id of Object.keys(this._convertThreadDataFromStorage(legacyRaw))) { ids.add(id); legacyIds.add(id) } }
+				catch { throw new Error('chat_replacement_legacy_state_invalid') }
+			}
+		}
+		for (const id of ids) {
+			const key = this._threadStorageKey(id)
+			const current = this._readThreadEnvelope(key, id)
+			const intended = after[id]
+			const isPureLocalBlank = !beforeEntries.has(key) && !legacyIds.has(id)
+				&& !!this.state.allThreads[id] && this._isPendingInputAnchorCandidate(this.state.allThreads[id]!)
+			let raw: string | undefined
+			if (intended && !(isPureLocalBlank && this._isPendingInputAnchorCandidate(intended))) {
+				// A normal per-thread CAS treats a tombstone as terminal.  The one
+				// exception is this application-global replacement transaction: its
+				// persisted intent binds the exact tombstoned baseline and the exact live
+				// replacement fingerprint while every ordinary history writer is fenced.
+				// This is what makes Reset -> import the same exported ids reversible
+				// without allowing a stale window to resurrect a deleted chat.
+				raw = JSON.stringify({ version: 1, revision: (current?.revision ?? 0) + 1, thread: intended } satisfies ThreadStorageEnvelope)
+			}
+			else if (beforeEntries.has(key) || (!isPureLocalBlank && this.state.allThreads[id]) || legacyIds.has(id)) raw = JSON.stringify({ version: 1, revision: (current?.revision ?? 0) + 1, deleted: true } satisfies ThreadStorageEnvelope)
+			if (raw !== undefined && raw !== beforeEntries.get(key)) { expected.set(key, raw); writes.push({ key, raw }) }
+		}
+		return Object.freeze({ writes: Object.freeze(writes), evidence: Object.freeze({ baselineFingerprint: this._storageFingerprint(beforeEntries), expectedFingerprint: this._storageFingerprint(expected) }) })
+	}
+	private _buildThreadDeletionPlan(id: string): ThreadStorageMutationPlan {
 		const key = this._threadStorageKey(id)
-		// Once a delivered delete is visible, a stale same-thread writer must not
-		// recreate it. New threads have fresh UUIDs, so fail closed is safe.
+		const beforeEntries = this._threadStorageRawEntries()
 		const current = this._readThreadEnvelope(key, id)
-		if (current?.deleted) return
-		this._storageService.store(key, JSON.stringify({ version: 1, revision: (current?.revision ?? 0) + 1, thread } satisfies ThreadStorageEnvelope), StorageScope.APPLICATION, StorageTarget.USER)
+		const raw = JSON.stringify({ version: 1, revision: (current?.revision ?? 0) + 1, deleted: true } satisfies ThreadStorageEnvelope)
+		const expected = new Map(beforeEntries); expected.set(key, raw)
+		return Object.freeze({ writes: Object.freeze([{ key, raw }]), fingerprintKeys: Object.freeze([key]), evidence: Object.freeze({ baselineFingerprint: this._storageFingerprint(beforeEntries, [key]), expectedFingerprint: this._storageFingerprint(expected, [key]) }) })
 	}
-	private _storeThreadTombstone(id: string): void {
-		const key = this._threadStorageKey(id)
-		this._storageService.store(key, JSON.stringify({ version: 1, revision: this._nextThreadRevision(key), deleted: true } satisfies ThreadStorageEnvelope), StorageScope.APPLICATION, StorageTarget.USER)
+	private async _commitThreadStorageMutation(plan: ThreadStorageMutationPlan, leaseId: string): Promise<void> {
+		for (const write of plan.writes) this._storageService.store(write.key, write.raw, StorageScope.APPLICATION, StorageTarget.USER)
+		this._storageService.store(pendingChatInputMutationReceiptKey(leaseId), leaseId, StorageScope.APPLICATION, StorageTarget.MACHINE)
+		await this._storageService.flush()
+		// These bytes were written through IStorageService immediately above. Read
+		// that post-flush cache directly: overlaying the last per-thread CAS response
+		// here would compare the transaction against its own stale predecessor and
+		// make every reset/delete after a normal CAS fail spuriously.
+		if (this._storageFingerprint(this._threadStorageRawEntries(false), plan.fingerprintKeys) !== plan.evidence.expectedFingerprint) throw new Error('chat_mutation_storage_readback_failed')
+		this._adoptThreadStorageMutationPlan(plan)
 	}
-	private _tombstoneAllStoredThreads(): void {
+	private _adoptThreadStorageMutationPlan(plan: ThreadStorageMutationPlan): void {
+		for (const write of plan.writes) { const id = this._threadIdFromStorageKey(write.key); if (id) this._threadStorageAuthoritativeRaw.set(id, write.raw) }
+	}
+	private _currentThreadStorageRaw(id: string): string | undefined {
+		return this._threadStorageAuthoritativeRaw.has(id)
+			? this._threadStorageAuthoritativeRaw.get(id)
+			: this._storageService.get(this._threadStorageKey(id), StorageScope.APPLICATION)
+	}
+	private _advanceThreadStorageWriteEpoch(id: string): number {
+		const next = (this._threadStorageWriteEpoch.get(id) ?? 0) + 1
+		this._threadStorageWriteEpoch.set(id, next)
+		return next
+	}
+	private _adoptAuthoritativeThreadRaw(id: string, raw: string | undefined): void {
+		this._threadStorageAuthoritativeRaw.set(id, raw)
+		if (raw === undefined) return
+		const envelope = this._parseThreadEnvelopeRaw(raw, id)
+		if (!envelope) return
+		this._consumeThreadEnvelope(id, envelope, true)
+	}
+	/** A main-authoritative CAS rejection is a parent-run boundary.  Cancel the
+	 * physical operations without publishing another stale history row, revoke the
+	 * exact generation, and let the queued write adopt the winner afterwards. */
+	private _fenceThreadStorageConflict(threadId: string): void {
+		const interrupt = this.streamState[threadId]?.interrupt
+		for (const receipt of this._activeToolCardReceipts(threadId)?.values() ?? []) {
+			if (receipt.cancelling) continue
+			receipt.cancelling = true
+			try { receipt.cancel() } catch { /* the generation fence still rejects settlement */ }
+		}
+		this._revokeAgentDelegation(threadId)
+		void Promise.resolve(interrupt).then(value => { if (typeof value === 'function') value() }, () => undefined)
+		this._setStreamState(threadId, { isRunning: undefined, error: { message: 'This chat changed in another Void window. The stale run was stopped before it could continue.', fullError: null } })
+	}
+	private _queueThreadStorageWrite(id: string, nextThread: ThreadType | undefined): Promise<boolean> {
+		const epoch = this._threadStorageWriteEpoch.get(id) ?? 0
+		const previous = this._threadStorageWriteTail.get(id) ?? Promise.resolve(true)
+		const task = previous.then(async previousSucceeded => {
+			if (!previousSucceeded || (this._threadStorageWriteEpoch.get(id) ?? 0) !== epoch) return false
+			if (!await this._ensurePendingInputBrokerReady()) return false
+			const expectedRaw = this._currentThreadStorageRaw(id)
+			const current = this._parseThreadEnvelopeRaw(expectedRaw, id)
+			if (expectedRaw !== undefined && !current) return false
+			if (current?.deleted && nextThread) {
+				this._advanceThreadStorageWriteEpoch(id)
+				this._adoptAuthoritativeThreadRaw(id, expectedRaw)
+				this._warnPendingInbox('This chat was deleted in another Void window. Your stale local change was not saved.')
+				return false
+			}
+			if ((current?.revision ?? 0) >= Number.MAX_SAFE_INTEGER) return false
+			const nextRaw = JSON.stringify(nextThread
+				? { version: 1, revision: (current?.revision ?? 0) + 1, thread: nextThread } satisfies ThreadStorageEnvelope
+				: { version: 1, revision: (current?.revision ?? 0) + 1, deleted: true } satisfies ThreadStorageEnvelope)
+			const committed = await this._pendingBroker().commitThreadRecord(id, expectedRaw, nextRaw)
+			if (!committed.ok) {
+				this._advanceThreadStorageWriteEpoch(id)
+				this._fenceThreadStorageConflict(id)
+				this._adoptAuthoritativeThreadRaw(id, committed.authoritativeRaw)
+				this._warnPendingMutation(committed, 'reconcile')
+				return false
+			}
+			this._threadStorageAuthoritativeRaw.set(id, committed.value)
+			return true
+		}, () => false).catch(() => false)
+		this._threadStorageWriteTail.set(id, task)
+		void task.finally(() => {
+			if (this._threadStorageWriteTail.get(id) !== task) return
+			this._threadStorageWriteTail.delete(id)
+			this._applyDeferredExternalThreadRecordIfQuiescent(id)
+		})
+		return task
+	}
+	private async _awaitThreadStorageWrites(id: string): Promise<boolean> {
+		// Production constructs the map eagerly. Prototype lifecycle fixtures bind
+		// this method to a narrow receiver and have no persistence work to await.
+		const tails = (this as unknown as { _threadStorageWriteTail?: Map<string, Promise<boolean>> })._threadStorageWriteTail
+		return await (tails?.get(id) ?? Promise.resolve(true))
+	}
+	private async _awaitAllThreadStorageWrites(): Promise<boolean> {
+		const tails = [...((this as unknown as { _threadStorageWriteTail?: Map<string, Promise<boolean>> })._threadStorageWriteTail?.values() ?? [])]
+		return (await Promise.all(tails)).every(Boolean)
+	}
+	private _storeThreadRecord(id: string, thread: ThreadType): void { void this._queueThreadStorageWrite(id, thread) }
+	private _storeThreadTombstone(id: string): void { void this._queueThreadStorageWrite(id, undefined) }
+	private _isThreadTombstoneDurable(id: string): boolean { return this._readThreadEnvelope(this._threadStorageKey(id), id)?.deleted === true }
+	private _threadFromBrokerHistoryInspection(threadId: string, inspection: PendingChatInputHistoryInspection): ThreadType | undefined {
+		if (!inspection.envelopeRaw) return undefined
+		try {
+			const parsed = JSON.parse(inspection.envelopeRaw) as ThreadStorageEnvelope
+			if (!parsed || parsed.version !== 1 || parsed.deleted || !parsed.thread) return undefined
+			const thread = this._convertThreadDataFromStorage(JSON.stringify({ [threadId]: parsed.thread }))[threadId]
+			if (thread?.id !== threadId) return undefined
+			;(this as unknown as { _threadStorageAuthoritativeRaw?: Map<string, string | undefined> })._threadStorageAuthoritativeRaw?.set(threadId, inspection.envelopeRaw)
+			return thread
+		} catch { return undefined }
+	}
+	private _adoptDurablePendingInputThread(threadId: string, durable: ThreadType): boolean {
+		const local = this.state.allThreads[threadId]
+		if (!local || durable.id !== threadId) return false
+		const thread = { ...durable, state: { ...durable.state, mountedInfo: local.state.mountedInfo, stagingSelections: local.state.stagingSelections, focusedMessageIdx: local.state.focusedMessageIdx } }
+		this.state = { ...this.state, allThreads: { ...this.state.allThreads, [threadId]: thread } }
+		this._onDidChangeCurrentThread.fire()
+		return true
+	}
+	private _removeUnpersistedPendingInputMessage(threadId: string, pendingInputId: string): void {
+		const thread = this.state.allThreads[threadId]; if (!thread) return
+		const index = thread.messages.findIndex(message => message.role === 'user' && message.pendingInputId === pendingInputId)
+		if (index < 0) return
+		const messages = [...thread.messages.slice(0, index), ...thread.messages.slice(index + 1)]
+		this.state = { ...this.state, allThreads: { ...this.state.allThreads, [threadId]: { ...thread, messages } } }
+		this._onDidChangeCurrentThread.fire()
+	}
+	private _isThreadReplacementDurable(before: ChatThreads, after: ChatThreads): boolean {
+		for (const id of new Set([...Object.keys(before), ...Object.keys(after)])) {
+			const intended = after[id]
+			if (!intended) { if (before[id] && !this._isThreadTombstoneDurable(id)) return false; continue }
+			if (this._isUnmaterializedEmptyThread(intended)) continue
+			const envelope = this._readThreadEnvelope(this._threadStorageKey(id), id)
+			if (!envelope?.thread || envelope.thread.id !== id || this._threadStorageFingerprint(envelope.thread) !== this._threadStorageFingerprint(intended)) return false
+		}
+		return true
+	}
+	private _threadStorageFingerprint(thread: ThreadType): string {
+		const state = { ...thread.state }
+		delete state.mountedInfo
+		const projected = { ...thread, state }
+		// Compare the bytes' logical storage projection, not incidental in-memory
+		// shape. JSON legitimately omits optional `undefined` fields and converts
+		// URI/Set-backed values before the next window revives them; treating those
+		// representation changes as a conflict makes an otherwise exact import fail
+		// its own post-flush readback.
+		try {
+			const normalized = this._convertThreadDataFromStorage(JSON.stringify({ [thread.id]: projected }))[thread.id]
+			return stableToolValue(normalized ?? projected)
+		} catch {
+			return stableToolValue(projected)
+		}
+	}
+	private _areStoredThreadsTombstoned(): boolean {
 		for (const key of this._storageService.keys(StorageScope.APPLICATION, StorageTarget.USER)) {
 			const id = this._threadIdFromStorageKey(key)
-			if (!id || !this._readThreadEnvelope(key, id)) continue
-			this._storeThreadTombstone(id)
+			if (id && !this._isThreadTombstoneDurable(id)) return false
 		}
-		if (!this._didReadLegacyThreadStorage) return
-		const legacy = this._storageService.get(THREAD_STORAGE_KEY, StorageScope.APPLICATION)
-		if (!legacy) return
-		try { for (const id of Object.keys(this._convertThreadDataFromStorage(legacy))) this._storeThreadTombstone(id) } catch { /* malformed legacy is not a deletion target */ }
+		return true
 	}
 	private _applyExternalThreadRecord(key: string): void {
 		const id = this._threadIdFromStorageKey(key); if (!id) return
-		if (this._isThreadLocallyActive(id)) { this._deferredExternalThreadKey.set(id, key); return }
+		if (this._isThreadLocallyActive(id) || this._threadStorageWriteTail.has(id)) { this._deferredExternalThreadKey.set(id, key); return }
 		this._consumeExternalThreadRecord(key, id)
 	}
 	private _isThreadLocallyActive(id: string): boolean {
@@ -1094,12 +1512,49 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	}
 	private _applyDeferredExternalThreadRecordIfQuiescent(id: string): void {
 		const key = this._deferredExternalThreadKey.get(id)
-		if (!key || this._isThreadLocallyActive(id)) return
+		if (!key || this._isThreadLocallyActive(id) || this._threadStorageWriteTail.has(id)) return
 		this._deferredExternalThreadKey.delete(id)
 		this._consumeExternalThreadRecord(key, id, true)
 	}
 	private _consumeExternalThreadRecord(key: string, id: string, wasActiveConflict = false): void {
-		const envelope = this._readThreadEnvelope(key, id); if (!envelope) return
+		const raw = this._storageService.get(key, StorageScope.APPLICATION)
+		// An external storage event is itself the authority update. Do not parse it
+		// through `_readThreadEnvelope`, which intentionally prefers the last CAS
+		// response and would otherwise replay that stale raw forever after the first
+		// cross-window change.
+		if (raw === undefined) {
+			const previousRaw = this._threadStorageAuthoritativeRaw.get(id)
+			const previous = this._parseThreadEnvelopeRaw(previousRaw, id)
+			const local = this.state.allThreads[id]
+			const isExactTemporaryAnchor = !!previous?.pendingInputAnchorLeaseId && !!previous.thread
+				&& previous.thread.messages.length === 0 && previous.thread.childActivities.records.length === 0
+				&& Object.keys(previous.thread.state.linksOfMessageIdx).length === 0 && !previous.thread.state.agentInstructionTurnSnapshot
+			if (!isExactTemporaryAnchor) return
+			// The authoritative anchor is gone even if this renderer has since typed a
+			// local draft.  Retire the cached raw first so a later Send can authorize a
+			// new anchor instead of being rejected forever against a phantom record.
+			this._threadStorageAuthoritativeRaw.set(id, undefined)
+			if (!local) return
+			const isLocalBlank = local.messages.length === 0 && local.childActivities.records.length === 0
+				&& Object.keys(local.state.linksOfMessageIdx).length === 0 && !local.state.agentInstructionTurnSnapshot
+			const hasLocalComposer = !!(this._transientComposerDraftOfThread.get(id) ?? '').trim() || local.state.stagingSelections.length > 0
+			if (!isLocalBlank || hasLocalComposer) {
+				this._onDidChangeCurrentThread.fire()
+				return
+			}
+			const allThreads = { ...this.state.allThreads }; delete allThreads[id]
+			if (this.state.currentThreadId === id) {
+				const blank = newThreadObject(); this._localEmptyThreadId = blank.id
+				this.state = { allThreads: { ...allThreads, [blank.id]: blank }, currentThreadId: blank.id }
+			} else this.state = { ...this.state, allThreads }
+			this._onDidChangeCurrentThread.fire()
+			return
+		}
+		const envelope = this._parseThreadEnvelopeRaw(raw, id); if (!envelope) return
+		this._threadStorageAuthoritativeRaw.set(id, raw)
+		this._consumeThreadEnvelope(id, envelope, wasActiveConflict)
+	}
+	private _consumeThreadEnvelope(id: string, envelope: ThreadStorageEnvelope, wasActiveConflict = false): void {
 		const allThreads = { ...this.state.allThreads }
 		if (envelope.deleted) {
 			// A delivered tombstone is terminal. Replaying the same storage event must
@@ -1111,6 +1566,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				const existing = this._localEmptyThreadId && allThreads[this._localEmptyThreadId] && this._isUnmaterializedEmptyThread(allThreads[this._localEmptyThreadId]!) ? allThreads[this._localEmptyThreadId]! : undefined
 				const blank = existing ?? newThreadObject(); this._localEmptyThreadId = blank.id
 				this.state = { allThreads: existing ? allThreads : { ...allThreads, [blank.id]: blank }, currentThreadId: blank.id }
+				this._scheduleExternalPendingDelete(id)
 				this._notificationService.info('This chat was deleted in another window.')
 				this._onDidChangeCurrentThread.fire(); return
 			}
@@ -1124,21 +1580,83 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		else return
 		// Do not use _setState: it rebuilds mount data and settles interrupted runs.
 		this.state = { ...this.state, allThreads }
+		if (envelope.deleted) this._scheduleExternalPendingDelete(id)
+		this._scheduleDeliveredPendingReconcile()
 		this._onDidChangeCurrentThread.fire()
 	}
 	private _clearExternallyDeletedThreadMetadata(threadId: string): void {
 		this._setStreamState(threadId, undefined)
 		this.clearTransientComposerDraft(threadId)
 		this._pendingChatSubmissionOfThread.delete(threadId)
-		// Do not rewrite the aggregate workspace inbox from a stale window. The
-		// removed thread's rows are locally inaccessible now; startup compaction
-		// filters them against restored threads and writes normalized bytes later.
-		this._pendingChatInputsOfThread.delete(threadId)
-		this._onDidChangePendingChatInputs.fire({ threadId })
-		this._drainingPendingChatInputs.delete(threadId); this._startingParentRunOfThread.delete(threadId); this._runQuiescenceOfThread.delete(threadId); this._parentRunTokenOfThread.delete(threadId); this._deferredExternalThreadKey.delete(threadId)
+		this._drainingPendingChatInputs.delete(threadId); this._startingParentRunOfThread.delete(threadId); this._runQuiescenceOfThread.delete(threadId); this._parentRunTokenOfThread.delete(threadId); this._deferredExternalThreadKey.delete(threadId); this._childGroupSourceOfThread.delete(threadId); this._childGroupSyncRevisionOfThread.delete(threadId); this._childGroupSyncTailOfThread.delete(threadId)
 		for (const key of this._stopAndSendFlights.keys()) if (key.startsWith(`${threadId}\u0000`)) this._stopAndSendFlights.delete(key)
 		this._agentInstructionSessionOfThread.delete(threadId); this._instructionTurnOfThread.delete(threadId); this._revokeAgentDelegation(threadId, true); this._agentControlGeneration.delete(threadId)
 		this._cancellingToolReceiptsOfThread.delete(threadId); this._activeToolCardReceiptsOfThread?.delete(threadId)
+	}
+	private _scheduleExternalPendingDelete(threadId: string, attempt = 0): void {
+		if (this.state.allThreads[threadId] || this._externalPendingDeleteRetries.has(threadId)) return
+		const handle = setTimeout(() => {
+			this._externalPendingDeleteRetries.delete(threadId)
+			void this._deleteExternallyRemovedPendingInputs(threadId, attempt)
+		}, attempt === 0 ? 0 : Math.min(2_000, 100 * 2 ** Math.min(attempt, 5)))
+		this._externalPendingDeleteRetries.set(threadId, { handle, attempt })
+	}
+	private async _deleteExternallyRemovedPendingInputs(threadId: string, attempt: number): Promise<void> {
+		let leaseId: string | undefined
+		let storagePlan: ThreadStorageMutationPlan | undefined
+		try {
+			await this._ensurePendingInputBrokerReady()
+			if (this.state.allThreads[threadId]) return
+			if (!await this._awaitThreadStorageWrites(threadId)) { this._scheduleExternalPendingDelete(threadId, attempt + 1); return }
+			storagePlan = this._buildThreadDeletionPlan(threadId)
+			const deleted = await this._pendingBroker().deleteThreadRecords(threadId, storagePlan.evidence)
+			if (!deleted.ok) { this._scheduleExternalPendingDelete(threadId, attempt + 1); return }
+			leaseId = deleted.value.leaseId
+			await this._commitThreadStorageMutation(storagePlan, leaseId)
+			const finalized = await this._pendingBroker().finalizeThreadDeletion(threadId, leaseId)
+			if (!finalized.ok) this._scheduleExternalPendingDelete(threadId, attempt + 1)
+		} catch {
+			if (leaseId) {
+				const outcome = await this._classifyThreadDeletion(threadId, leaseId)
+				if (outcome === 'committed') { if (storagePlan) this._adoptThreadStorageMutationPlan(storagePlan); return }
+				if (outcome === 'ambiguous') { this._scheduleThreadDeletionResolution(threadId, leaseId, () => { if (storagePlan) this._adoptThreadStorageMutationPlan(storagePlan) }); return }
+			}
+			this._scheduleExternalPendingDelete(threadId, attempt + 1)
+		}
+	}
+	private async _clearPendingRowsAfterDurableTombstone(threadId: string): Promise<void> {
+		if (!await this._awaitThreadStorageWrites(threadId)) return
+		if (!this._isThreadTombstoneDurable(threadId)) return
+		const storagePlan = this._buildThreadDeletionPlan(threadId)
+		const prepared = await this._pendingBroker().deleteThreadRecords(threadId, storagePlan.evidence)
+		if (!prepared.ok) return
+		try {
+			await this._commitThreadStorageMutation(storagePlan, prepared.value.leaseId)
+			const finalized = await this._pendingBroker().finalizeThreadDeletion(threadId, prepared.value.leaseId)
+			if (!finalized.ok) this._scheduleThreadDeletionResolution(threadId, prepared.value.leaseId, () => undefined)
+		} catch {
+			const outcome = await this._classifyThreadDeletion(threadId, prepared.value.leaseId)
+			if (outcome === 'committed') this._adoptThreadStorageMutationPlan(storagePlan)
+			if (outcome === 'ambiguous') this._scheduleThreadDeletionResolution(threadId, prepared.value.leaseId, () => this._adoptThreadStorageMutationPlan(storagePlan))
+		}
+	}
+	private async _classifyThreadDeletion(threadId: string, leaseId: string): Promise<'committed' | 'aborted' | 'ambiguous'> {
+		try { if ((await this._pendingBroker().finalizeThreadDeletion(threadId, leaseId)).ok) return 'committed' } catch { /* authoritative retry below */ }
+		try { if ((await this._pendingBroker().abortThreadDeletion(threadId, leaseId)).ok) return 'aborted' } catch { /* persisted intent remains fenced */ }
+		return 'ambiguous'
+	}
+	private _scheduleThreadDeletionResolution(threadId: string, leaseId: string, onCommitted: () => void, attempt = 0): void {
+		if (this._pendingThreadMutationRetries.has(threadId)) return
+		const handle = setTimeout(() => {
+			this._pendingThreadMutationRetries.delete(threadId)
+			void this._classifyThreadDeletion(threadId, leaseId).then(outcome => {
+				if (outcome === 'ambiguous') { this._scheduleThreadDeletionResolution(threadId, leaseId, onCommitted, attempt + 1); return }
+				if (outcome === 'committed') onCommitted()
+				this._deletingPendingInputThreads.delete(threadId); this._scheduleDeliveredPendingReconcile()
+				if (outcome === 'aborted' && this.state.allThreads[threadId]) this._wakePendingChatInputs(threadId)
+			}, () => this._scheduleThreadDeletionResolution(threadId, leaseId, onCommitted, attempt + 1))
+		}, Math.min(2_000, 100 * 2 ** Math.min(attempt, 5)))
+		this._pendingThreadMutationRetries.set(threadId, handle)
 	}
 
 
@@ -1515,52 +2033,64 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		}
 	}
 
-	approveLatestToolRequest(threadId: string) {
+	async approveLatestToolRequest(threadId: string): Promise<void> {
 		const releaseAwaitingApproval = (this as unknown as { _releaseAwaitingApprovalQuiescenceIfTracked?: (threadId: string, drain?: boolean) => void })._releaseAwaitingApprovalQuiescenceIfTracked ?? ChatThreadService.prototype._releaseAwaitingApprovalQuiescenceIfTracked
+		const flights = (this as unknown as { _approvalActionFlights?: Set<string> })._approvalActionFlights ?? new Set<string>()
+		if (flights.has(threadId)) return
 		const thread = this.state.allThreads[threadId]
 		if (!thread) { releaseAwaitingApproval.call(this, threadId); return } // should never happen
 
 		const lastMsg = thread.messages[thread.messages.length - 1]
 		if (!(lastMsg.role === 'tool' && lastMsg.type === 'tool_request')) { releaseAwaitingApproval.call(this, threadId); return } // should never happen
-
-		const callThisToolFirst: ToolMessage<ToolName> = lastMsg
-		const snapshot = this._instructionTurnOfThread.get(threadId)
-		const currentOwner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
-		if (!snapshot || snapshot.ownerProjectRoot !== currentOwner || snapshot.runCwd !== currentOwner || snapshot.workspaceTrustedAtAdmission !== this._workspaceTrustManagementService.isWorkspaceTrusted()) {
-			this._purgeInstructionTurn(threadId)
-			const content = 'This tool request cannot resume because the current workspace or trust context no longer matches its instruction snapshot. Send a new message in a new task to continue.'
-			this._updateLatestTool(threadId, { role: 'tool', type: 'rejected', params: lastMsg.params, name: lastMsg.name, content, result: null, id: lastMsg.id, rawParams: lastMsg.rawParams, mcpServerName: lastMsg.mcpServerName, ...(lastMsg.batchId === undefined || lastMsg.batchOrdinal === undefined ? {} : { batchId: lastMsg.batchId, batchOrdinal: lastMsg.batchOrdinal }) })
-			if (lastMsg.batchId) this._terminalizeBatchTail(threadId, lastMsg.batchId, content)
-			this._setStreamState(threadId, undefined)
-			releaseAwaitingApproval.call(this, threadId)
-			return
+		flights.add(threadId)
+		const paused = this._runQuiescenceOfThread.get(threadId)
+		const parentRun = paused
+			? resumeParentRunOwnership(threadId, paused.runId, paused.generation, this._parentRunTokenOfThread, this._agentControlGeneration)
+			: beginParentRunOwnership(threadId, this._parentRunTokenOfThread, this._agentControlGeneration)
+		if (!parentRun) { flights.delete(threadId); return }
+		const closeHeldApproval = async () => {
+			if (!await this._awaitThreadStorageWrites(threadId)) { parentRun.deactivate(); parentRun.releaseLatest(); return }
+			if (!await this._releaseUndeliveredSteers(threadId, parentRun)) { parentRun.deactivate(); parentRun.releaseLatest(); return }
+			releaseAwaitingApproval.call(this, threadId, false)
+			parentRun.deactivate(); parentRun.releaseLatest()
+			this._applyDeferredExternalThreadRecordIfQuiescent(threadId); void this._drainPendingChatInputs(threadId)
 		}
-		const admittedModel = snapshot.model
-		const currentProps = this._currentModelSelectionProps(); const selectedModel = currentProps.modelSelection
-		const currentContext = selectedModel ? getModelCapabilities(selectedModel.providerName, selectedModel.modelName, this._settingsService.state.overridesOfModel).contextWindow : 0
-		const currentReserve = selectedModel ? Math.max(Math.ceil(currentContext / 2), getReservedOutputTokenSpace(selectedModel.providerName, selectedModel.modelName, { isReasoningEnabled: getIsReasoningEnabledState('Chat', selectedModel.providerName, selectedModel.modelName, currentProps.modelSelectionOptions, this._settingsService.state.overridesOfModel), overridesOfModel: this._settingsService.state.overridesOfModel }) ?? 4096) : 0
-		const currentOverride = selectedModel ? this._settingsService.state.overridesOfModel[selectedModel.providerName]?.[selectedModel.modelName] ?? {} : {};
-		if (!admittedModel.hasModel || !selectedModel || selectedModel.providerName !== admittedModel.providerName || selectedModel.modelName !== admittedModel.modelName || runtimeModelFingerprint({ providerName: selectedModel.providerName, modelName: selectedModel.modelName, contextWindow: currentContext, reservedOutputTokens: currentReserve, modelSelectionOptions: currentProps.modelSelectionOptions ?? {}, selectedModelOverrides: currentOverride as never }) !== admittedModel.fingerprint) {
-			this._purgeInstructionTurn(threadId)
-			this._updateLatestTool(threadId, { role: 'tool', type: 'rejected', params: lastMsg.params, name: lastMsg.name, content: 'This tool request cannot resume because its admitted model changed. Send a new message.', result: null, id: lastMsg.id, rawParams: lastMsg.rawParams, mcpServerName: lastMsg.mcpServerName, ...(lastMsg.batchId === undefined || lastMsg.batchOrdinal === undefined ? {} : { batchId: lastMsg.batchId, batchOrdinal: lastMsg.batchOrdinal }) })
-			if (lastMsg.batchId) this._terminalizeBatchTail(threadId, lastMsg.batchId, 'This tool request cannot resume because its admitted model changed. Send a new message.')
-			this._setStreamState(threadId, undefined)
-			releaseAwaitingApproval.call(this, threadId)
-			return
-		}
-
-		// The approval continuation replaces the pause synchronously below. Do not
-		// drain the ordinary FIFO queue in the gap between logical turn segments.
-		releaseAwaitingApproval.call(this, threadId, false)
-		const parentRun = beginParentRunOwnership(threadId, this._parentRunTokenOfThread, this._agentControlGeneration)
-		const startTrackedParentRun = (this as unknown as { _startTrackedParentRun?: (threadId: string, parentRun: ParentRunOwnership, start: () => Promise<void>) => void })._startTrackedParentRun ?? ChatThreadService.prototype._startTrackedParentRun
-		startTrackedParentRun.call(this, threadId, parentRun, () =>
-			this._runChatAgent({ callThisToolFirst, threadId, instructionSnapshot: snapshot, modelSelection: { providerName: admittedModel.providerName as ModelSelection['providerName'], modelName: admittedModel.modelName }, modelSelectionOptions: admittedModel.modelSelectionOptions as ModelSelectionOptions, agentDelegationAuthority: this._agentDelegationAuthorityOfThread?.get(threadId), parentRun })
-		)
+		try {
+			const held = await this._pendingBroker().holdApproval(threadId, parentRun.runId, parentRun.generation, pendingApprovalIdentity(lastMsg))
+			if (!held.ok) { this._warnPendingMutation(held, 'reconcile'); parentRun.deactivate(); parentRun.releaseLatest(); return }
+			const callThisToolFirst: ToolMessage<ToolName> = lastMsg
+			const snapshot = this._instructionTurnOfThread.get(threadId)
+			const currentOwner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
+			if (!snapshot || snapshot.ownerProjectRoot !== currentOwner || snapshot.runCwd !== currentOwner || snapshot.workspaceTrustedAtAdmission !== this._workspaceTrustManagementService.isWorkspaceTrusted()) {
+				this._purgeInstructionTurn(threadId)
+				const content = 'This tool request cannot resume because the current workspace or trust context no longer matches its instruction snapshot. Send a new message in a new task to continue.'
+				this._updateLatestTool(threadId, { role: 'tool', type: 'rejected', params: lastMsg.params, name: lastMsg.name, content, result: null, id: lastMsg.id, rawParams: lastMsg.rawParams, mcpServerName: lastMsg.mcpServerName, ...(lastMsg.batchId === undefined || lastMsg.batchOrdinal === undefined ? {} : { batchId: lastMsg.batchId, batchOrdinal: lastMsg.batchOrdinal }) })
+				if (lastMsg.batchId) this._terminalizeBatchTail(threadId, lastMsg.batchId, content)
+				this._setStreamState(threadId, undefined); await closeHeldApproval(); return
+			}
+			const admittedModel = snapshot.model
+			const currentProps = this._currentModelSelectionProps(); const selectedModel = currentProps.modelSelection
+			const currentContext = selectedModel ? getModelCapabilities(selectedModel.providerName, selectedModel.modelName, this._settingsService.state.overridesOfModel).contextWindow : 0
+			const currentReserve = selectedModel ? Math.max(Math.ceil(currentContext / 2), getReservedOutputTokenSpace(selectedModel.providerName, selectedModel.modelName, { isReasoningEnabled: getIsReasoningEnabledState('Chat', selectedModel.providerName, selectedModel.modelName, currentProps.modelSelectionOptions, this._settingsService.state.overridesOfModel), overridesOfModel: this._settingsService.state.overridesOfModel }) ?? 4096) : 0
+			const currentOverride = selectedModel ? this._settingsService.state.overridesOfModel[selectedModel.providerName]?.[selectedModel.modelName] ?? {} : {};
+			if (!admittedModel.hasModel || !selectedModel || selectedModel.providerName !== admittedModel.providerName || selectedModel.modelName !== admittedModel.modelName || runtimeModelFingerprint({ providerName: selectedModel.providerName, modelName: selectedModel.modelName, contextWindow: currentContext, reservedOutputTokens: currentReserve, modelSelectionOptions: currentProps.modelSelectionOptions ?? {}, selectedModelOverrides: currentOverride as never }) !== admittedModel.fingerprint) {
+				this._purgeInstructionTurn(threadId)
+				const content = 'This tool request cannot resume because its admitted model changed. Send a new message.'
+				this._updateLatestTool(threadId, { role: 'tool', type: 'rejected', params: lastMsg.params, name: lastMsg.name, content, result: null, id: lastMsg.id, rawParams: lastMsg.rawParams, mcpServerName: lastMsg.mcpServerName, ...(lastMsg.batchId === undefined || lastMsg.batchOrdinal === undefined ? {} : { batchId: lastMsg.batchId, batchOrdinal: lastMsg.batchOrdinal }) })
+				if (lastMsg.batchId) this._terminalizeBatchTail(threadId, lastMsg.batchId, content)
+				this._setStreamState(threadId, undefined); await closeHeldApproval(); return
+			}
+			// The continuation reuses the paused main run identity. No foreign Queue or
+			// direct history writer can enter in the approval gap.
+			releaseAwaitingApproval.call(this, threadId, false)
+			const startTrackedParentRun = (this as unknown as { _startTrackedParentRun?: (threadId: string, parentRun: ParentRunOwnership, start: () => Promise<void>) => void })._startTrackedParentRun ?? ChatThreadService.prototype._startTrackedParentRun
+			startTrackedParentRun.call(this, threadId, parentRun, () => this._runChatAgent({ callThisToolFirst, threadId, instructionSnapshot: snapshot, modelSelection: { providerName: admittedModel.providerName as ModelSelection['providerName'], modelName: admittedModel.modelName }, modelSelectionOptions: admittedModel.modelSelectionOptions as ModelSelectionOptions, agentDelegationAuthority: this._agentDelegationAuthorityOfThread?.get(threadId), parentRun }))
+		} finally { flights.delete(threadId) }
 	}
-	rejectLatestToolRequest(threadId: string, revoke = true) {
+	async rejectLatestToolRequest(threadId: string, revoke = true): Promise<void> {
 		const releaseAwaitingApproval = (this as unknown as { _releaseAwaitingApprovalQuiescenceIfTracked?: (threadId: string, drain?: boolean) => void })._releaseAwaitingApprovalQuiescenceIfTracked ?? ChatThreadService.prototype._releaseAwaitingApprovalQuiescenceIfTracked
-		if (revoke) this._revokeAgentDelegation(threadId)
+		const flights = (this as unknown as { _approvalActionFlights?: Set<string> })._approvalActionFlights ?? new Set<string>()
+		if (flights.has(threadId)) return
 		const thread = this.state.allThreads[threadId]
 		if (!thread) { releaseAwaitingApproval.call(this, threadId); return } // should never happen
 
@@ -1571,18 +2101,34 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			params = lastMsg.params
 		}
 		else { releaseAwaitingApproval.call(this, threadId); return }
+		flights.add(threadId)
+		const paused = this._runQuiescenceOfThread.get(threadId)
+		const parentRun = paused
+			? resumeParentRunOwnership(threadId, paused.runId, paused.generation, this._parentRunTokenOfThread, this._agentControlGeneration)
+			: beginParentRunOwnership(threadId, this._parentRunTokenOfThread, this._agentControlGeneration)
+		if (!parentRun) { flights.delete(threadId); return }
+		try {
+			const held = await this._pendingBroker().holdApproval(threadId, parentRun.runId, parentRun.generation, pendingApprovalIdentity(lastMsg))
+			if (!held.ok) { this._warnPendingMutation(held, 'reconcile'); parentRun.deactivate(); parentRun.releaseLatest(); return }
+			if (revoke) this._revokeAgentDelegation(threadId)
 
-		const { name, id, rawParams, mcpServerName } = lastMsg
+			const { name, id, rawParams, mcpServerName } = lastMsg
 
-		const errorMessage = this.toolErrMsgs.rejected
-		this._updateLatestTool(threadId, { role: 'tool', type: 'rejected', params: params, name: name, content: errorMessage, result: null, id, rawParams, mcpServerName, ...(lastMsg.batchId === undefined || lastMsg.batchOrdinal === undefined ? {} : { batchId: lastMsg.batchId, batchOrdinal: lastMsg.batchOrdinal }) })
-		if (lastMsg.batchId) this._terminalizeBatchTail(threadId, lastMsg.batchId, errorMessage)
-		this._setStreamState(threadId, undefined)
-		releaseAwaitingApproval.call(this, threadId)
-		// Restored approval rows deliberately have no live quiescence lease. Once
-		// the user rejects one, wake a durable Queue that was held behind that row.
-		const drain = (this as unknown as { _drainPendingChatInputs?: (threadId: string) => Promise<void> })._drainPendingChatInputs
-		if (drain) void drain.call(this, threadId)
+			const errorMessage = this.toolErrMsgs.rejected
+			this._updateLatestTool(threadId, { role: 'tool', type: 'rejected', params: params, name: name, content: errorMessage, result: null, id, rawParams, mcpServerName, ...(lastMsg.batchId === undefined || lastMsg.batchOrdinal === undefined ? {} : { batchId: lastMsg.batchId, batchOrdinal: lastMsg.batchOrdinal }) })
+			if (lastMsg.batchId) this._terminalizeBatchTail(threadId, lastMsg.batchId, errorMessage)
+			this._setStreamState(threadId, undefined)
+			if (!await this._awaitThreadStorageWrites(threadId)) { this._setStreamState(threadId, { isRunning: 'awaiting_user' }); parentRun.deactivate(); parentRun.releaseLatest(); return }
+			if (!await this._releaseUndeliveredSteers(threadId, parentRun)) { parentRun.deactivate(); parentRun.releaseLatest(); return }
+			releaseAwaitingApproval.call(this, threadId, false)
+			parentRun.deactivate(); parentRun.releaseLatest()
+			// `revoke=false` is the paused-approval branch of abortRunning.  The
+			// replacement Stop-and-Send row is stamped with the next generation, so
+			// draining here (before abort advances the fence) would claim and demote it
+			// as stale.  The caller completes revocation, then the exact Stop flight
+			// drains once under the new generation.
+			if (revoke) { this._applyDeferredExternalThreadRecordIfQuiescent(threadId); void this._drainPendingChatInputs(threadId) }
+		} finally { flights.delete(threadId) }
 	}
 
 	private _computeMCPServerOfToolName(toolName: string) {
@@ -1720,6 +2266,15 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		if (transientControl && transientControl.toolInfo.lifecycle !== 'cancelling') {
 			this._setStreamState(threadId, { ...transientControl.state, toolInfo: { ...transientControl.toolInfo, lifecycle: 'cancelling' } })
 		}
+		// A paused approval still owns the old generation in both renderer and main.
+		// Terminalize and close that exact hold before revocation advances the local
+		// generation; doing this in the opposite order makes resumeParentRunOwnership
+		// reject the cancellation and leaves Stop-and-Send waiting forever.
+		const approvalAtAbort = this.streamState[threadId]?.isRunning === 'awaiting_user' ? this._runQuiescenceOfThread.get(threadId) : undefined
+		if (approvalAtAbort?.releaseAwaitingApproval) {
+			await this.rejectLatestToolRequest(threadId, false)
+			if (this._runQuiescenceOfThread.get(threadId) === approvalAtAbort) throw new Error('pending_approval_cancellation_not_settled')
+		}
 		this._revokeAgentDelegation(threadId)
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return // should never happen
@@ -1741,10 +2296,6 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			if (latestBatchRef) this._terminalizeBatchTailAfter(threadId, latestBatchRef, 'Native tool batch was interrupted before this call could start.')
 			if (receiptId && messageIndex >= 0 && latest?.role === 'tool' && latest.id === id && latest.type === 'running_now') { const receipts = this._cancellingToolReceiptsOfThread.get(threadId) ?? new Map(); receipts.set(receiptId, { toolId: id, batchRef: latestBatchRef, messageIndex }); this._cancellingToolReceiptsOfThread.set(threadId, receipts) }
 			this._updateLatestTool(threadId, { role: 'tool', name: toolName, params: toolParams, id, content, rawParams, type: 'running_now', result: null, mcpServerName, receiptId, startedAt: latest?.role === 'tool' ? latest.startedAt : undefined, lifecycle: 'cancelling', cardStopAvailable: false, cardStopUnavailableReason: 'Waiting for this tool to stop.', ...latestBatchRef })
-		}
-		// reject the tool for the user if relevant
-		else if (this.streamState[threadId]?.isRunning === 'awaiting_user') {
-			this.rejectLatestToolRequest(threadId, false)
 		}
 		else if (this.streamState[threadId]?.isRunning === 'idle') {
 			// do nothing
@@ -2376,6 +2927,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		// narrow object. Keep the new scheduler reachable in that harness without
 		// changing the production instance path.
 		const runNativeBatchRange = (this as unknown as { _runNativeBatchRange?: ChatThreadService['_runNativeBatchRange'] })._runNativeBatchRange ?? ChatThreadService.prototype._runNativeBatchRange
+		const awaitThreadStorageWrites = (this as unknown as { _awaitThreadStorageWrites?: ChatThreadService['_awaitThreadStorageWrites'] })._awaitThreadStorageWrites ?? ChatThreadService.prototype._awaitThreadStorageWrites
+		const currentThreadStorageRaw = (this as unknown as { _currentThreadStorageRaw?: ChatThreadService['_currentThreadStorageRaw'] })._currentThreadStorageRaw
 		const isDelegationAuthorityCurrent = () => !!agentDelegationAuthority?.allowed && this._agentDelegationAuthorityOfThread?.get(threadId) === agentDelegationAuthority && (this._agentControlGeneration.get(threadId) ?? 0) === agentDelegationAuthority.generation
 
 		let nMessagesSent = 0
@@ -2458,7 +3011,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 
 
 		// tool use loop
-		while (shouldSendAnotherMessage) {
+		messageLoop: while (shouldSendAnotherMessage) {
 			if (!isCurrentRun()) return
 			// false by default each iteration
 			shouldSendAnotherMessage = false
@@ -2468,10 +3021,18 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			this._setStreamState(threadId, { isRunning: 'idle', interrupt: idleInterruptor })
 			// A steer becomes model-visible only at this boundary: every preceding tool
 			// receipt has settled and the next provider request has not been assembled.
-			this._promoteSteerAtSafeBoundary?.(threadId, parentRun)
+			await this._promoteSteerAtSafeBoundary(threadId, parentRun)
 			// A synchronous history/event observer can Stop or replace this parent while
 			// the steer is being claimed. Never assemble a provider request after that.
 			if (!isCurrentRun()) return
+			if (!await awaitThreadStorageWrites.call(this, threadId)) {
+				this._setStreamState(threadId, { isRunning: undefined, error: { message: 'This chat changed in another Void window. Review the latest history before continuing.', fullError: null } })
+				return
+			}
+			// Conversion is asynchronous. Remember the exact authoritative B1 bytes it
+			// observed so a child/history mutation that lands during conversion or main
+			// run validation cannot be overtaken by provider dispatch.
+			const preparedAgainstRaw = currentThreadStorageRaw?.call(this, threadId)
 
 			const chatMessages = this.state.allThreads[threadId]?.messages ?? []
 			const { messages, separateSystemMessage } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
@@ -2511,7 +3072,15 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 					}
 				})
 
-				if (!isCurrentRun()) return
+				if (!await awaitThreadStorageWrites.call(this, threadId) || !isCurrentRun()) return
+				const runValidated = await this._pendingBroker().validateHistoryRun(threadId, parentRun.runId, parentRun.generation)
+				if (!runValidated.ok || !isCurrentRun()) { if (!runValidated.ok) this._warnPendingMutation(runValidated, 'reconcile'); return }
+				if (currentThreadStorageRaw && currentThreadStorageRaw.call(this, threadId) !== preparedAgainstRaw) {
+					// Rebuild provider context from the newly durable history. Nothing has been
+					// sent yet, so this is a local retry rather than a provider retry.
+					shouldSendAnotherMessage = true
+					continue messageLoop
+				}
 				const llmCancelToken = this._llmMessageService.sendLLMMessage({
 					messagesType: 'chatMessages',
 					chatMode,
@@ -2604,6 +3173,10 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				if (!validBatch) { this._setStreamState(threadId, { isRunning: undefined, error: { message: 'The provider returned an invalid or duplicate tool-call batch.', fullError: null } }); return }
 				const batchId = toolCalls.length ? generateUuid() : undefined
 				this._addMessageToThread(threadId, { role: 'assistant', displayContent: info.fullText, reasoning: info.fullReasoning, anthropicReasoning: info.anthropicReasoning, ...(batchId ? { toolBatch: { version: 1 as const, batchId, calls: toolCalls } } : {}) })
+				// The provider declaration is the durable authority for every following
+				// tool row. Never begin a mutation/terminal/MCP side effect while its CAS
+				// is unresolved or has lost to another window.
+				if (!await awaitThreadStorageWrites.call(this, threadId) || !isCurrentRun()) return
 
 				this._setStreamState(threadId, { isRunning: 'idle', interrupt: 'not_needed' }) // just decorative for clarity
 
@@ -2704,28 +3277,44 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		}).finally(() => parentRun.releaseLatest())
 	}
 	private _trackParentRun(threadId: string, parentRun: ParentRunOwnership, run: Promise<void>): void {
+		this._childGroupSourceOfThread.set(threadId, Object.freeze({ runId: parentRun.runId, generation: parentRun.generation }))
 		const wrapped = this._wrapRunAgentToNotify(run, threadId, parentRun)
 		let releaseAwaitingApproval!: () => void
 		const awaitingApprovalSettled = new Promise<void>(resolve => releaseAwaitingApproval = resolve)
-		const settled = wrapped.then(() => undefined, () => undefined).finally(() => {
+		const settled = wrapped.then(() => undefined, () => undefined).finally(async () => {
 			const current = this._runQuiescenceOfThread.get(threadId)
-			if (current?.runId === parentRun.runId && this.streamState[threadId]?.isRunning === 'awaiting_user') {
+			// Final assistant/tool/child rows remain protected by the main history-run
+			// owner until their exact CAS tail settles.  A foreign writer or destructive
+			// transaction cannot overtake the terminal row.
+			await this._awaitThreadStorageWrites(threadId)
+			const latest = this.state.allThreads[threadId]?.messages.at(-1)
+			if (current?.runId === parentRun.runId && latest?.role === 'tool' && latest.type === 'tool_request') {
+				// A continuation CAS can lose before it replaces the persisted approval.
+				// Restore the same paused identity instead of minting a new run against the
+				// retained main owner; the user can retry Approve or Reject exactly once.
+				this._setStreamState(threadId, { isRunning: 'awaiting_user' })
+				this._runQuiescenceOfThread.set(threadId, { runId: parentRun.runId, generation: parentRun.generation, settled: awaitingApprovalSettled, releaseAwaitingApproval })
+				const held = await this._pendingBroker().holdApproval(threadId, parentRun.runId, parentRun.generation, pendingApprovalIdentity(latest))
+				if (!held.ok) {
+					this._warnPendingMutation(held, 'reconcile')
+					return
+				}
 				// `_runChatAgent` has returned, but the approval request remains a
 				// user-owned logical boundary. Hold FIFO input until it is approved,
 				// rejected, or stopped; otherwise a queue drain would reject the row.
-				this._runQuiescenceOfThread.set(threadId, { runId: parentRun.runId, generation: parentRun.generation, settled: awaitingApprovalSettled, releaseAwaitingApproval })
-				this._releaseUndeliveredSteers(threadId, parentRun)
+				if (!await this._releaseUndeliveredSteers(threadId, parentRun, true)) return
 				return
 			}
 			// A steer that did not reach a valid tool boundary belongs to the normal
 			// FIFO queue once its target parent is truly quiescent. It must never be
 			// silently attached to a replacement parent.
-			this._releaseUndeliveredSteers(threadId, parentRun)
-			if (current?.runId === parentRun.runId) {
-				this._runQuiescenceOfThread.delete(threadId)
-			}
+			// Close the renderer target before awaiting the main-process close. A
+			// reentrant submit after main linearization must observe Queue locally,
+			// while the broker independently converts any stale Steer request.
+			if (!await this._releaseUndeliveredSteers(threadId, parentRun)) return
+			if (this._runQuiescenceOfThread.get(threadId)?.runId === parentRun.runId) this._runQuiescenceOfThread.delete(threadId)
 			this._applyDeferredExternalThreadRecordIfQuiescent(threadId)
-			void this._drainPendingChatInputs(threadId)
+			this._wakePendingChatInputs(threadId)
 		})
 		this._runQuiescenceOfThread.set(threadId, { runId: parentRun.runId, generation: parentRun.generation, settled })
 	}
@@ -2736,13 +3325,25 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			return
 		}
 		if (!current.releaseAwaitingApproval) return
-		this._runQuiescenceOfThread.delete(threadId)
-		current.releaseAwaitingApproval()
-		this._releaseUndeliveredSteers(threadId, current)
-		// `drain=false` immediately continues the same logical turn with a
-		// replacement parent run. Keep a deferred remote delete fenced until that
-		// continuation reaches a final quiescence boundary.
-		if (drain) { this._applyDeferredExternalThreadRecordIfQuiescent(threadId); void this._drainPendingChatInputs(threadId) }
+		if (!drain) {
+			this._runQuiescenceOfThread.delete(threadId)
+			current.releaseAwaitingApproval()
+			return
+		}
+		if (current.closing) return
+		current.closing = (async () => {
+			if (!await this._awaitThreadStorageWrites(threadId)) return false
+			return this._releaseUndeliveredSteers(threadId, current)
+		})()
+		void current.closing.then(closed => {
+			if (!closed || this._runQuiescenceOfThread.get(threadId) !== current) return
+			this._runQuiescenceOfThread.delete(threadId)
+			current.releaseAwaitingApproval?.()
+			// `drain=false` immediately continues the same logical turn with a
+			// replacement parent run. Keep a deferred remote delete fenced until that
+			// continuation reaches a final quiescence boundary.
+			this._applyDeferredExternalThreadRecordIfQuiescent(threadId); this._wakePendingChatInputs(threadId)
+		})
 	}
 	/**
 	 * Unit tests that bind an individual public approval method to a minimal
@@ -2795,122 +3396,217 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	private _isAwaitingUser(threadId: string): boolean {
 		return this.streamState[threadId]?.isRunning === 'awaiting_user'
 	}
-	private _releaseUndeliveredSteers(threadId: string, parentRun: Pick<ParentRunOwnership, 'runId' | 'generation'>): void {
-		const items = this._pendingChatInputsOfThread.get(threadId) ?? []
-		let changed = false
-		const next = items.map(item => {
-			if (item.runId !== parentRun.runId || item.generation !== parentRun.generation || (item.phase !== 'steering' && item.phase !== 'claiming')) return item
-			changed = true
-			return this._freezePendingInput({ ...item, mode: 'queue', phase: this._canDeliverPendingChatInput(item) ? 'queued' : 'dormant', runId: undefined, claimId: undefined })
-		})
-		if (changed) this._setPendingChatInputs(threadId, next)
+	private async _releaseUndeliveredSteers(threadId: string, parentRun: Pick<ParentRunOwnership, 'runId' | 'generation'>, retainApproval = false): Promise<boolean> {
+		let attempt = 0
+		let warned = false
+		while (this.state.allThreads[threadId] && !(this as unknown as { _store?: { isDisposed?: boolean } })._store?.isDisposed) {
+			let result: PendingChatInputMutationResult | undefined
+			try {
+				if (!await this._ensurePendingInputBrokerReady(false)) throw new Error('pending_input_broker_unavailable')
+				const childSync = await this._syncActiveChildGroup(threadId, parentRun, true)
+				// No local await may separate the complete child-set acknowledgement from
+				// issuing the exact close. A synchronous child admission event would first
+				// advance the local coordination view; a main-side sync that wins this race
+				// changes the source revision and makes this close retry instead of opening
+				// a parent->child ownership gap.
+				if (childSync.ok) result = await this._pendingBroker().closeRunAndReleaseSteers(threadId, parentRun.runId, parentRun.generation, this._pendingInputAuthority(threadId, parentRun.generation), retainApproval, childSync.identity)
+			} catch { /* retry the exact idempotent close */ }
+			if (result?.ok) {
+				if (!retainApproval && !this._coordinationChildRuns(threadId).length) this._childGroupSourceOfThread.delete(threadId)
+				return true
+			}
+			if (!warned) { this._warnPendingMutation(result ?? { ok: false, reason: 'backend_unavailable' }, 'reconcile'); warned = true }
+			if (result && result.reason !== 'backend_unavailable' && result.reason !== 'not_initialized' && result.reason !== 'append_in_progress') return false
+			const delay = (this as unknown as { _pendingRunCloseRetryDelay?: (attempt: number) => Promise<void> })._pendingRunCloseRetryDelay
+			if (delay) await delay(attempt++)
+			else await new Promise<void>(resolve => setTimeout(resolve, Math.min(2_000, 100 * 2 ** Math.min(attempt++, 5))))
+		}
+		return false
 	}
-	private _steerCanBePromotedInRun(record: PendingChatInputRecord): boolean {
-		// Normal admission resolves file/skill/agent selections and captures a fresh
-		// authority snapshot. A direct in-run append is intentionally restricted to
-		// plain text so it cannot bypass any of those gates.
-		return record.selections.length === 0 && !record.text.includes('$')
+	private _deliveredPendingInputIdsForThread(threadId: string): readonly string[] { return this._deliveredPendingInputIds()[threadId] ?? [] }
+	private async _settleUnappendedClaim(claim: PendingChatInputClaim, result: 'queued' | 'dormant' = 'dormant'): Promise<boolean> {
+		const current = this._findPendingChatInput(claim.record.threadId, claim.record.id)
+		if (!current || current.phase !== 'claiming' || current.claimId !== claim.record.claimId) return false
+		const settled = await this._pendingBroker().settleClaim(claim.record.threadId, claim.record.id, claim.record.claimId!, undefined, result)
+		if (!settled.ok) this._warnPendingMutation(settled, 'reconcile')
+		return settled.ok
 	}
-	private _promoteSteerAtSafeBoundary(threadId: string, parentRun: ParentRunOwnership): boolean {
-		const initialItems = this._pendingChatInputsOfThread.get(threadId) ?? []
-		const undeliveredItems = initialItems.filter(item => {
-			if (!this._hasPersistedPendingInputId(threadId, item.id)) return true
-			return false
-		})
-		if (undeliveredItems.length !== initialItems.length) this._setPendingChatInputs(threadId, undeliveredItems)
-		// `_setPendingChatInputs` emits synchronously. A listener may delete,
-		// reorder, or add records while delivered provenance is being pruned, so
-		// normalization must start from the latest map rather than the stale
-		// pre-event snapshot.
-		const currentUndeliveredItems = undeliveredItems.length === initialItems.length
-			? undeliveredItems
-			: (this._pendingChatInputsOfThread.get(threadId) ?? [])
-		// Normalize every ineligible steer now. Leaving a later attachment-bearing
-		// record in `steering` would strand it if this is the parent's last boundary.
-		let normalized = false
-		const items = currentUndeliveredItems.map(item => {
-			if (item.phase !== 'steering' || item.runId !== parentRun.runId || item.generation !== parentRun.generation) return item
-			if (!this._canDeliverPendingChatInput(item)) { normalized = true; return this._freezePendingInput({ ...item, phase: 'dormant', claimId: undefined }) }
-			if (!this._steerCanBePromotedInRun(item)) { normalized = true; return this._freezePendingInput({ ...item, mode: 'queue', phase: 'queued', runId: undefined, claimId: undefined }) }
-			return item
-		})
-		if (normalized) this._setPendingChatInputs(threadId, items)
-		// `_setPendingChatInputs` emits synchronously. Select only from the latest
-		// map after a listener had a chance to reorder, delete, or insert input.
-		const currentItems = this._pendingChatInputsOfThread.get(threadId) ?? []
-		const record = [...currentItems].sort(comparePendingChatInputs).find(item => item.phase === 'steering' && item.runId === parentRun.runId && item.generation === parentRun.generation)
-		if (!record) return false
-		const claimed = this._claimPendingChatInput(threadId, record.id, 'steering')
-		if (!claimed) return false
-		if (this._hasPersistedPendingInputId(threadId, claimed.id)) { this._finishPendingChatInputClaim(threadId, claimed, 'remove'); return false }
-		if (!parentRun.isActive() || !this._canDeliverPendingChatInput(claimed) || this._findPendingChatInput(threadId, claimed.id)?.claimId !== claimed.claimId) {
-			this._finishPendingChatInputClaim(threadId, claimed, this._canDeliverPendingChatInput(claimed) ? 'queued' : 'dormant')
+	private async _promoteSteerAtSafeBoundary(threadId: string, parentRun: ParentRunOwnership): Promise<boolean> {
+		await this._ensurePendingInputBrokerReady()
+		if (this._pendingNamespaceMutation) return false
+		const claimed = await this._pendingBroker().claimSteerAtBoundary(threadId, parentRun.runId, parentRun.generation, this._pendingInputAuthority(threadId, parentRun.generation), this._deliveredPendingInputIdsForThread(threadId))
+		if (!claimed.ok) { this._warnPendingMutation(claimed, 'reconcile'); return false }
+		const claim = claimed.value
+		if (!claim) return false
+		if (!parentRun.isActive() || !this._canDeliverPendingChatInput(claim.record)) { await this._settleUnappendedClaim(claim, this._canDeliverPendingChatInput(claim.record) ? 'queued' : 'dormant'); return false }
+		const authorized = await this._pendingBroker().authorizeAppend(threadId, claim.record.id, claim.record.claimId!, claim.fingerprint, this._pendingInputAuthority(threadId, parentRun.generation), parentRun.runId, parentRun.generation)
+		if (!authorized.ok) { await this._settleUnappendedClaim(claim); return false }
+		if (!parentRun.isActive() || this._agentControlGeneration.get(threadId) !== parentRun.generation || !this.state.allThreads[threadId] || !this._canDeliverPendingChatInput(claim.record)) {
+			await this._pendingBroker().settleClaim(threadId, claim.record.id, claim.record.claimId!, authorized.value.leaseId, 'dormant')
 			return false
 		}
-		this._addMessageToThread(threadId, { role: 'user', pendingInputId: claimed.id, content: claimed.text, displayContent: claimed.text, selections: [], state: defaultMessageState })
-		this._finishPendingChatInputClaim(threadId, claimed, 'remove')
-		return true
+		if (!await this._awaitThreadStorageWrites(threadId)) { await this._pendingBroker().settleClaim(threadId, claim.record.id, claim.record.claimId!, authorized.value.leaseId, 'dormant'); return false }
+		const inspected = await this._pendingBroker().inspectAppendHistory(threadId, claim.record.id, claim.record.claimId!, authorized.value.leaseId)
+		if (!inspected.ok) { await this._pendingBroker().settleClaim(threadId, claim.record.id, claim.record.claimId!, authorized.value.leaseId, 'dormant'); return false }
+		const beforeAppend = inspected.value
+		if (beforeAppend.kind === 'exact') {
+			const durableThread = this._threadFromBrokerHistoryInspection(threadId, beforeAppend)
+			if (!durableThread || !this._adoptDurablePendingInputThread(threadId, durableThread) || !parentRun.isActive() || this._agentControlGeneration.get(threadId) !== parentRun.generation || !this._canDeliverPendingChatInput(claim.record)) {
+				await this._pendingBroker().settleClaim(threadId, claim.record.id, claim.record.claimId!, authorized.value.leaseId, 'dormant'); return false
+			}
+			const recovered = await this._pendingBroker().verifyHistoryAndSettle(threadId, claim.record.id, claim.record.claimId!, authorized.value.leaseId)
+			const recoveredThread = recovered.ok ? this._threadFromBrokerHistoryInspection(threadId, recovered.value) : undefined
+			if (!recovered.ok || !recoveredThread || !this._adoptDurablePendingInputThread(threadId, recoveredThread)) { await this._pendingBroker().settleClaim(threadId, claim.record.id, claim.record.claimId!, authorized.value.leaseId, 'dormant'); this._scheduleDeliveredPendingReconcile(); return false }
+			return parentRun.isActive() && this._canDeliverPendingChatInput(claim.record)
+		}
+		if (beforeAppend.kind !== 'zero') {
+			await this._pendingBroker().settleClaim(threadId, claim.record.id, claim.record.claimId!, authorized.value.leaseId, 'dormant')
+			await this._clearPendingRowsAfterDurableTombstone(threadId); this._scheduleDeliveredPendingReconcile(); return false
+		}
+		let historyDurable = false
+		try {
+			const latestThread = this._threadFromBrokerHistoryInspection(threadId, beforeAppend)
+			if (latestThread && !this._adoptDurablePendingInputThread(threadId, latestThread)) throw new Error('pending_input_history_recovery_failed')
+			this._addMessageToThread(threadId, { role: 'user', pendingInputId: claim.record.id, pendingInputSelectionsFingerprint: authorized.value.selectionsFingerprint, content: claim.record.text, displayContent: claim.record.text, selections: [...claim.record.selections], state: defaultMessageState })
+			if (!await this._awaitThreadStorageWrites(threadId)) throw new Error('pending_input_history_write_failed')
+			historyDurable = true
+			const verified = await this._pendingBroker().verifyHistoryAndSettle(threadId, claim.record.id, claim.record.claimId!, authorized.value.leaseId)
+			const verifiedThread = verified.ok ? this._threadFromBrokerHistoryInspection(threadId, verified.value) : undefined
+			if (!verified.ok || verified.value.kind !== 'exact' || !verifiedThread || !this._adoptDurablePendingInputThread(threadId, verifiedThread)) throw new Error('pending_input_history_not_durable')
+		} catch {
+			if (!historyDurable) this._removeUnpersistedPendingInputMessage(threadId, claim.record.id)
+			await this._pendingBroker().settleClaim(threadId, claim.record.id, claim.record.claimId!, authorized.value.leaseId, 'dormant')
+			if (historyDurable) this._scheduleDeliveredPendingReconcile()
+			else await this._clearPendingRowsAfterDurableTombstone(threadId)
+			return false
+		}
+		return parentRun.isActive() && this._canDeliverPendingChatInput(claim.record)
 	}
-	private _stopAndSendPendingInput(threadId: string, expectedInput: PendingChatInputRecord, active: ParentRunQuiescence | undefined): void {
+	private _wakePendingChatInputs(threadId: string, expected?: PendingChatInputRecord): void {
+		const stop = expected?.mode === 'stop_and_send' && expected.phase === 'queued'
+			? this._findPendingChatInput(threadId, expected.id)
+			: this.getPendingChatInputs(threadId).find(record => record.mode === 'stop_and_send' && record.phase === 'queued')
+		const active = this._runQuiescenceOfThread.get(threadId)
+		if (!stop) { void this._drainPendingChatInputs(threadId); return }
+		if (active) {
+			if (stop.targetRunId === active.runId && stop.targetGeneration === active.generation) this._stopAndSendPendingInput(threadId, stop, active)
+			// A targetless row or a row bound to an older run is ordinary queued work
+			// behind this exact replacement.  Never retarget a delayed snapshot.
+			return
+		}
+		if (stop.targetChildGeneration !== undefined && stop.targetChildIds?.length) {
+			const activeChildren = this._coordinationChildRuns(threadId)
+			const targetIds = new Set(stop.targetChildIds)
+			const captured = activeChildren.filter(view => view.generation === stop.targetChildGeneration && targetIds.has(view.id))
+			const foreign = activeChildren.some(view => view.generation !== stop.targetChildGeneration || !targetIds.has(view.id))
+			if (captured.length && !foreign) { this._stopAndSendChildInput(threadId, stop); return }
+			// The captured child group already ended. A later child/run must not be
+			// cancelled by this delayed broker event; ordinary Queue ordering holds it.
+			if (activeChildren.length) return
+		}
+		const generation = this._agentControlGeneration.get(threadId) ?? stop.targetGeneration ?? stop.generation
+		if (generation <= stop.generation) this._agentControlGeneration.set(threadId, stop.generation)
+		void this._drainPendingChatInputs(threadId)
+	}
+	private _stopAndSendChildInput(threadId: string, expectedInput: PendingChatInputRecord): void {
+		const expectedFingerprint = pendingChatInputFingerprint(expectedInput)
+		const matchesExpected = (record: PendingChatInputRecord | undefined) => !!record && record.id === expectedInput.id && record.mode === 'stop_and_send' && record.phase === 'queued' && pendingChatInputFingerprint(record) === expectedFingerprint
 		const input = this._findPendingChatInput(threadId, expectedInput.id)
-		if (input !== expectedInput || input.mode !== 'stop_and_send' || input.phase !== 'queued' || !this._canDeliverPendingChatInput(input)) return
-		if (!active) { void this._drainPendingChatInputs(threadId); return }
-		const key = `${threadId}\u0000${active.runId}`
+		if (!matchesExpected(input) || !this._canDeliverPendingChatInput(input!) || input!.targetChildGeneration === undefined || !input!.targetChildIds?.length) return
+		const targetIds = new Set(input!.targetChildIds)
+		const activeChildren = this._coordinationChildRuns(threadId)
+		const captured = activeChildren.filter(view => view.generation === input!.targetChildGeneration && targetIds.has(view.id))
+		if (!captured.length || activeChildren.some(view => view.generation !== input!.targetChildGeneration || !targetIds.has(view.id))) { this._wakePendingChatInputs(threadId, input); return }
+		const key = `${threadId}\u0000child:${input!.targetChildGeneration}:${input!.targetChildIds.join(',')}`
 		if (this._stopAndSendFlights.has(key)) return
 		let completeFlight!: () => void
-		// Publish ownership before invoking abortRunning: abort emits synchronously and
-		// a reentrant listener must observe this sentinel rather than start a second
-		// cancellation for the same parent lease.
 		const flight = new Promise<void>(resolve => completeFlight = resolve)
 		this._stopAndSendFlights.set(key, flight)
 		void (async () => {
 			try {
-				// A delayed Stop-and-Send belonging to A must never interrupt B.
+				const generation = this._agentControlGeneration.get(threadId)
+				if (generation !== undefined && generation !== input!.targetChildGeneration) return
+				if (generation === undefined) this._agentControlGeneration.set(threadId, input!.targetChildGeneration!)
+				await this.abortRunning(threadId)
+				if (this._coordinationChildRuns(threadId).some(view => view.generation === input!.targetChildGeneration && targetIds.has(view.id))) return
+				const record = this._findPendingChatInput(threadId, expectedInput.id)
+				if (!matchesExpected(record) || !this.state.allThreads[threadId] || !this._canDeliverPendingChatInput(record!)) return
+				void this._drainPendingChatInputs(threadId)
+			} catch {
+				// The durable row remains visible and a later child/run event may retry.
+			} finally {
+				completeFlight()
+				if (this._stopAndSendFlights.get(key) === flight) {
+					this._stopAndSendFlights.delete(key)
+					const latest = this._findPendingChatInput(threadId, expectedInput.id)
+					if (latest?.phase === 'queued' && pendingChatInputFingerprint(latest) !== expectedFingerprint) setTimeout(() => this._wakePendingChatInputs(threadId, latest), 0)
+				}
+			}
+		})()
+	}
+	private _stopAndSendPendingInput(threadId: string, expectedInput: PendingChatInputRecord, active: ParentRunQuiescence | undefined): void {
+		const matchesExpected = (record: PendingChatInputRecord | undefined) => !!record && record.id === expectedInput.id && record.mode === 'stop_and_send' && record.phase === 'queued' && pendingChatInputFingerprint(record) === pendingChatInputFingerprint(expectedInput)
+		const input = this._findPendingChatInput(threadId, expectedInput.id)
+		if (!matchesExpected(input) || !this._canDeliverPendingChatInput(input!)) return
+		if (!active || input!.targetRunId !== active.runId || input!.targetGeneration !== active.generation) { this._wakePendingChatInputs(threadId, input); return }
+		const key = `${threadId}\u0000${active.runId}`
+		if (this._stopAndSendFlights.has(key)) return
+		let completeFlight!: () => void
+		const flight = new Promise<void>(resolve => completeFlight = resolve)
+		this._stopAndSendFlights.set(key, flight)
+		void (async () => {
+			const expectedFingerprint = pendingChatInputFingerprint(expectedInput)
+			try {
 				if (this._runQuiescenceOfThread.get(threadId)?.runId !== active.runId) return
 				await this.abortRunning(threadId)
 				await active.settled
 				const record = this._findPendingChatInput(threadId, expectedInput.id)
-				if (record !== expectedInput || record.mode !== 'stop_and_send' || !this.state.allThreads[threadId] || !this._canDeliverPendingChatInput(record)) return
+				if (!matchesExpected(record) || !this.state.allThreads[threadId] || !this._canDeliverPendingChatInput(record!)) return
 				void this._drainPendingChatInputs(threadId)
 			} catch {
-				// Stop is best-effort at this boundary; the retained record stays visible.
+				// Stop is best-effort at this boundary; the authoritative row stays visible.
 			} finally {
 				completeFlight()
-				if (this._stopAndSendFlights.get(key) === flight) this._stopAndSendFlights.delete(key)
+				if (this._stopAndSendFlights.get(key) === flight) {
+					this._stopAndSendFlights.delete(key)
+					// A remote/local Edit or Move can legitimately replace the row while
+					// the exact old parent is stopping. Its snapshot wake was coalesced by
+					// this flight, so re-evaluate only the newer authoritative identity.
+					// Deletion deliberately schedules nothing and the stale payload is
+					// never delivered.
+					const latest = this._findPendingChatInput(threadId, expectedInput.id)
+					if (latest?.phase === 'queued' && pendingChatInputFingerprint(latest) !== expectedFingerprint) setTimeout(() => this._wakePendingChatInputs(threadId, latest), 0)
+				}
 			}
 		})()
 	}
 	private async _drainPendingChatInputs(threadId: string): Promise<void> {
+		await this._ensurePendingInputBrokerReady()
+		if (this._pendingNamespaceMutation) return
+		const childSource = this._childGroupSourceOfThread.get(threadId)
+		if (childSource) {
+			const childSync = await this._syncActiveChildGroup(threadId, childSource)
+			if (!childSync.ok || childSync.identity.childIds.length) return
+			if (this._runQuiescenceOfThread.get(threadId)?.runId !== childSource.runId) this._childGroupSourceOfThread.delete(threadId)
+		}
 		const startingParentRuns = this._startingParentRunOfThread ?? new Map<string, StartingParentRun>()
-		if (this._deletingPendingInputThreads.has(threadId) || this._drainingPendingChatInputs.has(threadId) || this._runQuiescenceOfThread.has(threadId) || startingParentRuns.has(threadId) || this._pendingChatSubmissionOfThread.has(threadId) || this._isAwaitingUser(threadId)) return
+		if (this._deletingPendingInputThreads.has(threadId) || this._drainingPendingChatInputs.has(threadId) || this._runQuiescenceOfThread.has(threadId) || startingParentRuns.has(threadId) || this._pendingChatSubmissionOfThread.has(threadId) || this._isAwaitingUser(threadId) || this._coordinationChildRuns(threadId).length > 0) return
 		this._drainingPendingChatInputs.add(threadId)
 		try {
-			while (!this._deletingPendingInputThreads.has(threadId) && this.state.allThreads[threadId] && !this._runQuiescenceOfThread.has(threadId) && !startingParentRuns.has(threadId) && !this._pendingChatSubmissionOfThread.has(threadId) && !this._isAwaitingUser(threadId)) {
-				const items = this._pendingChatInputsOfThread.get(threadId) ?? []
-				const record = [...items].sort(comparePendingChatInputs).find(item => item.phase === 'queued')
-				if (!record) return
-				if (this._hasPersistedPendingInputId(threadId, record.id)) { this._setPendingChatInputs(threadId, items.filter(item => item.id !== record.id)); continue }
-				if (!this._canDeliverPendingChatInput(record)) { this._setPendingChatInputs(threadId, items.map(item => item.id === record.id ? this._freezePendingInput({ ...item, phase: 'dormant', claimId: undefined }) : item)); continue }
-				const claimed = this._claimPendingChatInput(threadId, record.id, 'queued')
-				if (!claimed) continue
-				if (this._hasPersistedPendingInputId(threadId, claimed.id)) { this._finishPendingChatInputClaim(threadId, claimed, 'remove'); continue }
-				if (!this.state.allThreads[threadId] || !this._canDeliverPendingChatInput(claimed) || this._findPendingChatInput(threadId, claimed.id)?.claimId !== claimed.claimId) return
-				let accepted = false
-				try { accepted = await this._addUserMessageAndStreamResponse({ userMessage: claimed.text, _chatSelections: this._clonePendingSelections(claimed.selections), threadId, pendingInputId: claimed.id, pendingInputClaim: claimed }) }
-				catch { accepted = false }
-				if (!this.state.allThreads[threadId]) return
-				if (this._hasPersistedPendingInputId(threadId, claimed.id)) { this._finishPendingChatInputClaim(threadId, claimed, 'remove'); continue }
-				// A successful admission already owns the user-history append. Remove its
-				// exact claim even if a later owner/trust event arrives, otherwise that
-				// same input could be delivered twice on a future drain.
-				// Failed admission has not written history or called a provider. It becomes
-				// an explicit dormant draft rather than a stranded queued row with no
-				// future drain trigger; the user can resume, edit, or delete it.
-				this._finishPendingChatInputClaim(threadId, claimed, accepted ? 'remove' : 'dormant')
-				if (!accepted) return
-				return
-			}
-		} finally { this._drainingPendingChatInputs.delete(threadId) }
+			if (this._deletingPendingInputThreads.has(threadId) || !this.state.allThreads[threadId]) return
+			const claimed = await this._pendingBroker().claimNextQueued(threadId, this._pendingInputAuthority(threadId), this._deliveredPendingInputIdsForThread(threadId))
+			if (!claimed.ok) { this._warnPendingMutation(claimed, 'reconcile'); return }
+			const claim = claimed.value
+			if (!claim) return
+			if (!this.state.allThreads[threadId] || !this._canDeliverPendingChatInput(claim.record)) { await this._settleUnappendedClaim(claim); return }
+			let accepted = false
+			try { accepted = await this._addUserMessageAndStreamResponse({ userMessage: claim.record.text, _chatSelections: [...claim.record.selections], threadId, pendingInputId: claim.record.id, pendingInputClaim: claim }) }
+			catch { accepted = false }
+			if (!accepted) await this._settleUnappendedClaim(claim)
+		} finally {
+			this._drainingPendingChatInputs.delete(threadId)
+			if (!this.state.allThreads[threadId]) this._scheduleExternalPendingDelete(threadId)
+		}
 	}
 
 	dismissStreamError(threadId: string): void {
@@ -2918,7 +3614,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	}
 
 
-	private async _addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, pending, pendingInputId, pendingInputClaim }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string, pending?: PendingChatSubmissionRecord, pendingInputId?: string, pendingInputClaim?: PendingChatInputRecord }) {
+	private async _addUserMessageAndStreamResponse({ userMessage, _chatSelections, threadId, pending, pendingInputId, pendingInputClaim, messageEdit }: { userMessage: string, _chatSelections?: StagingSelectionItem[], threadId: string, pending?: PendingChatSubmissionRecord, pendingInputId?: string, pendingInputClaim?: PendingChatInputClaim, messageEdit?: UserMessageEditPlan }) {
 		const thread = this.state.allThreads[threadId]
 		if (!thread) return false // should never happen
 		const capturedSelections = [...(_chatSelections ?? thread.state.stagingSelections)]
@@ -2941,25 +3637,44 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			return false;
 		}
 		const priorRun = pending?.priorRun ?? (this.streamState[threadId]?.isRunning ? this.abortRunning(threadId) : undefined)
-		if (!pending && !priorRun) this._revokeAgentDelegation(threadId, true)
-		const turnGeneration = pending?.generation ?? this._agentControlGeneration.get(threadId)
+		// Broker-claimed Queue/Steer/Stop-and-Send rows already carry the exact
+		// generation chosen at durable admission. Revoking again here advances past
+		// that row (most visibly after a paused approval Stop-and-Send) and makes the
+		// just-claimed input stale. Only the legacy non-broker direct-call seam owns a
+		// fresh generation boundary at this point.
+		if (!pending && !pendingInputClaim && !priorRun) this._revokeAgentDelegation(threadId, true)
+		const turnGeneration = pending?.generation ?? pendingInputClaim?.record.generation ?? this._agentControlGeneration.get(threadId)
 		if (turnGeneration === undefined) return false
+		if (pendingInputClaim && !this._agentControlGeneration.has(threadId)) this._agentControlGeneration.set(threadId, turnGeneration)
 		const isCurrentGeneration = () => this._agentControlGeneration.has(threadId) && this._agentControlGeneration.get(threadId) === turnGeneration
 		const isCurrentPendingInput = () => {
 			if (!pendingInputId) return true
-			if (!pendingInputClaim || pendingInputClaim.id !== pendingInputId || pendingInputClaim.threadId !== threadId || pendingInputClaim.phase !== 'claiming' || typeof pendingInputClaim.claimId !== 'string' || !pendingInputClaim.claimId) return false
+			const claimed = pendingInputClaim?.record
+			if (!claimed || claimed.id !== pendingInputId || claimed.threadId !== threadId || claimed.phase !== 'claiming' || typeof claimed.claimId !== 'string' || !claimed.claimId) return false
 			const current = this._findPendingChatInput(threadId, pendingInputId)
 			return current?.phase === 'claiming'
-				&& current.claimId === pendingInputClaim.claimId
-				&& current.generation === pendingInputClaim.generation
-				&& current.ownerProjectRoot === pendingInputClaim.ownerProjectRoot
-				&& current.trustedAtSubmit === pendingInputClaim.trustedAtSubmit
+				&& current.claimId === claimed.claimId
+				&& current.generation === claimed.generation
+				&& current.ownerProjectRoot === claimed.ownerProjectRoot
+				&& current.trustedAtSubmit === claimed.trustedAtSubmit
 				&& this._canDeliverPendingChatInput(current)
-				&& !this._hasPersistedPendingInputId(threadId, pendingInputId)
 		}
 		const isCurrentTurn = () => isCurrentGeneration() && (!pending || this._pendingChatSubmissionOfThread.get(threadId) === pending) && isCurrentPendingInput()
 		if (priorRun) await priorRun
 		if (!isCurrentTurn()) return false
+		if (pendingInputClaim) {
+			if (!await this._awaitThreadStorageWrites(threadId)) { await this._settleUnappendedClaim(pendingInputClaim); return false }
+			const inspected = await this._pendingBroker().inspectAppendHistory(threadId, pendingInputClaim.record.id, pendingInputClaim.record.claimId!, undefined)
+			if (!inspected.ok) { await this._settleUnappendedClaim(pendingInputClaim); return false }
+			const beforePreparation = inspected.value
+			if (beforePreparation.kind === 'exact' || beforePreparation.kind === 'zero' && beforePreparation.envelopeRaw) {
+				const durableThread = this._threadFromBrokerHistoryInspection(threadId, beforePreparation)
+				if (!durableThread || !this._adoptDurablePendingInputThread(threadId, durableThread) || !isCurrentTurn()) return false
+			}
+			else if (beforePreparation.kind !== 'zero') {
+				await this._settleUnappendedClaim(pendingInputClaim); await this._clearPendingRowsAfterDurableTombstone(threadId); this._scheduleDeliveredPendingReconcile(); return false
+			}
+		}
 		const owner = this._workspaceContextService.getWorkspace().folders[0]?.uri
 		const roleCatalog = agentDelegationIntent && agentDelegationAllowed ? await this._agentCustomAgentService.getCatalog(owner, owner) : undefined
 		if (!isCurrentTurn()) return false
@@ -3048,20 +3763,100 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const startingParentRuns = this._startingParentRunOfThread ?? new Map<string, StartingParentRun>()
 		const startingParent: StartingParentRun = Object.freeze({ id: generateUuid(), generation: turnGeneration })
 		startingParentRuns.set(threadId, startingParent)
+		const parentRun = beginParentRunOwnership(threadId, this._parentRunTokenOfThread, this._agentControlGeneration)
+		let parentRunStarted = false
 		try {
-			if (pending && !this._settlePendingChatSubmission(pending, true)) return false
+			const claimedRecord = pendingInputClaim?.record
+			const directAuthorized = !claimedRecord ? await this._pendingBroker().authorizeDirectHistoryAppend(threadId, instructions, currSelns, parentRun.runId, parentRun.generation) : undefined
+			if (directAuthorized && !directAuthorized.ok) return false
+			if (pending && !this._settlePendingChatSubmission(pending, true)) { if (directAuthorized?.ok) await this._pendingBroker().abandonDirectHistoryAppend(threadId, directAuthorized.value.leaseId); return false }
 			// A direct pending receipt is intentionally removed by settlement above.
 			// Queue admission has a separate exact-claim/provenance fence that must
 			// remain current through the final history append boundary.
 			if (!isCurrentGeneration() || !isCurrentPendingInput() || !this.state.allThreads[threadId]) return false
-			const userHistoryElt: ChatMessage = { role: 'user', ...(pendingInputId ? { pendingInputId } : {}), content: userMessageContent, displayContent: instructions, selections: currSelns, state: defaultMessageState }
-			this._addMessageToThread(threadId, userHistoryElt)
+			const authorized = claimedRecord
+				? await this._pendingBroker().authorizeAppend(threadId, claimedRecord.id, claimedRecord.claimId!, pendingInputClaim!.fingerprint, this._pendingInputAuthority(threadId, turnGeneration), parentRun.runId, parentRun.generation)
+				: undefined
+			if (authorized && !authorized.ok) { await this._settleUnappendedClaim(pendingInputClaim!); return false }
+			if (!isCurrentGeneration() || !this.state.allThreads[threadId] || (claimedRecord && !this._canDeliverPendingChatInput(claimedRecord))) {
+				if (authorized?.ok) await this._pendingBroker().settleClaim(threadId, claimedRecord!.id, claimedRecord!.claimId!, authorized.value.leaseId, 'dormant')
+				if (directAuthorized?.ok) await this._pendingBroker().abandonDirectHistoryAppend(threadId, directAuthorized.value.leaseId)
+				return false
+			}
+			const historyInputId = pendingInputId ?? (directAuthorized?.ok ? directAuthorized.value.pendingInputId : undefined)
+			const historySelectionsFingerprint = authorized?.ok ? authorized.value.selectionsFingerprint : directAuthorized?.ok ? directAuthorized.value.selectionsFingerprint : undefined
+			const userHistoryElt: ChatMessage = { role: 'user', ...(historyInputId ? { pendingInputId: historyInputId, ...(historySelectionsFingerprint ? { pendingInputSelectionsFingerprint: historySelectionsFingerprint } : {}) } : {}), content: userMessageContent, displayContent: instructions, selections: currSelns, state: defaultMessageState }
+			let appendedPendingHistory = false
+			let pendingHistoryDurable = false
+			try {
+				if (authorized?.ok) {
+					if (!await this._awaitThreadStorageWrites(threadId)) throw new Error('pending_input_history_prior_write_failed')
+					const inspected = await this._pendingBroker().inspectAppendHistory(threadId, claimedRecord!.id, claimedRecord!.claimId!, authorized.value.leaseId)
+					if (!inspected.ok) throw new Error('pending_input_history_inspection_failed')
+					const beforeAppend = inspected.value
+					if (beforeAppend.kind === 'exact') {
+						const durableThread = this._threadFromBrokerHistoryInspection(threadId, beforeAppend)
+						if (!durableThread || !this._adoptDurablePendingInputThread(threadId, durableThread)) throw new Error('pending_input_history_recovery_failed')
+						pendingHistoryDurable = true
+					}
+					else if (beforeAppend.kind === 'zero') {
+						const durableThread = this._threadFromBrokerHistoryInspection(threadId, beforeAppend)
+						if (durableThread && !this._adoptDurablePendingInputThread(threadId, durableThread)) throw new Error('pending_input_history_recovery_failed')
+						this._addMessageToThread(threadId, userHistoryElt); appendedPendingHistory = true
+					}
+					else throw new Error('pending_input_history_corrupt')
+					if (!await this._awaitThreadStorageWrites(threadId)) throw new Error('pending_input_history_write_failed')
+					pendingHistoryDurable = true
+					const verified = await this._pendingBroker().verifyHistoryAndSettle(threadId, claimedRecord!.id, claimedRecord!.claimId!, authorized.value.leaseId)
+					const verifiedThread = verified.ok ? this._threadFromBrokerHistoryInspection(threadId, verified.value) : undefined
+					if (!verified.ok || verified.value.kind !== 'exact' || !verifiedThread || !this._adoptDurablePendingInputThread(threadId, verifiedThread)) throw new Error('pending_input_history_not_durable')
+				}
+				else {
+					if (messageEdit) {
+						const current = this.state.allThreads[threadId]
+						if (!current || current.messages !== messageEdit.messages || current.childActivities !== messageEdit.childActivities || current.messages[messageEdit.messageIdx] !== messageEdit.target) throw new Error('direct_history_edit_changed')
+						const prefix = current.messages.slice(0, messageEdit.messageIdx)
+						const editedThread: ThreadType = {
+							...current,
+							lastModified: new Date().toISOString(),
+							messages: [...prefix, userHistoryElt],
+							childActivities: this._pruneChildActivitiesForMessages(current, prefix),
+							state: { ...current.state, focusedMessageIdx: undefined },
+						}
+						// The direct lease is the ordering fence, while the main-owned CAS is the
+						// stale-writer fence. Do not adopt the speculative edit locally until both
+						// the CAS and authoritative history verification succeed.
+						if (!await this._queueThreadStorageWrite(threadId, editedThread)) throw new Error('direct_history_edit_write_failed')
+					}
+					else this._addMessageToThread(threadId, userHistoryElt)
+					if (directAuthorized?.ok) {
+						if (!messageEdit && !await this._awaitThreadStorageWrites(threadId)) throw new Error('direct_history_write_failed')
+						const verified = await this._pendingBroker().verifyDirectHistoryAndRelease(threadId, directAuthorized.value.leaseId)
+						const verifiedThread = verified.ok ? this._threadFromBrokerHistoryInspection(threadId, verified.value) : undefined
+						if (!verified.ok || verified.value.kind !== 'exact' || !verifiedThread || !this._adoptDurablePendingInputThread(threadId, verifiedThread)) throw new Error('direct_history_not_durable')
+					}
+				}
+			} catch {
+				if (authorized?.ok) {
+					if (appendedPendingHistory && !pendingHistoryDurable) this._removeUnpersistedPendingInputMessage(threadId, claimedRecord!.id)
+					await this._pendingBroker().settleClaim(threadId, claimedRecord!.id, claimedRecord!.claimId!, authorized.value.leaseId, 'dormant')
+					if (pendingHistoryDurable) this._scheduleDeliveredPendingReconcile()
+					else await this._clearPendingRowsAfterDurableTombstone(threadId)
+				}
+				if (directAuthorized?.ok) {
+					await this._pendingBroker().abandonDirectHistoryAppend(threadId, directAuthorized.value.leaseId).catch(() => undefined)
+				}
+				return false
+			}
+			if (authorized?.ok) {
+				if (!isCurrentGeneration() || !this.state.allThreads[threadId] || !this._canDeliverPendingChatInput(claimedRecord!)) return false
+			}
 
-			const parentRun = beginParentRunOwnership(threadId, this._parentRunTokenOfThread, this._agentControlGeneration)
 			const startTrackedParentRun = (this as unknown as { _startTrackedParentRun?: (threadId: string, parentRun: ParentRunOwnership, start: () => Promise<void>) => void })._startTrackedParentRun ?? ChatThreadService.prototype._startTrackedParentRun
 			startTrackedParentRun.call(this, threadId, parentRun,
 				() => this._runChatAgent({ threadId, instructionSnapshot: runtimeSnapshot, agentDelegationAuthority, parentRun, ...capturedModel, }),
 			)
+			parentRunStarted = true
 
 			// scroll to bottom
 			this.state.allThreads[threadId]?.state.mountedInfo?.whenMounted.then(m => {
@@ -3069,7 +3864,14 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			})
 			return true
 		} finally {
-			if (startingParentRuns.get(threadId) === startingParent) startingParentRuns.delete(threadId)
+			if (!parentRunStarted) {
+				parentRun.deactivate(); parentRun.releaseLatest()
+				await this._releaseUndeliveredSteers(threadId, parentRun).catch(() => undefined)
+			}
+			if (startingParentRuns.get(threadId) === startingParent) {
+				startingParentRuns.delete(threadId)
+				if (!parentRunStarted) this._applyDeferredExternalThreadRecordIfQuiescent(threadId)
+			}
 		}
 	}
 
@@ -3115,34 +3917,23 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		return this.beginUserMessageAndStreamResponse({ userMessage, threadId }).settled
 	}
 
-	editUserMessageAndStreamResponse: IChatThreadService['editUserMessageAndStreamResponse'] = async ({ userMessage, messageIdx, threadId }) => {
+	async editUserMessageAndStreamResponse({ userMessage, messageIdx, threadId }: { userMessage: string, messageIdx: number, threadId: string }): Promise<boolean> {
 
 		const thread = this.state.allThreads[threadId]
-		if (!thread) return // should never happen
+		if (!thread) return false // should never happen
 
-		if (thread.messages?.[messageIdx]?.role !== 'user') {
+		const target = thread.messages?.[messageIdx]
+		if (target?.role !== 'user') {
 			throw new Error(`Error: editing a message with role !=='user'`)
 		}
 
-		// get prev and curr selections before clearing the message
-		const currSelns = thread.messages[messageIdx].state.stagingSelections || [] // staging selections for the edited message
-
-		// clear messages up to the index
-		const slicedMessages = thread.messages.slice(0, messageIdx)
-		const childActivities = this._pruneChildActivitiesForMessages(thread, slicedMessages)
-		this._setState({
-			allThreads: {
-				...this.state.allThreads,
-				[thread.id]: {
-					...thread,
-					messages: slicedMessages,
-					childActivities,
-				}
-			}
+		const currSelns = target.state.stagingSelections || []
+		return this._addUserMessageAndStreamResponse({
+			userMessage,
+			_chatSelections: currSelns,
+			threadId,
+			messageEdit: Object.freeze({ messageIdx, messages: thread.messages, childActivities: thread.childActivities, target }),
 		})
-
-		// re-add the message and stream it
-		this._addUserMessageAndStreamResponse({ userMessage, _chatSelections: currSelns, threadId })
 	}
 
 	// ---------- the rest ----------
@@ -3466,45 +4257,64 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	}
 
 
-	deleteThread(threadId: string): void {
-		if (this._deletingPendingInputThreads.has(threadId)) return
+	private _adoptCommittedThreadDeletion(threadId: string): void {
+		if (!this.state.allThreads[threadId]) return
+		const newThreads = { ...this.state.allThreads }; delete newThreads[threadId]
+		this._drainingPendingChatInputs.delete(threadId); this._runQuiescenceOfThread.get(threadId)?.releaseAwaitingApproval?.(); this._runQuiescenceOfThread.delete(threadId); this._startingParentRunOfThread?.delete(threadId); this._childGroupSourceOfThread.delete(threadId); this._childGroupSyncRevisionOfThread.delete(threadId); this._childGroupSyncTailOfThread.delete(threadId)
+		for (const key of this._stopAndSendFlights.keys()) if (key.startsWith(`${threadId}\u0000`)) this._stopAndSendFlights.delete(key)
+		this._cancelPendingChatSubmission(threadId); this._revokeAgentDelegation(threadId, true); this._parentRunTokenOfThread.delete(threadId); this._cancellingToolReceiptsOfThread.delete(threadId); this._activeToolCardReceiptsOfThread?.delete(threadId); this._agentControlGeneration.delete(threadId); this.clearTransientComposerDraft(threadId); this._deferredExternalThreadKey.delete(threadId); this._agentInstructionSessionOfThread.delete(threadId); this._instructionTurnOfThread.delete(threadId); this._toolsService.invalidateReadReceipts(threadId)
+		this._setState({ ...this.state, allThreads: newThreads })
+	}
+	async deleteThread(threadId: string): Promise<boolean> {
+		if (this._pendingNamespaceMutation || this._deletingPendingInputThreads.has(threadId)) return false
 		this._deletingPendingInputThreads.add(threadId)
+		let brokerLeaseId: string | undefined
+		let storagePlan: ThreadStorageMutationPlan | undefined
+		let storageCommitted = false
+		let recoveryPending = false
 		try {
-			this._setPendingChatInputs(threadId, [])
-			this._drainingPendingChatInputs.delete(threadId)
-			this._runQuiescenceOfThread.get(threadId)?.releaseAwaitingApproval?.()
-			this._runQuiescenceOfThread.delete(threadId)
-			this._startingParentRunOfThread?.delete(threadId)
-			for (const key of this._stopAndSendFlights.keys()) if (key.startsWith(`${threadId}\u0000`)) this._stopAndSendFlights.delete(key)
-			this._cancelPendingChatSubmission(threadId)
-			this._revokeAgentDelegation(threadId, true)
-			this._parentRunTokenOfThread.delete(threadId)
-			this._cancellingToolReceiptsOfThread.delete(threadId)
-			this._activeToolCardReceiptsOfThread?.delete(threadId)
-			this._agentControlGeneration.delete(threadId)
-			this.clearTransientComposerDraft(threadId)
-			this._deferredExternalThreadKey.delete(threadId)
-			const { allThreads: currentThreads } = this.state
-
-			// delete the thread
-			const newThreads = { ...currentThreads };
-			delete newThreads[threadId];
-			this._agentInstructionSessionOfThread.delete(threadId); this._instructionTurnOfThread.delete(threadId)
-			this._toolsService.invalidateReadReceipts(threadId)
-
-			// store the updated threads
-			this._storeAllThreads(newThreads);
-			this._setState({ ...this.state, allThreads: newThreads })
-		} finally { this._deletingPendingInputThreads.delete(threadId) }
+			await this._ensurePendingInputBrokerReady()
+			if (!await this._awaitThreadStorageWrites(threadId)) throw new Error('chat_delete_pending_write_failed')
+			storagePlan = this._buildThreadDeletionPlan(threadId)
+			const deleted = await this._pendingBroker().deleteThreadRecords(threadId, storagePlan.evidence)
+			if (!deleted.ok) return this._warnPendingMutation(deleted, 'clear')
+			brokerLeaseId = deleted.value.leaseId
+			await this._commitThreadStorageMutation(storagePlan, brokerLeaseId)
+			if (!this._isThreadTombstoneDurable(threadId)) throw new Error('chat_delete_storage_readback_failed')
+			storageCommitted = true
+			this._adoptCommittedThreadDeletion(threadId)
+			const finalized = await this._pendingBroker().finalizeThreadDeletion(threadId, brokerLeaseId)
+			if (!finalized.ok) {
+				const outcome = await this._classifyThreadDeletion(threadId, brokerLeaseId)
+				if (outcome !== 'committed') { recoveryPending = true; this._warnPendingMutation(finalized, 'reconcile'); this._scheduleThreadDeletionResolution(threadId, brokerLeaseId, () => { if (storagePlan) this._adoptThreadStorageMutationPlan(storagePlan); this._adoptCommittedThreadDeletion(threadId) }); return false }
+			}
+			return true
+		} catch {
+			if (brokerLeaseId && !storageCommitted) {
+				const outcome = await this._classifyThreadDeletion(threadId, brokerLeaseId)
+				if (outcome === 'committed') { storageCommitted = true; if (storagePlan) this._adoptThreadStorageMutationPlan(storagePlan); this._adoptCommittedThreadDeletion(threadId); return true }
+				if (outcome === 'ambiguous') { recoveryPending = true; this._scheduleThreadDeletionResolution(threadId, brokerLeaseId, () => { if (storagePlan) this._adoptThreadStorageMutationPlan(storagePlan); this._adoptCommittedThreadDeletion(threadId) }) }
+			}
+			return this._warnPendingMutation({ ok: false, reason: 'backend_unavailable' }, 'clear')
+		}
+		finally {
+			if (!recoveryPending) this._deletingPendingInputThreads.delete(threadId)
+			if (!storageCommitted && !recoveryPending) { this._scheduleDeliveredPendingReconcile(); if (this.state.allThreads[threadId]) this._wakePendingChatInputs(threadId) }
+		}
 	}
 	override dispose(): void {
 		for (const threadId of this._pendingChatSubmissionOfThread.keys()) this._cancelPendingChatSubmission(threadId)
 		for (const threadId of Object.keys(this.state.allThreads)) this._revokeAgentDelegation(threadId, true)
-		// Dispose is ordinary shutdown. Keep the durable inbox but revoke all live
-		// claims so a restart presents every item as an explicitly resumable draft.
-		for (const [threadId, records] of this._pendingChatInputsOfThread) this._pendingChatInputsOfThread.set(threadId, records.map(record => this._freezePendingInput({ ...record, phase: 'dormant', claimId: undefined, runId: undefined })))
+		// Electron-main owns exact-session disconnect recovery. This renderer must
+		// not rewrite the shared cache or another window's records during dispose.
 		for (const quiescence of this._runQuiescenceOfThread.values()) quiescence.releaseAwaitingApproval?.()
-		this._agentDelegationAuthorityOfThread.clear(); this._agentControlGeneration.clear(); this._parentRunTokenOfThread.clear(); this._cancellingToolReceiptsOfThread.clear(); this._activeToolCardReceiptsOfThread?.clear(); this._transientComposerDraftOfThread.clear(); this._deferredExternalThreadKey.clear(); this._drainingPendingChatInputs.clear(); this._runQuiescenceOfThread.clear(); this._startingParentRunOfThread?.clear(); this._stopAndSendFlights.clear(); this._deletingPendingInputThreads.clear(); this._storePendingChatInputs(); super.dispose();
+		for (const retry of this._externalPendingDeleteRetries.values()) clearTimeout(retry.handle)
+		if (this._pendingDeliveredReconcileRetry) clearTimeout(this._pendingDeliveredReconcileRetry)
+		this._pendingDeliveredReconcileRetry = undefined
+		if (this._pendingNamespaceFinalizeRetry) clearTimeout(this._pendingNamespaceFinalizeRetry)
+		this._pendingNamespaceFinalizeRetry = undefined; this._pendingNamespaceFinalizeLeaseId = undefined
+		for (const retry of this._pendingThreadMutationRetries.values()) clearTimeout(retry)
+		this._pendingThreadMutationRetries.clear(); this._externalPendingDeleteRetries.clear(); this._agentDelegationAuthorityOfThread.clear(); this._agentControlGeneration.clear(); this._parentRunTokenOfThread.clear(); this._cancellingToolReceiptsOfThread.clear(); this._activeToolCardReceiptsOfThread?.clear(); this._transientComposerDraftOfThread.clear(); this._deferredExternalThreadKey.clear(); this._drainingPendingChatInputs.clear(); this._runQuiescenceOfThread.clear(); this._startingParentRunOfThread?.clear(); this._approvalActionFlights.clear(); this._stopAndSendFlights.clear(); this._deletingPendingInputThreads.clear(); this._childGroupSourceOfThread.clear(); this._childGroupSyncRevisionOfThread.clear(); this._childGroupSyncTailOfThread.clear(); super.dispose();
 	}
 
 	duplicateThread(threadId: string) {

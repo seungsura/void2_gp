@@ -135,6 +135,7 @@ import { IVoidSCMService } from '../../workbench/contrib/void/common/voidSCMType
 import { MCPChannel } from '../../workbench/contrib/void/electron-main/mcpChannel.js';
 import { ControlledSearchFallbackChannel } from '../../workbench/contrib/void/electron-main/controlledSearchFallbackChannel.js';
 import { CONTROLLED_SEARCH_CHANNEL_NAME } from '../../workbench/contrib/void/common/controlledSearchFallback.js';
+import { PendingChatInputBrokerChannel, registerPendingChatInputBrokerChannel } from '../../workbench/contrib/void/electron-main/pendingChatInputBrokerChannel.js';
 /**
  * The main VS Code application. There will only ever be one instance,
  * even if the user starts many instances (e.g. from the command line).
@@ -1258,6 +1259,9 @@ export class CodeApplication extends Disposable {
 
 		const controlledSearchFallbackChannel = new ControlledSearchFallbackChannel();
 		mainProcessElectronServer.registerChannel(CONTROLLED_SEARCH_CHANNEL_NAME, controlledSearchFallbackChannel);
+
+		const pendingChatInputBrokerChannel = disposables.add(new PendingChatInputBrokerChannel(accessor.get(IApplicationStorageMainService) as unknown as IApplicationStorageMainService));
+		disposables.add(registerPendingChatInputBrokerChannel(mainProcessElectronServer, pendingChatInputBrokerChannel, error => this.logService.error('Pending chat input broker disconnect recovery failed', error)));
 
 		// Extension Host Debug Broadcasting
 		const electronExtensionHostDebugBroadcastChannel = new ElectronExtensionHostDebugBroadcastChannel(accessor.get(IWindowsMainService));

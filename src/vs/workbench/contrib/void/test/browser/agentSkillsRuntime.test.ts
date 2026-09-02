@@ -11,7 +11,89 @@ const skillText = (name: string) => `---\nname: ${name}\ndescription: ${name}\n-
 const instructions = () => { const config = projectAgentConfig({ developerInstructions: 'developer' }, undefined, [{ uri: 'file:///home/.codex/config.toml', scope: 'user', status: 'loaded', projectedKeys: ['developer_instructions'] }], 'file:///workspace', 'file:///workspace'); const candidates = [{ uri: 'file:///workspace/AGENTS.md', outcome: Object.freeze({ status: 'bytes' as const, bytes: bytes('agents') }) }]; return resolveAgentInstructions(config, candidates, stableAgentInstructionRevision(config, candidates)); };
 const catalog = () => createSkillCatalog(['one', 'two'].map((name, rank) => ({ source: 'user' as const, rank, root: 'file:///home', skillRoot: `file:///home/${name}`, directoryName: name, bytes: bytes(skillText(name)) })));
 const runtime = (selected = ['one'], window = 10000) => { const value = catalog(); return createAgentRuntimeTurnSnapshot(instructions(), value, skillAdvertisement(value, window), selected.map(name => { const skill = value.skills.find(item => item.identity === name)!; const body = new TextDecoder().decode((['one', 'two'].map((n, rank) => ({ n, rank })).find(item => item.n === name) ? bytes(`---\nname: ${name}\ndescription: ${name}\n---\n---frontmatter-${name}\nbody-${name}\n`) : bytes(''))); return { identity: name, skillRoot: skill.provenance.skillRoot, bodyRevision: skill.bodyRevision, body }; }), { hasModel: true as const, providerName: 'openAI', modelName: 'gpt-4.1', contextWindow: window, reservedOutputTokens: 10, modelSelectionOptions: { reasoningEnabled: true }, selectedModelOverrides: { temperature: .2 } }, true); };
-const useProductionSubmissionLifecycle = (value: any) => { Object.setPrototypeOf(value, ChatThreadService.prototype); value._childToolApprovals ??= new Map(); value._onDidChangeChildToolApprovals ??= { fire() { } }; value._mcpService ??= { getMCPTools: () => [] }; value._toolsService ??= { invalidateReadReceipts(_threadId: string) { } }; value._transientComposerDraftOfThread ??= new Map(); value._pendingChatSubmissionOfThread ??= new Map(); value._onDidChangePendingChatSubmission ??= { fire() { } }; value._parentRunTokenOfThread ??= new Map(); value._deferredExternalThreadKey ??= new Map(); value._runQuiescenceOfThread ??= new Map(); value._startingParentRunOfThread ??= new Map(); value._settingsService.state.globalSettings ??= { chatMode: 'normal' }; return value; };
+const brokerSnapshot = Object.freeze({ namespace: Object.freeze({ profileId: 'fixture-profile', workspaceIdentity: 'fixture-workspace' }), revision: 0, records: Object.freeze([]) });
+const brokerSuccess = <T>(value: T) => Object.freeze({ ok: true as const, snapshot: brokerSnapshot, value });
+let nextDirectInput = 0;
+const durableThreadEnvelope = (value: any, threadId: string): string => {
+	const thread = value.state.allThreads[threadId];
+	return JSON.stringify({
+		version: 1,
+		revision: 1,
+		thread: {
+			...thread,
+			id: threadId,
+			createdAt: thread.createdAt ?? '2026-01-01T00:00:00.000Z',
+			lastModified: thread.lastModified ?? '2026-01-01T00:00:00.000Z',
+			childActivities: thread.childActivities ?? { version: 1, records: [], omitted: 0, retentionSaturated: false },
+			state: { stagingSelections: [], focusedMessageIdx: undefined, linksOfMessageIdx: {}, ...thread.state },
+		},
+	});
+};
+const useProductionSubmissionLifecycle = (value: any) => {
+	Object.setPrototypeOf(value, ChatThreadService.prototype);
+	value._childToolApprovals ??= new Map();
+	value._onDidChangeChildToolApprovals ??= { fire() { } };
+	value._mcpService ??= { getMCPTools: () => [] };
+	value._toolsService ??= { invalidateReadReceipts(_threadId: string) { } };
+	value._transientComposerDraftOfThread ??= new Map();
+	value._pendingChatSubmissionOfThread ??= new Map();
+	value._onDidChangePendingChatSubmission ??= { fire() { } };
+	value._parentRunTokenOfThread ??= new Map();
+	value._deferredExternalThreadKey ??= new Map();
+	value._runQuiescenceOfThread ??= new Map();
+	value._startingParentRunOfThread ??= new Map();
+	value._approvalActionFlights ??= new Set();
+	value._pendingChatInputsOfThread ??= new Map();
+	value._drainingPendingChatInputs ??= new Set();
+	value._deletingPendingInputThreads ??= new Set();
+	value._pendingNamespaceMutation ??= false;
+	value._pendingInputBrokerReady ??= Promise.resolve(true);
+	value._threadStorageAuthoritativeRaw ??= new Map();
+	for (const threadId of Object.keys(value.state.allThreads)) if (!value._threadStorageAuthoritativeRaw.has(threadId)) value._threadStorageAuthoritativeRaw.set(threadId, undefined);
+	value._threadStorageWriteTail ??= new Map();
+	value._threadStorageWriteEpoch ??= new Map();
+	value._childGroupSourceOfThread ??= new Map();
+	value._childGroupSyncRevisionOfThread ??= new Map();
+	value._childGroupSyncTailOfThread ??= new Map();
+	value._onDidChangePendingChatInputs ??= { fire() { } };
+	value._onDidChangeCurrentThread ??= { fire() { } };
+	value._notificationService ??= { notify() { } };
+	value._workspaceContextService ??= { getWorkspace: () => ({ folders: [{ uri: { toString: () => 'file:///workspace' } }] }) };
+	value._workspaceTrustManagementService ??= { isWorkspaceTrusted: () => true };
+	value._setStreamState ??= ((threadId: string, state: unknown) => { value.streamState[threadId] = state; });
+	value._awaitThreadStorageWrites ??= async () => true;
+	value._agentSubagentService ??= { cancelParent() { }, forgetParent() { } };
+	value._agentSubagentService.getRunViews ??= () => [];
+	value._agentSubagentService.getCoordinationRunViews ??= () => [];
+	const directLeases = new Map<string, { leaseId: string; pendingInputId: string; selectionsFingerprint: string }>();
+	value._pendingInputBrokerTestSeam ??= {
+		initializeNamespace: async () => brokerSuccess({ sessionId: 'fixture-session', removeLegacy: false }),
+		reconcileDeliveredPendingInputIds: async () => brokerSuccess(undefined),
+		authorizeDirectHistoryAppend: async (threadId: string) => {
+			const ordinal = ++nextDirectInput;
+			const lease = { leaseId: `fixture-lease-${ordinal}`, pendingInputId: `fixture-input-${ordinal}`, selectionsFingerprint: `fixture-selections-${ordinal}` };
+			directLeases.set(threadId, lease);
+			return brokerSuccess(lease);
+		},
+		verifyDirectHistoryAndRelease: async (threadId: string, leaseId: string) => {
+			const lease = directLeases.get(threadId);
+			const messages = value.state.allThreads[threadId]?.messages ?? [];
+			const exact = messages.filter((message: any) => message.role === 'user' && message.pendingInputId === lease?.pendingInputId && message.pendingInputSelectionsFingerprint === lease?.selectionsFingerprint);
+			if (!lease || lease.leaseId !== leaseId || exact.length !== 1) return Object.freeze({ ok: false as const, reason: 'conflict' as const, snapshot: brokerSnapshot });
+			directLeases.delete(threadId);
+			return brokerSuccess({ kind: 'exact' as const, envelopeRaw: durableThreadEnvelope(value, threadId) });
+		},
+		abandonDirectHistoryAppend: async (threadId: string, leaseId: string) => { if (directLeases.get(threadId)?.leaseId === leaseId) directLeases.delete(threadId); return brokerSuccess(undefined); },
+		claimNextQueued: async () => brokerSuccess(undefined),
+		claimSteerAtBoundary: async () => brokerSuccess(undefined),
+		validateHistoryRun: async () => brokerSuccess(undefined),
+		holdApproval: async () => brokerSuccess(undefined),
+		closeRunAndReleaseSteers: async () => brokerSuccess(undefined),
+	};
+	value._pendingBroker = () => value._pendingInputBrokerTestSeam;
+	value._settingsService.state.globalSettings ??= { chatMode: 'normal' };
+	return value;
+};
 
 suite('Agent Skills runtime paths', () => {
 	test('publishes a bounded pending receipt before deferred instruction admission, promotes exactly once, and restores on cancel', async () => {
@@ -71,16 +153,17 @@ suite('Agent Skills runtime paths', () => {
 		const snapshot = Object.freeze(runtime(['one'])); const thread: any = { messages: [{ role: 'user', content: 'start' }], state: {}, filesWithUserChanges: new Set<string>() }; const prepared: unknown[][] = []; const receivedSnapshots: unknown[] = []; const converterAuthorities: boolean[] = []; const sent: unknown[] = []; const sendAuthorities: boolean[] = []; const streamState: any = {}; let preparation = 0, sends = 0, safeReadWaves = 0, legacyToolCalls = 0;
 		const authority = Object.freeze({ allowed: true, generation: 7 });
 		const receiver: any = { state: { allThreads: { task: thread }, overridesOfModel: {} }, streamState, _agentControlGeneration: new Map([['task', 7]]), _parentRunTokenOfThread: new Map(), _agentDelegationAuthorityOfThread: new Map([['task', authority]]), _settingsService: { state: { globalSettings: { chatMode: 'agent' }, overridesOfModel: {} } }, _setStreamState: (threadId: string, value: any) => streamState[threadId] = value, _convertToLLMMessagesService: { prepareLLMChatMessages: async ({ chatMessages, instructionSnapshot, agentDelegationAllowed }: any) => { assert.strictEqual(chatMessages, thread.messages); receivedSnapshots.push(instructionSnapshot); converterAuthorities.push(agentDelegationAllowed); const messages = [{ role: 'user', content: `prepared-${preparation++}` }]; prepared.push(messages); return { messages, separateSystemMessage: undefined }; } }, _llmMessageService: { sendLLMMessage: (options: any) => { sent.push(options.messages); sendAuthorities.push(options.agentDelegationAllowed); sends++; if (sends === 1) void options.onError({ message: 'transient', fullError: null }); else if (sends === 2) void options.onFinalMessage({ fullText: 'tool', fullReasoning: '', toolCalls: [{ name: 'read_file', id: 'tool-1', rawParams: {} }], anthropicReasoning: null }); else void options.onFinalMessage({ fullText: 'done', fullReasoning: '', anthropicReasoning: null }); return `send-${sends}`; }, abort: () => { } }, _mcpService: { getMCPTools: () => [{ name: 'read_file', mcpServerName: 'local' }] }, async _runParentSafeReadWave(threadId: string, calls: readonly { id: string; name: string; rawParams: Record<string, unknown>; ordinal: number }[], batchId: string, receivedSnapshot: unknown, receivedAuthority: unknown, generation: number, isCurrentRun: () => boolean) { safeReadWaves++; assert.strictEqual(threadId, 'task'); assert.strictEqual(receivedSnapshot, snapshot); assert.strictEqual(Object.isFrozen(receivedSnapshot), true); assert.strictEqual(receivedAuthority, authority); assert.strictEqual(Object.isFrozen(receivedAuthority), true); assert.strictEqual(generation, parentRun.generation); assert.strictEqual(isCurrentRun, parentRun.isActive); assert.strictEqual(isCurrentRun(), true); assert.strictEqual(calls.length, 1); const call = calls[0]; assert.deepStrictEqual({ id: call.id, name: call.name, rawParams: call.rawParams, ordinal: call.ordinal }, { id: 'tool-1', name: 'read_file', rawParams: {}, ordinal: 0 }); return [{ call, batchRef: { batchId, batchOrdinal: call.ordinal } }]; }, _runToolCall: async () => { legacyToolCalls++; return { awaitingUserApproval: false, interrupted: false }; }, _addMessageToThread: (_: string, message: any) => thread.messages.push(message), _metricsService: { capture: () => { } } };
-		const parentRunToken = Symbol('skills-parent-run'); let parentRunActive = true; receiver._parentRunTokenOfThread.set('task', parentRunToken); const isLatestParentRun = () => receiver._parentRunTokenOfThread.get('task') === parentRunToken && receiver._agentControlGeneration.get('task') === 7; const parentRun = { token: parentRunToken, generation: 7, isLatest: isLatestParentRun, isActive: () => parentRunActive && isLatestParentRun(), deactivate: () => { parentRunActive = false; }, releaseLatest: () => { if (isLatestParentRun()) receiver._parentRunTokenOfThread.delete('task'); } };
+		useProductionSubmissionLifecycle(receiver);
+		const parentRunToken = Symbol('skills-parent-run'); let parentRunActive = true; receiver._parentRunTokenOfThread.set('task', parentRunToken); const isLatestParentRun = () => receiver._parentRunTokenOfThread.get('task') === parentRunToken && receiver._agentControlGeneration.get('task') === 7; const parentRun = { token: parentRunToken, runId: 'skills-parent-run', generation: 7, isLatest: isLatestParentRun, isActive: () => parentRunActive && isLatestParentRun(), deactivate: () => { parentRunActive = false; }, releaseLatest: () => { if (isLatestParentRun()) receiver._parentRunTokenOfThread.delete('task'); } };
 		await (ChatThreadService.prototype as any)._runChatAgent.call(receiver, { threadId: 'task', modelSelection: { providerName: 'openAI', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.hasModel ? snapshot.model.modelSelectionOptions : undefined, instructionSnapshot: snapshot, agentDelegationAuthority: authority, parentRun });
 		assert.strictEqual(sends, 3); assert.strictEqual(sent[0], sent[1]); assert.strictEqual(sent[0], prepared[0]); assert.strictEqual(sent[2], prepared[1]); assert.notStrictEqual(prepared[0], prepared[1]); assert.deepStrictEqual(receivedSnapshots, [snapshot, snapshot]); assert.deepStrictEqual(converterAuthorities, [true, true]); assert.deepStrictEqual(sendAuthorities, [true, true, true]); assert.strictEqual(safeReadWaves, 1); assert.strictEqual(legacyToolCalls, 0); assert.strictEqual(snapshot.selected[0].body, skillText('one')); assert.strictEqual(Object.prototype.hasOwnProperty.call(snapshot, 'agentDelegationAllowed'), false);
 
 		const approvalSnapshot = createAgentRuntimeTurnSnapshot(snapshot.instructions, snapshot.catalog, snapshot.advertisement, snapshot.selected, { hasModel: true, providerName: 'openAI', modelName: 'gpt-4.1', contextWindow: 10_000, reservedOutputTokens: 5_000, modelSelectionOptions: { reasoningEnabled: true }, selectedModelOverrides: { contextWindow: 10_000, reservedOutputTokenSpace: 10 } }, true); const persisted = JSON.parse(JSON.stringify(approvalSnapshot)); const pending: any = { role: 'tool', type: 'tool_request', name: 'read_file', params: {}, content: 'approval requested', result: null, id: 'tool-1', rawParams: {}, mcpServerName: undefined }; const approvalThread = (): any => ({ messages: [{ ...pending }], state: { stagingSelections: [], focusedMessageIdx: undefined, linksOfMessageIdx: {}, agentInstructionTurnSnapshot: persisted }, filesWithUserChanges: new Set<string>() });
-		const approvalBase = (approvalThreadValue: any, resume: (options: any) => void): any => ({ _purgeInstructionTurn: () => { }, _workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: { toString: () => 'file:///workspace' } }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => true }, state: { allThreads: { task: approvalThreadValue } }, _parentRunTokenOfThread: new Map<string, symbol>(), _runChatAgent: (options: any) => { resume(options); return Promise.resolve(); }, _updateLatestTool: () => { }, _setStreamState: () => { }, _wrapRunAgentToNotify: () => { }, _settingsService: { state: { overridesOfModel: { openAI: { 'gpt-4.1': { contextWindow: 10_000, reservedOutputTokenSpace: 10 } } } } }, _currentModelSelectionProps: () => ({ modelSelection: { providerName: 'openAI', modelName: 'gpt-4.1' }, modelSelectionOptions: { reasoningEnabled: true } }) });
+		const approvalBase = (approvalThreadValue: any, resume: (options: any) => void): any => useProductionSubmissionLifecycle({ _purgeInstructionTurn: () => { }, _workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: { toString: () => 'file:///workspace' } }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => true }, state: { allThreads: { task: approvalThreadValue } }, streamState: {}, _parentRunTokenOfThread: new Map<string, symbol>(), _runChatAgent: (options: any) => { resume(options); return Promise.resolve(); }, _updateLatestTool: () => { }, _setStreamState: () => { }, _wrapRunAgentToNotify: (promise: Promise<void>) => promise, _startTrackedParentRun: (_threadId: string, _parentRun: unknown, start: () => Promise<void>) => { void start(); }, _settingsService: { state: { globalSettings: { chatMode: 'agent' }, overridesOfModel: { openAI: { 'gpt-4.1': { contextWindow: 10_000, reservedOutputTokenSpace: 10 } } } } }, _currentModelSelectionProps: () => ({ modelSelection: { providerName: 'openAI', modelName: 'gpt-4.1' }, modelSelectionOptions: { reasoningEnabled: true } }) });
 		let sameProcessResumed: any; const liveAuthority = Object.freeze({ allowed: true, generation: 4 }); const sameProcessThread = approvalThread(); const sameProcessReceiver = { ...approvalBase(sameProcessThread, options => sameProcessResumed = options), _instructionTurnOfThread: new Map([['task', approvalSnapshot]]), _agentControlGeneration: new Map([['task', 4]]), _agentDelegationAuthorityOfThread: new Map([['task', liveAuthority]]) };
-		ChatThreadService.prototype.approveLatestToolRequest.call(sameProcessReceiver as never, 'task'); assert.strictEqual(sameProcessResumed.agentDelegationAuthority, liveAuthority);
+		await ChatThreadService.prototype.approveLatestToolRequest.call(sameProcessReceiver as never, 'task'); assert.strictEqual(sameProcessResumed.agentDelegationAuthority, liveAuthority);
 		let restartedResumed: any; const restartedThread = approvalThread(); const restartedReceiver = { ...approvalBase(restartedThread, options => restartedResumed = options), _instructionTurnOfThread: new Map(), _agentControlGeneration: new Map([['task', 4]]), _agentDelegationAuthorityOfThread: new Map([['task', liveAuthority]]) };
-		(ChatThreadService.prototype as any)._restoreInstructionTurns.call(restartedReceiver, restartedReceiver.state.allThreads); const revived = restartedReceiver._instructionTurnOfThread.get('task'); ChatThreadService.prototype.approveLatestToolRequest.call(restartedReceiver, 'task'); assert.notStrictEqual(revived, persisted); assert.strictEqual(restartedResumed.instructionSnapshot, revived); assert.strictEqual(restartedResumed.agentDelegationAuthority, undefined); assert.deepStrictEqual(restartedResumed.modelSelection, { providerName: 'openAI', modelName: 'gpt-4.1' }); assert.strictEqual(restartedResumed.modelSelectionOptions, revived.model.modelSelectionOptions); assert.deepStrictEqual(revived.selected.map((item: any) => item.body), [skillText('one')]);
+		(ChatThreadService.prototype as any)._restoreInstructionTurns.call(restartedReceiver, restartedReceiver.state.allThreads); const revived = restartedReceiver._instructionTurnOfThread.get('task'); await ChatThreadService.prototype.approveLatestToolRequest.call(restartedReceiver, 'task'); assert.notStrictEqual(revived, persisted); assert.strictEqual(restartedResumed.instructionSnapshot, revived); assert.strictEqual(restartedResumed.agentDelegationAuthority, undefined); assert.deepStrictEqual(restartedResumed.modelSelection, { providerName: 'openAI', modelName: 'gpt-4.1' }); assert.strictEqual(restartedResumed.modelSelectionOptions, revived.model.modelSelectionOptions); assert.deepStrictEqual(revived.selected.map((item: any) => item.body), [skillText('one')]);
 	});
 	test('captures model options and overrides before awaiting catalog and skill bodies', async () => {
 		const value = catalog(); const modelA: any = { providerName: 'openAI', modelName: 'gpt-4.1' }; const optionsA: any = { reasoningEnabled: true, reasoningEffort: 'high-A' }; const overridesA: any = { contextWindow: 10_001, reservedOutputTokenSpace: 10 }; const modelB: any = { providerName: 'openAI', modelName: 'gpt-4.1-mini' }; const optionsB: any = { reasoningEnabled: false, reasoningEffort: 'low-B' }; const overridesB: any = { contextWindow: 20_000, reservedOutputTokenSpace: 20 }; let current: any = { modelSelection: modelA, modelSelectionOptions: optionsA }; let resolveCatalog!: () => void; let catalogRequested!: () => void; const catalogReady = new Promise<void>(resolve => { resolveCatalog = resolve; }); const catalogStarted = new Promise<void>(resolve => { catalogRequested = resolve; }); const thread: any = { messages: [], state: { stagingSelections: [] }, filesWithUserChanges: new Set<string>() }; let remembered: any; let provider: any;
