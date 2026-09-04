@@ -840,6 +840,9 @@ export const VoidInputBox2 = forwardRef<HTMLTextAreaElement, InputBox2Props>(fun
 
 			onFocus={onFocus}
 			onBlur={onBlur}
+			onDragOver={useCallback((e: React.DragEvent<HTMLTextAreaElement>) => {
+				e.preventDefault();
+			}, [])}
 
 			disabled={!isEnabled}
 

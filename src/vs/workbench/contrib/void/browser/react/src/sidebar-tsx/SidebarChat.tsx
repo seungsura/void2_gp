@@ -11,6 +11,7 @@ import { ScrollType } from '../../../../../../../editor/common/editorCommon.js';
 
 import { ChatMarkdownRender, ChatMessageLocation, getApplyBoxId } from '../markdown/ChatMarkdownRender.js';
 import { URI } from '../../../../../../../base/common/uri.js';
+import { extractEditorsDropData } from '../../../../../../../platform/dnd/browser/dnd.js';
 import { IDisposable } from '../../../../../../../base/common/lifecycle.js';
 import { ErrorDisplay } from './ErrorDisplay.js';
 import { BlockCode, TextAreaFns, VoidInputBox2, VoidSlider, VoidSwitch } from '../util/inputs.js';
@@ -318,6 +319,128 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
 }) => {
 	const shouldShowStop = showStop ?? isStreaming;
 
+	const accessor = useAccessor();
+	const chatThreadsService = accessor.get('IChatThreadService');
+	const fileService = accessor.get('IFileService');
+	const languageService = accessor.get('ILanguageService');
+
+	const [isDraggingOver, setIsDraggingOver] = useState(false);
+	const dragCounterRef = useRef(0);
+
+	const handleDragEnter = useCallback((e: React.DragEvent) => {
+		e.preventDefault();
+		e.stopPropagation();
+		dragCounterRef.current += 1;
+		setIsDraggingOver(true);
+	}, []);
+
+	const handleDragOver = useCallback((e: React.DragEvent) => {
+		e.preventDefault();
+		e.stopPropagation();
+		e.dataTransfer.dropEffect = 'copy';
+		if (!isDraggingOver) {
+			setIsDraggingOver(true);
+		}
+	}, [isDraggingOver]);
+
+	const handleDragLeave = useCallback((e: React.DragEvent) => {
+		e.preventDefault();
+		e.stopPropagation();
+		dragCounterRef.current -= 1;
+		if (dragCounterRef.current <= 0) {
+			dragCounterRef.current = 0;
+			setIsDraggingOver(false);
+		}
+	}, []);
+
+	const handleDrop = useCallback(async (e: React.DragEvent) => {
+		e.preventDefault();
+		e.stopPropagation();
+		dragCounterRef.current = 0;
+		setIsDraggingOver(false);
+
+		let editors = extractEditorsDropData(e.nativeEvent);
+
+		// Fallback: extract directly if extractEditorsDropData returned empty
+		if (!editors || editors.length === 0) {
+			const fallbackEditors: { resource: URI }[] = [];
+			try {
+				const rawResources = e.dataTransfer.getData('ResourceURLs');
+				if (rawResources) {
+					const parsed: string[] = JSON.parse(rawResources);
+					for (const p of parsed) {
+						fallbackEditors.push({ resource: URI.parse(p) });
+					}
+				}
+			} catch { }
+
+			if (fallbackEditors.length === 0 && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+				for (let i = 0; i < e.dataTransfer.files.length; i++) {
+					const f = e.dataTransfer.files[i];
+					const p = (f as any).path;
+					if (p) {
+						fallbackEditors.push({ resource: URI.file(p) });
+					}
+				}
+			}
+			editors = fallbackEditors;
+		}
+
+		if (!editors || editors.length === 0) return;
+
+		for (const editor of editors) {
+			if (!editor.resource) continue;
+			const uri = editor.resource;
+
+			let newSelection: StagingSelectionItem;
+			try {
+				const stat = await fileService.stat(uri);
+				if (stat.isDirectory) {
+					newSelection = {
+						type: 'Folder',
+						uri: uri,
+						language: undefined,
+						state: undefined,
+					};
+				} else {
+					newSelection = {
+						type: 'File',
+						uri: uri,
+						language: languageService.guessLanguageIdByFilepathOrFirstLine(uri) || '',
+						state: { wasAddedAsCurrentFile: false },
+					};
+				}
+			} catch {
+				newSelection = {
+					type: 'File',
+					uri: uri,
+					language: languageService.guessLanguageIdByFilepathOrFirstLine(uri) || '',
+					state: { wasAddedAsCurrentFile: false },
+				};
+			}
+
+			if (setSelections && selections) {
+				const itemKey = `${newSelection.type}:${newSelection.uri.toString()}`;
+				const existingIdx = selections.findIndex(s => {
+					if (s.type === 'File' || s.type === 'Folder' || s.type === 'CodeSelection') {
+						return `${s.type}:${s.uri.toString()}` === itemKey;
+					}
+					return false;
+				});
+
+				if (existingIdx !== -1) {
+					const next = [...selections];
+					next[existingIdx] = newSelection;
+					setSelections(next);
+				} else {
+					setSelections([...selections, newSelection]);
+				}
+			} else {
+				chatThreadsService.addNewStagingSelection(newSelection);
+			}
+		}
+	}, [extractEditorsDropData, fileService, languageService, setSelections, selections, chatThreadsService]);
+
 	return (
 		<div
 			ref={divRef}
@@ -327,14 +450,24 @@ export const VoidChatArea: React.FC<VoidChatAreaProps> = ({
                 rounded-md
                 bg-void-bg-1
 				transition-all duration-200
-				border border-void-border-3 focus-within:border-void-border-1 hover:border-void-border-1
+				border ${isDraggingOver ? 'border-void-border-1 ring-1 ring-void-border-1' : 'border-void-border-3 focus-within:border-void-border-1 hover:border-void-border-1'}
 				max-h-[80vh] overflow-y-auto
                 ${className}
             `}
 			onClick={(e) => {
 				onClickAnywhere?.()
 			}}
+			onDragEnter={handleDragEnter}
+			onDragOver={handleDragOver}
+			onDragLeave={handleDragLeave}
+			onDrop={handleDrop}
 		>
+			{isDraggingOver && (
+				<div className="absolute inset-0 z-50 rounded-md bg-void-bg-1/90 backdrop-blur-[1px] border-2 border-dashed border-void-border-1 flex flex-col items-center justify-center pointer-events-none transition-all duration-150">
+					<CirclePlus size={24} className="text-void-fg-1 mb-1 animate-pulse" />
+					<span className="text-xs font-medium text-void-fg-1">Drop files or folders to add</span>
+				</div>
+			)}
 			{/* Selections section */}
 			{showSelections && selections && setSelections && (
 				<div aria-disabled={selectionsDisabled} className={selectionsDisabled ? 'pointer-events-none opacity-70' : undefined}>
