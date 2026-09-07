@@ -19,7 +19,7 @@ import { ConvertToLLMMessageService } from '../../browser/convertToLLMMessageSer
 import { ToolsService } from '../../browser/toolsService.js';
 import '../../browser/editCodeService.js';
 import { IEditCodeService } from '../../browser/editCodeServiceInterface.js';
-import { assembleProtectedAgentAuthority, createAgentRuntimeTurnSnapshot, createSkillCatalog, skillAdvertisement } from '../../common/agentSkills.js';
+import { assembleProtectedAgentAuthority, createAgentRuntimeTurnSnapshot, createSkillCatalog, reviveAgentRuntimeTurnSnapshot, skillAdvertisement } from '../../common/agentSkills.js';
 import { projectAgentConfig, resolveAgentInstructions, stableAgentInstructionRevision } from '../../common/agentInstructions.js';
 import { assertCanonicalAgentChildRawUri, readOnlyChildToolNames } from '../../common/agentSubagents.js';
 import { availableTools, captureParentModelToolSnapshot, InternalToolInfo } from '../../common/prompt/prompts.js';
@@ -733,7 +733,37 @@ suite('Void AgentSubagentService', () => {
 		liveSettings.openAI.models[1].isHidden = true; state.optionsOfModelSelection.Chat.openAI['gpt-4.1-mini'].reasoningEnabled = true;
 		await f.service.wait('parent', 1000);
 		assert.strictEqual(f.providerCalls[0].modelSelection.modelName, 'gpt-4.1-mini'); assert.strictEqual(f.providerCalls[0].overridesOfModel.openAI['gpt-4.1-mini'].temperature, .7); assert.strictEqual(f.providerCalls[0].modelSelectionOptions.reasoningEnabled, false);
-		assert.strictEqual(f.converterCalls[0].instructionSnapshot.instructions.developerInstructions, 'developer\n\nrole developer'); assert.strictEqual(f.converterCalls[0].instructionSnapshot.instructions.agentsInstructions, 'agents'); assert.notStrictEqual(f.converterCalls[0].instructionSnapshot.revision, snapshot().revision); assert.strictEqual(f.service.getRunView('parent')?.roleName, 'reader'); assert.strictEqual(typeof f.service.getRunView('parent')?.generation, 'number'); assert.ok(f.events.every((event: any) => typeof event.generation === 'number')); f.service.forgetParent('parent'); assert.strictEqual(f.service.getRunView('parent'), undefined); assert.strictEqual(f.events.some((event: any) => event.removed), true);
+		assert.strictEqual(f.converterCalls[0].instructionSnapshot.instructions.developerInstructions, 'developer'); assert.strictEqual(f.converterCalls[0].instructionSnapshot.instructions.additionalDeveloperInstructions, 'role developer'); assert.ok(assembleProtectedAgentAuthority(f.converterCalls[0].instructionSnapshot).startsWith('developer\n\nrole developer\n\nagents')); assert.strictEqual(f.converterCalls[0].instructionSnapshot.instructions.agentsInstructions, 'agents'); assert.notStrictEqual(f.converterCalls[0].instructionSnapshot.revision, snapshot().revision); assert.strictEqual(f.service.getRunView('parent')?.roleName, 'reader'); assert.strictEqual(typeof f.service.getRunView('parent')?.generation, 'number'); assert.ok(f.events.every((event: any) => typeof event.generation === 'number')); f.service.forgetParent('parent'); assert.strictEqual(f.service.getRunView('parent'), undefined); assert.strictEqual(f.events.some((event: any) => event.removed), true);
+	});
+
+	test('spawns and completes named roles with default parent instructions in both capability profiles', async () => {
+		for (const capabilityProfile of ['read_only', 'inherit_parent_write'] as const) {
+			const role: any = { identity: 'reader', name: 'reader', description: 'Read.', developerInstructions: '읽기 전용\nInspect the project.', capabilityProfile, revision: 'role-1', skillRules: [] };
+			const roles: any = { revision: 'roles', agents: [role], diagnostics: [] };
+			const f = fixture({ customCatalog: roles, send: options => { final(options, 'named completed'); return 'request'; } });
+			const config = projectAgentConfig(undefined, undefined, [{ uri: 'file:///home/.codex/config.toml', scope: 'user', status: 'missing', projectedKeys: [] }], 'file:///workspace', 'file:///workspace');
+			const candidates = [{ uri: 'file:///workspace/AGENTS.md', outcome: { status: 'bytes' as const, bytes: bytes('project instructions') } }];
+			const base = snapshot();
+			const parent = createAgentRuntimeTurnSnapshot(resolveAgentInstructions(config, candidates, stableAgentInstructionRevision(config, candidates)), base.catalog, base.advertisement, [], base.model, true);
+			const before = JSON.stringify(parent);
+			try {
+				const child = await f.service.spawn('parent', 'inspect', parent, 'reader', roles, undefined, undefined, 0, captureParentModelToolSnapshot('agent', [], true), f.broker);
+				assert.strictEqual(typeof child.id, 'string');
+				const waited = await f.service.wait('parent', 1_000);
+				assert.strictEqual(waited.receipt?.summary, 'named completed');
+				assert.strictEqual(f.providerCalls.length, 1);
+				const runtime = f.converterCalls[0].instructionSnapshot;
+				assert.deepStrictEqual(runtime.instructions.config, parent.instructions.config);
+				assert.strictEqual(runtime.instructions.config.developerInstructionsSource, 'default');
+				assert.strictEqual(runtime.instructions.developerInstructions, '');
+				assert.ok(assembleProtectedAgentAuthority(runtime).startsWith('읽기 전용\nInspect the project.\n\nproject instructions'));
+				assert.notStrictEqual(runtime.revision, parent.revision);
+				assert.ok(reviveAgentRuntimeTurnSnapshot(JSON.parse(JSON.stringify(runtime))));
+				const changed = JSON.parse(JSON.stringify(runtime)); changed.instructions.additionalDeveloperInstructions = 'different role';
+				assert.strictEqual(reviveAgentRuntimeTurnSnapshot(changed), undefined);
+				assert.strictEqual(JSON.stringify(parent), before);
+			} finally { f.service.dispose(); }
+		}
 	});
 
 	test('inherits the admitted parent model for effort-only roles despite live settings mutation', async () => {

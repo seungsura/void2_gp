@@ -64,6 +64,8 @@ export type AgentInstructionTurnSnapshot = Readonly<{
 	ownerProjectRoot: string | undefined;
 	runCwd: string | undefined;
 	developerInstructions: string;
+	/** Named-child constraints, separate from the original config and its provenance. */
+	additionalDeveloperInstructions?: string;
 	agentsInstructions: string;
 	provenance: readonly AgentInstructionSourceProvenance[];
 }>;
@@ -247,7 +249,7 @@ const utf8PrefixLength = (bytes: Uint8Array, max: number): number => {
 };
 
 export const assembleAgentInstructionText = (snapshot: AgentInstructionTurnSnapshot): string =>
-	[snapshot.developerInstructions, snapshot.agentsInstructions].filter(Boolean).join('\n\n');
+	[snapshot.developerInstructions, snapshot.additionalDeveloperInstructions, snapshot.agentsInstructions].filter(Boolean).join('\n\n');
 
 /**
  * A named child adds constraints to the already-admitted Task/session authority; it never
@@ -257,14 +259,13 @@ export const assembleAgentInstructionText = (snapshot: AgentInstructionTurnSnaps
 export const appendAgentInstructionDeveloperInstructions = (snapshot: AgentInstructionTurnSnapshot, additionalInstructions: string): AgentInstructionTurnSnapshot => {
 	const parent = reviveAgentInstructionTurnSnapshot(snapshot);
 	if (!parent || typeof additionalInstructions !== 'string' || !additionalInstructions.trim()) throw new Error('agent_instruction_snapshot_invalid');
-	const developerInstructions = [parent.developerInstructions, additionalInstructions].filter(Boolean).join('\n\n');
+	const additionalDeveloperInstructions = [parent.additionalDeveloperInstructions, additionalInstructions].filter(Boolean).join('\n\n');
 	let value = 2166136261;
-	for (const byte of encoder.encode(`${parent.revision}\0${developerInstructions}`)) value = Math.imul(value ^ byte, 16777619);
+	for (const byte of encoder.encode(`${parent.revision}\0${additionalDeveloperInstructions}`)) value = Math.imul(value ^ byte, 16777619);
 	const derived = Object.freeze({
 		...parent,
 		revision: `agents-${(value >>> 0).toString(16)}`,
-		config: Object.freeze({ ...parent.config, developerInstructions }),
-		developerInstructions,
+		additionalDeveloperInstructions,
 	});
 	const revived = reviveAgentInstructionTurnSnapshot(derived);
 	if (!revived) throw new Error('agent_instruction_snapshot_invalid');
@@ -337,6 +338,7 @@ export const reviveAgentInstructionTurnSnapshot = (value: unknown): AgentInstruc
 		|| typeof root.revision !== 'string'
 		|| !root.revision
 		|| typeof root.developerInstructions !== 'string'
+		|| (root.additionalDeveloperInstructions !== undefined && (typeof root.additionalDeveloperInstructions !== 'string' || !root.additionalDeveloperInstructions.trim()))
 		|| typeof root.agentsInstructions !== 'string'
 	) return undefined;
 
@@ -489,6 +491,7 @@ export const reviveAgentInstructionTurnSnapshot = (value: unknown): AgentInstruc
 		ownerProjectRoot: owner as string | undefined,
 		runCwd: cwd as string | undefined,
 		developerInstructions: root.developerInstructions,
+		...(root.additionalDeveloperInstructions === undefined ? {} : { additionalDeveloperInstructions: root.additionalDeveloperInstructions as string }),
 		agentsInstructions: root.agentsInstructions,
 		provenance: Object.freeze(provenance),
 	});

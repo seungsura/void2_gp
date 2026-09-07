@@ -1,7 +1,7 @@
 import assert from 'assert';
 import { parse } from 'smol-toml';
 import { URI } from '../../../../../base/common/uri.js';
-import { DEFAULT_AGENT_DELEGATION_LIMITS, DEFAULT_PROJECT_DOC_MAX_BYTES, agentConfigSourceDescriptors, agentInstructionChain, appendAgentInstructionDeveloperInstructions, parseAgentConfigSource, projectAgentConfig, resolveAgentInstructions, reviveAgentInstructionTurnSnapshot, stableAgentInstructionRevision } from '../../common/agentInstructions.js';
+import { DEFAULT_AGENT_DELEGATION_LIMITS, DEFAULT_PROJECT_DOC_MAX_BYTES, agentConfigSourceDescriptors, agentInstructionChain, appendAgentInstructionDeveloperInstructions, assembleAgentInstructionText, parseAgentConfigSource, projectAgentConfig, resolveAgentInstructions, reviveAgentInstructionTurnSnapshot, stableAgentInstructionRevision } from '../../common/agentInstructions.js';
 
 const encode = (value: string) => new TextEncoder().encode(value);
 const source = (uri: string, value: string) => ({ uri, outcome: Object.freeze({ status: 'bytes' as const, bytes: encode(value) }) });
@@ -194,14 +194,40 @@ suite('AGENTS instruction resolver', () => {
 		);
 		const base = resolveAgentInstructions(roleConfig, [source('file:///workspace/AGENTS.md', 'same-turn agents')], 'base-revision');
 		const derived = appendAgentInstructionDeveloperInstructions(base, 'role developer');
-		assert.strictEqual(derived.developerInstructions, 'developer\n\nrole developer');
-		assert.strictEqual(derived.config.developerInstructions, derived.developerInstructions);
+		assert.strictEqual(derived.developerInstructions, 'developer');
+		assert.strictEqual(derived.additionalDeveloperInstructions, 'role developer');
+		assert.deepStrictEqual(derived.config, base.config);
+		assert.strictEqual(assembleAgentInstructionText(derived), 'developer\n\nrole developer\n\nsame-turn agents');
 		assert.strictEqual(derived.agentsInstructions, base.agentsInstructions);
 		assert.deepStrictEqual(derived.provenance, base.provenance);
 		assert.notStrictEqual(derived.revision, base.revision);
 		assert.strictEqual(Object.isFrozen(derived), true);
 		assert.strictEqual(Object.isFrozen(derived.config), true);
 		assert.strictEqual(reviveAgentInstructionTurnSnapshot(JSON.parse(JSON.stringify(derived)))?.developerInstructions, derived.developerInstructions);
+	});
+
+	test('adds named-role instructions without requiring a parent developer config or changing its provenance', () => {
+		for (const scope of ['user', 'project'] as const) {
+			for (const text of [undefined, '', '[agents]\nmax_depth = 2', 'developer_instructions = ""', 'developer_instructions = "parent developer"']) {
+				const parsed = parseAgentConfigSource(scope, `file:///workspace/${scope}/.codex/config.toml`, text === undefined ? { status: 'missing' } : { status: 'bytes', bytes: encode(text) }, parse);
+				const userMissing = { uri: 'file:///home/.codex/config.toml', scope: 'user' as const, status: 'missing' as const, projectedKeys: [] };
+				const config = projectAgentConfig(scope === 'user' ? parsed.projected : undefined, scope === 'project' ? parsed.projected : undefined, scope === 'user' ? [parsed.provenance] : [userMissing, parsed.provenance], 'file:///workspace', 'file:///workspace');
+				const parent = resolveAgentInstructions(config, [source('file:///workspace/AGENTS.md', 'project instructions')], 'parent-revision');
+				const before = JSON.stringify(parent);
+				const child = appendAgentInstructionDeveloperInstructions(parent, '읽기 전용\nInspect the project.');
+				const nested = appendAgentInstructionDeveloperInstructions(child, 'Nested role');
+				assert.deepStrictEqual(child.config, parent.config);
+				assert.strictEqual(child.developerInstructions, parent.developerInstructions);
+				assert.strictEqual(JSON.stringify(parent), before);
+				assert.strictEqual(assembleAgentInstructionText(nested), [parent.developerInstructions, '읽기 전용\nInspect the project.', 'Nested role', 'project instructions'].filter(Boolean).join('\n\n'));
+				assert.notStrictEqual(child.revision, parent.revision);
+				assert.notStrictEqual(nested.revision, child.revision);
+				assert.deepStrictEqual(reviveAgentInstructionTurnSnapshot(JSON.parse(JSON.stringify(nested))), nested);
+				assert.strictEqual(Object.isFrozen(nested), true);
+				for (const invalid of [null, 1, [], {}, '', ' \n ']) assert.strictEqual(reviveAgentInstructionTurnSnapshot({ ...child, additionalDeveloperInstructions: invalid }), undefined);
+				if (config.developerInstructionsSource === 'default') assert.strictEqual(reviveAgentInstructionTurnSnapshot({ ...child, developerInstructions: 'forged', config: { ...config, developerInstructions: 'forged' } }), undefined);
+			}
+		}
 	});
 
 	test('revives a persisted runtime snapshot and rejects corrupt invariants', () => {

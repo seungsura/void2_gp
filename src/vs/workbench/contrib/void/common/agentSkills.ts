@@ -7,7 +7,7 @@ import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { URI } from '../../../../base/common/uri.js';
 // @ts-ignore -- yaml's browser entry intentionally has no separate declaration file.
 import * as YAMLRuntime from '../../../../../../node_modules/yaml/browser/index.js';
-import { AgentInstructionTurnSnapshot, reviveAgentInstructionTurnSnapshot } from './agentInstructions.js';
+import { AgentInstructionTurnSnapshot, assembleAgentInstructionText, reviveAgentInstructionTurnSnapshot } from './agentInstructions.js';
 const parse: typeof YAML.parse = YAMLRuntime.parse as typeof YAML.parse;
 
 export type SkillSource = 'repository' | 'user' | 'bundled' | 'plugin';
@@ -330,7 +330,7 @@ export const createAgentRuntimeTurnSnapshot = (instructions: AgentInstructionTur
 	if (model.hasModel && (typeof model.providerName !== 'string' || !model.providerName || typeof model.modelName !== 'string' || !model.modelName || !Number.isSafeInteger(model.contextWindow) || model.contextWindow < 0 || !Number.isSafeInteger(model.reservedOutputTokens) || model.reservedOutputTokens < 0 || !options || !overrides || Array.isArray(overrides) || typeof overrides !== 'object')) throw new Error('skill_runtime_model_invalid');
 	const normalizedModel: RuntimeModel = model.hasModel ? freeze({ ...model, modelSelectionOptions: options!, selectedModelOverrides: overrides as Readonly<{ [key: string]: RuntimeJsonValue }>, fingerprint: runtimeModelFingerprint({ ...model, modelSelectionOptions: options!, selectedModelOverrides: overrides as Readonly<{ [key: string]: RuntimeJsonValue }> }) }) : freeze({ hasModel: false, fingerprint: hash(['no-model']) });
 	const advertisement = skillAdvertisement(rebuiltCatalog, normalizedModel.hasModel ? normalizedModel.contextWindow : undefined);
-	const revision = hash([revivedInstructions.revision, rebuiltCatalog.revision, advertisement.text, ...frozenSelected.flatMap(item => [item.identity, item.skillRoot, item.bodyRevision, item.body]), normalizedModel.fingerprint, workspaceTrustedAtAdmission ? 'trusted' : 'untrusted']);
+	const revision = hash([revivedInstructions.revision, rebuiltCatalog.revision, advertisement.text, ...frozenSelected.flatMap(item => [item.identity, item.skillRoot, item.bodyRevision, item.body]), normalizedModel.fingerprint, workspaceTrustedAtAdmission ? 'trusted' : 'untrusted', ...(revivedInstructions.additionalDeveloperInstructions === undefined ? [] : ['role-developer', revivedInstructions.additionalDeveloperInstructions])]);
 	return freeze({ schemaVersion: 2, revision, instructions: revivedInstructions, catalog: rebuiltCatalog, advertisement, selected: frozenSelected, model: normalizedModel, ownerProjectRoot: revivedInstructions.ownerProjectRoot, runCwd: revivedInstructions.runCwd, workspaceTrustedAtAdmission });
 };
 export const reviveAgentRuntimeTurnSnapshot = (value: unknown): AgentRuntimeTurnSnapshot | undefined => {
@@ -382,7 +382,7 @@ export const skillAdvertisement = (catalog: AgentSkillCatalog, contextWindow: nu
 export const selectedSkillIdentityManifest = (snapshot: AgentRuntimeTurnSnapshot): string => snapshot.selected.length
 	? `Selected Skill identities for read_skill_resource (use one exact value):\n${snapshot.selected.map(selection => selection.identity).join('\n')}`
 	: '';
-export const assembleProtectedAgentAuthority = (snapshot: AgentRuntimeTurnSnapshot, includeResourceManifest = true): string => [snapshot.instructions.developerInstructions, snapshot.instructions.agentsInstructions, ...snapshot.selected.map(selection => selection.body), includeResourceManifest ? selectedSkillIdentityManifest(snapshot) : '', snapshot.advertisement.text].filter(Boolean).join('\n\n');
+export const assembleProtectedAgentAuthority = (snapshot: AgentRuntimeTurnSnapshot, includeResourceManifest = true): string => [assembleAgentInstructionText(snapshot.instructions), ...snapshot.selected.map(selection => selection.body), includeResourceManifest ? selectedSkillIdentityManifest(snapshot) : '', snapshot.advertisement.text].filter(Boolean).join('\n\n');
 export const admitProtectedAgentAuthority = (snapshot: AgentRuntimeTurnSnapshot, includeResourceManifest = true): string => {
 	const authority = assembleProtectedAgentAuthority(snapshot, includeResourceManifest);
 	if (!snapshot.model.hasModel) { if (snapshot.selected.length) throw new Error('skill_context_admission_failed'); return authority; }
