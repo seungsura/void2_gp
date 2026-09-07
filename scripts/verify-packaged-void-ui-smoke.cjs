@@ -263,7 +263,8 @@ async function assertSettings(page) {
 	const text = await heading.locator('..').innerText();
 	for (const required of ['Open children', '5', 'Concurrent children', '2', 'Maximum depth', '1', 'project']) if (!text.includes(required)) throw new Error(`Agent delegation settings did not show ${required}.`);
 	const featureOptions = page.getByRole('button', { name: 'Feature Options', exact: true }); await waitVisible(featureOptions, 'Feature Options settings'); await featureOptions.click();
-	for (const label of ['Auto-approve edits', 'Auto-approve terminal', 'Auto-approve MCP tools', 'Auto-accept LLM changes']) { const checkbox = page.getByRole('switch', { name: label, exact: true }); await waitVisible(checkbox, label); if (!(await checkbox.isChecked())) throw new Error(`${label} was not enabled by defaults.`); }
+	for (const label of ['Auto-approve edits', 'Auto-approve terminal', 'Auto-approve MCP tools']) { const checkbox = page.getByRole('switch', { name: label, exact: true }); await waitVisible(checkbox, label); if (!(await checkbox.isChecked())) throw new Error(`${label} was not enabled by defaults.`); }
+	const autoAccept = page.getByRole('switch', { name: 'Auto-accept LLM changes', exact: true }); await waitVisible(autoAccept, 'Auto-accept LLM changes'); if (await autoAccept.isChecked()) throw new Error('Auto-accept LLM changes was enabled by defaults.');
 }
 async function assertFixedAgentOnlyComposer(luna) {
 	const composerOptions = luna.locator('..');
@@ -383,5 +384,8 @@ async function main() {
 	finally { const expected = expectedAssertions(mode); evidence.pass = evidence.assertions.length === expected.length && expected.every((value, index) => evidence.assertions[index] === value) && evidence.errors.length === 0 && evidence.close.attempted && evidence.close.completed; writeEvidence(evidence); }
 	if (!evidence.pass) process.exitCode = 1;
 }
-process.on('unhandledRejection', error => { if (!activeEvidence) return; activeEvidence.pass = false; addError(activeEvidence, 'unhandled-rejection', error); writeEvidence(activeEvidence); process.exitCode = 1; });
-void main().catch(error => { const evidence = activeEvidence ?? newEvidence('fake'); evidence.pass = false; addError(evidence, 'helper', error); writeEvidence(evidence); process.exitCode = 1; });
+module.exports = { assertSettings };
+if (require.main === module) {
+	process.on('unhandledRejection', error => { if (!activeEvidence) return; activeEvidence.pass = false; addError(activeEvidence, 'unhandled-rejection', error); writeEvidence(activeEvidence); process.exitCode = 1; });
+	void main().catch(error => { const evidence = activeEvidence ?? newEvidence('fake'); evidence.pass = false; addError(evidence, 'helper', error); writeEvidence(evidence); process.exitCode = 1; });
+}
