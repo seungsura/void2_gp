@@ -78,6 +78,19 @@ function Get-RuntimeManifest {
 function Get-ProductVersionFromText { param([string]$Text) $v=($Text|ConvertFrom-Json).version;if([string]::IsNullOrWhiteSpace([string]$v)){throw 'product.json has no version.'};[string]$v }
 function Get-CorporateCredentialSourcePath { [IO.Path]::GetFullPath((Join-Path $SourceRoot 'API_KEY')) }
 function Get-CorporateCredentialArtifactPath { [IO.Path]::GetFullPath((Join-Path $ArtifactRoot 'resources\app\.corporate\API_KEY')) }
+function Get-OriginalLicenseSourcePath { [IO.Path]::GetFullPath((Join-Path $SourceRoot 'LICENSE-VS-Code.txt')) }
+function Assert-OriginalLicenseArtifact {
+    $source=Get-OriginalLicenseSourcePath;$artifact=Join-Path $ArtifactRoot 'resources\app\LICENSE-VS-Code.txt'
+    foreach($path in @($source,$artifact)) { if(-not(Test-Path -LiteralPath $path -PathType Leaf)){throw "Original license is missing: $path"};if((Get-Item -LiteralPath $path).Length -le 0){throw "Original license is empty: $path"};Assert-NotReparsePoint $path|Out-Null }
+    if((Get-Sha256File $source) -cne (Get-Sha256File $artifact)){throw 'Artifact original license does not match the source LICENSE-VS-Code.txt bytes.'}
+}
+function Assert-OriginalLicenseArchiveEntry {
+    param([hashtable]$EntriesByPath,[switch]$HistoricalArchive)
+    if($HistoricalArchive){return}
+    $source=Get-OriginalLicenseSourcePath;if(-not(Test-Path -LiteralPath $source -PathType Leaf)){throw "Original license is missing: $source"};if((Get-Item -LiteralPath $source).Length -le 0){throw "Original license is empty: $source"};Assert-NotReparsePoint $source|Out-Null
+    $archivePath='resources/app/LICENSE-VS-Code.txt';if(-not $EntriesByPath.ContainsKey($archivePath) -or $EntriesByPath[$archivePath].FullName -cne $archivePath -or $EntriesByPath[$archivePath].Length -le 0){throw "Portable archive missing or empty original license: $archivePath"}
+    $stream=$EntriesByPath[$archivePath].Open();try{$archiveHash=Get-Sha256Stream $stream}finally{$stream.Dispose()};if($archiveHash -cne (Get-Sha256File $source)){throw 'Portable archive original license does not match the source LICENSE-VS-Code.txt bytes.'}
+}
 function Assert-CorporateCredentialLocation {
     param([string]$Root,[string]$RelativePath,[string]$CandidatePath)
     try {
@@ -118,6 +131,7 @@ function Assert-Artifact {
     $data=Join-Path $ArtifactRoot 'data';if(Test-Path -LiteralPath $data){Assert-NotReparsePoint $data|Out-Null;foreach($bad in @((Join-Path $data 'argv.json'),(Join-Path $data 'user-data'))){if(Test-Path -LiteralPath $bad){throw "Artifact includes generated user data: $bad"}}}
     Assert-X64PeFile $void; $payload=Get-RuntimeManifest
     foreach($x in $payload){if(-not (Test-Path -LiteralPath $x.SourcePath -PathType Leaf)){throw "Manifest artifact missing: $($x.SourcePath)"};if((Get-Item -LiteralPath $x.SourcePath).Length -eq 0){throw "Manifest artifact empty: $($x.SourcePath)"};Assert-X64PeFile $x.SourcePath}
+    Assert-OriginalLicenseArtifact
     $null=Assert-CorporateCredentialArtifactPayload
     [pscustomobject]@{Version=(Get-ProductVersionFromText (Read-Utf8NoBomText $product));PayloadCount=$payload.Count;Manifest=$payload}
 }
@@ -127,6 +141,7 @@ function Assert-PortableArchive {
     try {
         $by=@{};foreach($e in $zip.Entries){$n=Assert-CanonicalArchiveEntryPath $e.FullName;if($by.ContainsKey($n)){throw "Duplicate archive path: $n"};$by[$n]=$e}
         $actual=@($by.Values|ForEach-Object{$_.FullName});foreach($n in @('Void.exe','resources/app/product.json','data/README.txt')){if(-not ($actual -ccontains $n) -or $by[$n].Length -le 0){throw "Portable archive missing or empty: $n"}}
+        Assert-OriginalLicenseArchiveEntry -EntriesByPath $by -HistoricalArchive:$HistoricalArchive
         Assert-CorporateCredentialArchiveEntries -EntriesByPath $by -HistoricalArchive:$HistoricalArchive
         $userData=@($actual|Where-Object{$_ -clike 'data/user-data/*'});if(($actual -ccontains 'data/argv.json') -or $userData.Count -gt 0){throw 'Portable archive contains test user data.'}
         $s=$by['Void.exe'].Open();try{Assert-X64PeStream $s}finally{$s.Dispose()};$payload=Get-RuntimeManifest
