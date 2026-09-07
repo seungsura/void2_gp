@@ -128,7 +128,7 @@ Filename은 declared `name`을 대신하거나 고치지 않습니다. Unknown k
 
 명시적 role model은 parent와 같은 provider에서 현재 보이고 설정돼 있으며 native Agent tool format을 지원해야 합니다. reasoning 값도 그 model이 제공하는 값만 사용할 수 있습니다. 조건을 만족하지 않으면 provider dispatch 전에 role admission이 거부됩니다. model을 생략하면 generic child처럼 parent의 effective model을 상속합니다.
 
-Native Agent tool format을 지원하는 Agent route는 marker가 없어도 generic `spawn_agent`, `wait_agent`, `interrupt_agent` controls를 노출합니다. `@Agent`는 optional generic/named intent이고 selection만으로 child를 자동 시작하지 않습니다. Named role을 고르면 그 turn의 revision-pinned exact intent가 되어 `spawn_agent.agent_type`은 그 exact role이어야 합니다. Unsupported provider format이나 usable model 부재는 history/provider send 전에 visible diagnostic으로 중단합니다.
+Native Agent tool format을 지원하는 Agent route는 marker가 없어도 generic `spawn_agent`, `wait_agent`, `interrupt_agent` controls와 그 turn에 발견한 named custom role catalog를 제공합니다. `@Agent`는 optional generic/named intent이고 selection만으로 child를 자동 시작하지 않습니다. Named role을 고르면 그 turn의 revision-pinned exact intent가 되어 `spawn_agent.agent_type`은 그 exact role이어야 합니다. Marker 없는 turn에서도 parent가 advertised exact `agent_type`으로 named child를 명시적으로 시작할 수 있습니다. Unsupported provider format이나 usable model 부재는 history/provider send 전에 visible diagnostic으로 중단합니다.
 
 Role catalog 또는 selected role revision이 send 전에 바뀌면 stale role로 fail-closed하고 reselect를 요구합니다. Stop, Task reset/purge, delete/replacement와 disposal은 해당 generation authority와 child work를 revoke/cancel합니다. 다른 Chat을 단순히 선택하는 동작이 새 authority를 부여하지 않습니다. Role의 developer instruction은 Task/session developer instruction 뒤에 붙고 기존 AGENTS revision은 유지되며, role Skill body 전체를 읽을 수 있을 때만 child admission을 atomic하게 완료합니다.
 

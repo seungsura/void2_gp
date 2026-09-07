@@ -104,7 +104,7 @@ Exact prompt:
 reviewer custom agent에게 현재 workspace의 최상위 file 이름을 읽기 전용으로 조사하도록 위임하세요. parent가 직접 대신 조사하지 말고 child 결과의 짧은 summary만 알려 주세요.
 ```
 
-Expected: supported native Agent route는 marker 없이 generic controls를 제공하고 parent의 `spawn_agent` call만 child를 시작합니다. Named picker selection을 사용한 turn에서는 `agent_type`이 exact `reviewer`입니다. Spawn receipt 뒤 durable Child Activity card에는 role name, `read_only`와 short identity가 표시됩니다. Parent에는 bounded terminal receipt가 한 번 전달되고 raw child transcript는 복사되지 않습니다. `spawn_agent` UI title은 **Start child Agent**이며 generic approval 또는 MCP card가 아닙니다.
+Expected: supported native Agent route는 marker 없이 generic controls와 discovered named role을 제공하고 parent의 `spawn_agent` call만 child를 시작합니다. Marker 없는 fresh turn에서도 parent가 exact `reviewer` `agent_type`으로 named child를 명시적으로 시작할 수 있으며, named picker selection을 사용한 turn에서도 `agent_type`은 exact `reviewer`입니다. Spawn receipt 뒤 durable Child Activity card에는 role name, `read_only`와 short identity가 표시됩니다. Parent에는 bounded terminal receipt가 한 번 전달되고 raw child transcript는 복사되지 않습니다. `spawn_agent` UI title은 **Start child Agent**이며 generic approval 또는 MCP card가 아닙니다.
 
 Negative variation: 같은 scope에 `name = "reviewer"`인 두 file을 두거나 `sandbox_mode = "workspace-write"`로 바꿉니다. Expected: disabled bounded diagnostic이 보이고 해당 scope identity가 provider dispatch 전에 거부되며 filename으로 name을 보정하거나 permission을 확대하지 않습니다. Valid role을 select한 뒤 file revision을 바꾸고 send하면 stale role reselect diagnostic이 나며 old authority가 재사용되지 않아야 합니다.
 

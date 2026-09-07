@@ -3676,7 +3676,11 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			}
 		}
 		const owner = this._workspaceContextService.getWorkspace().folders[0]?.uri
-		const roleCatalog = agentDelegationIntent && agentDelegationAllowed ? await this._agentCustomAgentService.getCatalog(owner, owner) : undefined
+		// Custom roles are part of the native Agent control surface, rather than an
+		// effect of selecting an Agent chip. A marker still carries exact parent
+		// intent, but a marker-free Agent turn must retain the catalog so a later
+		// explicit spawn_agent(agent_type) can resolve an advertised role.
+		const roleCatalog = agentDelegationAllowed ? await this._agentCustomAgentService.getCatalog(owner, owner) : undefined
 		if (!isCurrentTurn()) return false
 		if (agentSelection?.agentType && (!roleCatalog || roleCatalog.revision !== agentSelection.catalogRevision || roleCatalog.agents.find(role => role.identity === agentSelection.agentType)?.revision !== agentSelection.roleRevision)) {
 			this._setStreamState(threadId, { isRunning: undefined, error: { message: `The selected Agent role '${agentSelection.agentType}' changed or is no longer available. Select it again before sending.`, fullError: null } }); return false
@@ -3742,8 +3746,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const roleAd = roleCatalog ? customAgentAdvertisement(roleCatalog, runtimeModel.hasModel ? Math.min(2_000, Math.max(0, Math.floor(runtimeModel.contextWindow * .01 * 4))) : 2_000) : undefined
 		const delegationLimits = instructionSnapshot.config.agentDelegationLimits
 		if (instructionSnapshot.config.agentDelegationLimitDiagnostics.length) this._notificationService.notify({ severity: Severity.Warning, message: delegationLimits.maxConcurrentThreadsPerSession > delegationLimits.maxAcceptedChildren ? `Agent child concurrency (${delegationLimits.maxConcurrentThreadsPerSession}) exceeds open capacity (${delegationLimits.maxAcceptedChildren}). Edit the config before delegating.` : `Some Agent child-limit settings were invalid. Check the Agent delegation configuration.` })
-		const userMessageContent = agentDelegationIntent && agentDelegationAllowed
-			? `${userMessageContentBase}\n\n[User delegation marker: up to ${delegationLimits.maxAcceptedChildren} generic read-only children are available for this turn, with ${delegationLimits.maxConcurrentThreadsPerSession} running concurrently and maximum depth ${delegationLimits.maxDepth}. Named custom agents admitted for this turn (optional exact agent_type): ${roleAd?.text || 'none'}${roleAd?.omitted ? `; ${roleAd.omitted} omitted` : ''}.${agentSelection?.agentType ? ` For this selected role, call spawn_agent with agent_type=${agentSelection.agentType} exactly.` : ''} Call spawn_agent for delegated tasks, then wait_agent for their results; partial child failures do not prevent your synthesis.]`
+		const userMessageContent = agentDelegationAllowed
+			? `${userMessageContentBase}\n\n[${agentDelegationIntent ? 'User delegation marker' : 'Native Agent controls'}: up to ${delegationLimits.maxAcceptedChildren} generic read-only children are available for this turn, with ${delegationLimits.maxConcurrentThreadsPerSession} running concurrently and maximum depth ${delegationLimits.maxDepth}. Named custom agents admitted for this turn (optional exact agent_type): ${roleAd?.text || 'none'}${roleAd?.omitted ? `; ${roleAd.omitted} omitted` : ''}.${agentSelection?.agentType ? ` For this selected role, call spawn_agent with agent_type=${agentSelection.agentType} exactly.` : ''} Call spawn_agent for delegated tasks, then wait_agent for their results; partial child failures do not prevent your synthesis.]`
 			: userMessageContentBase
 		const currentOwner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
 		if (currentOwner !== runtimeSnapshot.ownerProjectRoot || currentOwner !== runtimeSnapshot.runCwd || this._workspaceTrustManagementService.isWorkspaceTrusted() !== runtimeSnapshot.workspaceTrustedAtAdmission) { this._purgeInstructionTurn(threadId, false); throw new Error('skill_owner_or_trust_changed') }
@@ -3753,7 +3757,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		// capture did not materialize a settings state. Preserve the historical
 		// default-deny policy instead of dereferencing an optional capture.
 		const autoApprove = capturedSettingsState?.globalSettings?.autoApprove ?? {}
-		const agentDelegationAuthority = Object.freeze({ allowed: agentDelegationAllowed, generation: turnGeneration, limits: delegationLimits, runtimeSnapshot, parentTools, autoApprove: Object.freeze({ edits: !!autoApprove.edits, terminal: !!autoApprove.terminal, mcp: !!autoApprove['MCP tools'] }), ...(roleCatalog ? { roles: roleCatalog, settingsState: capturedSettingsState, settingsOfProvider: capturedSettingsOfProvider } : {}) })
+		const agentDelegationAuthority = Object.freeze({ allowed: agentDelegationAllowed, generation: turnGeneration, limits: delegationLimits, runtimeSnapshot, parentTools, autoApprove: Object.freeze({ edits: !!autoApprove.edits, terminal: !!autoApprove.terminal, mcp: !!autoApprove['MCP tools'] }), ...(agentDelegationAllowed && roleCatalog ? { roles: roleCatalog, settingsState: capturedSettingsState, settingsOfProvider: capturedSettingsOfProvider } : {}) })
 		this._agentDelegationAuthorityOfThread.set(threadId, agentDelegationAuthority)
 		this._rememberInstructionTurn(threadId, runtimeSnapshot)
 		// The public pending-receipt event is synchronous. Hold FIFO admission while

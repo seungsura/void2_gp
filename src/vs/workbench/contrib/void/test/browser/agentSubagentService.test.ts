@@ -306,7 +306,7 @@ suite('Void AgentSubagentService', () => {
 		}
 	});
 
-	test('real ChatThread inherited-write spawn routes an auto-approved captured MCP tool without parent contamination', async () => {
+	test('marker-free real ChatThread admission routes an advertised custom role through spawn, wait, and its frozen broker', async () => {
 		const role: any = { identity: 'writer', name: 'writer', description: 'Write.', developerInstructions: 'role developer', model: 'o4-mini', modelReasoningEffort: 'medium', capabilityProfile: 'inherit_parent_write', revision: 'role-1', skillRules: [{ selector: 'demo', enabled: true }] };
 		const roles: any = { revision: 'roles-1', agents: [role], diagnostics: [] }; const capturedMcp: any = { name: 'captured_mcp', description: 'Captured mutation.', mcpServerName: 'server-a', params: {}, schema: { type: 'object' } }; let mcpCalls = 0; let releaseMcp!: (value: any) => void; let markMcpCalled!: () => void; const mcpSettlement = new Promise<any>(resolve => releaseMcp = resolve); const mcpCalled = new Promise<void>(resolve => markMcpCalled = resolve);
 		const f = fixture({ liveSettings: { openAI: { apiKey: 'captured-key', endpoint: 'https://captured.invalid', _didFillInProviderSettings: true, models: [{ modelName: 'gpt-4.1', isHidden: false, type: 'default' }, { modelName: 'o4-mini', isHidden: false, type: 'default' }] } }, customCatalog: roles, send: toolThenFinal({ id: 'captured-call', name: 'captured_mcp', rawParams: { change: 'one' } }) });
@@ -324,10 +324,9 @@ suite('Void AgentSubagentService', () => {
 		receiver._adoptDurablePendingInputThread = () => true;
 		receiver._releaseUndeliveredSteers = async () => { };
 		bindManualApproval(receiver);
-		const selection = { type: 'Agent', label: 'Void application-level read-only', agentType: 'writer', catalogRevision: 'roles-1', roleRevision: 'role-1', state: undefined } as const;
-		await (ChatThreadService.prototype as any)._addUserMessageAndStreamResponse.call(receiver, { userMessage: '$demo inspect', _chatSelections: [selection], threadId: 'parent' });
+		await (ChatThreadService.prototype as any)._addUserMessageAndStreamResponse.call(receiver, { userMessage: '$demo inspect', _chatSelections: [], threadId: 'parent' });
 		assert.strictEqual(directAuthorizations, 1); assert.strictEqual(directVerifications, 1);
-		assert.strictEqual(f.service.getRunView('parent'), undefined); assert.strictEqual(admitted?.allowed, true); assert.strictEqual(receiver.streamState.parent?.toolInfo, undefined);
+		assert.strictEqual(f.service.getRunView('parent'), undefined); assert.strictEqual(admitted?.allowed, true); assert.strictEqual(admitted?.roles, roles); assert.deepStrictEqual(admitted?.settingsState, receiver._settingsService.state); assert.deepStrictEqual(admitted?.settingsOfProvider, f.liveSettings); assert.strictEqual(receiver.streamState.parent?.toolInfo, undefined);
 		const generation = receiver._agentControlGeneration.get('parent'); receiver._agentDelegationAuthorityOfThread.set('parent', admitted);
 		await (ChatThreadService.prototype as any)._runToolCall.call(receiver, 'parent', 'spawn_agent', 'spawn-id', undefined, { preapproved: false, unvalidatedToolParams: { message: '$demo inspect', agent_type: 'writer' } }, snapshot(), admitted, false, undefined, () => true);
 		await Promise.race([mcpCalled, new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('captured_mcp_timeout')), 1_000))]); assert.strictEqual(messages.some(message => message.role === 'tool' && (message.type === 'invalid_params' || /agent_delegation_not_authorized/.test(message.content))), false, JSON.stringify(messages)); const child = f.service.getRunView('parent')!; assert.strictEqual(child.roleName, 'writer'); assert.strictEqual(child.capabilityProfile, 'inherit_parent_write'); assert.ok(f.events.some(event => event.id === child.id)); assert.strictEqual(f.providerCalls[0].modelSelection.modelName, 'o4-mini'); assert.strictEqual(f.providerCalls[0].modelSelectionOptions.reasoningEffort, 'medium'); assert.strictEqual(mcpCalls, 1);
