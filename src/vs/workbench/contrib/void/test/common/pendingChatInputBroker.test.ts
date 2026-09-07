@@ -462,6 +462,7 @@ suite('Void pending chat input main-process broker', () => {
 		assert.ok((await core.holdApproval('window:1', one.value.sessionId, 'task', 'run', 0, { toolId: 'tool-1', name: 'read_file', batchId: 'batch', batchOrdinal: 0 })).ok);
 		assert.ok((await core.closeRunAndReleaseSteers('window:1', one.value.sessionId, 'task', 'run', 0, authority, true)).ok);
 		const queued = await submit(core, 'window:2', two.value.sessionId, 'after approval'); assert.ok(queued.ok);
+		const lateSteer = await submit(core, 'window:1', one.value.sessionId, 'late steer during retained approval', 'steer', 'steering'); assert.ok(lateSteer.ok); assert.strictEqual(lateSteer.value.mode, 'queue'); assert.strictEqual(lateSteer.value.phase, 'queued');
 		const held = await core.claimNextQueued('window:2', two.value.sessionId, 'task', authority, []); assert.ok(held.ok); assert.strictEqual(held.value, undefined); assert.strictEqual(held.snapshot.records[0].phase, 'queued');
 		assert.ok(!(await core.authorizeDirectHistoryAppend('window:2', two.value.sessionId, 'task', 'overtake', [], 'other', 0)).ok);
 		const premature = await core.closeRunAndReleaseSteers('window:1', one.value.sessionId, 'task', 'run', 0, authority); assert.ok(!premature.ok && premature.reason === 'conflict');

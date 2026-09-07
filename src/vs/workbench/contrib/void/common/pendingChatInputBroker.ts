@@ -940,6 +940,7 @@ export class PendingChatInputBrokerCore {
 			const activeExactRun = childHistoryOwner?.kind === 'run'
 				&& childHistoryOwner.sessionId === session.id
 				&& childHistoryOwner.namespaceKey === session.namespaceKey
+				&& childHistoryOwner.approvalKey === undefined
 				&& childHistoryOwner.runId === request.runId
 				&& childHistoryOwner.generation === request.generation;
 			const staleSteer = request.phase === 'steering' && request.generation <= closedGeneration && !activeExactRun;
