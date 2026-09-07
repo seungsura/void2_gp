@@ -1,3 +1,0 @@
-#!/bin/sh
-echo "Void is configured for local-only Git. Push is disabled." >&2
-exit 1
