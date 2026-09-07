@@ -936,7 +936,13 @@ export class PendingChatInputBrokerCore {
 			// A close operation is main-authoritative. If a renderer submitted with a
 			// stale run snapshot after close linearized but before its ACK resumed, keep
 			// the user input by atomically converting it to an ordinary FIFO row.
-			const staleSteer = request.phase === 'steering' && request.generation <= (this.closedRunGenerationOfThread.get(this.runGenerationKey(state, request.threadId)) ?? -1);
+			const closedGeneration = this.closedRunGenerationOfThread.get(this.runGenerationKey(state, request.threadId)) ?? -1;
+			const activeExactRun = childHistoryOwner?.kind === 'run'
+				&& childHistoryOwner.sessionId === session.id
+				&& childHistoryOwner.namespaceKey === session.namespaceKey
+				&& childHistoryOwner.runId === request.runId
+				&& childHistoryOwner.generation === request.generation;
+			const staleSteer = request.phase === 'steering' && request.generation <= closedGeneration && !activeExactRun;
 			const mode: PendingInputMode = staleSteer ? 'queue' : request.mode;
 			const phase: 'queued' | 'steering' = staleSteer ? 'queued' : request.phase;
 			const id = this.uuid();

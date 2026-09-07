@@ -313,6 +313,19 @@ suite('Void pending chat input main-process broker', () => {
 		const stale = await submit(core, 'window:1', init.value.sessionId, 'after close', 'steer', 'steering'); assert.ok(stale.ok); assert.strictEqual(stale.value.mode, 'queue'); assert.strictEqual(stale.value.phase, 'queued'); assert.strictEqual(stale.value.runId, undefined);
 	});
 
+	test('keeps an exact active same-generation steer while rejecting closed run identities', async () => {
+		let id = 0; const storage = new MemoryStorage(); const core = new PendingChatInputBrokerCore(storage, () => 100, () => `id-${++id}`); const init = await initialize(core, 'window:1'); assert.ok(init.ok);
+		const steering = (text: string, runId: string) => core.submit('window:1', { sessionId: init.value.sessionId, threadId: 'task', text, selections: [], mode: 'steer', phase: 'steering', ownerProjectRoot: 'file:///workspace', trustedAtSubmit: true, generation: 0, runId });
+		assert.ok((await core.closeRunAndReleaseSteers('window:1', init.value.sessionId, 'task', 'run-a', 0, authority)).ok);
+		const active = await core.authorizeDirectHistoryAppend('window:1', init.value.sessionId, 'task', 'active B', [], 'run-b', 0); assert.ok(active.ok);
+		const current = await steering('current B', 'run-b'); assert.ok(current.ok); assert.strictEqual(current.value.mode, 'steer'); assert.strictEqual(current.value.phase, 'steering');
+		const lateA = await steering('late A while B active', 'run-a'); assert.ok(lateA.ok); assert.strictEqual(lateA.value.mode, 'queue'); assert.strictEqual(lateA.value.phase, 'queued');
+		storage.storeUser(pendingChatInputThreadStorageKey('task'), historyEnvelope('task', active.value.pendingInputId, 'active B'));
+		assert.ok((await core.verifyDirectHistoryAndRelease('window:1', init.value.sessionId, 'task', active.value.leaseId)).ok);
+		assert.ok((await core.closeRunAndReleaseSteers('window:1', init.value.sessionId, 'task', 'run-b', 0, authority)).ok);
+		const lateAfterClose = await steering('late A after B close', 'run-a'); assert.ok(lateAfterClose.ok); assert.strictEqual(lateAfterClose.value.mode, 'queue'); assert.strictEqual(lateAfterClose.value.phase, 'queued');
+	});
+
 	test('rolls migration storage back on flush failure and imports once on retry', async () => {
 		const legacy = JSON.stringify({ version: 1, records: [{ id: 'legacy', threadId: 'task', text: 'legacy', draft: 'legacy', selections: [], mode: 'queue', order: 0, createdAt: 1, ownerProjectRoot: 'file:///workspace', trustedAtSubmit: true, generation: 0, phase: 'queued' }] });
 		const storage = new MemoryStorage(); storage.failFlushes = 1; const core = new PendingChatInputBrokerCore(storage);
