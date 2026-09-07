@@ -155,7 +155,7 @@ function requestSummary(payload) {
 	const instructions = messages.filter(message => message && (message.role === 'developer' || message.role === 'system')).map(message => contentText(message.content)).join('\n');
 	const userText = messages.filter(message => message?.role === 'user').map(message => contentText(message.content)).join('\n');
 	const tools = Array.isArray(payload?.tools) ? payload.tools.map(tool => typeof tool?.function?.name === 'string' ? tool.function.name : '').filter(Boolean).sort() : [];
-	return { modelIsWire: payload?.model === 'gpt-4.1', hasAgentsMarker: instructions.includes('VOID_SMOKE_AGENTS_MARKER'), hasConfigMarker: instructions.includes('VOID_SMOKE_CONFIG_MARKER'), hasRoleMarker: instructions.includes('VOID_SMOKE_ROLE_MARKER'), looksLikeFixtureChild: instructions.includes('fixture-reader'), taskRequestsTerminal: userText.includes('VOID_SMOKE_TERMINAL'), tools };
+	return { modelIsWire: payload?.model === 'gpt-4.1', hasAgentsMarker: instructions.includes('VOID_SMOKE_AGENTS_MARKER'), hasConfigMarker: instructions.includes('VOID_SMOKE_CONFIG_MARKER'), hasRoleMarker: instructions.includes('VOID_SMOKE_ROLE_MARKER'), looksLikeFixtureChild: instructions.includes('fixture-reader'), taskRequestsTerminal: userText.includes('VOID_SMOKE_TERMINAL'), userText, tools };
 }
 function completionChunk(delta, finishReason = null) { return { id: 'void-smoke', object: 'chat.completion.chunk', created: 0, model: 'gpt-4.1', choices: [{ index: 0, delta, finish_reason: finishReason }] }; }
 function writeSse(response, events) {
@@ -177,13 +177,13 @@ function readJsonRequest(request) {
 	});
 }
 async function startFakeServer(evidence) {
-	let parentPhase = 0; let terminalIssued = false; let childResponse; let childHeldResolve;
+	let parentPhase = 0; let terminalIssued = false; let childResponse; let childHeldResolve; const requestSummaries = [];
 	const childHeld = new Promise(resolve => { childHeldResolve = resolve; });
 	const server = http.createServer(async (request, response) => {
 		try {
 			evidence.transport.requests += 1;
 			if (request.method !== 'POST' || request.url !== '/chat/completions') { response.writeHead(404).end(); return; }
-			const summary = requestSummary(await readJsonRequest(request));
+			const summary = requestSummary(await readJsonRequest(request)); requestSummaries.push(summary);
 			evidence.transport.pathExact = true;
 			evidence.transport.wireModelGpt41 ||= summary.modelIsWire;
 			evidence.transport.parentAgentsMarker ||= summary.hasAgentsMarker;
@@ -212,6 +212,7 @@ async function startFakeServer(evidence) {
 	if (!address || typeof address === 'string') throw new Error('Fake smoke server did not bind ephemeral loopback.');
 	return {
 		endpoint: `http://127.0.0.1:${address.port}`,
+		requestSummaries: () => [...requestSummaries],
 		waitForChild: () => childHeld,
 		releaseChild: () => { if (!childResponse) throw new Error('Child completion was requested before provider request arrived.'); const response = childResponse; childResponse = undefined; writeText(response, 'Fixture reader completed.'); },
 		close: async () => { if (childResponse) { childResponse.destroy(); childResponse = undefined; } server.closeAllConnections?.(); await new Promise(resolve => server.close(() => resolve())); },
@@ -384,7 +385,7 @@ async function main() {
 	finally { const expected = expectedAssertions(mode); evidence.pass = evidence.assertions.length === expected.length && expected.every((value, index) => evidence.assertions[index] === value) && evidence.errors.length === 0 && evidence.close.attempted && evidence.close.completed; writeEvidence(evidence); }
 	if (!evidence.pass) process.exitCode = 1;
 }
-module.exports = { assertSettings };
+module.exports = { assertSettings, attachPageListeners, getChatComposer, launchEnvironment, startFakeServer, waitVisible, writeFixtureWorkspace };
 if (require.main === module) {
 	process.on('unhandledRejection', error => { if (!activeEvidence) return; activeEvidence.pass = false; addError(activeEvidence, 'unhandled-rejection', error); writeEvidence(activeEvidence); process.exitCode = 1; });
 	void main().catch(error => { const evidence = activeEvidence ?? newEvidence('fake'); evidence.pass = false; addError(evidence, 'helper', error); writeEvidence(evidence); process.exitCode = 1; });

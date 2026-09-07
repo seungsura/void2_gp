@@ -1252,6 +1252,7 @@ class SettingsEditorTitleContribution extends Disposable implements IWorkbenchCo
 	private registerSettingsEditorTitleActions() {
 		const registerOpenUserSettingsEditorFromJsonActionDisposables = this._register(new MutableDisposable());
 		const registerOpenUserSettingsEditorFromJsonAction = () => {
+			registerOpenUserSettingsEditorFromJsonActionDisposables.clear();
 			const openUserSettingsEditorWhen = ContextKeyExpr.and(
 				CONTEXT_SETTINGS_EDITOR.toNegated(),
 				ContextKeyExpr.or(
