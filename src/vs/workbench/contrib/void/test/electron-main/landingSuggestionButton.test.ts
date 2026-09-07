@@ -66,7 +66,7 @@ const buildRuntime = async (generatedSidebarPath: string) => {
 suite('Landing suggestion buttons', function () {
 	this.timeout(20_000);
 
-	test('uses native buttons that submit each forced prompt once and only disable for unavailable Chat', async () => {
+	test('uses native buttons that submit each forced prompt once and disables for unavailable Chat or a pending submission', async () => {
 		const root = process.cwd();
 		const sourceSidebarPath = path.join(root, 'src', 'vs', 'workbench', 'contrib', 'void', 'browser', 'react', 'src', 'sidebar-tsx', 'SidebarChat.tsx');
 		const generatedSidebarPath = path.join(root, 'src', 'vs', 'workbench', 'contrib', 'void', 'browser', 'react', 'src2', 'sidebar-tsx', 'SidebarChat.tsx');
@@ -88,7 +88,7 @@ suite('Landing suggestion buttons', function () {
 		assert.strictEqual(occurrences(sourceComponent, 'focus-ring'), 1);
 		assert.strictEqual(occurrences(generatedComponent, 'void-focus-ring'), 1);
 		const sourceCallSite = between(source, 'const initiallySuggestedPromptsHTML =', 'const threadPageInput =');
-		assert.strictEqual(sourceCallSite.trim(), 'const initiallySuggestedPromptsHTML = <LandingSuggestedPrompts onSubmit={onSubmit} disabled={chatModelUnavailable} />');
+		assert.strictEqual(sourceCallSite.trim(), 'const initiallySuggestedPromptsHTML = <LandingSuggestedPrompts onSubmit={onSubmit} disabled={chatModelUnavailable || pendingComposerActionInFlight} />');
 		assert.strictEqual(occurrences(sourceCallSite, 'currentStatusPresentation.sendDisabled'), 0);
 
 		const runtime = await buildRuntime(generatedSidebarPath);
