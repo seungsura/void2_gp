@@ -25,7 +25,7 @@ Expand-Archive .\Void-*-win32-x64-portable.zip .\Void-portable
 
 이 portable은 조직용 연결과 model을 package가 관리합니다. provider나 model을 선택하거나 연결 정보를 입력할 필요가 없습니다. Chat에는 `gpt-5.6-luna`가 표시됩니다. 첫 대화와 도구 결과를 확인한 뒤 중요한 파일 작업을 시작하세요.
 
-초기 Settings에는 edits, terminal, MCP tools와 LLM changes의 자동 승인이 켜져 있습니다. 필요하면 현재 Project의 작업 방식에 맞게 명시적으로 바꾸세요. 연결 오류가 나면 표시된 진단을 기록하고, 같은 요청을 반복하기 전에 원인을 확인하세요.
+초기 Settings에는 edits, terminal, MCP tools의 자동 승인이 켜져 있습니다. LLM 편집 결과의 자동 수락(Auto-accept LLM changes)은 기본으로 꺼져 있으며, 기존에 저장한 설정은 유지됩니다. 필요하면 현재 Project의 작업 방식에 맞게 명시적으로 바꾸세요. 연결 오류가 나면 표시된 진단을 기록하고, 같은 요청을 반복하기 전에 원인을 확인하세요.
 
 ## 4. Agent instructions를 작은 workspace에서 확인
 

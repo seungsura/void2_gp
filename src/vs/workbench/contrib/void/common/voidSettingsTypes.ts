@@ -475,7 +475,7 @@ export const defaultGlobalSettings: GlobalSettings = {
 	includeToolLintErrors: true,
 	isOnboardingComplete: true,
 	disableSystemMessage: false,
-	autoAcceptLLMChanges: true,
+	autoAcceptLLMChanges: false,
 }
 
 export type GlobalSettingName = keyof GlobalSettings

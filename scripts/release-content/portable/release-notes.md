@@ -4,7 +4,7 @@
 
 ## Fixed start
 
-이 portable은 조직용 연결과 model을 package가 관리합니다. provider나 model을 선택하거나 연결 정보를 입력할 필요가 없고 Chat에는 `gpt-5.6-luna`가 표시됩니다. 초기 Settings에는 edits, terminal, MCP tools와 LLM changes의 자동 승인이 켜져 있습니다.
+이 portable은 조직용 연결과 model을 package가 관리합니다. provider나 model을 선택하거나 연결 정보를 입력할 필요가 없고 Chat에는 `gpt-5.6-luna`가 표시됩니다. 초기 Settings에는 edits, terminal, MCP tools의 자동 승인이 켜져 있습니다. LLM 편집 결과의 자동 수락(Auto-accept LLM changes)은 기본으로 꺼져 있으며, 기존에 저장한 설정은 유지됩니다.
 
 ## Native file tools
 

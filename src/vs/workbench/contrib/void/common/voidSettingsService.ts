@@ -366,7 +366,7 @@ export class VoidSettingsService extends Disposable implements IVoidSettingsServ
 			
 			// add autoAcceptLLMChanges feature
 			if (readS.globalSettings.autoAcceptLLMChanges === undefined) {
-				readS.globalSettings.autoAcceptLLMChanges = true;
+				readS.globalSettings.autoAcceptLLMChanges = false;
 				shouldPersistMigration = true
 			}
 		}
