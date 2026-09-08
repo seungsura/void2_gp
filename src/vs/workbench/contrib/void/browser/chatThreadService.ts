@@ -3414,7 +3414,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				const mailbox = this._agentSubagentService.peekParentMailbox(threadId, generation); if (!mailbox.messages.length) { parentRun.deactivate(); parentRun.releaseLatest(); return; }
 				const content = mailbox.messages.join('\n\n'); this._addMessageToThread(threadId, { role: 'user', content, displayContent: content, selections: [], state: defaultMessageState });
 				if (!await this._awaitThreadStorageWrites(threadId) || !parentRun.isActive() || this._pendingChatSubmissionOfThread.has(threadId) || !this._agentSubagentService.ackParentMailbox(threadId, generation, mailbox)) { parentRun.deactivate(); parentRun.releaseLatest(); return; }
-				this._startTrackedParentRun(threadId, parentRun, () => this._runChatAgent({ threadId, instructionSnapshot: authority.runtimeSnapshot, agentDelegationAuthority: authority, parentRun, modelSelection: { providerName: model.providerName as ModelSelection['providerName'], modelName: model.modelName }, modelSelectionOptions: model.modelSelectionOptions as ModelSelectionOptions }));
+				const continuationRun = parentRun;
+				this._startTrackedParentRun(threadId, continuationRun, () => this._runChatAgent({ threadId, instructionSnapshot: authority.runtimeSnapshot, agentDelegationAuthority: authority, parentRun: continuationRun, modelSelection: { providerName: model.providerName as ModelSelection['providerName'], modelName: model.modelName }, modelSelectionOptions: model.modelSelectionOptions as ModelSelectionOptions }));
 			} catch { parentRun?.deactivate(); parentRun?.releaseLatest(); }
 			finally { this._agentMailboxContinuationScheduled.delete(key); }
 		})(), 0);
