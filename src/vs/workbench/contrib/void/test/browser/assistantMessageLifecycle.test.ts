@@ -115,6 +115,9 @@ const prepareRunChatAgentReceiver = (receiver: ParentRunFixture) => {
 	fixture._pendingBroker ??= () => fixture._pendingInputBrokerTestSeam;
 	fixture._promoteSteerAtSafeBoundary ??= async () => false;
 	fixture._awaitThreadStorageWrites ??= async () => true;
+	fixture._agentSubagentService ??= {};
+	fixture._agentSubagentService.peekParentMailbox ??= () => ({ messages: Object.freeze([]), parentMessageCount: 0, completionSequences: Object.freeze([]) });
+	fixture._agentSubagentService.ackParentMailbox ??= () => true;
 	fixture._warnPendingMutation ??= () => false;
 	return fixture;
 };

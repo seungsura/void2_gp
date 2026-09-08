@@ -65,6 +65,8 @@ const useProductionSubmissionLifecycle = (value: any) => {
 	value._agentSubagentService ??= { cancelParent() { }, forgetParent() { } };
 	value._agentSubagentService.getRunViews ??= () => [];
 	value._agentSubagentService.getCoordinationRunViews ??= () => [];
+	value._agentSubagentService.peekParentMailbox ??= () => ({ messages: Object.freeze([]), parentMessageCount: 0, completionSequences: Object.freeze([]) });
+	value._agentSubagentService.ackParentMailbox ??= () => true;
 	const directLeases = new Map<string, { leaseId: string; pendingInputId: string; selectionsFingerprint: string }>();
 	value._pendingInputBrokerTestSeam ??= {
 		initializeNamespace: async () => brokerSuccess({ sessionId: 'fixture-session', removeLegacy: false }),

@@ -353,6 +353,7 @@ suite('AGENTS instruction runtime paths', () => {
 			async _runToolCall() { legacyToolCalls++; return { awaitingUserApproval: false, interrupted: false }; },
 			_addMessageToThread(_threadId: string, message: unknown) { thread.messages.push(message); },
 			_metricsService: { capture: (...args: unknown[]) => metrics.push(args) },
+			_agentSubagentService: { peekParentMailbox: () => ({ messages: Object.freeze([]), parentMessageCount: 0, completionSequences: Object.freeze([]) }), ackParentMailbox: () => true },
 			_promoteSteerAtSafeBoundary: async () => false,
 			_awaitThreadStorageWrites: async () => true,
 			_pendingBroker: () => ({ validateHistoryRun: async () => brokerSuccess(undefined) }),
