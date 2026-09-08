@@ -203,7 +203,7 @@ async function startFakeServer(evidence) {
 				childResponse = response; childHeldResolve(); return;
 			}
 			if (summary.taskRequestsTerminal && !terminalIssued) { terminalIssued = true; writeTool(response, 'smoke-terminal-tool', 'run_command', { command: 'ping -n 30 127.0.0.1 > nul', cwd: '.' }); return; }
-			if (parentPhase === 0) { parentPhase = 1; writeTool(response, 'smoke-spawn-tool', 'spawn_agent', { message: 'Inspect the fixture as the selected role.', agent_type: 'fixture-reader', model: 'gpt-4.1', fork_turns: 'all' }); return; }
+			if (parentPhase === 0) { parentPhase = 1; writeTool(response, 'smoke-spawn-tool', 'spawn_agent', { message: 'Inspect the fixture as the selected role.', agent_type: 'fixture-reader', model: 'gpt-5.6-luna', fork_turns: 'all' }); return; }
 			if (parentPhase === 1) { parentPhase = 2; writeTool(response, 'smoke-list-tool', 'list_agents', {}); return; }
 			if (parentPhase === 2 && summary.childId) { parentPhase = 3; writeTool(response, 'smoke-message-tool', 'send_message', { target: summary.childId, message: 'Include the late completion evidence.' }); return; }
 			if (parentPhase <= 3) { parentPhase = 4; writeTool(response, 'smoke-wait-tool', 'wait_agent', { timeout_ms: 5000 }); return; }
@@ -299,7 +299,7 @@ async function runFakeAcceptance(page, evidence, fakeServer) {
 	const luna = page.getByTestId('void-corporate-model-display'); await waitVisible(luna, 'Fixed Luna model label'); if ((await luna.innerText()).trim() !== 'gpt-5.6-luna') throw new Error('Fixed model label was not gpt-5.6-luna.'); await assertFixedAgentOnlyComposer(luna); evidence.assertions.push('fixed-visible-luna-model');
 	const chat = getChatComposer(page); const send = page.getByRole('button', { name: 'Send message', exact: true }); await waitVisible(chat, 'Chat composer'); await waitVisible(send, 'Chat send'); if (!(await send.isDisabled())) throw new Error('Empty Chat Send control was enabled.'); evidence.assertions.push('chat-empty-send-disabled');
 	await assertSettings(page); evidence.assertions.push('settings-project-delegation-and-defaults');
-	await waitVisible(chat, 'Chat composer after Settings'); await selectFixtureAgent(page, chat); await chat.fill('Inspect the fixture with the selected Agent.'); await send.click(); await fakeServer.waitForChild();
+	await waitVisible(chat, 'Chat composer after Settings'); await selectFixtureAgent(page, chat); await chat.fill('Inspect the fixture with the selected Agent.'); await send.click(); await Promise.race([fakeServer.waitForChild(), sleep(timeoutMs).then(() => { throw new Error('Child provider request did not arrive after parent spawn.'); })]);
 	if (!evidence.transport.pathExact || !evidence.transport.wireModelGpt41 || !evidence.transport.parentAgentsMarker || !evidence.transport.parentConfigMarker || !evidence.transport.parentSpawnAgentControlTool || evidence.transport.childRequests < 1 || !evidence.transport.childRoleMarker || !evidence.transport.childReadOnlyToolsExact || !evidence.transport.childControlToolsAbsent) throw new Error('Fixed route, project instructions, parent control, or read-only child tool contract did not reach fake provider.');
 	evidence.assertions.push('child-agent-project-instructions');
 	const childActivity = page.getByTestId('child-activity-card'); await waitVisible(childActivity, 'Child Activity card'); const childSummary = childActivity.locator('summary[aria-label^="Child Activity "]'); await waitVisible(childSummary, 'Child Activity summary');

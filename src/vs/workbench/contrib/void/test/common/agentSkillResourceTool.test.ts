@@ -18,7 +18,9 @@ suite('Void selected Skill resource application tool', () => {
 		assert.strictEqual(parent.filter(tool => tool.name === 'read_skill_resource').length, 1);
 		assert.strictEqual(parent.find(tool => tool.name === 'read_skill_resource')!.mcpServerName, undefined);
 		assert.ok(parent.some(tool => tool.name === 'remote_read'));
-		assert.deepStrictEqual(availableTools('agent', [collision, remote], 'read-only-child')!.map(tool => tool.name), [...readOnlyChildToolNames]);
+		const childTools = availableTools('agent', [collision, remote], 'read-only-child')!.map(tool => tool.name);
+		assert.deepStrictEqual(childTools, [...readOnlyChildToolNames, 'wait_agent', 'list_agents', 'send_message', 'interrupt_agent']);
+		for (const forbidden of ['read_skill_resource', 'remote_read']) assert.strictEqual(childTools.includes(forbidden), false);
 		for (const mode of ['normal', 'gather', null] as const) assert.strictEqual(availableTools(mode, [collision, remote])?.some(tool => tool.name === 'read_skill_resource') ?? false, false);
 	});
 

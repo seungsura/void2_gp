@@ -589,9 +589,17 @@ suite('Void pending chat input main-process broker', () => {
 		assert.ok((await core.syncActiveChildGroup('window:1', first.value.sessionId, 'task', 'parent-run', 0, 1, 0, ['child-a', 'child-b'])).ok);
 		const identity = Object.freeze({ sourceRevision: 1, generation: 0, childIds: Object.freeze(['child-a', 'child-b']) });
 		assert.ok((await core.closeRunAndReleaseSteers('window:1', first.value.sessionId, 'task', 'parent-run', 0, authority, false, identity)).ok);
+		const late = await core.authorizeDirectHistoryAppend('window:1', first.value.sessionId, 'task', 'late child result', [], 'parent-run', 0); assert.ok(late.ok);
+		assert.ok(!(await core.authorizeDirectHistoryAppend('window:2', second.value.sessionId, 'task', 'foreign late result', [], 'parent-run', 0)).ok);
+		storage.storeUser(pendingChatInputThreadStorageKey('task'), JSON.stringify({ version: 1, revision: 3, thread: { id: 'task', messages: [
+			{ role: 'user', pendingInputId: direct.value.pendingInputId, displayContent: 'parent', pendingInputSelectionsFingerprint: direct.value.selectionsFingerprint },
+			{ role: 'user', pendingInputId: late.value.pendingInputId, displayContent: 'late child result', pendingInputSelectionsFingerprint: late.value.selectionsFingerprint },
+		] } }));
+		assert.ok((await core.verifyDirectHistoryAndRelease('window:1', first.value.sessionId, 'task', late.value.leaseId)).ok);
+		assert.ok((await core.validateHistoryRun('window:1', first.value.sessionId, 'task', 'parent-run', 0)).ok);
 
 		const stop = await core.submit('window:2', { sessionId: second.value.sessionId, threadId: 'task', text: 'stop children', selections: [], mode: 'stop_and_send', phase: 'queued', ownerProjectRoot: 'file:///workspace', trustedAtSubmit: true, generation: 0 });
-		assert.ok(stop.ok); assert.strictEqual(stop.value.targetChildGeneration, 0); assert.deepStrictEqual(stop.value.targetChildIds, ['child-a', 'child-b']); assert.strictEqual(stop.value.generation, 1);
+		assert.ok(stop.ok); assert.strictEqual(stop.value.targetRunId, 'parent-run'); assert.strictEqual(stop.value.targetGeneration, 0); assert.strictEqual(stop.value.targetChildIds, undefined); assert.strictEqual(stop.value.generation, 1);
 		const stopFingerprint = pendingChatInputFingerprint(stop.value);
 		// Lost close ACK is retried against the already-transferred exact child owner.
 		// It must not normalize or erase the Stop tuple admitted after the first close.

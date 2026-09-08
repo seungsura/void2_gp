@@ -1127,9 +1127,15 @@ export class PendingChatInputBrokerCore {
 		return this.mutate(ctx, sessionId, async (state, session) => {
 			if (!isNonemptyString(threadId) || typeof text !== 'string' || !text.trim() || !Array.isArray(selections) || selections.some(selection => !revivePendingChatSelection(selection)) || !isNonemptyString(runId) || !Number.isSafeInteger(generation) || generation < 0) return this.failed('invalid_request', state);
 			if (this.mutationBlocked(state, threadId)) return this.failed('conflict', state);
-			if (this.brokerStorageContainsActiveThreadRecord(threadId) || this.hasAnyActiveChildGroup(threadId)) return this.failed('append_in_progress', state);
+			if (this.brokerStorageContainsActiveThreadRecord(threadId)) return this.failed('append_in_progress', state);
 			const leaseId = this.uuid(); if (!isNonemptyString(leaseId)) return this.failed('backend_unavailable', state);
-			const historyOwner = this.historyRunOwner(session, threadId, runId, generation);
+			const current = this.activeHistoryOwner(threadId);
+			let historyOwner: HistoryRunOwner | undefined;
+			if (current?.kind === 'child') {
+				if (current.sessionId !== session.id || current.sourceRunId !== runId || current.sourceGeneration !== generation || current.write) return this.failed('append_in_progress', state);
+				historyOwner = { ...current, kind: 'run', runId, generation, sourceRunId: undefined, sourceGeneration: undefined };
+				this.historyRunOwners.set(threadId, historyOwner);
+			} else historyOwner = this.historyRunOwner(session, threadId, runId, generation);
 			if (!historyOwner || historyOwner.write) return this.failed('append_in_progress', state);
 			const selectionsFingerprint = pendingChatInputSelectionsFingerprint(selections);
 			historyOwner.write = Object.freeze({ kind: 'direct', leaseId, text, selectionsFingerprint, pendingInputId: leaseId });

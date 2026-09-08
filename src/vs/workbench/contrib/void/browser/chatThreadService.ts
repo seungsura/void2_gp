@@ -3404,19 +3404,36 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		this._agentMailboxContinuationScheduled.add(key);
 		setTimeout(() => void (async () => {
 			let parentRun: ParentRunOwnership | undefined;
+			let directLeaseId: string | undefined;
+			let brokerRunOpened = false;
+			const closeAbortedRun = async () => {
+				if (directLeaseId) { await this._pendingBroker().abandonDirectHistoryAppend(threadId, directLeaseId).catch(() => undefined); directLeaseId = undefined; }
+				if (brokerRunOpened && parentRun) await this._releaseUndeliveredSteers(threadId, parentRun).catch(() => undefined);
+				parentRun?.deactivate(); parentRun?.releaseLatest();
+			};
 			try {
 				const quiescence = this._runQuiescenceOfThread.get(threadId); if (quiescence) await quiescence.settled;
 				if ((this._agentControlGeneration.get(threadId) ?? -1) !== generation || this._parentRunTokenOfThread.has(threadId) || this._startingParentRunOfThread.has(threadId) || this._pendingChatSubmissionOfThread.has(threadId) || this._isAwaitingUser(threadId)) return;
 				const source = this._childGroupSourceOfThread.get(threadId) ?? capturedSource; const authority = this._agentDelegationAuthorityOfThread.get(threadId); const thread = this.state.allThreads[threadId];
 				if (!source || source.generation !== generation || !authority?.allowed || authority.generation !== generation || !thread || authority.runtimeSnapshot.ownerProjectRoot !== this._workspaceContextService.getWorkspace().folders[0]?.uri.toString() || authority.runtimeSnapshot.workspaceTrustedAtAdmission !== this._workspaceTrustManagementService.isWorkspaceTrusted()) return;
 				const model = authority.runtimeSnapshot.model; if (!model.hasModel) return;
+				const childSync = await this._syncActiveChildGroup(threadId, source); if (!childSync.ok) return;
 				parentRun = resumeParentRunOwnership(threadId, source.runId, generation, this._parentRunTokenOfThread, this._agentControlGeneration); if (!parentRun) return;
 				const mailbox = this._agentSubagentService.peekParentMailbox(threadId, generation); if (!mailbox.messages.length) { parentRun.deactivate(); parentRun.releaseLatest(); return; }
-				const content = mailbox.messages.join('\n\n'); this._addMessageToThread(threadId, { role: 'user', content, displayContent: content, selections: [], state: defaultMessageState });
-				if (!await this._awaitThreadStorageWrites(threadId) || !parentRun.isActive() || this._pendingChatSubmissionOfThread.has(threadId) || !this._agentSubagentService.ackParentMailbox(threadId, generation, mailbox)) { parentRun.deactivate(); parentRun.releaseLatest(); return; }
+				const content = mailbox.messages.join('\n\n'); const authorized = await this._pendingBroker().authorizeDirectHistoryAppend(threadId, content, [], parentRun.runId, generation);
+				if (!authorized.ok) { this._warnPendingMutation(authorized, 'reconcile'); parentRun.deactivate(); parentRun.releaseLatest(); return; }
+				directLeaseId = authorized.value.leaseId; brokerRunOpened = true;
+				if (!parentRun.isActive()) { await closeAbortedRun(); return; }
+				this._addMessageToThread(threadId, { role: 'user', pendingInputId: authorized.value.pendingInputId, pendingInputSelectionsFingerprint: authorized.value.selectionsFingerprint, content, displayContent: content, selections: [], state: defaultMessageState });
+				const durable = await this._awaitThreadStorageWrites(threadId); const verified = durable ? await this._pendingBroker().verifyDirectHistoryAndRelease(threadId, directLeaseId) : undefined;
+				if (!verified?.ok) { await closeAbortedRun(); return; }
+				directLeaseId = undefined;
+				const mailboxAcked = this._agentSubagentService.ackParentMailbox(threadId, generation, mailbox);
+				if (!parentRun.isActive() || this._pendingChatSubmissionOfThread.has(threadId) || !mailboxAcked) { await closeAbortedRun(); return; }
 				const continuationRun = parentRun;
 				this._startTrackedParentRun(threadId, continuationRun, () => this._runChatAgent({ threadId, instructionSnapshot: authority.runtimeSnapshot, agentDelegationAuthority: authority, parentRun: continuationRun, modelSelection: { providerName: model.providerName as ModelSelection['providerName'], modelName: model.modelName }, modelSelectionOptions: model.modelSelectionOptions as ModelSelectionOptions }));
-			} catch { parentRun?.deactivate(); parentRun?.releaseLatest(); }
+				brokerRunOpened = false;
+			} catch { await closeAbortedRun(); }
 			finally { this._agentMailboxContinuationScheduled.delete(key); }
 		})(), 0);
 	}
