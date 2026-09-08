@@ -378,13 +378,16 @@ suite('Void AgentSubagentService', () => {
 
 	test('gates nested child controls by remaining depth while sharing one root group budget', async () => {
 		let calls = 0;
-		const f = fixture({ send: options => { calls++; if (calls === 1) queueMicrotask(() => options.onFinalMessage({ fullText: 'delegate', fullReasoning: '', anthropicReasoning: null, toolCalls: [{ id: 'nested-spawn', name: 'spawn_agent', rawParams: { message: 'grandchild' } }] })); else queueMicrotask(() => options.onFinalMessage({ fullText: 'done', fullReasoning: '', anthropicReasoning: null })); return `request-${calls}`; } });
+		const liveSettings: any = { openAI: { apiKey: 'captured-key', endpoint: 'https://captured.invalid', _didFillInProviderSettings: true, models: [{ modelName: 'gpt-4.1', isHidden: false, type: 'default' }, { modelName: 'gpt-4.1-mini', isHidden: false, type: 'default' }] } };
+		const settingsState: any = { settingsOfProvider: liveSettings, optionsOfModelSelection: { Chat: { openAI: { 'gpt-4.1-mini': { reasoningEnabled: false } } } }, overridesOfModel: { openAI: { 'gpt-4.1-mini': { temperature: .7 } } } };
+		const f = fixture({ liveSettings, settingsState, send: options => { calls++; if (calls === 1) queueMicrotask(() => options.onFinalMessage({ fullText: 'delegate', fullReasoning: '', anthropicReasoning: null, toolCalls: [{ id: 'nested-spawn', name: 'spawn_agent', rawParams: { message: 'grandchild', model: 'gpt-4.1-mini' } }] })); else queueMicrotask(() => options.onFinalMessage({ fullText: 'done', fullReasoning: '', anthropicReasoning: null })); return `request-${calls}`; } });
 		await f.service.spawn('depth-two', 'top', snapshot([], 'file:///workspace', 'gpt-4.1', { maxAcceptedChildren: 2, maxConcurrentThreadsPerSession: 2, maxDepth: 2 }));
 		await new Promise(resolve => setTimeout(resolve, 0));
 		const runs = f.service.getRunViews('depth-two'); const top = runs.find(run => run.depth === 1)!; const nested = runs.find(run => run.depth === 2)!;
 		assert.deepStrictEqual({ parentRunId: top.parentRunId, depth: top.depth, remainingDepth: top.remainingDepth }, { parentRunId: undefined, depth: 1, remainingDepth: 1 });
 		assert.deepStrictEqual({ parentRunId: nested.parentRunId, depth: nested.depth, remainingDepth: nested.remainingDepth }, { parentRunId: top.id, depth: 2, remainingDepth: 0 });
 		assert.strictEqual(f.providerCalls.some(call => call.agentDelegationAllowed === true), true); assert.strictEqual(f.providerCalls.some(call => call.agentDelegationAllowed === false), true);
+		assert.deepStrictEqual(f.providerCalls.map(call => call.modelSelection.modelName), ['gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1']); assert.strictEqual(f.providerCalls[1].overridesOfModel.openAI['gpt-4.1-mini'].temperature, .7);
 		assert.strictEqual(f.converterCalls.some(call => call.agentDelegationAllowed === true), true); assert.strictEqual(f.converterCalls.some(call => call.agentDelegationAllowed === false), true);
 		assert.deepStrictEqual(f.service.getBudgetView('depth-two') && { accepted: f.service.getBudgetView('depth-two')!.accepted, maxAccepted: f.service.getBudgetView('depth-two')!.maxAccepted, maxConcurrent: f.service.getBudgetView('depth-two')!.maxConcurrent }, { accepted: 0, maxAccepted: 2, maxConcurrent: 2 });
 		await assert.rejects(() => f.service.wait('depth-two', 0, [nested.id]), /agent_child_not_direct/); assert.throws(() => f.service.interrupt('depth-two', nested.id), /agent_target_terminal/);
@@ -734,6 +737,22 @@ suite('Void AgentSubagentService', () => {
 		await f.service.wait('parent', 1000);
 		assert.strictEqual(f.providerCalls[0].modelSelection.modelName, 'gpt-4.1-mini'); assert.strictEqual(f.providerCalls[0].overridesOfModel.openAI['gpt-4.1-mini'].temperature, .7); assert.strictEqual(f.providerCalls[0].modelSelectionOptions.reasoningEnabled, false);
 		assert.strictEqual(f.converterCalls[0].instructionSnapshot.instructions.developerInstructions, 'developer'); assert.strictEqual(f.converterCalls[0].instructionSnapshot.instructions.additionalDeveloperInstructions, 'role developer'); assert.ok(assembleProtectedAgentAuthority(f.converterCalls[0].instructionSnapshot).startsWith('developer\n\nrole developer\n\nagents')); assert.strictEqual(f.converterCalls[0].instructionSnapshot.instructions.agentsInstructions, 'agents'); assert.notStrictEqual(f.converterCalls[0].instructionSnapshot.revision, snapshot().revision); assert.strictEqual(f.service.getRunView('parent')?.roleName, 'reader'); assert.strictEqual(typeof f.service.getRunView('parent')?.generation, 'number'); assert.ok(f.events.every((event: any) => typeof event.generation === 'number')); f.service.forgetParent('parent'); assert.strictEqual(f.service.getRunView('parent'), undefined); assert.strictEqual(f.events.some((event: any) => event.removed), true);
+	});
+
+	test('applies a different explicit model to a generic child provider request', async () => {
+		const liveSettings: any = { openAI: { apiKey: 'captured-key', endpoint: 'https://captured.invalid', _didFillInProviderSettings: true, models: [{ modelName: 'gpt-4.1', isHidden: false, type: 'default' }, { modelName: 'gpt-4.1-mini', isHidden: false, type: 'default' }] } };
+		const state: any = { settingsOfProvider: liveSettings, optionsOfModelSelection: { Chat: { openAI: { 'gpt-4.1-mini': { reasoningEnabled: false } } } }, overridesOfModel: { openAI: { 'gpt-4.1-mini': { temperature: .7 } } } };
+		const f = fixture({ liveSettings, settingsState: state, send: options => { final(options); return 'request'; } });
+		await f.service.spawn('generic-explicit-model', 'inspect', snapshot(), undefined, undefined, state, liveSettings, 0, undefined, undefined, 'gpt-4.1-mini'); await f.service.wait('generic-explicit-model', 1_000);
+		assert.strictEqual(f.converterCalls[0].instructionSnapshot.model.modelName, 'gpt-4.1-mini'); assert.strictEqual(f.providerCalls[0].modelSelection.modelName, 'gpt-4.1-mini'); assert.strictEqual(f.providerCalls[0].overridesOfModel.openAI['gpt-4.1-mini'].temperature, .7);
+	});
+
+	test('applies an explicit effort without changing a generic child model', async () => {
+		const liveSettings: any = { openAI: { apiKey: 'captured-key', endpoint: 'https://captured.invalid', _didFillInProviderSettings: true, models: [{ modelName: 'o3', isHidden: false, type: 'default' }] } };
+		const state: any = { settingsOfProvider: liveSettings, optionsOfModelSelection: { Chat: { openAI: { o3: { reasoningEnabled: true, reasoningEffort: 'low' } } } }, overridesOfModel: { openAI: { o3: {} } } };
+		const f = fixture({ liveSettings, settingsState: state, send: options => { final(options); return 'request'; } });
+		await f.service.spawn('generic-explicit-effort', 'inspect', snapshot([], 'file:///workspace', 'o3'), undefined, undefined, state, liveSettings, 0, undefined, undefined, undefined, 'high'); await f.service.wait('generic-explicit-effort', 1_000);
+		assert.strictEqual(f.converterCalls[0].instructionSnapshot.model.modelName, 'o3'); assert.strictEqual(f.converterCalls[0].instructionSnapshot.model.modelSelectionOptions.reasoningEffort, 'high'); assert.strictEqual(f.providerCalls[0].modelSelection.modelName, 'o3'); assert.strictEqual(f.providerCalls[0].modelSelectionOptions.reasoningEffort, 'high');
 	});
 
 	test('spawns and completes named roles with default parent instructions in both capability profiles', async () => {
