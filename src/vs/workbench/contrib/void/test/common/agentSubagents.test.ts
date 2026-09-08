@@ -19,25 +19,25 @@ suite('Void agent subagents', () => {
 		assert.strictEqual(isToolAllowedByProfile('read-only-child', 'write_file'), false);
 		assert.strictEqual(isToolAllowedByProfile('read-only-child', 'run_command'), false);
 		assert.deepStrictEqual(agentSubagentToolSchemas.spawn_agent, {
-			type: 'object', additionalProperties: false, required: ['message'], properties: { message: { type: 'string', minLength: 1, maxLength: 8000 }, agent_type: { type: 'string', minLength: 1, maxLength: 64 } },
+			type: 'object', additionalProperties: false, required: ['message'], properties: { message: { type: 'string', minLength: 1, maxLength: 8000 }, agent_type: { type: 'string', minLength: 1, maxLength: 64 }, model: { type: 'string', minLength: 1, maxLength: 256 }, reasoning_effort: { type: 'string', minLength: 1, maxLength: 64 }, fork_turns: { type: 'string', minLength: 1, maxLength: 16 } },
 		});
 	});
 
 	test('keeps child orchestration controls exact and excludes Plan-like tool surfaces', () => {
-		const delegationControls = ['spawn_agent', 'wait_agent', 'interrupt_agent'];
+		const delegationControls = ['spawn_agent', 'wait_agent', 'list_agents', 'send_message', 'interrupt_agent'];
 		assert.deepStrictEqual(Object.keys(agentSubagentToolSchemas), delegationControls);
-		const fakeMcp = [{ name: 'remote_mutation', description: 'no', params: {}, mcpServerName: 'remote' }, ...(['spawn_agent', 'wait_agent', 'interrupt_agent'] as const).map(name => ({ name, description: 'colliding MCP tool', params: {}, mcpServerName: 'remote' }))];
+		const fakeMcp = [{ name: 'remote_mutation', description: 'no', params: {}, mcpServerName: 'remote' }, ...(delegationControls.map(name => ({ name, description: 'colliding MCP tool', params: {}, mcpServerName: 'remote' })))];
 		const childRegistry = availableTools('agent', fakeMcp, 'read-only-child')!.map(tool => tool.name);
 		const delegatedChildRegistry = availableTools('agent', fakeMcp, 'read-only-child', true)!.map(tool => tool.name);
-		assert.deepStrictEqual(childRegistry, [...readOnlyChildToolNames]);
+		assert.deepStrictEqual(childRegistry, [...readOnlyChildToolNames, 'wait_agent', 'list_agents', 'send_message', 'interrupt_agent']);
 		assert.deepStrictEqual(delegatedChildRegistry, [...readOnlyChildToolNames, ...delegationControls]);
 		const controlText = availableTools('agent', fakeMcp, 'read-only-child', true)!.filter(tool => ['spawn_agent', 'wait_agent'].includes(tool.name)).map(tool => `${tool.description}\n${JSON.stringify(tool.params)}`).join('\n');
 		assert.strictEqual(/four|two|one to eight/i.test(controlText), false);
 		const unselectedParent = availableTools('agent', fakeMcp)!.map(tool => tool.name);
-		for (const name of ['spawn_agent', 'wait_agent', 'interrupt_agent']) assert.strictEqual(unselectedParent.includes(name), false);
+		for (const name of delegationControls) assert.strictEqual(unselectedParent.includes(name), false);
 		assert.ok(unselectedParent.includes('remote_mutation'));
 		const parent = availableTools('agent', fakeMcp, 'default-parent', true)!.map(tool => tool.name);
-		for (const name of ['spawn_agent', 'wait_agent', 'interrupt_agent', 'remote_mutation']) assert.ok(parent.includes(name));
+		for (const name of [...delegationControls, 'remote_mutation']) assert.ok(parent.includes(name));
 		for (const name of delegationControls) assert.strictEqual(parent.filter(candidate => candidate === name).length, 1);
 
 		const calls: Array<{ command: string; params: any }> = []; let mcpReads = 0; let allowMcpRead = false;
@@ -78,17 +78,17 @@ suite('Void agent subagents', () => {
 			assert.ok(/Void application-level read-only — terminal disabled, no OS sandbox/.test(xml)); assert.strictEqual(xml.includes(root), true); assert.strictEqual(xml.includes('C:\\workspace'), false); for (const name of readOnlyChildToolNames) assert.ok(new RegExp(`<${name}>`).test(xml)); for (const forbidden of ['run_command', 'write_file', 'remote_mutation', 'spawn_agent', 'get_dir_tree', 'read_lint_errors', 'plan', 'update_plan', 'todowrite']) assert.strictEqual(xml.includes(`<${forbidden}>`), false);
 		}
 		const delegatedChild = chat_systemMessage({ workspaceFolders: ['C:\\workspace'], openedURIs: [], activeURI: undefined, persistentTerminalIDs: [], directoryStr: '', chatMode: 'agent', mcpTools: [], includeXMLToolDefinitions: true, toolExecutionProfile: 'read-only-child', agentDelegationAllowed: true });
-		for (const name of ['spawn_agent', 'wait_agent', 'interrupt_agent']) assert.ok(delegatedChild.includes(`<${name}>`));
+		for (const name of ['spawn_agent', 'wait_agent', 'list_agents', 'send_message', 'interrupt_agent']) assert.ok(delegatedChild.includes(`<${name}>`));
 		for (const name of ['plan', 'update_plan', 'todowrite']) assert.strictEqual(delegatedChild.includes(`<${name}>`), false);
 		const unselectedParent = chat_systemMessage({ workspaceFolders: ['C:\\workspace'], openedURIs: [], activeURI: undefined, persistentTerminalIDs: [], directoryStr: '', chatMode: 'agent', mcpTools: [], includeXMLToolDefinitions: true });
 		assert.strictEqual(unselectedParent.includes('<spawn_agent>'), false);
 		const selectedParent = chat_systemMessage({ workspaceFolders: ['C:\\workspace'], openedURIs: [], activeURI: undefined, persistentTerminalIDs: [], directoryStr: '', chatMode: 'agent', mcpTools: [], includeXMLToolDefinitions: true, agentDelegationAllowed: true });
-		for (const name of ['spawn_agent', 'wait_agent', 'interrupt_agent']) assert.ok(selectedParent.includes(`<${name}>`));
+		for (const name of ['spawn_agent', 'wait_agent', 'list_agents', 'send_message', 'interrupt_agent']) assert.ok(selectedParent.includes(`<${name}>`));
 	});
 
 	test('rejects unknown control fields before dispatch and defaults a safe wait', () => {
 		assert.deepStrictEqual(validateAgentSubagentControlParams('wait_agent', {}), { name: 'wait_agent', timeoutMs: AGENT_SUBAGENT_DEFAULT_WAIT_MS });
-		assert.throws(() => validateAgentSubagentControlParams('spawn_agent', { message: 'x', model: 'override' }), /spawn_agent_invalid_params/);
+		assert.deepStrictEqual(validateAgentSubagentControlParams('spawn_agent', { message: 'x', model: 'override' }), { name: 'spawn_agent', message: 'x', model: 'override', forkTurns: 'none' });
 		assert.throws(() => validateAgentSubagentControlParams('wait_agent', { timeout_ms: 30001 }), /wait_agent_invalid_params/);
 		assert.throws(() => validateAgentSubagentControlParams('interrupt_agent', { target: 'child', extra: true }), /interrupt_agent_invalid_params/);
 	});
@@ -99,8 +99,9 @@ suite('Void agent subagents', () => {
 		assert.deepStrictEqual(validateAgentSubagentControlParams('wait_agent', { targets: ['1', '2', '3', '4', '5', '6', '7', '8'] }), { name: 'wait_agent', timeoutMs: AGENT_SUBAGENT_DEFAULT_WAIT_MS, targets: ['1', '2', '3', '4', '5', '6', '7', '8'] });
 		for (const raw of [{ targets: [] }, { targets: ['one', 'one'] }, { targets: ['1', '2', '3', '4', '5', '6', '7', '8', '9'] }, { targets: ['one', 2] }]) assert.throws(() => validateAgentSubagentControlParams('wait_agent', raw), /wait_agent_invalid_params/);
 		for (const raw of [{ timeout_ms: -1 }, { timeout_ms: 30001 }, { timeout_ms: 1.5 }, { timeout_ms: Number.POSITIVE_INFINITY }, { timeout_ms: '1' }]) assert.throws(() => validateAgentSubagentControlParams('wait_agent', raw), /wait_agent_invalid_params/);
-		assert.deepStrictEqual(validateAgentSubagentControlParams('spawn_agent', { message: 'x', agent_type: 'reader_1' }), { name: 'spawn_agent', message: 'x', agentType: 'reader_1' });
-		for (const raw of [{}, { message: ' ' }, { message: 'x'.repeat(8001) }, { message: 'x', agent_type: '../path' }]) assert.throws(() => validateAgentSubagentControlParams('spawn_agent', raw), /spawn_agent_invalid_params/);
+		assert.deepStrictEqual(validateAgentSubagentControlParams('spawn_agent', { message: 'x', agent_type: 'reader_1', reasoning_effort: 'high', fork_turns: '3' }), { name: 'spawn_agent', message: 'x', agentType: 'reader_1', reasoningEffort: 'high', forkTurns: 3 });
+		assert.deepStrictEqual(validateAgentSubagentControlParams('list_agents', {}), { name: 'list_agents' }); assert.deepStrictEqual(validateAgentSubagentControlParams('send_message', { target: 'child', message: 'steer' }), { name: 'send_message', target: 'child', message: 'steer' });
+		for (const raw of [{}, { message: ' ' }, { message: 'x'.repeat(8001) }, { message: 'x', agent_type: '../path' }, { message: 'x', fork_turns: '0' }, { message: 'x', fork_turns: 2 }]) assert.throws(() => validateAgentSubagentControlParams('spawn_agent', raw), /spawn_agent_invalid_params/);
 	});
 
 	test('settles once and delivers a terminal summary at most once', () => {

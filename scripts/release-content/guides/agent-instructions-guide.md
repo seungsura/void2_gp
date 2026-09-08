@@ -98,7 +98,7 @@ references, scripts, templates와 assets는 discovery 때 eager load하지 않�
 
 resource read는 exact-or-fail입니다. 성공하면 resource body만 원문 그대로 반환하며 wrapper, source path marker 또는 부분 내용은 덧붙이지 않습니다. missing, outside-root, stale Skill, unreadable/invalid UTF-8 또는 context admission 오류는 해당 resource call만 fail-closed하고 같은 이름의 다른 resource나 Skill로 fallback하지 않습니다. 이미 캡처한 current turn과 selected Skill body는 유지됩니다. invalid Skill은 해당 catalog item만 제외하고 이유를 diagnostic에 남기며 다른 valid Skill은 유지합니다.
 
-UI에서 `read_skill_resource`, `spawn_agent`, `wait_agent`, `interrupt_agent`는 순서대로 **Read Skill resource**, **Start child Agent**, **Wait for child Agent**, **Interrupt child Agent** application card를 사용합니다. 상태는 **Running / Completed / Failed / Rejected / Invalid request / Cancelled / Requested** 중 하나이고 params/result/error는 bounded detail입니다. 이 네 name은 MCP title/stringify fallback과 generic tool approval button을 사용하지 않습니다. 실제 MCP tool의 title과 approval path는 바뀌지 않습니다.
+UI에서 `read_skill_resource`, `spawn_agent`, `wait_agent`, `list_agents`, `send_message`, `interrupt_agent`는 순서대로 **Read Skill resource**, **Start child Agent**, **Wait for child Agent**, **List Agents**, **Message Agent**, **Interrupt child Agent** application card를 사용합니다. 상태는 **Running / Completed / Failed / Rejected / Invalid request / Cancelled / Requested** 중 하나이고 params/result/error는 bounded detail입니다. 이 여섯 name은 MCP title/stringify fallback과 generic tool approval button을 사용하지 않습니다. 실제 MCP tool의 title과 approval path는 바뀌지 않습니다.
 
 model-facing Skill metadata catalog는 resolved context의 2%를 사용합니다. context size를 알 수 없으면 8,000 characters가 한도입니다. description을 먼저 줄이고 whole entry만 omit하며, model advertisement에서 빠진 enabled Skill도 typed selector의 전체 catalog에서는 찾을 수 있습니다.
 
@@ -109,7 +109,7 @@ Void는 다음 위치의 direct-child TOML file을 custom agent role로 읽습�
 - user: `$HOME/.codex/agents/*.toml`
 - trusted Project: `<root>/.codex/agents/*.toml`
 
-각 file에는 `name`, `description`, `developer_instructions`가 필요합니다. child는 fixed parent model을 상속하며, 선택적으로 `capability_profile = "read_only" | "inherit_parent_write"`와 exact-name `[[skills.config]]` rule을 사용할 수 있습니다. Legacy `sandbox_mode = "read-only"`는 `read_only` compatibility spelling일 뿐 OS sandbox가 아닙니다.
+각 file에는 `name`, `description`, `developer_instructions`가 필요합니다. child model과 reasoning effort는 spawn의 명시값, role TOML, parent 설정 순서로 결정되며, 선택적으로 `capability_profile = "read_only" | "inherit_parent_write"`와 exact-name `[[skills.config]]` rule을 사용할 수 있습니다. Legacy `sandbox_mode = "read-only"`는 `read_only` compatibility spelling일 뿐 OS sandbox가 아닙니다.
 
 ```toml
 name = "reviewer"
@@ -128,7 +128,7 @@ Filename은 declared `name`을 대신하거나 고치지 않습니다. Unknown k
 
 명시적 role model은 parent와 같은 provider에서 현재 보이고 설정돼 있으며 native Agent tool format을 지원해야 합니다. reasoning 값도 그 model이 제공하는 값만 사용할 수 있습니다. 조건을 만족하지 않으면 provider dispatch 전에 role admission이 거부됩니다. model을 생략하면 generic child처럼 parent의 effective model을 상속합니다.
 
-Native Agent tool format을 지원하는 Agent route는 marker가 없어도 generic `spawn_agent`, `wait_agent`, `interrupt_agent` controls와 그 turn에 발견한 named custom role catalog를 제공합니다. `@Agent`는 optional generic/named intent이고 selection만으로 child를 자동 시작하지 않습니다. Named role을 고르면 그 turn의 revision-pinned exact intent가 되어 `spawn_agent.agent_type`은 그 exact role이어야 합니다. Marker 없는 turn에서도 parent가 advertised exact `agent_type`으로 named child를 명시적으로 시작할 수 있습니다. Unsupported provider format이나 usable model 부재는 history/provider send 전에 visible diagnostic으로 중단합니다.
+Native Agent tool format을 지원하는 Agent route는 marker가 없어도 generic `spawn_agent`, `wait_agent`, `list_agents`, `send_message`, `interrupt_agent` controls와 그 turn에 발견한 named custom role catalog를 제공합니다. `@Agent`는 optional generic/named intent이고 selection만으로 child를 자동 시작하지 않습니다. Named role을 고르면 그 turn의 revision-pinned exact intent가 되어 `spawn_agent.agent_type`은 그 exact role이어야 합니다. Marker 없는 turn에서도 parent가 advertised exact `agent_type`으로 named child를 명시적으로 시작할 수 있습니다. Unsupported provider format이나 usable model 부재는 history/provider send 전에 visible diagnostic으로 중단합니다.
 
 Role catalog 또는 selected role revision이 send 전에 바뀌면 stale role로 fail-closed하고 reselect를 요구합니다. Stop, Task reset/purge, delete/replacement와 disposal은 해당 generation authority와 child work를 revoke/cancel합니다. 다른 Chat을 단순히 선택하는 동작이 새 authority를 부여하지 않습니다. Role의 developer instruction은 Task/session developer instruction 뒤에 붙고 기존 AGENTS revision은 유지되며, role Skill body 전체를 읽을 수 있을 때만 child admission을 atomic하게 완료합니다.
 
@@ -138,7 +138,9 @@ Child는 Chat의 supported native route에서만 사용합니다. `@Agent` selec
 
 Default group은 accepted `4`, concurrent `2`, depth `1`이며 `[agents]` config에서 유효한 값을 선택할 수 있습니다. 전체 parent group은 direct와 nested child를 함께 세며 나머지는 admission 순서대로 **FIFO** queue에 머뭅니다. Admission 자체가 실패하면 reservation을 돌려주고 terminal child가 settle되면 open capacity도 다음 FIFO admission에 반환됩니다. Nested child는 configured depth 안에서만 요청할 수 있고 동일한 root owner, frozen authority와 shared nested group budget을 사용합니다.
 
-Generic child는 parent effective provider/model/reasoning을 상속합니다. Named child만 앞 절의 frozen same-provider role 설정을 적용합니다. 각 child는 parent history와 parent-selected Skill body 전체를 복제하지 않는 별도 context에서 delegated task 하나로 시작합니다. parent에는 bounded identity/status와 새 terminal `receipt` 또는 `receipts`만 전달하며 raw child transcript 전체를 복사하지 않습니다.
+Generic child는 parent effective provider/model/reasoning을 상속합니다. Named child만 앞 절의 frozen same-provider role 설정을 적용합니다. Spawn의 explicit `model`/`reasoning_effort`는 role, parent보다 우선하지만 frozen same-provider configured/visible/native-tool model 경계를 유지합니다. `fork_turns`는 `none`/`all`/positive decimal string이며 기본 `none`입니다. 선택한 completed logical turn만 atomic하게 복사하고 현재 미완료 tool declaration·approval·authority는 복사하지 않습니다. parent에는 bounded identity/status와 terminal receipt만 전달하며 raw child transcript 전체를 복사하지 않습니다.
+
+`list_agents`는 optional target 아래 bounded same-root tree/status/terminal summary를 소비 없이 보여 줍니다. Root target id도 결과에 포함됩니다. `send_message`는 active parent/peer/child의 다음 safe model boundary에 queue-only 전달하고 terminal child를 재시작하지 않습니다. Child는 자신이나 ancestor를 interrupt할 수 없습니다. Parent final은 모든 child를 강제로 기다리지 않으며 late completion은 Stop/new user turn/owner/generation fence 뒤 coalesced automatic continuation으로 전달됩니다. Repeated `wait_agent`는 retained summary와 `delivered_now`/`already_delivered` 상태를 구분합니다.
 
 ### `read_only` profile
 

@@ -13,7 +13,7 @@ const { _electron } = require('@playwright/test');
 const FAKE_KEY = 'void-ui-smoke-fake-key';
 const timeoutMs = 75_000;
 const closeTimeoutMs = 5_000;
-const readonlyChildTools = ['ls_dir', 'read_file', 'search_for_files', 'search_in_file', 'search_pathnames_only'];
+const readonlyChildTools = ['interrupt_agent', 'list_agents', 'ls_dir', 'read_file', 'search_for_files', 'search_in_file', 'search_pathnames_only', 'send_message', 'wait_agent'];
 const fakeAssertions = [
 	'fixed-start-without-onboarding',
 	'fixed-visible-luna-model',
@@ -155,7 +155,8 @@ function requestSummary(payload) {
 	const instructions = messages.filter(message => message && (message.role === 'developer' || message.role === 'system')).map(message => contentText(message.content)).join('\n');
 	const userText = messages.filter(message => message?.role === 'user').map(message => contentText(message.content)).join('\n');
 	const tools = Array.isArray(payload?.tools) ? payload.tools.map(tool => typeof tool?.function?.name === 'string' ? tool.function.name : '').filter(Boolean).sort() : [];
-	return { modelIsWire: payload?.model === 'gpt-4.1', hasAgentsMarker: instructions.includes('VOID_SMOKE_AGENTS_MARKER'), hasConfigMarker: instructions.includes('VOID_SMOKE_CONFIG_MARKER'), hasRoleMarker: instructions.includes('VOID_SMOKE_ROLE_MARKER'), looksLikeFixtureChild: instructions.includes('fixture-reader'), taskRequestsTerminal: userText.includes('VOID_SMOKE_TERMINAL'), userText, tools };
+	const childId = JSON.stringify(messages).match(/\\?"id\\?":\\?"([0-9a-f-]{36})/i)?.[1];
+	return { modelIsWire: payload?.model === 'gpt-4.1', hasAgentsMarker: instructions.includes('VOID_SMOKE_AGENTS_MARKER'), hasConfigMarker: instructions.includes('VOID_SMOKE_CONFIG_MARKER'), hasRoleMarker: instructions.includes('VOID_SMOKE_ROLE_MARKER'), looksLikeFixtureChild: instructions.includes('fixture-reader'), taskRequestsTerminal: userText.includes('VOID_SMOKE_TERMINAL'), userText, tools, childId };
 }
 function completionChunk(delta, finishReason = null) { return { id: 'void-smoke', object: 'chat.completion.chunk', created: 0, model: 'gpt-4.1', choices: [{ index: 0, delta, finish_reason: finishReason }] }; }
 function writeSse(response, events) {
@@ -177,8 +178,10 @@ function readJsonRequest(request) {
 	});
 }
 async function startFakeServer(evidence) {
-	let parentPhase = 0; let terminalIssued = false; let childResponse; let childHeldResolve; const requestSummaries = [];
+	let parentPhase = 0; let terminalIssued = false; let childResponse; let childHeldResolve; let parentFinalResolve; let lateContinuationResolve; const requestSummaries = [];
 	const childHeld = new Promise(resolve => { childHeldResolve = resolve; });
+	const parentFinal = new Promise(resolve => { parentFinalResolve = resolve; });
+	const lateContinuation = new Promise(resolve => { lateContinuationResolve = resolve; });
 	const server = http.createServer(async (request, response) => {
 		try {
 			evidence.transport.requests += 1;
@@ -194,14 +197,19 @@ async function startFakeServer(evidence) {
 				evidence.transport.childRequests += 1;
 				evidence.transport.childRoleMarker = summary.hasRoleMarker;
 				evidence.transport.childReadOnlyToolsExact = summary.tools.join('|') === readonlyChildTools.join('|');
-				evidence.transport.childControlToolsAbsent = !summary.tools.some(name => ['spawn_agent', 'wait_agent', 'interrupt_agent', 'run_command', 'run_persistent_command'].includes(name));
-				if (childResponse) throw new Error('Fake smoke received more than one held child request.');
+				evidence.transport.childControlToolsAbsent = !summary.tools.some(name => ['spawn_agent', 'run_command', 'run_persistent_command'].includes(name));
+				if (childResponse) throw new Error('Fake smoke received an overlapping held child request.');
+				if (evidence.transport.childRequests > 1) { writeText(response, 'Fixture reader completed after message.'); return; }
 				childResponse = response; childHeldResolve(); return;
 			}
 			if (summary.taskRequestsTerminal && !terminalIssued) { terminalIssued = true; writeTool(response, 'smoke-terminal-tool', 'run_command', { command: 'ping -n 30 127.0.0.1 > nul', cwd: '.' }); return; }
-			if (parentPhase === 0) { parentPhase = 1; writeTool(response, 'smoke-spawn-tool', 'spawn_agent', { message: 'Inspect the fixture as the selected role.', agent_type: 'fixture-reader' }); return; }
-			if (parentPhase === 1) { parentPhase = 2; writeTool(response, 'smoke-wait-tool', 'wait_agent', { timeout_ms: 5000 }); return; }
-			writeText(response, 'Void smoke fixture completed.');
+			if (parentPhase === 0) { parentPhase = 1; writeTool(response, 'smoke-spawn-tool', 'spawn_agent', { message: 'Inspect the fixture as the selected role.', agent_type: 'fixture-reader', model: 'gpt-4.1', fork_turns: 'all' }); return; }
+			if (parentPhase === 1) { parentPhase = 2; writeTool(response, 'smoke-list-tool', 'list_agents', {}); return; }
+			if (parentPhase === 2 && summary.childId) { parentPhase = 3; writeTool(response, 'smoke-message-tool', 'send_message', { target: summary.childId, message: 'Include the late completion evidence.' }); return; }
+			if (parentPhase <= 3) { parentPhase = 4; writeTool(response, 'smoke-wait-tool', 'wait_agent', { timeout_ms: 5000 }); return; }
+			if (parentPhase === 4) { parentPhase = 5; writeText(response, 'Void smoke parent completed before its child.'); parentFinalResolve(); return; }
+			if (!summary.userText.includes('Fixture reader completed after message.')) throw new Error('Late continuation did not include the completed child result.');
+			writeText(response, 'Void smoke late completion observed.'); lateContinuationResolve();
 		} catch (error) {
 			if (!response.headersSent) response.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
 			response.end('fixture failure'); addError(evidence, 'fake-loopback', error);
@@ -214,6 +222,8 @@ async function startFakeServer(evidence) {
 		endpoint: `http://127.0.0.1:${address.port}`,
 		requestSummaries: () => [...requestSummaries],
 		waitForChild: () => childHeld,
+		waitForParentFinal: () => parentFinal,
+		waitForLateContinuation: () => lateContinuation,
 		releaseChild: () => { if (!childResponse) throw new Error('Child completion was requested before provider request arrived.'); const response = childResponse; childResponse = undefined; writeText(response, 'Fixture reader completed.'); },
 		close: async () => { if (childResponse) { childResponse.destroy(); childResponse = undefined; } server.closeAllConnections?.(); await new Promise(resolve => server.close(() => resolve())); },
 	};
@@ -290,11 +300,14 @@ async function runFakeAcceptance(page, evidence, fakeServer) {
 	const chat = getChatComposer(page); const send = page.getByRole('button', { name: 'Send message', exact: true }); await waitVisible(chat, 'Chat composer'); await waitVisible(send, 'Chat send'); if (!(await send.isDisabled())) throw new Error('Empty Chat Send control was enabled.'); evidence.assertions.push('chat-empty-send-disabled');
 	await assertSettings(page); evidence.assertions.push('settings-project-delegation-and-defaults');
 	await waitVisible(chat, 'Chat composer after Settings'); await selectFixtureAgent(page, chat); await chat.fill('Inspect the fixture with the selected Agent.'); await send.click(); await fakeServer.waitForChild();
-	if (!evidence.transport.pathExact || !evidence.transport.wireModelGpt41 || !evidence.transport.parentAgentsMarker || !evidence.transport.parentConfigMarker || !evidence.transport.parentSpawnAgentControlTool || evidence.transport.childRequests !== 1 || !evidence.transport.childRoleMarker || !evidence.transport.childReadOnlyToolsExact || !evidence.transport.childControlToolsAbsent) throw new Error('Fixed route, project instructions, parent control, or read-only child tool contract did not reach fake provider.');
+	if (!evidence.transport.pathExact || !evidence.transport.wireModelGpt41 || !evidence.transport.parentAgentsMarker || !evidence.transport.parentConfigMarker || !evidence.transport.parentSpawnAgentControlTool || evidence.transport.childRequests < 1 || !evidence.transport.childRoleMarker || !evidence.transport.childReadOnlyToolsExact || !evidence.transport.childControlToolsAbsent) throw new Error('Fixed route, project instructions, parent control, or read-only child tool contract did not reach fake provider.');
 	evidence.assertions.push('child-agent-project-instructions');
 	const childActivity = page.getByTestId('child-activity-card'); await waitVisible(childActivity, 'Child Activity card'); const childSummary = childActivity.locator('summary[aria-label^="Child Activity "]'); await waitVisible(childSummary, 'Child Activity summary');
 	if (!/running/i.test(await childSummary.innerText())) throw new Error('Child Activity did not remain visibly running before held response settled.');
-	fakeServer.releaseChild(); await waitVisible(childActivity.locator('summary[aria-label^="Child Activity "]').filter({ hasText: /completed/i }), 'completed Child Activity'); if (await childActivity.count() !== 1) throw new Error('Child Activity history was duplicated.'); evidence.assertions.push('child-running-and-completed'); await waitForCurrentRunToSettle(page);
+	await Promise.race([fakeServer.waitForParentFinal(), sleep(timeoutMs).then(() => { throw new Error('Parent did not finish after the bounded child wait.'); })]);
+	fakeServer.releaseChild(); await Promise.race([fakeServer.waitForLateContinuation(), sleep(timeoutMs).then(() => { throw new Error('Late child completion did not start a parent continuation.'); })]);
+	if (evidence.transport.childRequests !== 2) throw new Error(`Queued child message did not produce exactly two child provider boundaries: ${evidence.transport.childRequests}.`);
+	await waitVisible(page.getByText('Void smoke late completion observed.', { exact: true }).last(), 'late child completion continuation'); await waitVisible(childActivity.locator('summary[aria-label^="Child Activity "]').filter({ hasText: /completed/i }), 'completed Child Activity'); if (await childActivity.count() !== 1) throw new Error('Child Activity history was duplicated.'); evidence.assertions.push('child-running-and-completed'); await waitForCurrentRunToSettle(page);
 	const terminalCommand = '"ping -n 30 127.0.0.1 > nul"';
 	await chat.fill('VOID_SMOKE_TERMINAL'); await waitForEnabledCurrentSend(page); await chat.press('Enter'); const terminalCard = page.getByText(terminalCommand, { exact: true }).locator('xpath=ancestor::div[contains(@class, "border-void-border-3")][1]'); await waitVisible(terminalCard, 'Terminal card'); const terminalStop = terminalCard.getByRole('button', { name: 'Stop this tool', exact: true }); await waitVisible(terminalStop, 'Terminal card Stop'); if (await terminalStop.isDisabled()) throw new Error('Terminal card Stop was not independently enabled.');
 	await page.waitForTimeout(1_050); const elapsed = page.getByTestId('void-tool-elapsed').last(); await waitVisible(elapsed, 'Visible tool elapsed'); if (!/Elapsed\s+\d+s/.test(await elapsed.innerText())) throw new Error('Live tool elapsed text was not rendered.');

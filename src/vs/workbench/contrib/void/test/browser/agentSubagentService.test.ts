@@ -387,7 +387,7 @@ suite('Void AgentSubagentService', () => {
 		assert.strictEqual(f.providerCalls.some(call => call.agentDelegationAllowed === true), true); assert.strictEqual(f.providerCalls.some(call => call.agentDelegationAllowed === false), true);
 		assert.strictEqual(f.converterCalls.some(call => call.agentDelegationAllowed === true), true); assert.strictEqual(f.converterCalls.some(call => call.agentDelegationAllowed === false), true);
 		assert.deepStrictEqual(f.service.getBudgetView('depth-two') && { accepted: f.service.getBudgetView('depth-two')!.accepted, maxAccepted: f.service.getBudgetView('depth-two')!.maxAccepted, maxConcurrent: f.service.getBudgetView('depth-two')!.maxConcurrent }, { accepted: 0, maxAccepted: 2, maxConcurrent: 2 });
-		await assert.rejects(() => f.service.wait('depth-two', 0, [nested.id]), /agent_child_not_direct/); assert.throws(() => f.service.interrupt('depth-two', nested.id), /agent_child_not_direct/);
+		await assert.rejects(() => f.service.wait('depth-two', 0, [nested.id]), /agent_child_not_direct/); assert.throws(() => f.service.interrupt('depth-two', nested.id), /agent_target_terminal/);
 
 		let depthOneCalls = 0; const shallow = fixture({ send: options => { depthOneCalls++; if (depthOneCalls === 1) queueMicrotask(() => options.onFinalMessage({ fullText: 'deny', fullReasoning: '', anthropicReasoning: null, toolCalls: [{ id: 'denied-spawn', name: 'spawn_agent', rawParams: { message: 'not admitted' } }] })); else queueMicrotask(() => options.onFinalMessage({ fullText: 'done', fullReasoning: '', anthropicReasoning: null })); return `request-${depthOneCalls}`; } });
 		await shallow.service.spawn('depth-one', 'top', snapshot([], 'file:///workspace', 'gpt-4.1', { maxAcceptedChildren: 1, maxConcurrentThreadsPerSession: 1, maxDepth: 1 })); await new Promise(resolve => setTimeout(resolve, 0));
@@ -403,7 +403,7 @@ suite('Void AgentSubagentService', () => {
 		const view = f.service.getRunView('generic-profile')!;
 		assert.strictEqual(view.capabilityProfile, 'read_only'); assert.strictEqual(view.toolPresentation, undefined);
 		assert.strictEqual(f.converterCalls[0].toolExecutionProfile, 'read-only-child'); assert.strictEqual(f.providerCalls[0].toolExecutionProfile, 'read-only-child');
-		assert.deepStrictEqual(availableTools('agent', undefined, f.providerCalls[0].toolExecutionProfile, false, parentTools)!.map(tool => tool.name), [...readOnlyChildToolNames]);
+		assert.deepStrictEqual(availableTools('agent', undefined, f.providerCalls[0].toolExecutionProfile, false, parentTools)!.map(tool => tool.name), [...readOnlyChildToolNames, 'wait_agent', 'list_agents', 'send_message', 'interrupt_agent']);
 	});
 
 	test('uses the exact frozen parent snapshot only for an admitted inherit-parent-write role', async () => {
@@ -581,7 +581,7 @@ suite('Void AgentSubagentService', () => {
 		f.service.interrupt('tree', top.id);
 		assert.deepStrictEqual(f.service.getRunViews('tree').map(run => run.status), ['cancelled', 'cancelled']);
 		for (const options of pending) options.onFinalMessage({ fullText: 'late', fullReasoning: '', anthropicReasoning: null });
-		assert.deepStrictEqual(f.service.getRunViews('tree').map(run => run.status), ['cancelled', 'cancelled']); assert.ok(f.aborts() >= 2); assert.throws(() => f.service.interrupt('tree', nested.id), /agent_child_not_direct/);
+		assert.deepStrictEqual(f.service.getRunViews('tree').map(run => run.status), ['cancelled', 'cancelled']); assert.ok(f.aborts() >= 2); assert.throws(() => f.service.interrupt('tree', nested.id), /agent_target_terminal/);
 	});
 
 	test('cancels a deferred nested admission with its parent before it can append or dispatch', async () => {
@@ -672,7 +672,7 @@ suite('Void AgentSubagentService', () => {
 		const f = fixture({ send: () => 'request' }); const [one, two] = await Promise.all(['one', 'two'].map(message => f.service.spawn('wait-group', message, snapshot())));
 		f.service.interrupt('wait-group', one.id); const first = await f.service.wait('wait-group', 0, [one.id]); assert.strictEqual(first.deliverSummary, true);
 		const pending = f.service.wait('wait-group', 1_000, [one.id, two.id]); await new Promise(resolve => setTimeout(resolve, 0)); f.service.interrupt('wait-group', two.id); const next = await pending;
-		assert.strictEqual(next.deliverSummary, true); assert.strictEqual(next.receipt?.id, two.id); assert.deepStrictEqual(next.children.map(child => child.id), [one.id, two.id]);
+		assert.strictEqual(next.deliverSummary, true); assert.strictEqual(next.receipts?.find(receipt => receipt.id === two.id)?.id, two.id); assert.deepStrictEqual(next.children.map(child => child.id), [one.id, two.id]);
 		const repeated = await f.service.wait('wait-group', 0, [two.id, one.id]); assert.strictEqual(repeated.deliverSummary, false); assert.deepStrictEqual(repeated.children.map(child => child.id), [one.id, two.id]); assert.strictEqual(JSON.stringify(repeated.children).includes('Child cancelled by parent.'), false); assert.strictEqual(repeated.timedOut, false); assert.strictEqual(repeated.budget.maxResultChars, 32_000); assert.strictEqual(repeated.budget.usage, null); assert.strictEqual('deadlineMsRemaining' in repeated.budget, false); assert.strictEqual('maxChildTurns' in repeated.budget, false); assert.strictEqual('maxChildRunMs' in repeated.budget, false);
 		const active = await f.service.spawn('wait-group-active', 'active', snapshot()); const timedOut = await f.service.wait('wait-group-active', 0, [active.id]); assert.strictEqual(timedOut.timedOut, true); f.service.interrupt('wait-group-active', active.id);
 		for (const targets of [[], [one.id, one.id], [' ', two.id], ['x'.repeat(257)]]) await assert.rejects(() => f.service.wait('wait-group', 0, targets), /wait_agent_invalid_params|agent_child_not_direct/);
@@ -680,7 +680,7 @@ suite('Void AgentSubagentService', () => {
 
 	test('generation reset forgets quota and old ids cannot be interrupted in a new group', async () => {
 		const f = fixture({ send: () => 'request' }); const old = await f.service.spawn('generation', 'old', snapshot(), undefined, undefined, undefined, undefined, 1); f.service.forgetParent('generation'); const fresh = await f.service.spawn('generation', 'fresh', snapshot(), undefined, undefined, undefined, undefined, 2);
-		assert.deepStrictEqual(f.service.getRunViews('generation').map(view => view.id), [fresh.id]); assert.throws(() => f.service.interrupt('generation', old.id, 2), /agent_child_not_direct/);
+		assert.deepStrictEqual(f.service.getRunViews('generation').map(view => view.id), [fresh.id]); assert.throws(() => f.service.interrupt('generation', old.id, 2), /agent_target_not_found/);
 	});
 
 	test('enforces provider/result budgets and the shared cancellation path structurally', async () => {
@@ -710,7 +710,7 @@ suite('Void AgentSubagentService', () => {
 		const first = f.converterCalls[0]; assert.strictEqual(first.chatMessages.length, 1); assert.strictEqual(first.chatMessages[0].content, '$other delegated task');
 		assert.deepStrictEqual(first.instructionSnapshot.selected.map((item: any) => item.identity), ['other']); assert.strictEqual(first.instructionSnapshot.selected.some((item: any) => item.body.includes('body-demo')), false);
 		const childAuthority = assembleProtectedAgentAuthority(first.instructionSnapshot, false); assert.strictEqual(childAuthority.split(skillText('other')).length - 1, 1); assert.strictEqual(childAuthority.includes('read_skill_resource'), false);
-		assert.deepStrictEqual(availableTools('agent', undefined, 'read-only-child')!.map(tool => tool.name), [...readOnlyChildToolNames]);
+		assert.deepStrictEqual(availableTools('agent', undefined, 'read-only-child')!.map(tool => tool.name), [...readOnlyChildToolNames, 'wait_agent', 'list_agents', 'send_message', 'interrupt_agent']);
 		assert.deepStrictEqual(first.instructionSnapshot.model, snapshot().model); assert.strictEqual(first.toolExecutionProfile, 'read-only-child'); assert.strictEqual(first.childRoot, 'file:///workspace');
 		assert.strictEqual(f.providerCalls[0].settingsOfProviderOverride.openAI.apiKey, 'captured-key'); assert.strictEqual(f.providerCalls[0].settingsOfProviderOverride.openAI.endpoint, 'https://captured.invalid'); assert.strictEqual(f.providerCalls[0].modelSelectionOptions.reasoningEnabled, true); assert.strictEqual(f.providerCalls[0].overridesOfModel.openAI['gpt-4.1'].temperature, .2); assert.strictEqual(f.service.getRunView('parent')?.id, child.id);
 		for (const owner of [URI.file('C:\\workspace').toString(), 'vscode-remote://ssh-remote%2Bexample/workspace']) {
@@ -983,8 +983,25 @@ suite('Void AgentSubagentService', () => {
 	test('wait timeout is non-mutating; terminal summary delivers once; targets are direct', async () => {
 		const f = fixture({ send: () => 'request' }); await assert.rejects(() => f.service.wait('missing', 0), /agent_child_not_found/);
 		const child = await f.service.spawn('parent', 'inspect', snapshot()); const listenerBaseline = (f.service as any)._onDidChangeRun._size; for (let i = 0; i < 20; i++) { const waiting = await f.service.wait('parent', 0); assert.strictEqual(waiting.status, 'running'); } assert.strictEqual((f.service as any)._onDidChangeRun._size, listenerBaseline); assert.strictEqual(f.service.getRunView('parent')?.status, 'running');
-		assert.throws(() => f.service.interrupt('parent', 'not-direct'), /agent_child_not_direct/); f.service.interrupt('parent', child.id);
-		const first = await f.service.wait('parent', 0); const second = await f.service.wait('parent', 0); assert.strictEqual(first.deliverSummary, true); assert.ok(first.receipt?.summary); assert.strictEqual(second.deliverSummary, false); assert.strictEqual(second.receipt, undefined);
+		assert.throws(() => f.service.interrupt('parent', 'not-direct'), /agent_target_not_found/); f.service.interrupt('parent', child.id);
+		const first = await f.service.wait('parent', 0); const second = await f.service.wait('parent', 0); assert.strictEqual(first.deliverSummary, true); assert.ok(first.receipt?.summary); assert.strictEqual(first.children[0].completion, 'delivered_now'); assert.strictEqual(second.deliverSummary, false); assert.ok(second.receipt?.summary); assert.strictEqual(second.children[0].completion, 'already_delivered');
+	});
+
+	test('forks complete turns and delivers queued messages at the next child boundary', async () => {
+		const pending: any[] = []; const f = fixture({ send: options => { pending.push(options); return `request-${pending.length}`; } });
+		const prior: any[] = [
+			{ role: 'user', content: 'old-one', displayContent: 'old-one', selections: [], state: {} }, { role: 'assistant', displayContent: 'answer-one', reasoning: '', anthropicReasoning: null },
+			{ role: 'user', content: 'old-two', displayContent: 'old-two', selections: [], state: {} }, { role: 'assistant', displayContent: 'answer-two', reasoning: '', anthropicReasoning: null },
+			{ role: 'user', content: 'current', displayContent: 'current', selections: [], state: {} }, { role: 'assistant', displayContent: 'spawning', reasoning: '', anthropicReasoning: null },
+		];
+		const child = await f.service.spawn('parent', 'delegated', snapshot(), undefined, undefined, undefined, undefined, 0, undefined, undefined, undefined, undefined, 1, prior);
+		for (let i = 0; i < 10 && pending.length === 0; i++) await Promise.resolve();
+		assert.deepStrictEqual(f.converterCalls[0].chatMessages.map((message: any) => message.displayContent), ['old-two', 'answer-two', 'delegated']);
+		assert.deepStrictEqual(f.service.sendMessage('parent', child.id, 'new evidence'), { target: child.id, status: 'queued' });
+		pending[0].onFinalMessage({ fullText: 'first answer', fullReasoning: '', anthropicReasoning: null }); for (let i = 0; i < 20 && pending.length < 2; i++) await Promise.resolve();
+		assert.ok(f.converterCalls[1].chatMessages.some((message: any) => message.displayContent.includes('new evidence'))); pending[1].onFinalMessage({ fullText: 'final answer', fullReasoning: '', anthropicReasoning: null });
+		const done = await f.service.wait('parent', 1000); assert.strictEqual(done.status, 'completed'); assert.strictEqual(done.receipt?.summary, 'final answer');
+		const tree: any = f.service.list('parent'); assert.strictEqual(tree.root.target, 'parent'); assert.strictEqual(tree.agents[0].summary, 'final answer'); assert.throws(() => f.service.sendMessage('parent', child.id, 'late'), /agent_target_terminal/); assert.throws(() => f.service.interrupt('parent', child.id), /agent_target_terminal/);
 	});
 
 	test('owner/trust drift across awaited boundaries cancels without provider/tool leakage', async () => {

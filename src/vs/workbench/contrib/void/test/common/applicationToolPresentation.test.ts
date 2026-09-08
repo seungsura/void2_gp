@@ -3,11 +3,11 @@ import { applicationToolPresentation, applicationToolRoute, isApplicationToolNam
 
 suite('Application tool presentation', () => {
 	test('classifies the four reserved application names with exact titles', () => {
-		const expected = { read_skill_resource: 'Read Skill resource', spawn_agent: 'Start child Agent', wait_agent: 'Wait for child Agent', interrupt_agent: 'Interrupt child Agent' } as const;
+		const expected = { read_skill_resource: 'Read Skill resource', spawn_agent: 'Start child Agent', wait_agent: 'Wait for child Agent', list_agents: 'List Agents', send_message: 'Message Agent', interrupt_agent: 'Interrupt child Agent' } as const;
 		for (const [name, title] of Object.entries(expected)) { assert.strictEqual(isApplicationToolName(name), true); assert.strictEqual(applicationToolPresentation(name, 'success', {}, {})!.title, title); }
 	});
 	test('uses exact status labels for every persisted application state', () => {
-		const titles = { read_skill_resource: 'Read Skill resource', spawn_agent: 'Start child Agent', wait_agent: 'Wait for child Agent', interrupt_agent: 'Interrupt child Agent' } as const;
+		const titles = { read_skill_resource: 'Read Skill resource', spawn_agent: 'Start child Agent', wait_agent: 'Wait for child Agent', list_agents: 'List Agents', send_message: 'Message Agent', interrupt_agent: 'Interrupt child Agent' } as const;
 		const statuses = { running_now: 'Running', success: 'Completed', tool_error: 'Failed', rejected: 'Rejected', invalid_params: 'Invalid request', interrupted_streaming_tool: 'Cancelled', tool_request: 'Requested' } as const;
 		for (const [name, title] of Object.entries(titles)) for (const [type, status] of Object.entries(statuses)) {
 			const value = applicationToolPresentation(name, type, { name, type }, `${name}:${type}`)!;

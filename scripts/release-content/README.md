@@ -1,10 +1,10 @@
-# Void 1.99.3 Windows x64 배포 묶음
+# Void 1.99.4 Windows x64 배포 묶음
 
 이 묶음은 사용자 문서가 내장된 portable 제품 ZIP과 `write_file`/`read_file`/Agent/Ghost Chat 안내서, 그리고 실제 제품 관찰용 프롬프트를 함께 전달합니다. 이 README의 값은 assembler가 실제 새 portable을 만든 뒤에만 확정합니다. placeholder를 hash 또는 통과 사실로 해석하지 마세요.
 
 ## 포함 파일
 
-- `Void-1.99.3-win32-x64-portable.zip`: portable 제품 ZIP
+- `Void-1.99.4-win32-x64-portable.zip`: portable 제품 ZIP
 - `SHA256SUMS.txt`: assembler가 placeholder 치환 뒤 생성하는 manifest
 - `guides/write-tool-guide.md`, `guides/read-tool-guide.md`: 파일 도구 계약과 안전 경계
 - `guides/agent-instructions-guide.md`: `AGENTS.md`, config, Skills, custom agents와 profile-aware bounded subagent 사용 안내
@@ -28,9 +28,9 @@ portable ZIP을 새 폴더에 풀고 일반 사용자 권한으로 `Void.exe`를
 이 portable은 조직용 연결과 model을 package가 관리합니다. provider나 model을 선택하거나 연결 정보를 입력할 필요가 없고 Chat에는 `gpt-5.6-luna`가 표시됩니다.
 
 ```powershell
-Get-FileHash -Algorithm SHA256 .\Void-1.99.3-win32-x64-portable.zip
-Expand-Archive .\Void-1.99.3-win32-x64-portable.zip .\Void-1.99.3-portable
-.\Void-1.99.3-portable\Void.exe
+Get-FileHash -Algorithm SHA256 .\Void-1.99.4-win32-x64-portable.zip
+Expand-Archive .\Void-1.99.4-win32-x64-portable.zip .\Void-1.99.4-portable
+.\Void-1.99.4-portable\Void.exe
 ```
 
 ## Agent instructions, Skills, custom agents와 bounded subagent
@@ -41,7 +41,9 @@ Expand-Archive .\Void-1.99.3-win32-x64-portable.zip .\Void-1.99.3-portable
 
 Role의 `read_only` profile은 exact five read tools만 제공하고 terminal, MCP와 mutation을 제공하지 않습니다. `inherit_parent_write` profile은 parent가 turn admission 때 가진 frozen parent tool snapshot만 broker를 통해 사용합니다. Captured parent approval policy가 적용되며 manual approval policy에서는 composer-adjacent approval card의 Approve/Reject를 기다립니다. Mutation-capable child는 한 번에 하나만 실행되고 nested child도 같은 group budget과 cancellation을 공유하며 live authority 또는 독립 elevation을 얻지 않습니다. The durable Child Activity card shows role/description when present, coarse capability, status, and timing. It can show a bounded terminal summary and, when applicable, Result compacted, nested activity rows, and ledger-retention notices. The separate pending approval card is the child-specific surface that shows the pending tool title, approval category, bounded parameters, and Approve/Reject. The durable card's Capability field is coarse. Exact read-only tool membership and inherited frozen authority are not exposed there. Treat full membership and authority as source/focused unless explicitly defined registry or broker instrumentation exists; a normal bounded tool trace proves only the calls it records. Verify Undo from actual file/editor state. A failed child can leave bounded failure context in the activity summary. The durable card has no separate scheduler-capacity, diagnostic, or technical-detail panel and no raw/full child transcript. The composer has no separate child progress/status/detail panel; the pending approval card is its only child-specific panel. When a queued/running child is the only active work and no higher-priority error, preparing, retry, or approval state applies, the generic composer announces `Running · Esc to stop`, with an unsent-draft suffix when applicable, and shows Stop.
 
-`$`는 `@`의 기존 Skills catalog를 그대로 열어 filter하고 `$bare` 또는 `$qualified:identity`를 canonical selector text로 남깁니다. Markdown code의 selector-looking text는 literal이며 missing/ambiguous selection은 draft와 staging을 보존한 채 visible error로 중단합니다. `read_skill_resource`, `spawn_agent`, `wait_agent`, `interrupt_agent`는 exact application cards로 표시되며 MCP fallback이나 generic approval UI를 빌리지 않습니다.
+`$`는 `@`의 기존 Skills catalog를 그대로 열어 filter하고 `$bare` 또는 `$qualified:identity`를 canonical selector text로 남깁니다. Markdown code의 selector-looking text는 literal이며 missing/ambiguous selection은 draft와 staging을 보존한 채 visible error로 중단합니다. `read_skill_resource`, `spawn_agent`, `wait_agent`, `list_agents`, `send_message`, `interrupt_agent`는 exact application cards로 표시되며 MCP fallback이나 generic approval UI를 빌리지 않습니다.
+
+`spawn_agent`는 optional `model`, `reasoning_effort`, `fork_turns`(`none`/`all`/positive count, default `none`)를 지원하며 explicit 값이 role, parent보다 우선합니다. `list_agents`는 bounded tree/status/result를 비소비 조회하고, `send_message`는 active same-group target의 다음 안전 경계에 queue-only 전달합니다. Late completion은 Stop/new user turn/generation/owner fence 뒤 parent에 자동 전달되며 반복 wait는 retained terminal result와 delivery 상태를 구분합니다.
 
 Composer 위에는 pending child tool의 approval card만 child-specific surface로 남고 별도 child progress/status/detail panel은 없습니다. queued/running child가 only active work이고 higher-priority 상태가 없을 때 generic current-run announcement와 Stop control은 계속 표시됩니다. Spawn receipt에 묶인 bounded expandable Child activity card는 위의 compact activity 정보만 durable 상태 기록으로 보여 줍니다. bounded summary에는 failure context가 포함될 수 있지만 별도 scheduler-capacity/diagnostic/technical panel이나 raw/full child transcript/session, exact tool/authority surface는 아닙니다. thread-level `ChildActivitiesLedger`는 그 thread의 retained root cards가 공유하며 combined total 32 records / UTF-8 64 KiB projection retention을 적용합니다. 이는 separate Queue/Steer inbox envelope의 32/64 상한과 독립적이고 per-card 상한이 아닙니다. Local trace retention and provider-usage projection are SOURCE/FOCUSED contracts. Neither the current composer nor the durable Child Activity card renders diagnostics or usage. Landing의 non-empty Chat history는 newest-first이며 persistent history is not rendered below the current Chat composer. Header의 `View Past Chats`가 landing access path입니다. 정확한 지원 경계와 직접 관찰 절차는 `guides/agent-instructions-guide.md`와 `prompts/agent-instructions-test-prompts.md`를 확인하세요.
 

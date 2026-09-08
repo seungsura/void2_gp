@@ -537,6 +537,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				if (!result.identity.childIds.length && this._runQuiescenceOfThread.get(event.parentId)?.runId !== source.runId) this._childGroupSourceOfThread.delete(event.parentId)
 				this._wakePendingChatInputs(event.parentId)
 			})
+			if ('status' in event && event.status !== 'queued' && event.status !== 'running') this._scheduleAgentMailboxContinuation(event.parentId, event.generation, source)
+			else if ('mailboxTarget' in event && event.mailboxTarget === event.parentId) this._scheduleAgentMailboxContinuation(event.parentId, event.generation, source)
 		}));
 
 		// always be in a thread
@@ -549,6 +551,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	private readonly _agentInstructionSessionOfThread = new Map<string, AgentInstructionTaskSessionRecord>();
 	private readonly _instructionTurnOfThread = new Map<string, AgentRuntimeTurnSnapshot>();
 	private readonly _agentControlGeneration = new Map<string, number>();
+	private readonly _agentMailboxContinuationScheduled = new Set<string>();
 	private readonly _parentRunTokenOfThread = new Map<string, symbol>();
 	/** Cancellation is retained separately from the persisted tool message until the
 	 * underlying operation settles. This lets the card truthfully remain Cancelling
@@ -2526,17 +2529,21 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			}
 			if (!isControlCurrent()) return { interrupted: true };
 			const validatedParams = control.name === 'spawn_agent'
-				? { message: control.message, ...(control.agentType === undefined ? {} : { agent_type: control.agentType }) }
+				? { message: control.message, ...(control.agentType === undefined ? {} : { agent_type: control.agentType }), ...(control.model === undefined ? {} : { model: control.model }), ...(control.reasoningEffort === undefined ? {} : { reasoning_effort: control.reasoningEffort }), fork_turns: typeof control.forkTurns === 'number' ? String(control.forkTurns) : control.forkTurns }
 				: control.name === 'wait_agent'
 					? { timeout_ms: control.timeoutMs, ...(control.targets === undefined ? {} : { targets: [...control.targets] }) }
-					: { target: control.target };
+					: control.name === 'list_agents' ? { ...(control.target ? { target: control.target } : {}) }
+						: control.name === 'send_message' ? { target: control.target, message: control.message }
+							: { target: control.target };
 			const receiptId = generateUuid();
 			this._setStreamState?.(threadId, { isRunning: 'idle', interrupt: Promise.resolve(() => { }), toolInfo: { toolName, toolParams: validatedParams as never, id: toolId, content: '(child control in progress...)', rawParams: opts.unvalidatedToolParams, mcpServerName: undefined, receiptId, transient: true, startedAt: Date.now(), cardStopUnavailableReason: 'This child control can only be stopped with the parent run, so this card cannot stop it independently.' } });
 			const clearTransient = () => { const state = this.streamState[threadId]; if (state?.isRunning === 'idle' && state.toolInfo?.transient && state.toolInfo.receiptId === receiptId) this._setStreamState?.(threadId, { isRunning: 'idle', interrupt: 'not_needed' }); };
 			try {
 				let result: object;
-				if (control.name === 'spawn_agent') result = await this._agentSubagentService.spawn(threadId, control.message, instructionSnapshot, control.agentType, agentDelegationAuthority.roles, agentDelegationAuthority.settingsState, agentDelegationAuthority.settingsOfProvider, controlGeneration, agentDelegationAuthority.parentTools, this._createAgentSubagentToolBroker?.(threadId, agentDelegationAuthority));
+				if (control.name === 'spawn_agent') result = await this._agentSubagentService.spawn(threadId, control.message, instructionSnapshot, control.agentType, agentDelegationAuthority.roles, agentDelegationAuthority.settingsState, agentDelegationAuthority.settingsOfProvider, controlGeneration, agentDelegationAuthority.parentTools, this._createAgentSubagentToolBroker?.(threadId, agentDelegationAuthority), control.model, control.reasoningEffort, control.forkTurns, this.state.allThreads[threadId]?.messages ?? []);
 				else if (control.name === 'wait_agent') result = await this._agentSubagentService.wait(threadId, control.timeoutMs, control.targets, controlGeneration);
+				else if (control.name === 'list_agents') result = this._agentSubagentService.list(threadId, control.target, controlGeneration);
+				else if (control.name === 'send_message') result = this._agentSubagentService.sendMessage(threadId, control.target, control.message, controlGeneration);
 				else result = this._agentSubagentService.interrupt(threadId, control.target, controlGeneration);
 				if (!isControlCurrent()) return { interrupted: true };
 				clearTransient();
@@ -3025,10 +3032,14 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			// A synchronous history/event observer can Stop or replace this parent while
 			// the steer is being claimed. Never assemble a provider request after that.
 			if (!isCurrentRun()) return
+			const agentMailbox = this._agentSubagentService.peekParentMailbox(threadId, agentRunGeneration)
+			if (agentMailbox.messages.length) { const content = agentMailbox.messages.join('\n\n'); this._addMessageToThread(threadId, { role: 'user', content, displayContent: content, selections: [], state: defaultMessageState }) }
+			if (!isCurrentRun()) return
 			if (!await awaitThreadStorageWrites.call(this, threadId)) {
 				this._setStreamState(threadId, { isRunning: undefined, error: { message: 'This chat changed in another Void window. Review the latest history before continuing.', fullError: null } })
 				return
 			}
+			if (agentMailbox.messages.length && !this._agentSubagentService.ackParentMailbox(threadId, agentRunGeneration, agentMailbox)) return
 			// Conversion is asynchronous. Remember the exact authoritative B1 bytes it
 			// observed so a child/history mutation that lands during conversion or main
 			// run validation cannot be overtaken by provider dispatch.
@@ -3387,6 +3398,26 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		} catch (error) {
 			void this._wrapRunAgentToNotify(Promise.reject(error), threadId, parentRun)
 		}
+	}
+	private _scheduleAgentMailboxContinuation(threadId: string, generation: number, capturedSource?: Readonly<{ runId: string; generation: number }>): void {
+		const key = `${threadId}:${generation}`; if (this._agentMailboxContinuationScheduled.has(key)) return;
+		this._agentMailboxContinuationScheduled.add(key);
+		setTimeout(() => void (async () => {
+			let parentRun: ParentRunOwnership | undefined;
+			try {
+				const quiescence = this._runQuiescenceOfThread.get(threadId); if (quiescence) await quiescence.settled;
+				if ((this._agentControlGeneration.get(threadId) ?? -1) !== generation || this._parentRunTokenOfThread.has(threadId) || this._startingParentRunOfThread.has(threadId) || this._pendingChatSubmissionOfThread.has(threadId) || this._isAwaitingUser(threadId)) return;
+				const source = this._childGroupSourceOfThread.get(threadId) ?? capturedSource; const authority = this._agentDelegationAuthorityOfThread.get(threadId); const thread = this.state.allThreads[threadId];
+				if (!source || source.generation !== generation || !authority?.allowed || authority.generation !== generation || !thread || authority.runtimeSnapshot.ownerProjectRoot !== this._workspaceContextService.getWorkspace().folders[0]?.uri.toString() || authority.runtimeSnapshot.workspaceTrustedAtAdmission !== this._workspaceTrustManagementService.isWorkspaceTrusted()) return;
+				const model = authority.runtimeSnapshot.model; if (!model.hasModel) return;
+				parentRun = resumeParentRunOwnership(threadId, source.runId, generation, this._parentRunTokenOfThread, this._agentControlGeneration); if (!parentRun) return;
+				const mailbox = this._agentSubagentService.peekParentMailbox(threadId, generation); if (!mailbox.messages.length) { parentRun.deactivate(); parentRun.releaseLatest(); return; }
+				const content = mailbox.messages.join('\n\n'); this._addMessageToThread(threadId, { role: 'user', content, displayContent: content, selections: [], state: defaultMessageState });
+				if (!await this._awaitThreadStorageWrites(threadId) || !parentRun.isActive() || this._pendingChatSubmissionOfThread.has(threadId) || !this._agentSubagentService.ackParentMailbox(threadId, generation, mailbox)) { parentRun.deactivate(); parentRun.releaseLatest(); return; }
+				this._startTrackedParentRun(threadId, parentRun, () => this._runChatAgent({ threadId, instructionSnapshot: authority.runtimeSnapshot, agentDelegationAuthority: authority, parentRun, modelSelection: { providerName: model.providerName as ModelSelection['providerName'], modelName: model.modelName }, modelSelectionOptions: model.modelSelectionOptions as ModelSelectionOptions }));
+			} catch { parentRun?.deactivate(); parentRun?.releaseLatest(); }
+			finally { this._agentMailboxContinuationScheduled.delete(key); }
+		})(), 0);
 	}
 	private _canDeliverPendingChatInput(record: PendingChatInputRecord): boolean {
 		return !this._deletingPendingInputThreads.has(record.threadId)
@@ -3747,7 +3778,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const delegationLimits = instructionSnapshot.config.agentDelegationLimits
 		if (instructionSnapshot.config.agentDelegationLimitDiagnostics.length) this._notificationService.notify({ severity: Severity.Warning, message: delegationLimits.maxConcurrentThreadsPerSession > delegationLimits.maxAcceptedChildren ? `Agent child concurrency (${delegationLimits.maxConcurrentThreadsPerSession}) exceeds open capacity (${delegationLimits.maxAcceptedChildren}). Edit the config before delegating.` : `Some Agent child-limit settings were invalid. Check the Agent delegation configuration.` })
 		const userMessageContent = agentDelegationAllowed
-			? `${userMessageContentBase}\n\n[${agentDelegationIntent ? 'User delegation marker' : 'Native Agent controls'}: up to ${delegationLimits.maxAcceptedChildren} generic read-only children are available for this turn, with ${delegationLimits.maxConcurrentThreadsPerSession} running concurrently and maximum depth ${delegationLimits.maxDepth}. Named custom agents admitted for this turn (optional exact agent_type): ${roleAd?.text || 'none'}${roleAd?.omitted ? `; ${roleAd.omitted} omitted` : ''}.${agentSelection?.agentType ? ` For this selected role, call spawn_agent with agent_type=${agentSelection.agentType} exactly.` : ''} Call spawn_agent for delegated tasks, then wait_agent for their results; partial child failures do not prevent your synthesis.]`
+			? `${userMessageContentBase}\n\n[${agentDelegationIntent ? 'User delegation marker' : 'Native Agent controls'}: up to ${delegationLimits.maxAcceptedChildren} generic read-only children are available for this turn, with ${delegationLimits.maxConcurrentThreadsPerSession} running concurrently and maximum depth ${delegationLimits.maxDepth}. Named custom agents admitted for this turn (optional exact agent_type): ${roleAd?.text || 'none'}${roleAd?.omitted ? `; ${roleAd.omitted} omitted` : ''}.${agentSelection?.agentType ? ` For this selected role, call spawn_agent with agent_type=${agentSelection.agentType} exactly.` : ''} After spawn_agent, continue useful main work before wait_agent. Use list_agents to inspect retained results, send_message for active same-group coordination, and interrupt_agent for a selected active target. Late child completions are delivered at a safe model boundary; partial child failures do not prevent your synthesis.]`
 			: userMessageContentBase
 		const currentOwner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
 		if (currentOwner !== runtimeSnapshot.ownerProjectRoot || currentOwner !== runtimeSnapshot.runCwd || this._workspaceTrustManagementService.isWorkspaceTrusted() !== runtimeSnapshot.workspaceTrustedAtAdmission) { this._purgeInstructionTurn(threadId, false); throw new Error('skill_owner_or_trust_changed') }

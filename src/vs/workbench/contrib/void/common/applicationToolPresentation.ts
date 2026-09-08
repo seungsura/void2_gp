@@ -13,7 +13,7 @@ export const applicationToolRoute = (name: string, isBuiltin: boolean): Applicat
 export const shouldOfferGenericToolApproval = (route: ApplicationToolRoute, type: string): boolean => type === 'tool_request' && route !== 'application';
 export const applicationToolPresentation = (name: string, type: string, params: unknown, payload?: unknown): ApplicationToolPresentation | undefined => {
 	if (!isApplicationToolName(name)) return undefined;
-	const title = name === 'read_skill_resource' ? 'Read Skill resource' : name === 'spawn_agent' ? 'Start child Agent' : name === 'wait_agent' ? 'Wait for child Agent' : 'Interrupt child Agent';
+	const title = name === 'read_skill_resource' ? 'Read Skill resource' : name === 'spawn_agent' ? 'Start child Agent' : name === 'wait_agent' ? 'Wait for child Agent' : name === 'list_agents' ? 'List Agents' : name === 'send_message' ? 'Message Agent' : 'Interrupt child Agent';
 	const status = type === 'running_now' ? 'Running' : type === 'success' ? 'Completed' : type === 'tool_error' ? 'Failed' : type === 'rejected' ? 'Rejected' : type === 'invalid_params' ? 'Invalid request' : type === 'interrupted_streaming_tool' ? 'Cancelled' : 'Requested';
 	const paramsDetail = bounded(params);
 	const resultDetail = type === 'success' ? bounded(payload) : undefined;

@@ -85,7 +85,7 @@ type RuntimeFetch = (this: unknown, ...args: any[]) => Promise<any>;
 type OpenAIClientWithRuntimeFetch = { fetch: RuntimeFetch };
 
 const corporateProductionSmokeClients = new WeakSet<OpenAI>();
-const corporateProductionSmokeNativeToolNames = new Set(['read_file', 'write_file', 'run_command', 'spawn_agent', 'wait_agent', 'interrupt_agent']);
+const corporateProductionSmokeNativeToolNames = new Set(['read_file', 'write_file', 'run_command', 'spawn_agent', 'wait_agent', 'list_agents', 'send_message', 'interrupt_agent']);
 
 const getCorporateProductionSmokeCounters = () => {
 	if (process.env.VOID_CORPORATE_PRODUCTION_SMOKE !== '1') return undefined;
