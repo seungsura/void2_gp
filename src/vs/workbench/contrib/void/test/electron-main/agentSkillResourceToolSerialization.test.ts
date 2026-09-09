@@ -69,6 +69,13 @@ suite('Void selected Skill resource production serialization', () => {
 		assert.throws(() => validateAgentSubagentControlParams('wait_agent', malformed.rawParams), /wait_agent_invalid_params/);
 	});
 
+	test('normalizes only exact XML spawn background booleans before strict shared validation', () => {
+		const parse = (value: string) => { let tool: any; const wrapper = extractXMLToolsWrapper(() => { }, params => { tool = params.toolCalls?.[0]; }, 'agent', undefined, 'default-parent', true); wrapper.newOnFinalMessage({ fullText: `<spawn_agent><message>inspect</message><background>${value}</background></spawn_agent>`, fullReasoning: '', anthropicReasoning: null } as any); return tool.rawParams; };
+		assert.deepStrictEqual(validateAgentSubagentControlParams('spawn_agent', parse('true')), { name: 'spawn_agent', message: 'inspect', forkTurns: 'none', background: true });
+		assert.deepStrictEqual(validateAgentSubagentControlParams('spawn_agent', parse('false')), { name: 'spawn_agent', message: 'inspect', forkTurns: 'none', background: false });
+		assert.throws(() => validateAgentSubagentControlParams('spawn_agent', parse('TRUE')), /spawn_agent_invalid_params/);
+	});
+
 	test('normalizes only canonical XML page numbers for paginated tools', () => {
 		const parse = (fullText: string) => { let tool: any; const wrapper = extractXMLToolsWrapper(() => { }, params => { tool = params.toolCalls?.[0]; }, 'agent', undefined); wrapper.newOnFinalMessage({ fullText, fullReasoning: '', anthropicReasoning: null } as any); return tool; };
 		assert.deepStrictEqual([

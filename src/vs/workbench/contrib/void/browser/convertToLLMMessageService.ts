@@ -867,6 +867,10 @@ export class ConvertToLLMMessageService extends Disposable implements IConvertTo
 					content: m.content,
 				})
 			}
+			else if (m.role === 'agent') {
+				const envelope = JSON.stringify({ source: m.sourceId, kind: m.kind, sequence: m.sequence, ...(m.relatedSequence === undefined ? {} : { relatedSequence: m.relatedSequence }), ...(m.status === undefined ? {} : { status: m.status }), content: m.content })
+				simpleLLMMessages.push({ role: 'assistant', content: `<agent_event>${envelope}</agent_event>`, anthropicReasoning: null })
+			}
 		}
 		return simpleLLMMessages
 	}

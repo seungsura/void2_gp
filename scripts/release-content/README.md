@@ -1,10 +1,10 @@
-# Void 1.99.5 Windows x64 배포 묶음
+# Void 1.99.6 Windows x64 배포 묶음
 
 이 묶음은 사용자 문서가 내장된 portable 제품 ZIP과 `write_file`/`read_file`/Agent/Ghost Chat 안내서, 그리고 실제 제품 관찰용 프롬프트를 함께 전달합니다. 이 README의 값은 assembler가 실제 새 portable을 만든 뒤에만 확정합니다. placeholder를 hash 또는 통과 사실로 해석하지 마세요.
 
 ## 포함 파일
 
-- `Void-1.99.5-win32-x64-portable.zip`: portable 제품 ZIP
+- `Void-1.99.6-win32-x64-portable.zip`: portable 제품 ZIP
 - `SHA256SUMS.txt`: assembler가 placeholder 치환 뒤 생성하는 manifest
 - `guides/write-tool-guide.md`, `guides/read-tool-guide.md`: 파일 도구 계약과 안전 경계
 - `guides/agent-instructions-guide.md`: `AGENTS.md`, config, Skills, custom agents와 profile-aware bounded subagent 사용 안내
@@ -28,9 +28,9 @@ portable ZIP을 새 폴더에 풀고 일반 사용자 권한으로 `Void.exe`를
 이 portable은 조직용 연결과 model을 package가 관리합니다. provider나 model을 선택하거나 연결 정보를 입력할 필요가 없고 Chat에는 `gpt-5.6-luna`가 표시됩니다.
 
 ```powershell
-Get-FileHash -Algorithm SHA256 .\Void-1.99.5-win32-x64-portable.zip
-Expand-Archive .\Void-1.99.5-win32-x64-portable.zip .\Void-1.99.5-portable
-.\Void-1.99.5-portable\Void.exe
+Get-FileHash -Algorithm SHA256 .\Void-1.99.6-win32-x64-portable.zip
+Expand-Archive .\Void-1.99.6-win32-x64-portable.zip .\Void-1.99.6-portable
+.\Void-1.99.6-portable\Void.exe
 ```
 
 ## Agent instructions, Skills, custom agents와 bounded subagent

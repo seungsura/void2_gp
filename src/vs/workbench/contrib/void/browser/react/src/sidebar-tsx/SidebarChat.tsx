@@ -24,7 +24,7 @@ import { ICommandService } from '../../../../../../../platform/commands/common/c
 import { WarningBox } from '../void-settings-tsx/WarningBox.js';
 import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../common/modelCapabilities.js';
 import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, CircleEllipsis, Folder, ALargeSmall, TypeOutline, Text } from 'lucide-react';
-import { ChatMessage, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
+import { AgentChatMessage, ChatMessage, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
 import { AgentSubagentRunView, ChildActivitiesLedger, ChildActivityRecord, ChildToolApprovalView, isActiveChildRun, isPureAgentWaitTimeoutResult } from '../../../../common/agentSubagents.js';
 import { ChatCurrentStatusPresentation, getChatCurrentStatusPresentation } from '../../../../common/chatCurrentStatusPresentation.js';
 import { beginChatComposerSubmissionFlight, submitChatComposer, submitInlineChatEdit } from '../../../../common/chatComposerSubmission.js';
@@ -2620,6 +2620,14 @@ export function renderEarlyToolCard(toolMessage: ToolMessage<ToolName>) {
 	return toolMessage.type === 'skipped' ? <SkippedToolCard toolMessage={toolMessage} /> : undefined
 }
 
+const AgentMessageComponent = ({ chatMessage }: { chatMessage: AgentChatMessage }) => {
+	const label = chatMessage.kind === 'completion' || chatMessage.status ? `Agent ${chatMessage.sourceId.slice(0, 8)} · ${chatMessage.status ?? 'completed'}` : `Message from agent ${chatMessage.sourceId.slice(0, 8)}`;
+	return <div className='w-full rounded-md border border-void-border-2 bg-void-bg-2 px-3 py-2' aria-label={label}>
+		<div className='text-xs text-void-fg-3 mb-1'>{label}</div>
+		{chatMessage.content ? <div className='whitespace-pre-wrap text-sm'>{chatMessage.content}</div> : <div className='text-xs text-void-fg-3'>Final status recorded; the result matches the earlier message from this agent.</div>}
+	</div>;
+};
+
 const _ChatBubble = ({ threadId, chatMessage, isCommitted, messageIdx, _scrollToBottom, editable }: ChatBubbleProps) => {
 	const role = chatMessage.role
 
@@ -2631,6 +2639,7 @@ const _ChatBubble = ({ threadId, chatMessage, isCommitted, messageIdx, _scrollTo
 			editable={editable}
 		/>
 	}
+	else if (role === 'agent') return <AgentMessageComponent chatMessage={chatMessage} />
 	else if (role === 'assistant') {
 		return <AssistantMessageComponent
 			chatMessage={chatMessage}

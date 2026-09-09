@@ -116,8 +116,12 @@ const prepareRunChatAgentReceiver = (receiver: ParentRunFixture) => {
 	fixture._promoteSteerAtSafeBoundary ??= async () => false;
 	fixture._awaitThreadStorageWrites ??= async () => true;
 	fixture._agentSubagentService ??= {};
-	fixture._agentSubagentService.peekParentMailbox ??= () => ({ messages: Object.freeze([]), parentMessageCount: 0, completionSequences: Object.freeze([]) });
+	fixture._agentSubagentService.peekParentMailbox ??= () => ({ events: Object.freeze([]), parentMessageSequences: Object.freeze([]), completionSequences: Object.freeze([]) });
 	fixture._agentSubagentService.ackParentMailbox ??= () => true;
+	fixture._agentSubagentService.hasPendingRequired ??= () => false;
+	fixture._agentSubagentService.waitForRequired ??= async () => { };
+	fixture._appendAgentMailboxEvents ??= (...args: any[]) => (ChatThreadService.prototype as any)._appendAgentMailboxEvents.apply(fixture, args);
+	fixture._wakeAgentWaitForPendingSteer ??= () => false;
 	fixture._warnPendingMutation ??= () => false;
 	return fixture;
 };
@@ -833,6 +837,23 @@ suite('Assistant message lifecycle', () => {
 		for (const result of [anthropic, gemini, xml]) {
 			assert.strictEqual(JSON.stringify(result.messages).includes(INTERNAL_EMPTY_MESSAGE_SENTINEL), false);
 			for (const internal of ['toolBatch', 'batchId', 'batchOrdinal', 'native-batch']) assert.strictEqual(JSON.stringify(result.messages).includes(internal), false);
+		}
+	});
+
+	test('serializes attributed agent events as assistant-side provider context', async () => {
+		const converter = new ConvertToLLMMessageService(
+			{ getModels: () => [] } as never, { getWorkspace: () => ({ folders: [] }) } as never, { activeEditor: undefined } as never, { getAllDirectoriesStr: async () => '' } as never, { listPersistentTerminalIds: () => [] } as never,
+			{ state: { overridesOfModel: { openAICompatible: { 'fixture-xml-model': { specialToolFormat: 'openai-style' } } }, globalSettings: {}, optionsOfModelSelection: { Chat: { anthropic: {}, gemini: {}, openAICompatible: {} } } } } as never, { getMCPTools: () => [] } as never,
+		);
+		(converter as any)._generateChatMessagesSystemMessage = async () => 'agent event system';
+		const body = 'ATTRIBUTED_CHILD_RESULT'; const history: any[] = [{ role: 'user', content: 'start', displayContent: 'start' }, { role: 'agent', sourceId: 'child-1', kind: 'completion', sequence: 3, status: 'completed', content: body, createdAt: 1 }];
+		const results = [
+			await converter.prepareLLMChatMessages({ chatMessages: history, chatMode: 'agent', modelSelection: { providerName: 'anthropic', modelName: 'claude-sonnet-4-0' }, instructionSnapshot: instructionSnapshot() as never }),
+			await converter.prepareLLMChatMessages({ chatMessages: history, chatMode: 'agent', modelSelection: { providerName: 'gemini', modelName: 'gemini-2.0-flash' }, instructionSnapshot: instructionSnapshot() as never }),
+			await converter.prepareLLMChatMessages({ chatMessages: history, chatMode: 'agent', modelSelection: { providerName: 'openAICompatible', modelName: 'fixture-xml-model' }, instructionSnapshot: instructionSnapshot() as never }),
+		];
+		for (const result of results) {
+			const wire = JSON.stringify(result.messages); assert.strictEqual(wire.includes(body), true); assert.strictEqual(result.messages.some((message: any) => message.role === 'user' && JSON.stringify(message).includes(body)), false); assert.strictEqual(wire.includes('child-1'), true); assert.strictEqual(wire.includes('completion'), true);
 		}
 	});
 
@@ -2040,6 +2061,26 @@ suite('Assistant message lifecycle', () => {
 
 		const resetRecovered = createPendingInboxReceiver(); await resetRecovered.receiver._ensurePendingInputBrokerReady(); const exported = resetRecovered.receiver.state.allThreads.task; resetRecovered.storage.failMutationCommitFlushes = 1; assert.strictEqual(await resetRecovered.receiver.resetState(), true); assert.strictEqual(await resetRecovered.receiver.dangerousSetState({ allThreads: { task: exported }, currentThreadId: 'task' }), true, 'a journal-resolved reset tombstone must remain importable by the exact global transaction');
 		const afterImport = { ...exported, messages: [{ role: 'user', content: 'after import', displayContent: 'after import' }] }; resetRecovered.receiver._storeThreadRecord('task', afterImport); assert.strictEqual(await resetRecovered.receiver._awaitThreadStorageWrites('task'), true); assert.strictEqual(JSON.parse(resetRecovered.storage.get(pendingChatInputThreadStorageKey('task'))!).thread.messages[0].displayContent, 'after import');
+	});
+
+	test('holds a required-child provisional stream until attributed synthesis', async () => {
+		const gate = deferred<void>(); let required = true; let mailbox: any[] = []; const callbacks: TestProviderCallbacks[] = []; const prepared: any[][] = [];
+		const snapshot = instructionSnapshot(); const messages: any[] = [{ role: 'user', content: 'start', displayContent: 'start', selections: [], state: { stagingSelections: [], isBeingEdited: false } }]; const streamState: TestStreamRecord = {};
+		const receiver: any = {
+			state: { allThreads: { task: { messages, state: {}, filesWithUserChanges: new Set() } } }, streamState,
+			_agentControlGeneration: new Map([['task', 0]]), _parentRunTokenOfThread: new Map(), _agentDelegationAuthorityOfThread: new Map(), _settingsService: { state: { globalSettings: { chatMode: 'agent' } } },
+			_agentSubagentService: { hasPendingRequired: () => required, waitForRequired: () => gate.promise, peekParentMailbox: () => ({ events: mailbox, parentMessageSequences: mailbox.filter(event => event.kind === 'message').map(event => event.sequence), completionSequences: mailbox.filter(event => event.kind === 'completion').map(event => event.sequence) }), ackParentMailbox: () => { mailbox = []; return true; } },
+			_convertToLLMMessagesService: { prepareLLMChatMessages: async ({ chatMessages }: any) => { prepared.push(chatMessages.map((message: any) => ({ ...message }))); return { messages: chatMessages, separateSystemMessage: false }; } },
+			_llmMessageService: { sendLLMMessage: (options: TestProviderCallbacks) => { callbacks.push(options); return `request-${callbacks.length}`; }, abort() { } }, _mcpService: { getMCPTools: () => [] }, _metricsService: { capture() { } },
+			_setStreamState(threadId: string, value: TestStream | undefined) { streamState[threadId] = value; }, _addMessageToThread(_threadId: string, message: any) { messages.push(message); }, _editMessageInThread(_threadId: string, index: number, message: any) { messages[index] = message; },
+		};
+		receiver._appendAgentMailboxEvents = (...args: any[]) => (ChatThreadService.prototype as any)._appendAgentMailboxEvents.apply(receiver, args);
+		const running = runChatAgent(receiver, { threadId: 'task', modelSelection: { providerName: 'openAICompatible', modelName: 'gpt-4.1' }, modelSelectionOptions: snapshot.model.modelSelectionOptions, instructionSnapshot: snapshot });
+		await eventually(() => callbacks.length === 1, 'first provider request missing'); callbacks[0].onText({ fullText: 'PREMATURE', fullReasoning: 'draft', toolCalls: undefined }); assert.strictEqual(llmInfoOf(streamState.task).displayContentSoFar, ''); assert.strictEqual(JSON.stringify(messages).includes('PREMATURE'), false);
+		await callbacks[0].onFinalMessage({ fullText: 'PREMATURE', fullReasoning: 'draft', anthropicReasoning: null }); await flushMicrotasks(); assert.strictEqual(messages.some(message => message.role === 'assistant' && message.displayContent === 'PREMATURE'), false);
+		mailbox = [{ role: 'agent', sourceId: 'child-1', kind: 'completion', sequence: 7, status: 'completed', content: 'CHILD_RESULT', createdAt: 1 }]; required = false; gate.resolve(undefined);
+		await eventually(() => callbacks.length === 2, 'required completion did not create synthesis request'); assert.deepStrictEqual(prepared[1].filter(message => message.role === 'agent').map(message => [message.sourceId, message.kind, message.content]), [['child-1', 'completion', 'CHILD_RESULT']]);
+		await callbacks[1].onFinalMessage({ fullText: 'FINAL', fullReasoning: '', anthropicReasoning: null }); await running; assert.strictEqual(messages.filter(message => message.role === 'assistant' && message.displayContent === 'FINAL').length, 1); assert.strictEqual(messages.some(message => message.role === 'assistant' && message.displayContent === 'PREMATURE'), false);
 	});
 
 });

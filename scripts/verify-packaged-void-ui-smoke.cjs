@@ -13,6 +13,7 @@ const { _electron } = require('@playwright/test');
 const FAKE_KEY = 'void-ui-smoke-fake-key';
 const timeoutMs = 75_000;
 const closeTimeoutMs = 5_000;
+const SAME_CHILD_RESULT = 'VOID_SMOKE_SAME_CHILD_RESULT';
 const readonlyChildTools = ['interrupt_agent', 'list_agents', 'ls_dir', 'read_file', 'search_for_files', 'search_in_file', 'search_pathnames_only', 'send_message', 'wait_agent'];
 const fakeAssertions = [
 	'fixed-start-without-onboarding',
@@ -20,7 +21,8 @@ const fakeAssertions = [
 	'chat-empty-send-disabled',
 	'settings-project-delegation-and-defaults',
 	'child-agent-project-instructions',
-	'child-running-and-completed',
+	'required-child-held-and-deduplicated',
+	'background-child-does-not-restart-parent',
 	'queue-and-steer-during-live-tool',
 	'receipt-local-terminal-stop',
 	'renderer-clean-close',
@@ -97,7 +99,7 @@ function newEvidence(mode, development = false) {
 		close: { attempted: false, completed: false, error: null },
 		launch: { isolated: true, provider: 'openAICompatible', network: mode === 'fake' ? 'loopback fake endpoint only' : 'packaged provider one-request smoke', credentials: mode === 'fake' ? 'fake key redacted' : 'packaged resolver only' },
 		transport: mode === 'fake'
-			? { requests: 0, pathExact: false, wireModelGpt41: false, parentAgentsMarker: false, parentConfigMarker: false, parentSpawnAgentControlTool: false, childRequests: 0, childRoleMarker: false, childReadOnlyToolsExact: false, childControlToolsAbsent: false }
+			? { requests: 0, pathExact: false, wireModelGpt41: false, parentAgentsMarker: false, parentConfigMarker: false, parentSpawnAgentControlTool: false, childRequests: 0, childRoleMarker: false, childReadOnlyToolsExact: false, childControlToolsAbsent: false, requiredResultOccurrences: 0, requiredResultUserOccurrences: 0, requiredTerminalStatus: false, backgroundParentRequestsAfterRelease: 0 }
 			: { requests: 0, completed: 0, nativeAgentToolSchema: false },
 	};
 	if (development) evidence.launch.provenance = 'development-source-app fake-only';
@@ -155,8 +157,10 @@ function requestSummary(payload) {
 	const instructions = messages.filter(message => message && (message.role === 'developer' || message.role === 'system')).map(message => contentText(message.content)).join('\n');
 	const userText = messages.filter(message => message?.role === 'user').map(message => contentText(message.content)).join('\n');
 	const tools = Array.isArray(payload?.tools) ? payload.tools.map(tool => typeof tool?.function?.name === 'string' ? tool.function.name : '').filter(Boolean).sort() : [];
+	const serialized = messages.map(message => ({ role: message?.role, text: contentText(message?.content) }));
 	const childId = JSON.stringify(messages).match(/\\?"id\\?":\\?"([0-9a-f-]{36})/i)?.[1];
-	return { modelIsWire: payload?.model === 'gpt-4.1', hasAgentsMarker: instructions.includes('VOID_SMOKE_AGENTS_MARKER'), hasConfigMarker: instructions.includes('VOID_SMOKE_CONFIG_MARKER'), hasRoleMarker: instructions.includes('VOID_SMOKE_ROLE_MARKER'), looksLikeFixtureChild: instructions.includes('fixture-reader'), taskRequestsTerminal: userText.includes('VOID_SMOKE_TERMINAL'), userText, tools, childId };
+	const requiredResultOccurrences = serialized.reduce((count, message) => count + (message.text.split(SAME_CHILD_RESULT).length - 1), 0);
+	return { modelIsWire: payload?.model === 'gpt-4.1', hasAgentsMarker: instructions.includes('VOID_SMOKE_AGENTS_MARKER'), hasConfigMarker: instructions.includes('VOID_SMOKE_CONFIG_MARKER'), hasRoleMarker: instructions.includes('VOID_SMOKE_ROLE_MARKER'), looksLikeFixtureChild: instructions.includes('fixture-reader'), looksLikeBackgroundChild: userText.includes('VOID_SMOKE_BACKGROUND_CHILD'), taskRequestsBackground: userText.includes('VOID_SMOKE_BACKGROUND'), taskRequestsTerminal: userText.includes('VOID_SMOKE_TERMINAL'), userText, tools, childId, requiredResultOccurrences, requiredResultUserOccurrences: serialized.filter(message => message.role === 'user').reduce((count, message) => count + (message.text.split(SAME_CHILD_RESULT).length - 1), 0), requiredTerminalStatus: serialized.some(message => message.text.includes(SAME_CHILD_RESULT) && message.text.includes('completed')) };
 }
 function completionChunk(delta, finishReason = null) { return { id: 'void-smoke', object: 'chat.completion.chunk', created: 0, model: 'gpt-4.1', choices: [{ index: 0, delta, finish_reason: finishReason }] }; }
 function writeSse(response, events) {
@@ -178,57 +182,57 @@ function readJsonRequest(request) {
 	});
 }
 async function startFakeServer(evidence) {
-	let parentPhase = 0; let terminalIssued = false; let childResponse; let childHeldResolve; let parentFinalResolve; let lateContinuationResolve; const requestSummaries = [];
-	const childHeld = new Promise(resolve => { childHeldResolve = resolve; });
-	const parentFinal = new Promise(resolve => { parentFinalResolve = resolve; });
-	const lateContinuation = new Promise(resolve => { lateContinuationResolve = resolve; });
+	let parentPhase = 0; let backgroundPhase = 0; let childPhase = 0; let terminalIssued = false; let requiredChildResponse; let backgroundChildResponse; let backgroundReleased = false; const requestSummaries = [];
+	let requiredChildHeldResolve; let requiredCandidateResolve; let requiredSynthesisResolve; let backgroundChildHeldResolve; let backgroundParentFinalResolve;
+	const requiredChildHeld = new Promise(resolve => { requiredChildHeldResolve = resolve; });
+	const requiredCandidate = new Promise(resolve => { requiredCandidateResolve = resolve; });
+	const requiredSynthesis = new Promise(resolve => { requiredSynthesisResolve = resolve; });
+	const backgroundChildHeld = new Promise(resolve => { backgroundChildHeldResolve = resolve; });
+	const backgroundParentFinal = new Promise(resolve => { backgroundParentFinalResolve = resolve; });
 	const server = http.createServer(async (request, response) => {
 		try {
 			evidence.transport.requests += 1;
 			if (request.method !== 'POST' || request.url !== '/chat/completions') { response.writeHead(404).end(); return; }
 			const summary = requestSummary(await readJsonRequest(request)); requestSummaries.push(summary);
-			evidence.transport.pathExact = true;
-			evidence.transport.wireModelGpt41 ||= summary.modelIsWire;
-			evidence.transport.parentAgentsMarker ||= summary.hasAgentsMarker;
-			evidence.transport.parentConfigMarker ||= summary.hasConfigMarker;
-			evidence.transport.parentSpawnAgentControlTool ||= summary.tools.includes('spawn_agent');
+			evidence.transport.pathExact = true; evidence.transport.wireModelGpt41 ||= summary.modelIsWire; evidence.transport.parentAgentsMarker ||= summary.hasAgentsMarker; evidence.transport.parentConfigMarker ||= summary.hasConfigMarker; evidence.transport.parentSpawnAgentControlTool ||= summary.tools.includes('spawn_agent');
 			const isChild = summary.hasRoleMarker || summary.looksLikeFixtureChild;
 			if (isChild) {
-				evidence.transport.childRequests += 1;
-				evidence.transport.childRoleMarker = summary.hasRoleMarker;
-				evidence.transport.childReadOnlyToolsExact = summary.tools.join('|') === readonlyChildTools.join('|');
-				evidence.transport.childControlToolsAbsent = !summary.tools.some(name => ['spawn_agent', 'run_command', 'run_persistent_command'].includes(name));
-				if (childResponse) throw new Error('Fake smoke received an overlapping held child request.');
-				if (evidence.transport.childRequests > 1) { writeText(response, 'Fixture reader completed after message.'); return; }
-				childResponse = response; childHeldResolve(); return;
+				evidence.transport.childRequests += 1; evidence.transport.childRoleMarker = summary.hasRoleMarker; evidence.transport.childReadOnlyToolsExact = summary.tools.join('|') === readonlyChildTools.join('|'); evidence.transport.childControlToolsAbsent = !summary.tools.some(name => ['spawn_agent', 'run_command', 'run_persistent_command'].includes(name));
+				if (summary.looksLikeBackgroundChild) { if (backgroundChildResponse) throw new Error('Fake smoke received an overlapping background child request.'); backgroundChildResponse = response; backgroundChildHeldResolve(); return; }
+				if (childPhase === 0) { requiredChildResponse = response; requiredChildHeldResolve(); return; }
+				if (childPhase === 1) { if (!summary.childId) throw new Error('Child list_agents result did not expose the root parent id.'); childPhase = 2; writeTool(response, 'smoke-child-message-tool', 'send_message', { target: summary.childId, message: SAME_CHILD_RESULT }); return; }
+				if (childPhase === 2) { childPhase = 3; writeText(response, SAME_CHILD_RESULT); return; }
+				throw new Error('Fake smoke received an unexpected required child request.');
 			}
 			if (summary.taskRequestsTerminal && !terminalIssued) { terminalIssued = true; writeTool(response, 'smoke-terminal-tool', 'run_command', { command: 'ping -n 30 127.0.0.1 > nul', cwd: '.' }); return; }
+			if (summary.taskRequestsBackground) {
+				if (backgroundPhase === 0) { backgroundPhase = 1; writeTool(response, 'smoke-background-spawn-tool', 'spawn_agent', { message: 'VOID_SMOKE_BACKGROUND_CHILD', agent_type: 'fixture-reader', model: 'gpt-5.6-luna', fork_turns: 'none', background: true }); return; }
+				if (backgroundPhase === 1) { backgroundPhase = 2; writeText(response, 'Void smoke background parent finished.'); backgroundParentFinalResolve(); return; }
+				if (backgroundReleased) evidence.transport.backgroundParentRequestsAfterRelease += 1;
+				throw new Error('Background child completion restarted the idle parent.');
+			}
 			if (parentPhase === 0) { parentPhase = 1; writeTool(response, 'smoke-spawn-tool', 'spawn_agent', { message: 'Inspect the fixture as the selected role.', agent_type: 'fixture-reader', model: 'gpt-5.6-luna', fork_turns: 'all' }); return; }
 			if (parentPhase === 1) { parentPhase = 2; writeTool(response, 'smoke-list-tool', 'list_agents', {}); return; }
-			if (parentPhase === 2 && summary.childId) { parentPhase = 3; writeTool(response, 'smoke-message-tool', 'send_message', { target: summary.childId, message: 'Include the late completion evidence.' }); return; }
-			if (parentPhase <= 3) { parentPhase = 4; writeTool(response, 'smoke-wait-tool', 'wait_agent', { timeout_ms: 5000 }); return; }
-			if (parentPhase === 4) { parentPhase = 5; writeText(response, 'Void smoke parent completed before its child.'); parentFinalResolve(); return; }
-			if (!summary.userText.includes('Fixture reader completed after message.')) throw new Error('Late continuation did not include the completed child result.');
-			writeText(response, 'Void smoke late completion observed.'); lateContinuationResolve();
-		} catch (error) {
-			if (!response.headersSent) response.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
-			response.end('fixture failure'); addError(evidence, 'fake-loopback', error);
-		}
+			if (parentPhase === 2) { parentPhase = 3; writeTool(response, 'smoke-wait-tool', 'wait_agent', { timeout_ms: 5000 }); return; }
+			if (parentPhase === 3) { parentPhase = 4; writeText(response, 'VOID_SMOKE_PREMATURE_PARENT_CANDIDATE'); requiredCandidateResolve(); return; }
+			if (parentPhase === 4) {
+				evidence.transport.requiredResultOccurrences = summary.requiredResultOccurrences; evidence.transport.requiredResultUserOccurrences = summary.requiredResultUserOccurrences; evidence.transport.requiredTerminalStatus = summary.requiredTerminalStatus;
+				if (summary.requiredResultOccurrences !== 1 || summary.requiredResultUserOccurrences !== 0) throw new Error('Required child synthesis did not receive one attributed report body.');
+				if (!summary.requiredTerminalStatus) { writeText(response, 'VOID_SMOKE_COORDINATION_ONLY_CANDIDATE'); return; }
+				parentPhase = 5; writeText(response, 'Void smoke required completion observed.'); requiredSynthesisResolve(); return;
+			}
+			throw new Error('Fake smoke received an unexpected parent request.');
+		} catch (error) { if (!response.headersSent) response.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' }); response.end('fixture failure'); addError(evidence, 'fake-loopback', error); }
 	});
 	await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
-	const address = server.address();
-	if (!address || typeof address === 'string') throw new Error('Fake smoke server did not bind ephemeral loopback.');
+	const address = server.address(); if (!address || typeof address === 'string') throw new Error('Fake smoke server did not bind ephemeral loopback.');
 	return {
-		endpoint: `http://127.0.0.1:${address.port}`,
-		requestSummaries: () => [...requestSummaries],
-		waitForChild: () => childHeld,
-		waitForParentFinal: () => parentFinal,
-		waitForLateContinuation: () => lateContinuation,
-		releaseChild: () => { if (!childResponse) throw new Error('Child completion was requested before provider request arrived.'); const response = childResponse; childResponse = undefined; writeText(response, 'Fixture reader completed.'); },
-		close: async () => { if (childResponse) { childResponse.destroy(); childResponse = undefined; } server.closeAllConnections?.(); await new Promise(resolve => server.close(() => resolve())); },
+		endpoint: `http://127.0.0.1:${address.port}`, requestSummaries: () => [...requestSummaries], waitForChild: () => requiredChildHeld, waitForRequiredCandidate: () => requiredCandidate, waitForRequiredSynthesis: () => requiredSynthesis, waitForBackgroundChild: () => backgroundChildHeld, waitForBackgroundParentFinal: () => backgroundParentFinal,
+		releaseChild: () => { if (!requiredChildResponse) throw new Error('Required child completion was requested before provider request arrived.'); const response = requiredChildResponse; requiredChildResponse = undefined; childPhase = 1; writeTool(response, 'smoke-child-list-tool', 'list_agents', {}); },
+		releaseBackgroundChild: () => { if (!backgroundChildResponse) throw new Error('Background child completion was requested before provider request arrived.'); const response = backgroundChildResponse; backgroundChildResponse = undefined; backgroundReleased = true; writeText(response, 'Void smoke background child completed.'); },
+		close: async () => { for (const response of [requiredChildResponse, backgroundChildResponse]) response?.destroy(); requiredChildResponse = undefined; backgroundChildResponse = undefined; server.closeAllConnections?.(); await new Promise(resolve => server.close(() => resolve())); },
 	};
-}
-function writeFixtureWorkspace(workspace, mode) {
+}function writeFixtureWorkspace(workspace, mode) {
 	fs.writeFileSync(assertContained(workspace, path.join(workspace, 'README.md'), 'workspace fixture'), '# Void smoke fixture\n', 'utf8');
 	if (mode !== 'fake') return;
 	const codex = makeDirectory(workspace, '.codex'); const agents = makeDirectory(codex, 'agents');
@@ -304,10 +308,16 @@ async function runFakeAcceptance(page, evidence, fakeServer) {
 	evidence.assertions.push('child-agent-project-instructions');
 	const childActivity = page.getByTestId('child-activity-card'); await waitVisible(childActivity, 'Child Activity card'); const childSummary = childActivity.locator('summary[aria-label^="Child Activity "]'); await waitVisible(childSummary, 'Child Activity summary');
 	if (!/running/i.test(await childSummary.innerText())) throw new Error('Child Activity did not remain visibly running before held response settled.');
-	await Promise.race([fakeServer.waitForParentFinal(), sleep(timeoutMs).then(() => { throw new Error('Parent did not finish after the bounded child wait.'); })]);
-	fakeServer.releaseChild(); await Promise.race([fakeServer.waitForLateContinuation(), sleep(timeoutMs).then(() => { throw new Error('Late child completion did not start a parent continuation.'); })]);
-	if (evidence.transport.childRequests !== 2) throw new Error(`Queued child message did not produce exactly two child provider boundaries: ${evidence.transport.childRequests}.`);
-	await waitVisible(page.getByText('Void smoke late completion observed.', { exact: true }).last(), 'late child completion continuation'); await waitVisible(childActivity.locator('summary[aria-label^="Child Activity "]').filter({ hasText: /completed/i }), 'completed Child Activity'); if (await childActivity.count() !== 1) throw new Error('Child Activity history was duplicated.'); evidence.assertions.push('child-running-and-completed'); await waitForCurrentRunToSettle(page);
+	await Promise.race([fakeServer.waitForRequiredCandidate(), sleep(timeoutMs).then(() => { throw new Error('Parent did not reach its provisional required-child candidate.'); })]);
+	if (await page.getByText('VOID_SMOKE_PREMATURE_PARENT_CANDIDATE', { exact: true }).count()) throw new Error('A provisional parent candidate was displayed before the required child completed.');
+	fakeServer.releaseChild(); await Promise.race([fakeServer.waitForRequiredSynthesis(), sleep(timeoutMs).then(() => { throw new Error('Required child completion did not produce the parent synthesis.'); })]);
+	if (evidence.transport.childRequests !== 3 || evidence.transport.requiredResultOccurrences !== 1 || evidence.transport.requiredResultUserOccurrences !== 0 || !evidence.transport.requiredTerminalStatus) throw new Error('Required child result was missing, duplicated, or serialized as user context.');
+	await waitVisible(page.getByText('Void smoke required completion observed.', { exact: true }).last(), 'required child completion synthesis'); const agentReport = page.locator('[aria-label^="Agent "]').filter({ hasText: SAME_CHILD_RESULT }); await waitVisible(agentReport, 'attributed deduplicated child report'); if (await agentReport.count() !== 1 || !/completed/i.test(await agentReport.getAttribute('aria-label') ?? '')) throw new Error('The attributed child report was duplicated or lacked terminal status.'); await waitVisible(childActivity.locator('summary[aria-label^="Child Activity "]').filter({ hasText: /completed/i }), 'completed Child Activity'); if (await childActivity.count() !== 1) throw new Error('Child Activity history was duplicated.'); evidence.assertions.push('required-child-held-and-deduplicated'); await waitForCurrentRunToSettle(page);
+
+	const requestsBeforeBackground = evidence.transport.requests;
+	await chat.fill('VOID_SMOKE_BACKGROUND'); await waitForEnabledCurrentSend(page); await chat.press('Enter'); await Promise.race([fakeServer.waitForBackgroundChild(), sleep(timeoutMs).then(() => { throw new Error('Background child provider request did not arrive.'); })]); await Promise.race([fakeServer.waitForBackgroundParentFinal(), sleep(timeoutMs).then(() => { throw new Error('Background parent did not finish independently.'); })]); await waitVisible(page.getByText('Void smoke background parent finished.', { exact: true }).last(), 'background parent final');
+	fakeServer.releaseBackgroundChild(); await waitVisible(page.getByTestId('child-activity-card').last().locator('summary[aria-label^="Child Activity "]').filter({ hasText: /completed/i }), 'completed background Child Activity'); await page.waitForTimeout(1_000);
+	if (evidence.transport.backgroundParentRequestsAfterRelease !== 0 || evidence.transport.requests !== requestsBeforeBackground + 3) throw new Error('Background completion restarted the idle parent provider.'); if (await page.getByText('VOID_SMOKE_BACKGROUND', { exact: true }).count() !== 1) throw new Error('Background completion created an extra user bubble.'); evidence.assertions.push('background-child-does-not-restart-parent');
 	const terminalCommand = '"ping -n 30 127.0.0.1 > nul"';
 	await chat.fill('VOID_SMOKE_TERMINAL'); await waitForEnabledCurrentSend(page); await chat.press('Enter'); const terminalCard = page.getByText(terminalCommand, { exact: true }).locator('xpath=ancestor::div[contains(@class, "border-void-border-3")][1]'); await waitVisible(terminalCard, 'Terminal card'); const terminalStop = terminalCard.getByRole('button', { name: 'Stop this tool', exact: true }); await waitVisible(terminalStop, 'Terminal card Stop'); if (await terminalStop.isDisabled()) throw new Error('Terminal card Stop was not independently enabled.');
 	await page.waitForTimeout(1_050); const elapsed = page.getByTestId('void-tool-elapsed').last(); await waitVisible(elapsed, 'Visible tool elapsed'); if (!/Elapsed\s+\d+s/.test(await elapsed.innerText())) throw new Error('Live tool elapsed text was not rendered.');

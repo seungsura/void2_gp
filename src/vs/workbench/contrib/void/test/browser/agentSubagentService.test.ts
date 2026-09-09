@@ -470,7 +470,7 @@ suite('Void AgentSubagentService', () => {
 		assert.deepStrictEqual({ parentRunId: top.parentRunId, depth: top.depth, remainingDepth: top.remainingDepth }, { parentRunId: undefined, depth: 1, remainingDepth: 1 });
 		assert.deepStrictEqual({ parentRunId: nested.parentRunId, depth: nested.depth, remainingDepth: nested.remainingDepth }, { parentRunId: top.id, depth: 2, remainingDepth: 0 });
 		assert.strictEqual(f.providerCalls.some(call => call.agentDelegationAllowed === true), true); assert.strictEqual(f.providerCalls.some(call => call.agentDelegationAllowed === false), true);
-		assert.deepStrictEqual(f.providerCalls.map(call => call.modelSelection.modelName), ['gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1']); assert.strictEqual(f.providerCalls[1].overridesOfModel.openAI['gpt-4.1-mini'].temperature, .7);
+		assert.deepStrictEqual(f.providerCalls.map(call => call.modelSelection.modelName), ['gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4.1']); assert.strictEqual(f.providerCalls[1].overridesOfModel.openAI['gpt-4.1-mini'].temperature, .7);
 		assert.strictEqual(f.converterCalls.some(call => call.agentDelegationAllowed === true), true); assert.strictEqual(f.converterCalls.some(call => call.agentDelegationAllowed === false), true);
 		assert.deepStrictEqual(f.service.getBudgetView('depth-two') && { accepted: f.service.getBudgetView('depth-two')!.accepted, maxAccepted: f.service.getBudgetView('depth-two')!.maxAccepted, maxConcurrent: f.service.getBudgetView('depth-two')!.maxConcurrent }, { accepted: 0, maxAccepted: 2, maxConcurrent: 2 });
 		await assert.rejects(() => f.service.wait('depth-two', 0, [nested.id]), /agent_child_not_direct/); assert.throws(() => f.service.interrupt('depth-two', nested.id), /agent_target_terminal/);
@@ -1089,6 +1089,50 @@ suite('Void AgentSubagentService', () => {
 		const first = await f.service.wait('parent', 0); const second = await f.service.wait('parent', 0); assert.strictEqual(first.deliverSummary, true); assert.ok(first.receipt?.summary); assert.strictEqual(first.children[0].completion, 'delivered_now'); assert.strictEqual(second.deliverSummary, false); assert.ok(second.receipt?.summary); assert.strictEqual(second.children[0].completion, 'already_delivered');
 	});
 
+	test('coalesces one child report with an identical final while retaining the inspectable receipt', async () => {
+		const pending: any[] = []; const f = fixture({ send: options => { pending.push(options); return `request-${pending.length}`; } });
+		const child = await f.service.spawn('parent', 'inspect', snapshot()); for (let i = 0; i < 20 && !pending.length; i++) await Promise.resolve();
+		const body = 'same child report\r\n';
+		assert.deepStrictEqual((f.service as any).sendMessageFor('parent', child.id, 'parent', body, 0), { target: 'parent', status: 'queued' });
+		pending[0].onFinalMessage({ fullText: '  same child report\n', fullReasoning: '', anthropicReasoning: null });
+		for (let i = 0; i < 20 && f.service.getRunView('parent')?.status !== 'completed'; i++) await Promise.resolve();
+		assert.strictEqual(f.service.getRunView('parent')?.summary, '  same child report\n');
+		const claim: any = f.service.peekParentMailbox('parent', 0);
+		assert.deepStrictEqual(claim.events.map((event: any) => [event.kind, event.content]), [['message', body], ['completion', '']]);
+		assert.strictEqual(claim.events[1].relatedSequence, claim.events[0].sequence);
+		const waited = await f.service.wait('parent', 0, [child.id]);
+		assert.strictEqual(waited.deliverSummary, true); assert.strictEqual(waited.receipt?.summary, ''); assert.strictEqual(waited.receipt?.reportedMessageSequence, claim.events[0].sequence);
+		assert.strictEqual(f.service.getRunView('parent')?.summary, '  same child report\n');
+	});
+
+	test('does not reinject an acknowledged identical report and preserves changed or background results', async () => {
+		const pending: any[] = []; const f = fixture({ send: options => { pending.push(options); return `request-${pending.length}`; } });
+		const first = await f.service.spawn('parent', 'first', snapshot()); for (let i = 0; i < 20 && pending.length < 1; i++) await Promise.resolve();
+		assert.deepStrictEqual((f.service as any).sendMessageFor('parent', first.id, 'parent', 'already consumed', 0), { target: 'parent', status: 'queued' });
+		const before: any = f.service.peekParentMailbox('parent', 0); assert.strictEqual(f.service.ackParentMailbox('parent', 0, before), true);
+		pending[0].onFinalMessage({ fullText: 'already consumed', fullReasoning: '', anthropicReasoning: null });
+		for (let i = 0; i < 20 && f.service.getRunViews('parent')[0]?.status !== 'completed'; i++) await Promise.resolve();
+		const after: any = f.service.peekParentMailbox('parent', 0); assert.deepStrictEqual(after.events.map((event: any) => [event.kind, event.content]), [['completion', '']]); assert.strictEqual(after.events[0].relatedSequence, before.events[0].sequence);
+
+		const changed = await f.service.spawn('parent', 'changed', snapshot()); for (let i = 0; i < 20 && pending.length < 2; i++) await Promise.resolve();
+		assert.deepStrictEqual((f.service as any).sendMessageFor('parent', changed.id, 'parent', 'draft', 0), { target: 'parent', status: 'queued' }); pending[1].onFinalMessage({ fullText: 'final', fullReasoning: '', anthropicReasoning: null });
+		for (let i = 0; i < 20 && f.service.getRunViews('parent')[1]?.status !== 'completed'; i++) await Promise.resolve();
+		const changedClaim: any = f.service.peekParentMailbox('parent', 0); assert.deepStrictEqual(changedClaim.events.filter((event: any) => event.sourceId === changed.id).map((event: any) => [event.kind, event.content]), [['message', 'draft'], ['completion', 'final']]);
+
+		const background = await f.service.spawn('parent', 'background', snapshot(), undefined, undefined, undefined, undefined, 0, undefined, undefined, undefined, undefined, 'none', [], true); for (let i = 0; i < 20 && pending.length < 3; i++) await Promise.resolve(); pending[2].onFinalMessage({ fullText: 'background result', fullReasoning: '', anthropicReasoning: null });
+		for (let i = 0; i < 20 && f.service.getRunViews('parent')[2]?.status !== 'completed'; i++) await Promise.resolve();
+		assert.strictEqual(f.service.peekParentMailbox('parent', 0).events.some(event => event.sourceId === background.id), false);
+		const firstWait = await f.service.wait('parent', 0, [background.id]); const secondWait = await f.service.wait('parent', 0, [background.id]); assert.strictEqual(firstWait.deliverSummary, true); assert.strictEqual(firstWait.children[0].completion, 'delivered_now'); assert.strictEqual(secondWait.deliverSummary, false); assert.strictEqual(secondWait.children[0].completion, 'already_delivered');
+	});
+
+	test('retains exact report identity through long active coordination until settlement', async () => {
+		const pending: any[] = []; const f = fixture({ send: options => { pending.push(options); return 'request'; } }); const child = await f.service.spawn('parent', 'inspect', snapshot()); for (let i = 0; i < 20 && !pending.length; i++) await Promise.resolve();
+		const body = 'original final report'; (f.service as any).sendMessageFor('parent', child.id, 'parent', body, 0); let claim: any = f.service.peekParentMailbox('parent', 0); assert.strictEqual(f.service.ackParentMailbox('parent', 0, claim), true);
+		for (let index = 0; index < 32; index++) { (f.service as any).sendMessageFor('parent', child.id, 'parent', `later coordination ${index}`, 0); claim = f.service.peekParentMailbox('parent', 0); assert.strictEqual(f.service.ackParentMailbox('parent', 0, claim), true); }
+		pending[0].onFinalMessage({ fullText: body, fullReasoning: '', anthropicReasoning: null }); for (let i = 0; i < 20 && f.service.getRunView('parent')?.status !== 'completed'; i++) await Promise.resolve();
+		const terminal: any = f.service.peekParentMailbox('parent', 0); assert.deepStrictEqual(terminal.events.map((event: any) => [event.kind, event.content]), [['completion', '']]); assert.strictEqual(typeof terminal.events[0].relatedSequence, 'number'); assert.strictEqual((f.service as any).groups.get('parent').reportedMessages.has(child.id), false);
+	});
+
 	test('one-hour waits wake only for the exact root generation or addressed mailbox', async () => {
 		const f = fixture({ send: () => 'request' }); const child = await f.service.spawn('long-wait', 'inspect', snapshot(), undefined, undefined, undefined, undefined, 7);
 		let rootSettled = false; const rootWait = f.service.wait('long-wait', 3_600_000, [child.id], 7).then(result => { rootSettled = true; return result; });
@@ -1106,6 +1150,24 @@ suite('Void AgentSubagentService', () => {
 		f.service.interrupt('long-wait', child.id, 7); f.service.interrupt('nested-wait', root.id);
 	});
 
+	test('required waits wake for child coordination before terminal settlement', async () => {
+		const f = fixture({ send: () => 'request' }); const child = await f.service.spawn('required-message', 'inspect', snapshot());
+		let woke = false; const waiting = f.service.waitForRequired('required-message', 0).then(() => { woke = true; }); await Promise.resolve(); assert.strictEqual(woke, false);
+		assert.deepStrictEqual((f.service as any).sendMessageFor('required-message', child.id, 'required-message', 'need parent input', 0), { target: 'required-message', status: 'queued' }); await waiting; assert.strictEqual(woke, true); assert.strictEqual(f.service.hasPendingRequired('required-message', 0), true);
+		f.service.interrupt('required-message', child.id);
+	});
+
+	test('scopes exact-report coalescing to the recipient that actually received the message', async () => {
+		const pending = new Map<string, any[]>(); const f = fixture({ send: options => { const id = options.logging.loggingExtras.childId as string; const requests = pending.get(id) ?? []; requests.push(options); pending.set(id, requests); return `request-${id}-${requests.length}`; } });
+		const runtime = snapshot([], 'file:///workspace', 'gpt-4.1', { maxDepth: 2 }); const root = await f.service.spawn('parent', 'root', runtime); const group: any = (f.service as any).groups.get('parent'); const rootRun = group.runs.find((run: any) => run.id === root.id);
+		const nested = await (f.service as any).spawnWithin('parent', 'nested', runtime, undefined, undefined, undefined, undefined, 0, rootRun); for (let i = 0; i < 30 && !(pending.get(nested.id)?.length); i++) await Promise.resolve();
+		const body = 'outer report and nested final'; assert.deepStrictEqual((f.service as any).sendMessageFor('parent', nested.id, 'parent', body, 0), { target: 'parent', status: 'queued' }); pending.get(nested.id)![0].onFinalMessage({ fullText: body, fullReasoning: '', anthropicReasoning: null });
+		for (let i = 0; i < 30 && group.runs.find((run: any) => run.id === nested.id)?.lifecycle.status !== 'completed'; i++) await Promise.resolve();
+		const direct: any = await (f.service as any).waitFor('parent', root.id, 0, [nested.id], 0); assert.strictEqual(direct.deliverSummary, true); assert.strictEqual(direct.receipt?.summary, body);
+		const outer: any = f.service.peekParentMailbox('parent', 0); assert.strictEqual(outer.events.filter((event: any) => event.content === body).length, 1);
+		f.service.interrupt('parent', root.id);
+	});
+
 	test('forks complete turns and delivers queued messages at the next child boundary', async () => {
 		const pending: any[] = []; const f = fixture({ send: options => { pending.push(options); return `request-${pending.length}`; } });
 		const prior: any[] = [
@@ -1118,7 +1180,7 @@ suite('Void AgentSubagentService', () => {
 		assert.deepStrictEqual(f.converterCalls[0].chatMessages.map((message: any) => message.displayContent), ['old-two', 'answer-two', 'delegated']);
 		assert.deepStrictEqual(f.service.sendMessage('parent', child.id, 'new evidence'), { target: child.id, status: 'queued' });
 		pending[0].onFinalMessage({ fullText: 'first answer', fullReasoning: '', anthropicReasoning: null }); for (let i = 0; i < 20 && pending.length < 2; i++) await Promise.resolve();
-		assert.ok(f.converterCalls[1].chatMessages.some((message: any) => message.displayContent.includes('new evidence'))); pending[1].onFinalMessage({ fullText: 'final answer', fullReasoning: '', anthropicReasoning: null });
+		assert.ok(f.converterCalls[1].chatMessages.some((message: any) => (message.role === 'agent' ? message.content : message.displayContent)?.includes('new evidence'))); pending[1].onFinalMessage({ fullText: 'final answer', fullReasoning: '', anthropicReasoning: null });
 		const done = await f.service.wait('parent', 1000); assert.strictEqual(done.status, 'completed'); assert.strictEqual(done.receipt?.summary, 'final answer');
 		const tree: any = f.service.list('parent'); assert.strictEqual(tree.root.target, 'parent'); assert.strictEqual(tree.agents[0].summary, 'final answer'); assert.throws(() => f.service.sendMessage('parent', child.id, 'late'), /agent_target_terminal/); assert.throws(() => f.service.interrupt('parent', child.id), /agent_target_terminal/);
 	});

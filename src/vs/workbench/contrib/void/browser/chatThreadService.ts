@@ -23,7 +23,7 @@ import { computeMaxReadOutputTokens, isBoundedReadHistory, isBoundedReadHistoryS
 import { IToolsService } from './toolsServiceInterface.js';
 import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
 import { ILanguageFeaturesService } from '../../../../editor/common/services/languageFeatures.js';
-import { ChatMessage, CodespanLocationLink, isAgentDelegationSelection, StagingSelectionItem, ToolMessage } from '../common/chatThreadServiceTypes.js';
+import { AgentChatMessage, ChatMessage, CodespanLocationLink, isAgentDelegationSelection, StagingSelectionItem, ToolMessage } from '../common/chatThreadServiceTypes.js';
 import { Position } from '../../../../editor/common/core/position.js';
 import { IMetricsService } from '../common/metricsService.js';
 import { shorten } from '../../../../base/common/labels.js';
@@ -537,8 +537,8 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				if (!result.identity.childIds.length && this._runQuiescenceOfThread.get(event.parentId)?.runId !== source.runId) this._childGroupSourceOfThread.delete(event.parentId)
 				this._wakePendingChatInputs(event.parentId)
 			})
-			if ('status' in event && event.status !== 'queued' && event.status !== 'running') this._scheduleAgentMailboxContinuation(event.parentId, event.generation, source)
-			else if ('mailboxTarget' in event && event.mailboxTarget === event.parentId) this._scheduleAgentMailboxContinuation(event.parentId, event.generation, source)
+			// Terminal results and coordination messages wake active waits through the
+			// service event. An idle parent is never restarted automatically.
 		}));
 
 		// always be in a thread
@@ -551,7 +551,6 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 	private readonly _agentInstructionSessionOfThread = new Map<string, AgentInstructionTaskSessionRecord>();
 	private readonly _instructionTurnOfThread = new Map<string, AgentRuntimeTurnSnapshot>();
 	private readonly _agentControlGeneration = new Map<string, number>();
-	private readonly _agentMailboxContinuationScheduled = new Set<string>();
 	private readonly _parentRunTokenOfThread = new Map<string, symbol>();
 	/** Cancellation is retained separately from the persisted tool message until the
 	 * underlying operation settles. This lets the card truthfully remain Cancelling
@@ -2530,7 +2529,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			}
 			if (!isControlCurrent()) return { interrupted: true };
 			const validatedParams = control.name === 'spawn_agent'
-				? { message: control.message, ...(control.agentType === undefined ? {} : { agent_type: control.agentType }), ...(control.model === undefined ? {} : { model: control.model }), ...(control.reasoningEffort === undefined ? {} : { reasoning_effort: control.reasoningEffort }), fork_turns: typeof control.forkTurns === 'number' ? String(control.forkTurns) : control.forkTurns }
+				? { message: control.message, ...(control.agentType === undefined ? {} : { agent_type: control.agentType }), ...(control.model === undefined ? {} : { model: control.model }), ...(control.reasoningEffort === undefined ? {} : { reasoning_effort: control.reasoningEffort }), fork_turns: typeof control.forkTurns === 'number' ? String(control.forkTurns) : control.forkTurns, background: control.background }
 				: control.name === 'wait_agent'
 					? { timeout_ms: control.timeoutMs, ...(control.targets === undefined ? {} : { targets: [...control.targets] }) }
 					: control.name === 'list_agents' ? { ...(control.target ? { target: control.target } : {}) }
@@ -2541,7 +2540,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			const clearTransient = () => { const state = this.streamState[threadId]; if (state?.isRunning === 'idle' && state.toolInfo?.transient && state.toolInfo.receiptId === receiptId) this._setStreamState?.(threadId, { isRunning: 'idle', interrupt: 'not_needed' }); };
 			try {
 				let result: object;
-				if (control.name === 'spawn_agent') result = await this._agentSubagentService.spawn(threadId, control.message, instructionSnapshot, control.agentType, agentDelegationAuthority.roles, agentDelegationAuthority.settingsState, agentDelegationAuthority.settingsOfProvider, controlGeneration, agentDelegationAuthority.parentTools, this._createAgentSubagentToolBroker?.(threadId, agentDelegationAuthority), control.model, control.reasoningEffort, control.forkTurns, this.state.allThreads[threadId]?.messages ?? []);
+				if (control.name === 'spawn_agent') result = await this._agentSubagentService.spawn(threadId, control.message, instructionSnapshot, control.agentType, agentDelegationAuthority.roles, agentDelegationAuthority.settingsState, agentDelegationAuthority.settingsOfProvider, controlGeneration, agentDelegationAuthority.parentTools, this._createAgentSubagentToolBroker?.(threadId, agentDelegationAuthority), control.model, control.reasoningEffort, control.forkTurns, this.state.allThreads[threadId]?.messages ?? [], control.background);
 				else if (control.name === 'wait_agent') { const waiting = this._agentSubagentService.wait(threadId, control.timeoutMs, control.targets, controlGeneration); this._wakeAgentWaitForPendingSteer(threadId, controlGeneration); result = await waiting; }
 				else if (control.name === 'list_agents') result = this._agentSubagentService.list(threadId, control.target, controlGeneration);
 				else if (control.name === 'send_message') result = this._agentSubagentService.sendMessage(threadId, control.target, control.message, controlGeneration);
@@ -3034,13 +3033,13 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			// the steer is being claimed. Never assemble a provider request after that.
 			if (!isCurrentRun()) return
 			const agentMailbox = this._agentSubagentService.peekParentMailbox(threadId, agentRunGeneration)
-			if (agentMailbox.messages.length) { const content = agentMailbox.messages.join('\n\n'); this._addMessageToThread(threadId, { role: 'user', content, displayContent: content, selections: [], state: defaultMessageState }) }
+			this._appendAgentMailboxEvents(threadId, agentMailbox.events)
 			if (!isCurrentRun()) return
 			if (!await awaitThreadStorageWrites.call(this, threadId)) {
 				this._setStreamState(threadId, { isRunning: undefined, error: { message: 'This chat changed in another Void window. Review the latest history before continuing.', fullError: null } })
 				return
 			}
-			if (agentMailbox.messages.length && !this._agentSubagentService.ackParentMailbox(threadId, agentRunGeneration, agentMailbox)) return
+			if (agentMailbox.events.length && !this._agentSubagentService.ackParentMailbox(threadId, agentRunGeneration, agentMailbox)) return
 			// Conversion is asynchronous. Remember the exact authoritative B1 bytes it
 			// observed so a child/history mutation that lands during conversion or main
 			// run validation cannot be overtaken by provider dispatch.
@@ -3093,6 +3092,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 					shouldSendAnotherMessage = true
 					continue messageLoop
 				}
+				const holdNoToolCandidate = this._agentSubagentService.hasPendingRequired(threadId, agentRunGeneration)
 				const llmCancelToken = this._llmMessageService.sendLLMMessage({
 					messagesType: 'chatMessages',
 					chatMode,
@@ -3105,6 +3105,15 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 					separateSystemMessage: separateSystemMessage,
 					onText: ({ fullText, fullReasoning, toolCalls }) => {
 						if (providerSettled || !isCurrentRun()) return
+						if (holdNoToolCandidate) {
+							// A no-tool answer can only become authoritative after every current-answer
+							// child is terminal. Keep the provider candidate out of the visible stream;
+							// tool declarations remain visible so the parent can continue useful work.
+							if (!(toolCalls?.length)) {
+								this._setStreamState(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: '', reasoningSoFar: '', toolCallSoFar: null, toolCallsSoFar: [] }, interrupt: Promise.resolve(() => { if (llmCancelToken) this._llmMessageService.abort(llmCancelToken) }) })
+								return
+							}
+						}
 						this._setStreamState(threadId, { isRunning: 'LLM', llmInfo: { displayContentSoFar: sanitizeAssistantDisplayContent(fullText, true), reasoningSoFar: fullReasoning, toolCallSoFar: toolCalls?.[0] ?? null, toolCallsSoFar: toolCalls ?? [] }, interrupt: Promise.resolve(() => { if (llmCancelToken) this._llmMessageService.abort(llmCancelToken) }) })
 					},
 					onFinalMessage: async ({ fullText, fullReasoning, toolCalls, anthropicReasoning, }) => {
@@ -3183,6 +3192,24 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 				const { toolCalls, info } = llmRes
 				const validBatch = toolCalls.length === 0 || (toolCalls.every(call => !!call.id && !!call.name) && new Set(toolCalls.map(call => call.id)).size === toolCalls.length)
 				if (!validBatch) { this._setStreamState(threadId, { isRunning: undefined, error: { message: 'The provider returned an invalid or duplicate tool-call batch.', fullError: null } }); return }
+				if (!toolCalls.length && this._agentSubagentService.hasPendingRequired(threadId, agentRunGeneration)) {
+					// The streamed text is provisional while a current-answer child is active.
+					// Do not persist it as a final assistant turn; wait event-first, then let the
+					// next model boundary synthesize the attributed terminal result.
+					this._setStreamState(threadId, { isRunning: 'idle', interrupt: idleInterruptor })
+					const requiredActivity = this._agentSubagentService.waitForRequired(threadId, agentRunGeneration)
+					this._wakeAgentWaitForPendingSteer(threadId, agentRunGeneration)
+					await requiredActivity
+					if (!isCurrentRun()) return
+					shouldSendAnotherMessage = true
+					continue messageLoop
+				}
+				if (!toolCalls.length && this._agentSubagentService.peekParentMailbox(threadId, agentRunGeneration).events.length) {
+					// A completion or coordination message landed during this provider request.
+					// The current text was composed without it, so keep it provisional.
+					shouldSendAnotherMessage = true
+					continue messageLoop
+				}
 				const batchId = toolCalls.length ? generateUuid() : undefined
 				this._addMessageToThread(threadId, { role: 'assistant', displayContent: info.fullText, reasoning: info.fullReasoning, anthropicReasoning: info.anthropicReasoning, ...(batchId ? { toolBatch: { version: 1 as const, batchId, calls: toolCalls } } : {}) })
 				// The provider declaration is the durable authority for every following
@@ -3400,56 +3427,19 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			void this._wrapRunAgentToNotify(Promise.reject(error), threadId, parentRun)
 		}
 	}
-	private _scheduleAgentMailboxContinuation(threadId: string, generation: number, capturedSource?: Readonly<{ runId: string; generation: number }>): void {
-		const key = `${threadId}:${generation}`; if (this._agentMailboxContinuationScheduled.has(key)) return;
-		this._agentMailboxContinuationScheduled.add(key);
-		setTimeout(() => void (async () => {
-			let parentRun: ParentRunOwnership | undefined;
-			let directLeaseId: string | undefined;
-			let brokerRunOpened = false;
-			const closeAbortedRun = async () => {
-				if (directLeaseId) { await this._pendingBroker().abandonDirectHistoryAppend(threadId, directLeaseId).catch(() => undefined); directLeaseId = undefined; }
-				if (brokerRunOpened && parentRun) await this._releaseUndeliveredSteers(threadId, parentRun).catch(() => undefined);
-				parentRun?.deactivate(); parentRun?.releaseLatest();
-			};
-			try {
-				const quiescence = this._runQuiescenceOfThread.get(threadId); if (quiescence) await quiescence.settled;
-				if ((this._agentControlGeneration.get(threadId) ?? -1) !== generation || this._parentRunTokenOfThread.has(threadId) || this._startingParentRunOfThread.has(threadId) || this._pendingChatSubmissionOfThread.has(threadId) || this._isAwaitingUser(threadId)) return;
-				const source = this._childGroupSourceOfThread.get(threadId) ?? capturedSource; const authority = this._agentDelegationAuthorityOfThread.get(threadId);
-				if (!source || source.generation !== generation || !authority?.allowed || authority.generation !== generation) return;
-				const admissionCurrent = (requireUnowned: boolean) => {
-					const currentSource = this._childGroupSourceOfThread.get(threadId) ?? capturedSource;
-					return this._agentControlGeneration.get(threadId) === generation
-						&& currentSource?.runId === source.runId && currentSource.generation === source.generation
-						&& this._agentDelegationAuthorityOfThread.get(threadId) === authority && authority.allowed && authority.generation === generation
-						&& !!this.state.allThreads[threadId]
-						&& authority.runtimeSnapshot.ownerProjectRoot === this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
-						&& authority.runtimeSnapshot.workspaceTrustedAtAdmission === this._workspaceTrustManagementService.isWorkspaceTrusted()
-						&& !this._startingParentRunOfThread.has(threadId) && !this._pendingChatSubmissionOfThread.has(threadId) && !this._isAwaitingUser(threadId)
-						&& (requireUnowned ? !this._parentRunTokenOfThread.has(threadId) : !!parentRun?.isActive());
-				};
-				if (!admissionCurrent(true)) return;
-				const model = authority.runtimeSnapshot.model; if (!model.hasModel) return;
-				const childSync = await this._syncActiveChildGroup(threadId, source); if (!childSync.ok) return;
-				if (!admissionCurrent(true)) return;
-				parentRun = resumeParentRunOwnership(threadId, source.runId, generation, this._parentRunTokenOfThread, this._agentControlGeneration); if (!parentRun) return;
-				const mailbox = this._agentSubagentService.peekParentMailbox(threadId, generation); if (!mailbox.messages.length) { parentRun.deactivate(); parentRun.releaseLatest(); return; }
-				const content = mailbox.messages.join('\n\n'); const authorized = await this._pendingBroker().authorizeDirectHistoryAppend(threadId, content, [], parentRun.runId, generation);
-				if (!authorized.ok) { this._warnPendingMutation(authorized, 'reconcile'); parentRun.deactivate(); parentRun.releaseLatest(); return; }
-				directLeaseId = authorized.value.leaseId; brokerRunOpened = true;
-				if (!admissionCurrent(false)) { await closeAbortedRun(); return; }
-				this._addMessageToThread(threadId, { role: 'user', pendingInputId: authorized.value.pendingInputId, pendingInputSelectionsFingerprint: authorized.value.selectionsFingerprint, content, displayContent: content, selections: [], state: defaultMessageState });
-				const durable = await this._awaitThreadStorageWrites(threadId); const verified = durable ? await this._pendingBroker().verifyDirectHistoryAndRelease(threadId, directLeaseId) : undefined;
-				if (!verified?.ok) { await closeAbortedRun(); return; }
-				directLeaseId = undefined;
-				const mailboxAcked = this._agentSubagentService.ackParentMailbox(threadId, generation, mailbox);
-				if (!admissionCurrent(false) || !mailboxAcked) { await closeAbortedRun(); return; }
-				const continuationRun = parentRun;
-				this._startTrackedParentRun(threadId, continuationRun, () => this._runChatAgent({ threadId, instructionSnapshot: authority.runtimeSnapshot, agentDelegationAuthority: authority, parentRun: continuationRun, modelSelection: { providerName: model.providerName as ModelSelection['providerName'], modelName: model.modelName }, modelSelectionOptions: model.modelSelectionOptions as ModelSelectionOptions }));
-				brokerRunOpened = false;
-			} catch { await closeAbortedRun(); }
-			finally { this._agentMailboxContinuationScheduled.delete(key); }
-		})(), 0);
+	private _appendAgentMailboxEvents(threadId: string, events: readonly AgentChatMessage[]): void {
+		for (const event of events) {
+			if (event.kind === 'completion' && event.relatedSequence !== undefined) {
+				const messages = this.state.allThreads[threadId]?.messages ?? [];
+				const index = messages.findIndex(message => message.role === 'agent' && message.sourceId === event.sourceId && message.sequence === event.relatedSequence);
+				if (index >= 0) {
+					const previous = messages[index] as AgentChatMessage;
+					this._editMessageInThread(threadId, index, { ...previous, status: event.status, relatedSequence: event.sequence });
+					continue;
+				}
+			}
+			this._addMessageToThread(threadId, event);
+		}
 	}
 	private _canDeliverPendingChatInput(record: PendingChatInputRecord): boolean {
 		return !this._deletingPendingInputThreads.has(record.threadId)

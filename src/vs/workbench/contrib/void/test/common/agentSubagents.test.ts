@@ -19,7 +19,7 @@ suite('Void agent subagents', () => {
 		assert.strictEqual(isToolAllowedByProfile('read-only-child', 'write_file'), false);
 		assert.strictEqual(isToolAllowedByProfile('read-only-child', 'run_command'), false);
 		assert.deepStrictEqual(agentSubagentToolSchemas.spawn_agent, {
-			type: 'object', additionalProperties: false, required: ['message'], properties: { message: { type: 'string', minLength: 1, maxLength: 8000 }, agent_type: { type: 'string', minLength: 1, maxLength: 64 }, model: { type: 'string', minLength: 1, maxLength: 256 }, reasoning_effort: { type: 'string', minLength: 1, maxLength: 64 }, fork_turns: { type: 'string', minLength: 1, maxLength: 16 } },
+			type: 'object', additionalProperties: false, required: ['message'], properties: { message: { type: 'string', minLength: 1, maxLength: 8000 }, agent_type: { type: 'string', minLength: 1, maxLength: 64 }, model: { type: 'string', minLength: 1, maxLength: 256 }, reasoning_effort: { type: 'string', minLength: 1, maxLength: 64 }, fork_turns: { type: 'string', minLength: 1, maxLength: 16 }, background: { type: 'boolean' } },
 		});
 	});
 
@@ -89,7 +89,7 @@ suite('Void agent subagents', () => {
 
 	test('rejects unknown control fields before dispatch and defaults a safe wait', () => {
 		assert.deepStrictEqual(validateAgentSubagentControlParams('wait_agent', {}), { name: 'wait_agent', timeoutMs: AGENT_SUBAGENT_DEFAULT_WAIT_MS });
-		assert.deepStrictEqual(validateAgentSubagentControlParams('spawn_agent', { message: 'x', model: 'override' }), { name: 'spawn_agent', message: 'x', model: 'override', forkTurns: 'none' });
+		assert.deepStrictEqual(validateAgentSubagentControlParams('spawn_agent', { message: 'x', model: 'override' }), { name: 'spawn_agent', message: 'x', model: 'override', forkTurns: 'none', background: false });
 		assert.strictEqual(AGENT_SUBAGENT_DEFAULT_WAIT_MS, 3_600_000); assert.strictEqual(AGENT_SUBAGENT_MAX_WAIT_MS, 3_600_000);
 		assert.throws(() => validateAgentSubagentControlParams('wait_agent', { timeout_ms: 3_600_001 }), /wait_agent_invalid_params/);
 		assert.throws(() => validateAgentSubagentControlParams('interrupt_agent', { target: 'child', extra: true }), /interrupt_agent_invalid_params/);
@@ -101,9 +101,9 @@ suite('Void agent subagents', () => {
 		assert.deepStrictEqual(validateAgentSubagentControlParams('wait_agent', { targets: ['1', '2', '3', '4', '5', '6', '7', '8'] }), { name: 'wait_agent', timeoutMs: AGENT_SUBAGENT_DEFAULT_WAIT_MS, targets: ['1', '2', '3', '4', '5', '6', '7', '8'] });
 		for (const raw of [{ targets: [] }, { targets: ['one', 'one'] }, { targets: ['1', '2', '3', '4', '5', '6', '7', '8', '9'] }, { targets: ['one', 2] }]) assert.throws(() => validateAgentSubagentControlParams('wait_agent', raw), /wait_agent_invalid_params/);
 		for (const raw of [{ timeout_ms: -1 }, { timeout_ms: 3_600_001 }, { timeout_ms: 1.5 }, { timeout_ms: Number.POSITIVE_INFINITY }, { timeout_ms: '1' }]) assert.throws(() => validateAgentSubagentControlParams('wait_agent', raw), /wait_agent_invalid_params/);
-		assert.deepStrictEqual(validateAgentSubagentControlParams('spawn_agent', { message: 'x', agent_type: 'reader_1', reasoning_effort: 'high', fork_turns: '3' }), { name: 'spawn_agent', message: 'x', agentType: 'reader_1', reasoningEffort: 'high', forkTurns: 3 });
+		assert.deepStrictEqual(validateAgentSubagentControlParams('spawn_agent', { message: 'x', agent_type: 'reader_1', reasoning_effort: 'high', fork_turns: '3', background: true }), { name: 'spawn_agent', message: 'x', agentType: 'reader_1', reasoningEffort: 'high', forkTurns: 3, background: true });
 		assert.deepStrictEqual(validateAgentSubagentControlParams('list_agents', {}), { name: 'list_agents' }); assert.deepStrictEqual(validateAgentSubagentControlParams('send_message', { target: 'child', message: 'steer' }), { name: 'send_message', target: 'child', message: 'steer' });
-		for (const raw of [{}, { message: ' ' }, { message: 'x'.repeat(8001) }, { message: 'x', agent_type: '../path' }, { message: 'x', fork_turns: '0' }, { message: 'x', fork_turns: 2 }]) assert.throws(() => validateAgentSubagentControlParams('spawn_agent', raw), /spawn_agent_invalid_params/);
+		for (const raw of [{}, { message: ' ' }, { message: 'x'.repeat(8001) }, { message: 'x', agent_type: '../path' }, { message: 'x', fork_turns: '0' }, { message: 'x', fork_turns: 2 }, { message: 'x', background: 'false' }]) assert.throws(() => validateAgentSubagentControlParams('spawn_agent', raw), /spawn_agent_invalid_params/);
 	});
 	test('hides only a pure pending wait timeout result', () => {
 		const pure = { timedOut: true, deliverSummary: false, children: [{ id: 'child', status: 'running', completion: 'pending', usage: null }], receipts: [], budget: {} };

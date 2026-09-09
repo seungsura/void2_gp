@@ -236,7 +236,7 @@ const deepFreeze = <T>(value: T): T => { if (value && typeof value === 'object' 
 
 /** Flat schemas are intentionally dialect-conservative. Runtime validation below is authoritative. */
 export const agentSubagentToolSchemas = deepFreeze({
-	spawn_agent: flatObject({ message: { type: 'string', minLength: 1, maxLength: AGENT_SUBAGENT_MAX_MESSAGE_CHARS }, agent_type: { type: 'string', minLength: 1, maxLength: 64 }, model: { type: 'string', minLength: 1, maxLength: 256 }, reasoning_effort: { type: 'string', minLength: 1, maxLength: 64 }, fork_turns: { type: 'string', minLength: 1, maxLength: 16 } }, ['message']),
+	spawn_agent: flatObject({ message: { type: 'string', minLength: 1, maxLength: AGENT_SUBAGENT_MAX_MESSAGE_CHARS }, agent_type: { type: 'string', minLength: 1, maxLength: 64 }, model: { type: 'string', minLength: 1, maxLength: 256 }, reasoning_effort: { type: 'string', minLength: 1, maxLength: 64 }, fork_turns: { type: 'string', minLength: 1, maxLength: 16 }, background: { type: 'boolean' } }, ['message']),
 	wait_agent: flatObject({ timeout_ms: { type: 'integer', minimum: 0, maximum: AGENT_SUBAGENT_MAX_WAIT_MS }, targets: { type: 'array', minItems: 1, maxItems: AGENT_SUBAGENT_MAX_WAIT_TARGETS, items: { type: 'string', minLength: 1, maxLength: 256 } } }),
 	list_agents: flatObject({ target: { type: 'string', minLength: 1, maxLength: 256 } }),
 	send_message: flatObject({ target: { type: 'string', minLength: 1, maxLength: 256 }, message: { type: 'string', minLength: 1, maxLength: AGENT_SUBAGENT_MAX_MESSAGE_CHARS } }, ['target', 'message']),
@@ -253,7 +253,7 @@ export const readOnlyChildBuiltinSchemas: Readonly<Record<string, Record<string,
 });
 
 export type AgentSubagentControlParams =
-	| { readonly name: 'spawn_agent'; readonly message: string; readonly agentType?: string; readonly model?: string; readonly reasoningEffort?: string; readonly forkTurns: 'none' | 'all' | number }
+	| { readonly name: 'spawn_agent'; readonly message: string; readonly agentType?: string; readonly model?: string; readonly reasoningEffort?: string; readonly forkTurns: 'none' | 'all' | number; readonly background: boolean }
 	| { readonly name: 'wait_agent'; readonly timeoutMs: number; readonly targets?: readonly string[] }
 	| { readonly name: 'list_agents'; readonly target?: string }
 	| { readonly name: 'send_message'; readonly target: string; readonly message: string }
@@ -273,11 +273,11 @@ const exactKeys = (value: Record<string, unknown>, keys: readonly string[]) => O
 export const validateAgentSubagentControlParams = (name: AgentSubagentControlName, raw: unknown): AgentSubagentControlParams => {
 	if (!isPlainObject(raw)) throw new Error('agent_control_invalid_params');
 	if (name === 'spawn_agent') {
-		if (!exactKeys(raw, ['message', 'agent_type', 'model', 'reasoning_effort', 'fork_turns']) || typeof raw.message !== 'string' || !raw.message.trim() || raw.message.length > AGENT_SUBAGENT_MAX_MESSAGE_CHARS || (raw.agent_type !== undefined && (typeof raw.agent_type !== 'string' || !/^[a-z][a-z0-9_-]{0,63}$/.test(raw.agent_type))) || (raw.model !== undefined && (typeof raw.model !== 'string' || !raw.model.trim() || raw.model.length > 256)) || (raw.reasoning_effort !== undefined && (typeof raw.reasoning_effort !== 'string' || !/^[a-z][a-z0-9_-]{0,63}$/.test(raw.reasoning_effort)))) throw new Error('spawn_agent_invalid_params');
+		if (!exactKeys(raw, ['message', 'agent_type', 'model', 'reasoning_effort', 'fork_turns', 'background']) || typeof raw.message !== 'string' || !raw.message.trim() || raw.message.length > AGENT_SUBAGENT_MAX_MESSAGE_CHARS || (raw.agent_type !== undefined && (typeof raw.agent_type !== 'string' || !/^[a-z][a-z0-9_-]{0,63}$/.test(raw.agent_type))) || (raw.model !== undefined && (typeof raw.model !== 'string' || !raw.model.trim() || raw.model.length > 256)) || (raw.reasoning_effort !== undefined && (typeof raw.reasoning_effort !== 'string' || !/^[a-z][a-z0-9_-]{0,63}$/.test(raw.reasoning_effort))) || (raw.background !== undefined && typeof raw.background !== 'boolean')) throw new Error('spawn_agent_invalid_params');
 		const forkRaw = raw.fork_turns ?? 'none';
 		const forkTurns = forkRaw === 'none' || forkRaw === 'all' ? forkRaw : typeof forkRaw === 'string' && /^[1-9][0-9]{0,5}$/.test(forkRaw) ? Number(forkRaw) : undefined;
 		if (forkTurns === undefined || (typeof forkTurns === 'number' && (!Number.isSafeInteger(forkTurns) || forkTurns > 100000))) throw new Error('spawn_agent_invalid_params');
-		return { name, message: raw.message, forkTurns, ...(raw.agent_type === undefined ? {} : { agentType: raw.agent_type as string }), ...(raw.model === undefined ? {} : { model: raw.model as string }), ...(raw.reasoning_effort === undefined ? {} : { reasoningEffort: raw.reasoning_effort as string }) };
+		return { name, message: raw.message, forkTurns, background: raw.background === true, ...(raw.agent_type === undefined ? {} : { agentType: raw.agent_type as string }), ...(raw.model === undefined ? {} : { model: raw.model as string }), ...(raw.reasoning_effort === undefined ? {} : { reasoningEffort: raw.reasoning_effort as string }) };
 	}
 	if (name === 'wait_agent') {
 		if (!exactKeys(raw, ['timeout_ms', 'targets'])) throw new Error('wait_agent_invalid_params');
@@ -302,7 +302,7 @@ export const validateAgentSubagentControlParams = (name: AgentSubagentControlNam
 export const isAgentSubagentControlName = (name: string): name is AgentSubagentControlName =>
 	name === 'spawn_agent' || name === 'wait_agent' || name === 'list_agents' || name === 'send_message' || name === 'interrupt_agent';
 
-export type AgentSubagentReceipt = Readonly<{ id: string; status: Exclude<AgentSubagentStatus, 'queued' | 'running'>; summary: string; resultTruncated?: true; usage: null }>;
+export type AgentSubagentReceipt = Readonly<{ id: string; status: Exclude<AgentSubagentStatus, 'queued' | 'running'>; summary: string; resultTruncated?: true; reportedMessageSequence?: number; usage: null }>;
 
 /** A small CAS-like state holder: completion/interrupt/late callbacks cannot settle twice. */
 export class AgentSubagentLifecycle {

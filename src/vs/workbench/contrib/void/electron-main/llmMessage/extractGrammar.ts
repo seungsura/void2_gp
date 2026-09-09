@@ -185,6 +185,10 @@ const parseXMLPrefixToToolCall = <T extends ToolName,>(toolName: T, toolId: stri
 			const targets = paramsObj.targets;
 			if (targets !== undefined) { try { const parsed = JSON.parse(targets); if (Array.isArray(parsed)) (paramsObj as Record<string, unknown>).targets = parsed; } catch { /* runtime validator rejects malformed text */ } }
 		}
+		if (toolName === 'spawn_agent') {
+			const background = paramsObj.background;
+			if (background === 'true' || background === 'false') (paramsObj as Record<string, unknown>).background = background === 'true';
+		}
 		if (toolName === 'ls_dir' || toolName === 'search_pathnames_only' || toolName === 'search_for_files') {
 			const pageNumber = paramsObj.page_number;
 			if (pageNumber !== undefined && /^[1-9]\d*$/.test(pageNumber)) (paramsObj as Record<string, unknown>).page_number = Number(pageNumber);

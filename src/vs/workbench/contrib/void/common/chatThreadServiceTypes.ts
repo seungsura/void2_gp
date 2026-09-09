@@ -71,6 +71,18 @@ export type DecorativeCanceledTool = {
 	mcpServerName: string | undefined; // the server name at the time of the call
 }
 
+/** Persisted inter-agent context. This is deliberately not a user turn. */
+export type AgentChatMessage = {
+	role: 'agent';
+	sourceId: string;
+	kind: 'message' | 'completion';
+	sequence: number;
+	relatedSequence?: number;
+	status?: 'completed' | 'failed' | 'cancelled';
+	content: string;
+	createdAt: number;
+}
+
 
 // WARNING: changing this format is a big deal!!!!!! need to migrate old format to new format on users' computers so people don't get errors.
 export type ChatMessage =
@@ -96,6 +108,7 @@ export type ChatMessage =
 		/** Persisted once before any call in the native declaration executes. */
 		toolBatch?: { version: 1; batchId: string; calls: readonly RawToolCallObj[] };
 	}
+	| AgentChatMessage
 	| ToolMessage<ToolName>
 	| DecorativeCanceledTool
 
