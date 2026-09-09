@@ -857,6 +857,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		if (effectiveMode === 'stop_and_send') {
 			this._wakePendingChatInputs(threadId, record)
 		}
+		else if (phase === 'steering') this._wakePendingChatInputs(threadId, record)
 		else if (phase === 'queued') void this._drainPendingChatInputs(threadId)
 		return record
 	}
@@ -2541,7 +2542,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			try {
 				let result: object;
 				if (control.name === 'spawn_agent') result = await this._agentSubagentService.spawn(threadId, control.message, instructionSnapshot, control.agentType, agentDelegationAuthority.roles, agentDelegationAuthority.settingsState, agentDelegationAuthority.settingsOfProvider, controlGeneration, agentDelegationAuthority.parentTools, this._createAgentSubagentToolBroker?.(threadId, agentDelegationAuthority), control.model, control.reasoningEffort, control.forkTurns, this.state.allThreads[threadId]?.messages ?? []);
-				else if (control.name === 'wait_agent') result = await this._agentSubagentService.wait(threadId, control.timeoutMs, control.targets, controlGeneration);
+				else if (control.name === 'wait_agent') { const waiting = this._agentSubagentService.wait(threadId, control.timeoutMs, control.targets, controlGeneration); this._wakeAgentWaitForPendingSteer(threadId, controlGeneration); result = await waiting; }
 				else if (control.name === 'list_agents') result = this._agentSubagentService.list(threadId, control.target, controlGeneration);
 				else if (control.name === 'send_message') result = this._agentSubagentService.sendMessage(threadId, control.target, control.message, controlGeneration);
 				else result = this._agentSubagentService.interrupt(threadId, control.target, controlGeneration);
@@ -3549,7 +3550,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 			? this._findPendingChatInput(threadId, expected.id)
 			: this.getPendingChatInputs(threadId).find(record => record.mode === 'stop_and_send' && record.phase === 'queued')
 		const active = this._runQuiescenceOfThread.get(threadId)
-		if (!stop) { void this._drainPendingChatInputs(threadId); return }
+		if (!stop) { this._wakeAgentWaitForPendingSteer(threadId); void this._drainPendingChatInputs(threadId); return }
 		if (active) {
 			if (stop.targetRunId === active.runId && stop.targetGeneration === active.generation) this._stopAndSendPendingInput(threadId, stop, active)
 			// A targetless row or a row bound to an older run is ordinary queued work
@@ -3569,6 +3570,12 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const generation = this._agentControlGeneration.get(threadId) ?? stop.targetGeneration ?? stop.generation
 		if (generation <= stop.generation) this._agentControlGeneration.set(threadId, stop.generation)
 		void this._drainPendingChatInputs(threadId)
+	}
+	private _wakeAgentWaitForPendingSteer(threadId: string, generation?: number): boolean {
+		const active = this._runQuiescenceOfThread.get(threadId)
+		if (!active || (generation !== undefined && active.generation !== generation)) return false
+		const steer = this.getPendingChatInputs(threadId).some(record => record.phase === 'steering' && record.runId === active.runId && record.generation === active.generation)
+		return steer && this._agentSubagentService.wakeParentWait(threadId, active.generation)
 	}
 	private _stopAndSendChildInput(threadId: string, expectedInput: PendingChatInputRecord): void {
 		const expectedFingerprint = pendingChatInputFingerprint(expectedInput)
@@ -3809,7 +3816,7 @@ export class ChatThreadService extends Disposable implements IChatThreadService 
 		const delegationLimits = instructionSnapshot.config.agentDelegationLimits
 		if (instructionSnapshot.config.agentDelegationLimitDiagnostics.length) this._notificationService.notify({ severity: Severity.Warning, message: delegationLimits.maxConcurrentThreadsPerSession > delegationLimits.maxAcceptedChildren ? `Agent child concurrency (${delegationLimits.maxConcurrentThreadsPerSession}) exceeds open capacity (${delegationLimits.maxAcceptedChildren}). Edit the config before delegating.` : `Some Agent child-limit settings were invalid. Check the Agent delegation configuration.` })
 		const userMessageContent = agentDelegationAllowed
-			? `${userMessageContentBase}\n\n[${agentDelegationIntent ? 'User delegation marker' : 'Native Agent controls'}: up to ${delegationLimits.maxAcceptedChildren} generic read-only children are available for this turn, with ${delegationLimits.maxConcurrentThreadsPerSession} running concurrently and maximum depth ${delegationLimits.maxDepth}. Named custom agents admitted for this turn (optional exact agent_type): ${roleAd?.text || 'none'}${roleAd?.omitted ? `; ${roleAd.omitted} omitted` : ''}.${agentSelection?.agentType ? ` For this selected role, call spawn_agent with agent_type=${agentSelection.agentType} exactly.` : ''} After spawn_agent, continue useful main work before wait_agent. Use list_agents to inspect retained results, send_message for active same-group coordination, and interrupt_agent for a selected active target. Late child completions are delivered at a safe model boundary; partial child failures do not prevent your synthesis.]`
+			? `${userMessageContentBase}\n\n[${agentDelegationIntent ? 'User delegation marker' : 'Native Agent controls'}: up to ${delegationLimits.maxAcceptedChildren} generic read-only children are available for this turn, with ${delegationLimits.maxConcurrentThreadsPerSession} running concurrently and maximum depth ${delegationLimits.maxDepth}. Named custom agents admitted for this turn (optional exact agent_type): ${roleAd?.text || 'none'}${roleAd?.omitted ? `; ${roleAd.omitted} omitted` : ''}.${agentSelection?.agentType ? ` For this selected role, call spawn_agent with agent_type=${agentSelection.agentType} exactly.` : ''} After spawn_agent, continue useful main work before wait_agent. For an ordinary wait, omit timeout_ms and wait once; completion, coordination, or a user Steer wakes it early, so do not repeatedly poll. Use list_agents to inspect retained results, send_message for active same-group coordination, and interrupt_agent for a selected active target. Late child completions are delivered at a safe model boundary; partial child failures do not prevent your synthesis.]`
 			: userMessageContentBase
 		const currentOwner = this._workspaceContextService.getWorkspace().folders[0]?.uri.toString()
 		if (currentOwner !== runtimeSnapshot.ownerProjectRoot || currentOwner !== runtimeSnapshot.runCwd || this._workspaceTrustManagementService.isWorkspaceTrusted() !== runtimeSnapshot.workspaceTrustedAtAdmission) { this._purgeInstructionTurn(threadId, false); throw new Error('skill_owner_or_trust_changed') }

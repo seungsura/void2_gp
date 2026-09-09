@@ -11,6 +11,8 @@
 | `create` | `uri`, `operation`, `content` (빈 문자열 가능) | `read_receipt_id`, `edits`, 기타 unknown key | 존재하지 않는 경로에 새 파일 생성 |
 | `modify` | `uri`, `operation`, current `read_receipt_id`, 비어 있지 않은 `edits` | `content`, 기타 unknown key | 현재 read snapshot의 exact edit |
 
+`create`는 파일을 한 번만 생성한 뒤 전체 내용을 empty baseline에 대한 editor review diff로 등록합니다. 기존 **Auto-accept LLM changes** 설정이 켜져 있으면 즉시 수락하고, 꺼져 있으면 상단 변경 목록에서 Accept/Reject할 수 있습니다. Reject 또는 Undo는 새 파일 자체를 삭제하지 않고 내용을 빈 문자열로 되돌립니다. 빈 content도 유효한 create이며 빈 review row를 유지할 수 있습니다.
+
 각 edit object는 `old_text`, `new_text`를 모두 요구하고 unknown key를 거부합니다. `old_text`는 현재 snapshot에서 정확히 한 번 일치하는 whole-line 범위여야 하며 fuzzy match/replace-all은 없습니다. `new_text: ""`는 삭제에 사용할 수 있습니다.
 
 유일한 empty 예외는 **empty snapshot + exactly one edit + `old_text: ""`** 입니다. 일반 empty `old_text`, non-empty snapshot의 empty `old_text`, multiple-edit 안의 empty `old_text`는 모두 거부되고 plan/mutation은 만들어지지 않습니다.
@@ -25,7 +27,7 @@
 
 1. 새 OpenAI-compatible Agent chat에서 먼저 간단한 `1`을 보내 stream completion을 확인합니다.
 2. 새 파일 `create`, 최신 read receipt를 사용한 existing-file `modify`, stale receipt rejection을 별도 임시 workspace에서 관찰합니다.
-3. tool success 문구만 믿지 말고 editor, disk, Undo, tool trace를 함께 확인합니다.
+3. tool success 문구만 믿지 말고 editor, 상단 변경 목록, disk, Accept/Reject와 Undo를 함께 확인합니다. Create를 Reject하거나 Undo한 뒤에는 파일이 존재하고 내용만 비어 있어야 합니다.
 4. 불완전한 stream이 성공으로 표시되지 않고 route/tool/schema/phase를 구분하는 diagnostic error로 끝나는지 기록합니다.
 
 requested alias와 observed actual route는 provider routing에 따라 다를 수 있습니다. 차이가 보이면 configured/effective route 불일치라는 관찰로만 기록하고 일반적인 model alias 동작으로 단정하지 마세요.

@@ -152,10 +152,10 @@ Record: config scope / new Task 여부 / effective accepted·concurrent·depth /
 Exact prompt:
 
 ```text
-두 child를 시작하세요. 첫 child는 README를 조사하고, 둘째 child는 workspace의 파일 이름을 조사하게 하세요. 둘째 child만 targets에 넣어 wait_agent를 호출하고, 아직 queued 또는 running이면 interrupt_agent로 둘째 child만 중단하세요. 첫 child는 계속 두세요.
+두 child를 시작하세요. 첫 child는 README를 조사하고, 둘째 child는 workspace의 파일 이름을 조사하게 하세요. 둘째 child만 targets에 넣고 timeout_ms=0으로 wait_agent를 호출해 현재 상태를 확인하세요. 아직 queued 또는 running이면 interrupt_agent로 둘째 child만 중단하세요. 첫 child는 계속 두세요.
 ```
 
-Expected: targeted `wait_agent`는 선택한 child만 관찰하고 result row는 spawn order를 유지합니다. `targets`는 distinct `1..8`개를 받으며 empty/duplicate/unknown은 bounded invalid request입니다. `interrupt_agent`는 선택한 queued/running child만 `cancelled`로 한 번 settle하며 다른 child나 parent를 abort하지 않습니다. UI title/status는 **Wait for child Agent**와 **Interrupt child Agent**, Requested/Running/Completed/Cancelled 중 실제 상태입니다. Child가 너무 빨리 terminal이 되어 interrupt 경계를 관찰할 수 없으면 `BLOCKED`로 기록하세요.
+Expected: targeted `wait_agent`는 선택한 child만 관찰하고 result row는 spawn order를 유지합니다. 일반 대기는 timeout을 생략해 기본 최대 1시간 한 번 기다리며 terminal completion, addressed coordination message 또는 같은 parent run의 Steer에 즉시 깨어납니다. 짧은 timeout 반복 poll은 하지 않습니다. 결과가 없는 순수 timeout 행은 Chat에서 보이지 않지만 저장된 tool call/result pair는 trace에 남고, 실제 receipt/error/message wake는 계속 표시됩니다. `targets`는 distinct `1..8`개를 받으며 empty/duplicate/unknown은 bounded invalid request입니다. `interrupt_agent`는 선택한 queued/running child만 `cancelled`로 한 번 settle하며 다른 child나 parent를 abort하지 않습니다. UI title/status는 **Wait for child Agent**와 **Interrupt child Agent**, Requested/Running/Completed/Cancelled 중 실제 상태입니다. Child가 너무 빨리 terminal이 되어 interrupt 경계를 관찰할 수 없으면 `BLOCKED`로 기록하세요.
 
 Record: wait targets / wake reason / selected·unselected final state / cancellation settlement 수 / receipt가 한 번만 전달됐는지.
 

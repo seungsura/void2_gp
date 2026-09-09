@@ -318,6 +318,7 @@ suite('Void AgentSubagentService', () => {
 		let createCalls = 0;
 		(fileService as any).createFile = async (...args: any[]) => { createCalls++; return originalCreateFile(args[0], args[1], args[2]); };
 		let model: ReturnType<typeof createTextModel> | undefined;
+		const disposeCurrentModel = () => { assert.ok(model); model.dispose(); model = undefined; };
 		let saveCalls = 0;
 		const onModelAdded = new Emitter<ReturnType<typeof createTextModel>>();
 		const voidModels: any = {
@@ -339,6 +340,7 @@ suite('Void AgentSubagentService', () => {
 		try {
 			const tools = new ToolsService(fileService, { getWorkspace: () => ({ folders: [{ uri: workspace }] }) } as never, {} as never, { search: async () => ({ ok: false, code: 'search_backend_unavailable', trace: 'terminal-fallback-unavailable' }) } as never, { createInstance: () => ({}) } as never, voidModels, { state: { globalSettings: {} } } as never, editCode, {} as never, commandBar, {} as never, { read: () => [] } as never);
 			const prepared = await tools.prepareWriteFile({ uri, operation: 'create', content: 'first\nsecond' } as any);
+			assert.ok(prepared);
 			assert.deepStrictEqual(await prepared.execute(), { operation: 'create', didChange: true, editCount: 0 });
 			assert.strictEqual(createCalls, 1); assert.strictEqual(saveCalls, 0); assert.strictEqual(model!.getValue(), 'first\nsecond'); assert.strictEqual((await fileService.readFile(uri)).value.toString(), 'first\nsecond');
 			const zones = [...editCode.diffAreasOfURI[uri.fsPath] ?? []].map(id => editCode.diffAreaOfId[id]).filter(area => area.type === 'DiffZone');
@@ -358,25 +360,28 @@ suite('Void AgentSubagentService', () => {
 			await editCode.acceptOrRejectAllDiffAreas({ uri, removeCtrlKs: false, behavior: 'reject' });
 			assert.strictEqual(model!.getValue(), ''); assert.strictEqual((await fileService.readFile(uri)).value.toString(), ''); assert.strictEqual((await fileService.stat(uri)).isFile, true); assert.strictEqual(editCode.diffAreasOfURI[uri.fsPath]?.size, 0);
 
-			model.dispose(); model = undefined;
+			disposeCurrentModel();
 			const emptyURI = URI.joinPath(workspace, 'empty.txt');
 			const emptyPrepared = await tools.prepareWriteFile({ uri: emptyURI, operation: 'create', content: '' } as any);
+			assert.ok(emptyPrepared);
 			await emptyPrepared.execute();
 			assert.strictEqual((await fileService.stat(emptyURI)).isFile, true); assert.strictEqual(editCode.diffAreasOfURI[emptyURI.fsPath]?.size, 1);
 			const emptyZone = editCode.diffAreaOfId[[...editCode.diffAreasOfURI[emptyURI.fsPath]!][0]];
 			assert.strictEqual(emptyZone.type, 'DiffZone'); assert.strictEqual(Object.keys(emptyZone._diffOfId).length, 0);
 			assert.deepStrictEqual(commandBar.sortedURIs.map(value => value.toString()), [emptyURI.toString()]); assert.deepStrictEqual(commandBar.stateOfURI[emptyURI.fsPath]?.sortedDiffIds, []);
 
-			model.dispose(); model = undefined; settings.state.globalSettings.autoAcceptLLMChanges = true;
+			disposeCurrentModel(); settings.state.globalSettings.autoAcceptLLMChanges = true;
 			const acceptedURI = URI.joinPath(workspace, 'auto-accepted.txt');
 			const acceptedPrepared = await tools.prepareWriteFile({ uri: acceptedURI, operation: 'create', content: 'accepted' } as any);
+			assert.ok(acceptedPrepared);
 			await acceptedPrepared.execute();
 			assert.strictEqual((await fileService.readFile(acceptedURI)).value.toString(), 'accepted'); assert.strictEqual(editCode.diffAreasOfURI[acceptedURI.fsPath]?.size, 0); assert.strictEqual(createCalls, 3);
 
-			model.dispose(); model = undefined; settings.state.globalSettings.autoAcceptLLMChanges = false;
+			disposeCurrentModel(); settings.state.globalSettings.autoAcceptLLMChanges = false;
 			const staleURI = URI.joinPath(workspace, 'stale-model.txt');
 			voidModels.initializeModel = async (target: URI) => { model = createTextModel('stale editor contents', null, undefined, target); onModelAdded.fire(model); };
 			const stalePrepared = await tools.prepareWriteFile({ uri: staleURI, operation: 'create', content: 'created contents' } as any);
+			assert.ok(stalePrepared);
 			await assert.rejects(() => stalePrepared.execute(), /created the file.*created file and its contents remain.*does not match/);
 			assert.strictEqual((await fileService.readFile(staleURI)).value.toString(), 'created contents'); assert.strictEqual((await fileService.stat(staleURI)).isFile, true); assert.strictEqual(editCode.diffAreasOfURI[staleURI.fsPath]?.size ?? 0, 0); assert.strictEqual(createCalls, 4);
 		} finally {
@@ -389,7 +394,7 @@ suite('Void AgentSubagentService', () => {
 		const roles: any = { revision: 'roles-1', agents: [role], diagnostics: [] }; const capturedMcp: any = { name: 'captured_mcp', description: 'Captured mutation.', mcpServerName: 'server-a', params: {}, schema: { type: 'object' } }; let mcpCalls = 0; let releaseMcp!: (value: any) => void; let markMcpCalled!: () => void; const mcpSettlement = new Promise<any>(resolve => releaseMcp = resolve); const mcpCalled = new Promise<void>(resolve => markMcpCalled = resolve);
 		const f = fixture({ liveSettings: { openAI: { apiKey: 'captured-key', endpoint: 'https://captured.invalid', _didFillInProviderSettings: true, models: [{ modelName: 'gpt-4.1', isHidden: false, type: 'default' }, { modelName: 'o4-mini', isHidden: false, type: 'default' }] } }, customCatalog: roles, send: toolThenFinal({ id: 'captured-call', name: 'captured_mcp', rawParams: { change: 'one' } }) });
 		const messages: any[] = []; let admitted: any; const thread: any = { messages, state: { stagingSelections: [] }, filesWithUserChanges: new Set<string>() };
-		const receiver: any = { state: { allThreads: { parent: thread }, currentThreadId: 'parent' }, streamState: {}, _agentControlGeneration: new Map(), _parentRunTokenOfThread: new Map<string, symbol>(), _agentDelegationAuthorityOfThread: new Map(), _agentInstructionSessionOfThread: new Map(), _instructionTurnOfThread: new Map(), _agentSubagentService: f.service, _revokeAgentDelegation(threadId: string, forget = false) { return (ChatThreadService.prototype as any)._revokeAgentDelegation.call(this, threadId, forget); }, _createAgentSubagentToolBroker(threadId: string, authority: any) { return (ChatThreadService.prototype as any)._createAgentSubagentToolBroker.call(this, threadId, authority); }, _agentCustomAgentService: { getCatalog: async () => roles }, _currentModelSelectionProps: () => ({ modelSelection: { providerName: 'openAI', modelName: 'gpt-4.1' }, modelSelectionOptions: {} }), _settingsService: { state: { globalSettings: { chatMode: 'agent', autoApprove: { 'MCP tools': true } }, settingsOfProvider: f.liveSettings, optionsOfModelSelection: { Chat: { openAI: { 'o4-mini': { reasoningEnabled: true, reasoningEffort: 'medium' } } } }, overridesOfModel: { openAI: { 'gpt-4.1': { specialToolFormat: 'openai-style' }, 'o4-mini': { temperature: .7 } } } } }, _llmMessageService: { captureSettingsOfProvider: () => f.liveSettings }, _beginInstructionTurn: async () => instructions(), _purgeInstructionTurn() { }, _workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: URI.parse('file:///workspace') }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => true }, _agentSkillsService: { getCatalog: async () => catalog(), readSkillBody: async (root: string) => ({ body: skillText(root.endsWith('/other') ? 'other' : 'demo') }) }, _directoryStringService: {}, _fileService: {}, _rememberInstructionTurn(threadId: string, runtimeSnapshot: any) { this._instructionTurnOfThread.set(threadId, runtimeSnapshot); }, _addMessageToThread: (_: string, message: any) => messages.push(message), _runChatAgent: async ({ agentDelegationAuthority }: any) => { admitted = agentDelegationAuthority; }, _wrapRunAgentToNotify: (promise: Promise<void>) => promise, _toolsService: { invalidateReadReceipts() { }, validateParams: {} }, _mcpService: { getMCPTools: () => [capturedMcp], callMCPTool() { mcpCalls++; markMcpCalled(); return mcpSettlement; }, stringifyResult: () => 'captured' } };
+		const receiver: any = { state: { allThreads: { parent: thread }, currentThreadId: 'parent' }, streamState: {}, _agentControlGeneration: new Map(), _parentRunTokenOfThread: new Map<string, symbol>(), _agentDelegationAuthorityOfThread: new Map(), _agentInstructionSessionOfThread: new Map(), _instructionTurnOfThread: new Map(), _agentSubagentService: f.service, _wakeAgentWaitForPendingSteer: () => false, _revokeAgentDelegation(threadId: string, forget = false) { return (ChatThreadService.prototype as any)._revokeAgentDelegation.call(this, threadId, forget); }, _createAgentSubagentToolBroker(threadId: string, authority: any) { return (ChatThreadService.prototype as any)._createAgentSubagentToolBroker.call(this, threadId, authority); }, _agentCustomAgentService: { getCatalog: async () => roles }, _currentModelSelectionProps: () => ({ modelSelection: { providerName: 'openAI', modelName: 'gpt-4.1' }, modelSelectionOptions: {} }), _settingsService: { state: { globalSettings: { chatMode: 'agent', autoApprove: { 'MCP tools': true } }, settingsOfProvider: f.liveSettings, optionsOfModelSelection: { Chat: { openAI: { 'o4-mini': { reasoningEnabled: true, reasoningEffort: 'medium' } } } }, overridesOfModel: { openAI: { 'gpt-4.1': { specialToolFormat: 'openai-style' }, 'o4-mini': { temperature: .7 } } } } }, _llmMessageService: { captureSettingsOfProvider: () => f.liveSettings }, _beginInstructionTurn: async () => instructions(), _purgeInstructionTurn() { }, _workspaceContextService: { getWorkspace: () => ({ folders: [{ uri: URI.parse('file:///workspace') }] }) }, _workspaceTrustManagementService: { isWorkspaceTrusted: () => true }, _agentSkillsService: { getCatalog: async () => catalog(), readSkillBody: async (root: string) => ({ body: skillText(root.endsWith('/other') ? 'other' : 'demo') }) }, _directoryStringService: {}, _fileService: {}, _rememberInstructionTurn(threadId: string, runtimeSnapshot: any) { this._instructionTurnOfThread.set(threadId, runtimeSnapshot); }, _addMessageToThread: (_: string, message: any) => messages.push(message), _runChatAgent: async ({ agentDelegationAuthority }: any) => { admitted = agentDelegationAuthority; }, _wrapRunAgentToNotify: (promise: Promise<void>) => promise, _toolsService: { invalidateReadReceipts() { }, validateParams: {} }, _mcpService: { getMCPTools: () => [capturedMcp], callMCPTool() { mcpCalls++; markMcpCalled(); return mcpSettlement; }, stringifyResult: () => 'captured' } };
 		const brokerSnapshot = { namespace: { profileId: 'profile', workspaceId: 'workspace' }, revision: 0, records: [] };
 		let directAuthorizations = 0, directVerifications = 0;
 		receiver._pendingBroker = () => ({
@@ -1084,6 +1089,23 @@ suite('Void AgentSubagentService', () => {
 		const first = await f.service.wait('parent', 0); const second = await f.service.wait('parent', 0); assert.strictEqual(first.deliverSummary, true); assert.ok(first.receipt?.summary); assert.strictEqual(first.children[0].completion, 'delivered_now'); assert.strictEqual(second.deliverSummary, false); assert.ok(second.receipt?.summary); assert.strictEqual(second.children[0].completion, 'already_delivered');
 	});
 
+	test('one-hour waits wake only for the exact root generation or addressed mailbox', async () => {
+		const f = fixture({ send: () => 'request' }); const child = await f.service.spawn('long-wait', 'inspect', snapshot(), undefined, undefined, undefined, undefined, 7);
+		let rootSettled = false; const rootWait = f.service.wait('long-wait', 3_600_000, [child.id], 7).then(result => { rootSettled = true; return result; });
+		assert.strictEqual(f.service.wakeParentWait('long-wait', 6), false); await Promise.resolve(); assert.strictEqual(rootSettled, false);
+		assert.strictEqual(f.service.wakeParentWait('long-wait', 7), true); const rootResult = await rootWait; assert.strictEqual(rootResult.timedOut, false); assert.strictEqual(rootResult.deliverSummary, false);
+
+		const inWait = f.service.wait('long-wait', 3_600_000, [child.id], 7); assert.deepStrictEqual((f.service as any).sendMessageFor('long-wait', child.id, 'long-wait', 'parent evidence', 7), { target: 'long-wait', status: 'queued' }); assert.strictEqual((await inWait).timedOut, false);
+		const alreadyQueued = await f.service.wait('long-wait', 3_600_000, [child.id], 7); assert.strictEqual(alreadyQueued.timedOut, false);
+
+		const nestedSnapshot = snapshot([], 'file:///workspace', 'gpt-4.1', { maxDepth: 2 }); const root = await f.service.spawn('nested-wait', 'root', nestedSnapshot); const group = (f.service as any).groups.get('nested-wait'); const rootRun = group.runs.find((run: any) => run.id === root.id);
+		const nested = await (f.service as any).spawnWithin('nested-wait', 'nested', nestedSnapshot, undefined, undefined, undefined, undefined, 0, rootRun);
+		let nestedSettled = false; const nestedWait = (f.service as any).waitFor('nested-wait', root.id, 3_600_000, [nested.id], 0).then((result: any) => { nestedSettled = true; return result; });
+		assert.strictEqual(f.service.wakeParentWait('nested-wait', 0), true); await Promise.resolve(); assert.strictEqual(nestedSettled, false);
+		assert.deepStrictEqual((f.service as any).sendMessageFor('nested-wait', nested.id, root.id, 'peer evidence', 0), { target: root.id, status: 'queued' }); assert.strictEqual((await nestedWait).timedOut, false);
+		f.service.interrupt('long-wait', child.id, 7); f.service.interrupt('nested-wait', root.id);
+	});
+
 	test('forks complete turns and delivers queued messages at the next child boundary', async () => {
 		const pending: any[] = []; const f = fixture({ send: options => { pending.push(options); return `request-${pending.length}`; } });
 		const prior: any[] = [
@@ -1147,7 +1169,7 @@ suite('Void AgentSubagentService', () => {
 
 	test('shows deferred wait control without contaminating persisted parent history', async () => {
 		let release!: () => void; const gate = new Promise<void>(resolve => release = resolve); const messages: any[] = []; const streamState: any = {}; const authority: any = { allowed: true, generation: 1 };
-		const receiver: any = { state: { allThreads: { parent: { messages } } }, streamState, _agentDelegationAuthorityOfThread: new Map([['parent', authority]]), _agentControlGeneration: new Map([['parent', 1]]), _agentSubagentService: { wait: async () => { await gate; return { id: 'child', status: 'completed', deliverSummary: true }; } }, _setStreamState(id: string, state: any) { streamState[id] = state; }, _addMessageToThread(_id: string, message: any) { messages.push(message); } };
+		const receiver: any = { state: { allThreads: { parent: { messages } } }, streamState, _agentDelegationAuthorityOfThread: new Map([['parent', authority]]), _agentControlGeneration: new Map([['parent', 1]]), _agentSubagentService: { wait: async () => { await gate; return { id: 'child', status: 'completed', deliverSummary: true }; } }, _wakeAgentWaitForPendingSteer: () => false, _setStreamState(id: string, state: any) { streamState[id] = state; }, _addMessageToThread(_id: string, message: any) { messages.push(message); } };
 		const pending = (ChatThreadService.prototype as any)._runToolCall.call(receiver, 'parent', 'wait_agent', 'wait-provider-id', undefined, { preapproved: false, unvalidatedToolParams: { timeout_ms: 0 } }, { ownerProjectRoot: 'file:///workspace' }, authority, false, 1, () => true);
 		await Promise.resolve();
 		assert.strictEqual(streamState.parent.isRunning, 'idle'); assert.strictEqual(streamState.parent.toolInfo.transient, true); assert.strictEqual(streamState.parent.toolInfo.toolName, 'wait_agent'); assert.strictEqual(streamState.parent.toolInfo.id, 'wait-provider-id'); assert.ok(streamState.parent.toolInfo.receiptId); assert.deepStrictEqual(messages, []);
@@ -1160,7 +1182,7 @@ suite('Void AgentSubagentService', () => {
 		const receiver: any = {
 			state: { allThreads: { parent: { messages } } }, streamState,
 			_agentDelegationAuthorityOfThread: new Map([['parent', authority]]), _agentControlGeneration: new Map([['parent', 1]]),
-			_agentSubagentService: { wait: async () => { await gate; return { id: 'child', status: 'cancelled', deliverSummary: false }; }, cancelParent: () => { cancelParent++; } },
+			_agentSubagentService: { wait: async () => { await gate; return { id: 'child', status: 'cancelled', deliverSummary: false }; }, cancelParent: () => { cancelParent++; } }, _wakeAgentWaitForPendingSteer: () => false,
 			_setStreamState(id: string, state: any) { streamState[id] = state; }, _addMessageToThread(_id: string, message: any) { messages.push(message); },
 			_revokeAgentDelegation(id: string) { this._agentDelegationAuthorityOfThread.delete(id); this._agentControlGeneration.delete(id); this._agentSubagentService.cancelParent(id); },
 		};
@@ -1175,7 +1197,7 @@ suite('Void AgentSubagentService', () => {
 
 	test('classifies validated child-control execution failures without confusing malformed input', async () => {
 		const authority: any = { allowed: true, generation: 1 }; const messages: any[] = []; const streamState: any = {};
-		const receiver: any = { state: { allThreads: { parent: { messages } } }, streamState, _agentDelegationAuthorityOfThread: new Map([['parent', authority]]), _agentControlGeneration: new Map([['parent', 1]]), _agentSubagentService: { wait: async () => { throw new Error('child wait backend failed'); } }, _setStreamState(id: string, state: any) { streamState[id] = state; }, _addMessageToThread(_id: string, message: any) { messages.push(message); } };
+		const receiver: any = { state: { allThreads: { parent: { messages } } }, streamState, _agentDelegationAuthorityOfThread: new Map([['parent', authority]]), _agentControlGeneration: new Map([['parent', 1]]), _agentSubagentService: { wait: async () => { throw new Error('child wait backend failed'); } }, _wakeAgentWaitForPendingSteer: () => false, _setStreamState(id: string, state: any) { streamState[id] = state; }, _addMessageToThread(_id: string, message: any) { messages.push(message); } };
 		const failed = await (ChatThreadService.prototype as any)._runToolCall.call(receiver, 'parent', 'wait_agent', 'valid-id', undefined, { preapproved: false, unvalidatedToolParams: { timeout_ms: 0 } }, { ownerProjectRoot: 'file:///workspace' }, authority, false, 1, () => true);
 		assert.deepStrictEqual(failed, { failure: 'error: child wait backend failed', validatedParams: { timeout_ms: 0 } }); assert.deepStrictEqual({ type: messages[0].type, id: messages[0].id, params: messages[0].params }, { type: 'tool_error', id: 'valid-id', params: { timeout_ms: 0 } }); assert.strictEqual(streamState.parent.toolInfo, undefined);
 		const malformed = await (ChatThreadService.prototype as any)._runToolCall.call(receiver, 'parent', 'wait_agent', 'bad-id', undefined, { preapproved: false, unvalidatedToolParams: { timeout_ms: -1 } }, { ownerProjectRoot: 'file:///workspace' }, authority, false, 1, () => true);

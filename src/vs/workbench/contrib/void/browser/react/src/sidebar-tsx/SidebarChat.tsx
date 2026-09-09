@@ -25,7 +25,7 @@ import { WarningBox } from '../void-settings-tsx/WarningBox.js';
 import { getModelCapabilities, getIsReasoningEnabledState } from '../../../../common/modelCapabilities.js';
 import { AlertTriangle, File, Ban, Check, ChevronRight, Dot, FileIcon, Pencil, Undo, Undo2, X, Flag, Copy as CopyIcon, Info, CirclePlus, Ellipsis, CircleEllipsis, Folder, ALargeSmall, TypeOutline, Text } from 'lucide-react';
 import { ChatMessage, StagingSelectionItem, ToolMessage } from '../../../../common/chatThreadServiceTypes.js';
-import { AgentSubagentRunView, ChildActivitiesLedger, ChildActivityRecord, ChildToolApprovalView, isActiveChildRun } from '../../../../common/agentSubagents.js';
+import { AgentSubagentRunView, ChildActivitiesLedger, ChildActivityRecord, ChildToolApprovalView, isActiveChildRun, isPureAgentWaitTimeoutResult } from '../../../../common/agentSubagents.js';
 import { ChatCurrentStatusPresentation, getChatCurrentStatusPresentation } from '../../../../common/chatCurrentStatusPresentation.js';
 import { beginChatComposerSubmissionFlight, submitChatComposer, submitInlineChatEdit } from '../../../../common/chatComposerSubmission.js';
 import { PendingChatInput, PendingInputMode } from '../../../chatThreadService.js';
@@ -2616,6 +2616,7 @@ export function SkippedToolCard({ toolMessage }: { toolMessage: Extract<ToolMess
  * validated params. Returning before the typed route prevents URI/command decoders
  * from observing never-executed provider arguments. */
 export function renderEarlyToolCard(toolMessage: ToolMessage<ToolName>) {
+	if (toolMessage.type === 'success' && toolMessage.name === 'wait_agent' && isPureAgentWaitTimeoutResult(toolMessage.result)) return null
 	return toolMessage.type === 'skipped' ? <SkippedToolCard toolMessage={toolMessage} /> : undefined
 }
 

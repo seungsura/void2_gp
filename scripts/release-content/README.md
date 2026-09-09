@@ -1,10 +1,10 @@
-# Void 1.99.4 Windows x64 배포 묶음
+# Void 1.99.5 Windows x64 배포 묶음
 
 이 묶음은 사용자 문서가 내장된 portable 제품 ZIP과 `write_file`/`read_file`/Agent/Ghost Chat 안내서, 그리고 실제 제품 관찰용 프롬프트를 함께 전달합니다. 이 README의 값은 assembler가 실제 새 portable을 만든 뒤에만 확정합니다. placeholder를 hash 또는 통과 사실로 해석하지 마세요.
 
 ## 포함 파일
 
-- `Void-1.99.4-win32-x64-portable.zip`: portable 제품 ZIP
+- `Void-1.99.5-win32-x64-portable.zip`: portable 제품 ZIP
 - `SHA256SUMS.txt`: assembler가 placeholder 치환 뒤 생성하는 manifest
 - `guides/write-tool-guide.md`, `guides/read-tool-guide.md`: 파일 도구 계약과 안전 경계
 - `guides/agent-instructions-guide.md`: `AGENTS.md`, config, Skills, custom agents와 profile-aware bounded subagent 사용 안내
@@ -28,9 +28,9 @@ portable ZIP을 새 폴더에 풀고 일반 사용자 권한으로 `Void.exe`를
 이 portable은 조직용 연결과 model을 package가 관리합니다. provider나 model을 선택하거나 연결 정보를 입력할 필요가 없고 Chat에는 `gpt-5.6-luna`가 표시됩니다.
 
 ```powershell
-Get-FileHash -Algorithm SHA256 .\Void-1.99.4-win32-x64-portable.zip
-Expand-Archive .\Void-1.99.4-win32-x64-portable.zip .\Void-1.99.4-portable
-.\Void-1.99.4-portable\Void.exe
+Get-FileHash -Algorithm SHA256 .\Void-1.99.5-win32-x64-portable.zip
+Expand-Archive .\Void-1.99.5-win32-x64-portable.zip .\Void-1.99.5-portable
+.\Void-1.99.5-portable\Void.exe
 ```
 
 ## Agent instructions, Skills, custom agents와 bounded subagent
@@ -68,6 +68,8 @@ Settings의 shared switch는 실제 native checkbox를 interaction owner로 유�
 ## OpenAI-compatible file tool contract
 
 OpenAI-compatible Agent의 `write_file`은 root `type: object`, `create`/`modify` operation enum과 optional branch fields를 가진 flat model-facing schema를 사용합니다. `oneOf`, `anyOf`, `allOf`, `if`, `then`, `else`, `const`는 사용하지 않습니다. create/modify의 required·forbidden 조합, unknown key 거부, current read receipt와 stale snapshot 검사는 runtime이 계속 엄격하게 강제합니다.
+
+새 파일 create도 전체 내용을 empty baseline에 대한 Chat diff로 표시하며 기존 Auto-accept 설정을 따릅니다. 사용자가 Reject하거나 Undo하면 파일은 삭제하지 않고 빈 파일로 남습니다. `wait_agent`는 timeout을 생략하면 최대 1시간 기다리되 child completion, coordination message 또는 같은 parent run의 Steer가 도착하면 즉시 깨어납니다. 결과가 없는 순수 timeout 행만 Chat 화면에서 숨기고 저장된 tool call/result 원장은 유지합니다.
 
 완료 전에 닫힌 stream은 tool success로 처리하지 않습니다. 사용자에게 보이는 진단은 tool/schema posture와 stream phase를 구분할 수 있으며 secret 또는 request content를 기록하지 않아야 합니다. 중요한 파일을 변경하기 전 작은 임시 workspace에서 실제 chat, tool trace, editor 결과와 Undo를 함께 확인하세요.
 

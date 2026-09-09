@@ -24,6 +24,7 @@ suite('Void selected Skill resource production serialization', () => {
 		assert.ok('input_schema' in anthropic); if ('input_schema' in anthropic) assert.deepStrictEqual(anthropic.input_schema, registry.schema);
 		const targets = gemini.parameters?.properties?.targets as any;
 		assert.ok(targets); assert.strictEqual(targets.minItems, '1'); assert.strictEqual(targets.maxItems, '8'); assert.strictEqual(targets.items?.type, 'STRING'); assert.strictEqual(targets.items?.maxLength, '256');
+		assert.strictEqual((openAI.function.parameters as any).properties.timeout_ms.maximum, 3_600_000); assert.strictEqual((gemini.parameters?.properties?.timeout_ms as any).maximum, 3_600_000);
 		assert.deepStrictEqual(openAIToolset.find(tool => tool.function.name === 'spawn_agent')!.function.parameters, spawnRegistry.schema);
 		const anthropicSpawn = anthropicToolset.find(tool => tool.name === 'spawn_agent')!; assert.ok('input_schema' in anthropicSpawn); if ('input_schema' in anthropicSpawn) assert.deepStrictEqual(anthropicSpawn.input_schema, spawnRegistry.schema);
 		const geminiAgentType = geminiToolset.find(tool => tool.name === 'spawn_agent')!.parameters?.properties?.agent_type as any; assert.strictEqual(geminiAgentType.type, 'STRING');

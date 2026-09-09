@@ -1,6 +1,6 @@
 import * as assert from 'assert';
 import { URI } from '../../../../../base/common/uri.js';
-import { AGENT_SUBAGENT_DEFAULT_WAIT_MS, AgentSubagentLifecycle, agentSubagentStatusLabel, agentSubagentToolSchemas, assertCanonicalAgentChildRawUri, assertCanonicalAgentChildUriPath, assertCanonicalReadOnlyChildRawPaths, assertExactReadOnlyChildRawKeys, childToolApprovalStructuralKey, createChildToolApprovalView, isActiveChildRun, isToolAllowedByProfile, normalizeChildActivities, readOnlyChildToolNames, validateAgentSubagentControlParams } from '../../common/agentSubagents.js';
+import { AGENT_SUBAGENT_DEFAULT_WAIT_MS, AGENT_SUBAGENT_MAX_WAIT_MS, AgentSubagentLifecycle, agentSubagentStatusLabel, agentSubagentToolSchemas, assertCanonicalAgentChildRawUri, assertCanonicalAgentChildUriPath, assertCanonicalReadOnlyChildRawPaths, assertExactReadOnlyChildRawKeys, childToolApprovalStructuralKey, createChildToolApprovalView, isActiveChildRun, isPureAgentWaitTimeoutResult, isToolAllowedByProfile, normalizeChildActivities, readOnlyChildToolNames, validateAgentSubagentControlParams } from '../../common/agentSubagents.js';
 import { AGENT_DELEGATION_SELECTION_LABEL, isAgentDelegationSelection, StagingSelectionItem } from '../../common/chatThreadServiceTypes.js';
 import { availableTools, chat_systemMessage, messageOfSelection } from '../../common/prompt/prompts.js';
 import { LLMMessageService } from '../../common/sendLLMMessageService.js';
@@ -33,6 +33,7 @@ suite('Void agent subagents', () => {
 		assert.deepStrictEqual(delegatedChildRegistry, [...readOnlyChildToolNames, ...delegationControls]);
 		const controlText = availableTools('agent', fakeMcp, 'read-only-child', true)!.filter(tool => ['spawn_agent', 'wait_agent'].includes(tool.name)).map(tool => `${tool.description}\n${JSON.stringify(tool.params)}`).join('\n');
 		assert.strictEqual(/four|two|one to eight/i.test(controlText), false);
+		assert.match(controlText, /omit timeout_ms/); assert.match(controlText, /instead of repeatedly polling/);
 		const unselectedParent = availableTools('agent', fakeMcp)!.map(tool => tool.name);
 		for (const name of delegationControls) assert.strictEqual(unselectedParent.includes(name), false);
 		assert.ok(unselectedParent.includes('remote_mutation'));
@@ -89,19 +90,25 @@ suite('Void agent subagents', () => {
 	test('rejects unknown control fields before dispatch and defaults a safe wait', () => {
 		assert.deepStrictEqual(validateAgentSubagentControlParams('wait_agent', {}), { name: 'wait_agent', timeoutMs: AGENT_SUBAGENT_DEFAULT_WAIT_MS });
 		assert.deepStrictEqual(validateAgentSubagentControlParams('spawn_agent', { message: 'x', model: 'override' }), { name: 'spawn_agent', message: 'x', model: 'override', forkTurns: 'none' });
-		assert.throws(() => validateAgentSubagentControlParams('wait_agent', { timeout_ms: 30001 }), /wait_agent_invalid_params/);
+		assert.strictEqual(AGENT_SUBAGENT_DEFAULT_WAIT_MS, 3_600_000); assert.strictEqual(AGENT_SUBAGENT_MAX_WAIT_MS, 3_600_000);
+		assert.throws(() => validateAgentSubagentControlParams('wait_agent', { timeout_ms: 3_600_001 }), /wait_agent_invalid_params/);
 		assert.throws(() => validateAgentSubagentControlParams('interrupt_agent', { target: 'child', extra: true }), /interrupt_agent_invalid_params/);
 	});
 
 	test('enforces control boundary matrix', () => {
-		assert.deepStrictEqual(validateAgentSubagentControlParams('wait_agent', { timeout_ms: 0 }), { name: 'wait_agent', timeoutMs: 0 }); assert.deepStrictEqual(validateAgentSubagentControlParams('wait_agent', { timeout_ms: 30000 }), { name: 'wait_agent', timeoutMs: 30000 });
+		assert.deepStrictEqual(validateAgentSubagentControlParams('wait_agent', { timeout_ms: 0 }), { name: 'wait_agent', timeoutMs: 0 }); assert.deepStrictEqual(validateAgentSubagentControlParams('wait_agent', { timeout_ms: 3_600_000 }), { name: 'wait_agent', timeoutMs: 3_600_000 });
 		assert.deepStrictEqual(validateAgentSubagentControlParams('wait_agent', { targets: ['one', 'two'] }), { name: 'wait_agent', timeoutMs: AGENT_SUBAGENT_DEFAULT_WAIT_MS, targets: ['one', 'two'] });
 		assert.deepStrictEqual(validateAgentSubagentControlParams('wait_agent', { targets: ['1', '2', '3', '4', '5', '6', '7', '8'] }), { name: 'wait_agent', timeoutMs: AGENT_SUBAGENT_DEFAULT_WAIT_MS, targets: ['1', '2', '3', '4', '5', '6', '7', '8'] });
 		for (const raw of [{ targets: [] }, { targets: ['one', 'one'] }, { targets: ['1', '2', '3', '4', '5', '6', '7', '8', '9'] }, { targets: ['one', 2] }]) assert.throws(() => validateAgentSubagentControlParams('wait_agent', raw), /wait_agent_invalid_params/);
-		for (const raw of [{ timeout_ms: -1 }, { timeout_ms: 30001 }, { timeout_ms: 1.5 }, { timeout_ms: Number.POSITIVE_INFINITY }, { timeout_ms: '1' }]) assert.throws(() => validateAgentSubagentControlParams('wait_agent', raw), /wait_agent_invalid_params/);
+		for (const raw of [{ timeout_ms: -1 }, { timeout_ms: 3_600_001 }, { timeout_ms: 1.5 }, { timeout_ms: Number.POSITIVE_INFINITY }, { timeout_ms: '1' }]) assert.throws(() => validateAgentSubagentControlParams('wait_agent', raw), /wait_agent_invalid_params/);
 		assert.deepStrictEqual(validateAgentSubagentControlParams('spawn_agent', { message: 'x', agent_type: 'reader_1', reasoning_effort: 'high', fork_turns: '3' }), { name: 'spawn_agent', message: 'x', agentType: 'reader_1', reasoningEffort: 'high', forkTurns: 3 });
 		assert.deepStrictEqual(validateAgentSubagentControlParams('list_agents', {}), { name: 'list_agents' }); assert.deepStrictEqual(validateAgentSubagentControlParams('send_message', { target: 'child', message: 'steer' }), { name: 'send_message', target: 'child', message: 'steer' });
 		for (const raw of [{}, { message: ' ' }, { message: 'x'.repeat(8001) }, { message: 'x', agent_type: '../path' }, { message: 'x', fork_turns: '0' }, { message: 'x', fork_turns: 2 }]) assert.throws(() => validateAgentSubagentControlParams('spawn_agent', raw), /spawn_agent_invalid_params/);
+	});
+	test('hides only a pure pending wait timeout result', () => {
+		const pure = { timedOut: true, deliverSummary: false, children: [{ id: 'child', status: 'running', completion: 'pending', usage: null }], receipts: [], budget: {} };
+		assert.strictEqual(isPureAgentWaitTimeoutResult(pure), true);
+		for (const result of [{ ...pure, timedOut: false }, { ...pure, deliverSummary: true }, { ...pure, receipt: { id: 'child' } }, { ...pure, receipts: [{ id: 'child' }] }, { ...pure, children: [{ status: 'completed', completion: 'delivered_now' }] }, { ...pure, children: [{ status: 'running', completion: 'already_delivered' }] }, { ...pure, children: [] }, null]) assert.strictEqual(isPureAgentWaitTimeoutResult(result), false);
 	});
 
 	test('settles once and delivers a terminal summary at most once', () => {

@@ -64,6 +64,7 @@ export interface IAgentSubagentService {
 	readonly _serviceBrand: undefined;
 	spawn(parentId: string, message: string, snapshot: AgentRuntimeTurnSnapshot, agentType?: string, admittedRoles?: CustomAgentCatalog, admittedSettingsState?: IVoidSettingsService['state'], admittedSettingsOfProvider?: SettingsOfProvider, generation?: number, parentTools?: AgentSubagentToolSnapshot, broker?: AgentSubagentToolBroker, model?: string, reasoningEffort?: string, forkTurns?: 'none' | 'all' | number, forkHistory?: readonly ChatMessage[]): Promise<{ id: string; status: AgentSubagentStatus }>;
 	wait(parentId: string, timeoutMs: number, targets?: readonly string[], generation?: number): Promise<AgentSubagentWaitResult>;
+	wakeParentWait(parentId: string, generation?: number): boolean;
 	list(parentId: string, target?: string, generation?: number): object;
 	sendMessage(parentId: string, target: string, message: string, generation?: number): object;
 	peekParentMailbox(parentId: string, generation?: number): AgentSubagentParentMailboxClaim;
@@ -668,6 +669,10 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 	async wait(parentId: string, timeoutMs: number, targets?: readonly string[], generation = 0): Promise<AgentSubagentWaitResult> {
 		return this.waitFor(parentId, undefined, timeoutMs, targets, generation);
 	}
+	wakeParentWait(parentId: string, generation = 0): boolean {
+		const group = this.groups.get(parentId); if (!group || group.generation !== generation || group.cancellation) return false;
+		this._onDidChangeRun.fire({ parentId, generation, id: parentId, mailboxTarget: parentId }); return true;
+	}
 	private assertWaitTargets(parentId: string, directParentRunId: string | undefined, targets: readonly string[] | undefined, generation: number): void {
 		const group = this.groups.get(parentId); if (!group || group.generation !== generation) throw new Error('agent_child_not_found');
 		const direct = group.runs.filter(candidate => candidate.parentRunId === directParentRunId);
@@ -683,7 +688,9 @@ export class AgentSubagentService extends Disposable implements IAgentSubagentSe
 		if (!selected.length) throw new Error('agent_child_not_found');
 		const selectedIds = new Set(selected.map(run => run.id));
 		let unread = group.completions.filter(item => selectedIds.has(item.id) && !item.delivered); let timedOut = false;
-		if (!unread.length && selected.some(run => run.lifecycle.status === 'queued' || run.lifecycle.status === 'running')) { timedOut = await new Promise<boolean>(resolve => { let done = false; let handle: ReturnType<typeof setTimeout>; const finish = (timeout: boolean) => { if (done) return; done = true; clearTimeout(handle); listener.dispose(); resolve(timeout); }; const listener = this.onDidChangeRun(event => { if (event.parentId === parentId && ((('mailboxTarget' in event) && event.mailboxTarget === (directParentRunId ?? parentId)) || (selected.some(run => run.id === event.id) && (('removed' in event && event.removed) || ('status' in event && event.status !== 'queued' && event.status !== 'running'))))) finish(false); }); handle = setTimeout(() => finish(true), timeoutMs); }); unread = group.completions.filter(item => selectedIds.has(item.id) && !item.delivered); }
+		const waitingRun = directParentRunId ? group.runs.find(run => run.id === directParentRunId) : undefined;
+		const mailboxPending = directParentRunId ? !!waitingRun?.inbox.length : group.parentInbox.length > 0;
+		if (!unread.length && !mailboxPending && selected.some(run => run.lifecycle.status === 'queued' || run.lifecycle.status === 'running')) { timedOut = await new Promise<boolean>(resolve => { let done = false; let handle: ReturnType<typeof setTimeout>; const finish = (timeout: boolean) => { if (done) return; done = true; clearTimeout(handle); listener.dispose(); resolve(timeout); }; const listener = this.onDidChangeRun(event => { if (event.parentId === parentId && event.generation === generation && ((('mailboxTarget' in event) && event.mailboxTarget === (directParentRunId ?? parentId)) || (selected.some(run => run.id === event.id) && (('removed' in event && event.removed) || ('status' in event && event.status !== 'queued' && event.status !== 'running'))))) finish(false); }); handle = setTimeout(() => finish(true), timeoutMs); }); unread = group.completions.filter(item => selectedIds.has(item.id) && !item.delivered); }
 		const newlyDelivered = unread.map(item => Object.freeze({ id: item.id, status: item.status, summary: item.summary, ...(item.resultTruncated ? { resultTruncated: true as const } : {}), usage: null }));
 		const deliveredNow = new Set(unread.map(item => item.id));
 		for (const item of unread) { const index = group.completions.indexOf(item); group.completions[index] = Object.freeze({ ...item, delivered: true }); }

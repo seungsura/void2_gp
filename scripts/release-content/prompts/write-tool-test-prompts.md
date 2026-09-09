@@ -29,8 +29,8 @@
 
 - Setup: `sandbox` 폴더는 만들고 `sandbox/new-file.txt`는 만들지 않습니다.
 - Exact prompt: “`sandbox/new-file.txt`를 새로 만들고 내용은 정확히 `created by native write_file` 한 줄로 해 주세요.”
-- Expected: `create`가 한 번 생성하고 content가 정확합니다. existing target overwrite는 허용되지 않습니다.
-- Direct state check: 파일 존재, byte 내용, editor 표시를 확인합니다.
+- Expected: `create`가 한 번 생성하고 content가 정확하며 전체 추가 내용이 상단 Chat diff 목록에 표시됩니다. 기존 Auto-accept 설정이 켜져 있으면 review 없이 수락되고, existing target overwrite는 허용되지 않습니다.
+- Direct state check: 파일 존재, byte 내용, editor와 상단 diff 표시를 확인합니다. Auto-accept를 끈 별도 실행에서 Reject 또는 Undo하면 파일은 남고 내용만 빈 문자열이 되는지 확인합니다.
 - Pass/fail record: 상태 / create 호출 / 파일 hash 또는 내용 / 추가 파일 생성 여부.
 
 ## 4. create no-overwrite

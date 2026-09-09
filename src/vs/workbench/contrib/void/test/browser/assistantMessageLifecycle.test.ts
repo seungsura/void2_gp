@@ -318,7 +318,7 @@ const createPendingInboxReceiver = (options?: {
 		_notificationService: { notify(notification: { message: string }) { warnings.push(notification.message); } },
 		toolErrMsgs: { rejected: 'Tool call was rejected by the user.', interrupted: 'Tool call was interrupted by the user.' },
 		_toolsService: { invalidateReadReceipts() { } },
-		_agentSubagentService: { getRunViews: () => [], cancelParent() { }, forgetParent() { } },
+		_agentSubagentService: { getRunViews: () => [], wakeParentWait: () => false, cancelParent() { }, forgetParent() { } },
 		_childToolApprovals: new Map(),
 		_onDidChangeChildToolApprovals: { fire() { } },
 		_onDidChangePendingChatSubmission: { fire() { } },
@@ -1880,6 +1880,16 @@ suite('Assistant message lifecycle', () => {
 		childViews[0].status = 'completed'; (ChatThreadService.prototype as any)._wakePendingChatInputs.call(fixture.receiver, 'task');
 		await eventually(() => fixture.providerStarts === 2 && fixture.receiver.getPendingChatInputs('task').length === 0, 'child terminal did not release queued FIFO');
 		assert.deepStrictEqual(fixture.receiver.state.allThreads.task.messages.filter((message: any) => message.role === 'user').map((message: any) => message.displayContent), ['after child queue', 'after child steer']);
+	});
+
+	test('wakes a root Agent wait for only the exact persisted Steer run and generation', async () => {
+		const fixture = createPendingInboxReceiver(); const active = { runId: 'waiting-parent', generation: 4, settled: new Promise<void>(() => { }) }; fixture.receiver._runQuiescenceOfThread.set('task', active); fixture.receiver._agentControlGeneration.set('task', 4);
+		const wakes: Array<[string, number]> = []; fixture.receiver._agentSubagentService = { getRunViews: () => [], wakeParentWait: (threadId: string, generation: number) => { wakes.push([threadId, generation]); return true; }, cancelParent() { }, forgetParent() { } };
+		const steer = await fixture.receiver.submitPendingInput({ threadId: 'task', text: 'new evidence while waiting', mode: 'steer', selections: [] }); assert.ok(steer); assert.deepStrictEqual([steer.phase, steer.runId, steer.generation], ['steering', active.runId, active.generation]);
+		await eventually(() => wakes.length === 1, 'persisted Steer did not wake the root wait');
+		assert.strictEqual((ChatThreadService.prototype as any)._wakeAgentWaitForPendingSteer.call(fixture.receiver, 'task', 4), true); assert.deepStrictEqual(wakes, [['task', 4], ['task', 4]]);
+		fixture.receiver._runQuiescenceOfThread.set('task', { runId: 'replacement', generation: 5, settled: Promise.resolve() });
+		assert.strictEqual((ChatThreadService.prototype as any)._wakeAgentWaitForPendingSteer.call(fixture.receiver, 'task', 4), false); assert.deepStrictEqual(wakes, [['task', 4], ['task', 4]]);
 	});
 
 	test('child-only Stop-and-Send cancels only its captured group and never a later child', async () => {

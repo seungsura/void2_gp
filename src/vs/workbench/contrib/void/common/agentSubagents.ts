@@ -217,8 +217,8 @@ export const agentSubagentStatusLabel = (status: AgentSubagentStatus): string =>
 export type AgentSubagentControlName = 'spawn_agent' | 'wait_agent' | 'list_agents' | 'send_message' | 'interrupt_agent';
 
 export const AGENT_SUBAGENT_MAX_MESSAGE_CHARS = 8_000;
-export const AGENT_SUBAGENT_MAX_WAIT_MS = 30_000;
-export const AGENT_SUBAGENT_DEFAULT_WAIT_MS = 10_000;
+export const AGENT_SUBAGENT_MAX_WAIT_MS = 3_600_000;
+export const AGENT_SUBAGENT_DEFAULT_WAIT_MS = AGENT_SUBAGENT_MAX_WAIT_MS;
 export const AGENT_SUBAGENT_MAX_RESULTS = 100;
 export const AGENT_SUBAGENT_MAX_CONCURRENT = 2;
 export const AGENT_SUBAGENT_MAX_ACCEPTED = 4;
@@ -260,6 +260,13 @@ export type AgentSubagentControlParams =
 	| { readonly name: 'interrupt_agent'; readonly target: string };
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
+
+export const isPureAgentWaitTimeoutResult = (value: unknown): boolean => {
+	if (!isPlainObject(value) || value.timedOut !== true || value.deliverSummary !== false || Object.hasOwn(value, 'receipt')) return false;
+	if (value.receipts !== undefined && (!Array.isArray(value.receipts) || value.receipts.length !== 0)) return false;
+	if (!Array.isArray(value.children) || value.children.length === 0) return false;
+	return value.children.every(child => isPlainObject(child) && child.completion === 'pending' && (child.status === 'queued' || child.status === 'running'));
+};
 const exactKeys = (value: Record<string, unknown>, keys: readonly string[]) => Object.keys(value).every(key => keys.includes(key));
 
 /** Reject unknown fields before dispatch; callers must not fall through to a normal registry lookup. */
