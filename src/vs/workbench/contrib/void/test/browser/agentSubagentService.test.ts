@@ -2,7 +2,7 @@ import assert from 'assert';
 import { VSBuffer } from '../../../../../base/common/buffer.js';
 import { CancellationTokenSource } from '../../../../../base/common/cancellation.js';
 import { URI } from '../../../../../base/common/uri.js';
-import { Event } from '../../../../../base/common/event.js';
+import { Emitter, Event } from '../../../../../base/common/event.js';
 import { DisposableStore } from '../../../../../base/common/lifecycle.js';
 import { Schemas } from '../../../../../base/common/network.js';
 import { FileService } from '../../../../../platform/files/common/fileService.js';
@@ -17,6 +17,7 @@ import { AgentSubagentService } from '../../browser/agentSubagentService.js';
 import { ChatThreadService } from '../../browser/chatThreadService.js';
 import { ConvertToLLMMessageService } from '../../browser/convertToLLMMessageService.js';
 import { ToolsService } from '../../browser/toolsService.js';
+import { VoidCommandBarService } from '../../browser/voidCommandBarService.js';
 import '../../browser/editCodeService.js';
 import { IEditCodeService } from '../../browser/editCodeServiceInterface.js';
 import { assembleProtectedAgentAuthority, createAgentRuntimeTurnSnapshot, createSkillCatalog, reviveAgentRuntimeTurnSnapshot, skillAdvertisement } from '../../common/agentSkills.js';
@@ -303,6 +304,83 @@ suite('Void AgentSubagentService', () => {
 			assert.strictEqual(freshResult.fileContents, 'alpha\ngamma'); assert.notStrictEqual(freshResult.receipt.id, receipt); assert.strictEqual(freshModel.getValue(), 'alpha\ngamma');
 		} finally {
 			model?.dispose(); editCode.dispose(); disposables.dispose();
+		}
+	});
+
+	test('real write_file create registers an empty baseline diff without rewriting or deleting the file', async () => {
+		const workspace = URI.parse('file:///workspace');
+		const uri = URI.joinPath(workspace, 'created.txt');
+		const disposables = new DisposableStore();
+		const fileService = disposables.add(new FileService(new NullLogService()));
+		disposables.add(fileService.registerProvider(Schemas.file, disposables.add(new InMemoryFileSystemProvider())));
+		await fileService.createFolder(workspace);
+		const originalCreateFile = fileService.createFile.bind(fileService);
+		let createCalls = 0;
+		(fileService as any).createFile = async (...args: any[]) => { createCalls++; return originalCreateFile(args[0], args[1], args[2]); };
+		let model: ReturnType<typeof createTextModel> | undefined;
+		let saveCalls = 0;
+		const onModelAdded = new Emitter<ReturnType<typeof createTextModel>>();
+		const voidModels: any = {
+			initializeModel: async (target: URI) => { if (!model) { model = createTextModel((await fileService.readFile(target)).value.toString(), null, undefined, target); onModelAdded.fire(model); } },
+			getModelSafe: async () => ({ model }),
+			getModel: () => ({ model }),
+			saveModel: async (target: URI) => { saveCalls++; await fileService.writeFile(target, VSBuffer.fromString(model!.getValue())); },
+		};
+		const undoRedo = new UndoRedoService(new TestDialogService(), new TestNotificationService());
+		const editDescriptor = getSingletonServiceDescriptors().find(([id]) => id === IEditCodeService)?.[1];
+		assert.ok(editDescriptor, 'editCodeService side-effect registration must be loaded');
+		const settings = { state: { globalSettings: { autoAcceptLLMChanges: false } } };
+		const editCode = new editDescriptor.ctor(
+			{ listCodeEditors: () => [], onCodeEditorAdd: Event.None }, { getModels: () => model ? [model] : [], onModelAdded: onModelAdded.event }, undoRedo,
+			{}, { addConsistentItemToURI: () => 'none', removeConsistentItemFromURI: () => { } }, { createInstance: () => ({}), invokeFunction: () => undefined },
+			{ addToEditor: () => 'none', removeFromEditor: () => { } }, { capture: () => { } }, new TestNotificationService(), settings, voidModels, {},
+		);
+		const commandBar = new VoidCommandBarService({ createInstance: () => ({}) } as never, { listCodeEditors: () => [], onCodeEditorAdd: Event.None, onCodeEditorRemove: Event.None } as never, { getModels: () => model ? [model] : [], onModelAdded: onModelAdded.event } as never, editCode, voidModels);
+		try {
+			const tools = new ToolsService(fileService, { getWorkspace: () => ({ folders: [{ uri: workspace }] }) } as never, {} as never, { search: async () => ({ ok: false, code: 'search_backend_unavailable', trace: 'terminal-fallback-unavailable' }) } as never, { createInstance: () => ({}) } as never, voidModels, { state: { globalSettings: {} } } as never, editCode, {} as never, commandBar, {} as never, { read: () => [] } as never);
+			const prepared = await tools.prepareWriteFile({ uri, operation: 'create', content: 'first\nsecond' } as any);
+			assert.deepStrictEqual(await prepared.execute(), { operation: 'create', didChange: true, editCount: 0 });
+			assert.strictEqual(createCalls, 1); assert.strictEqual(saveCalls, 0); assert.strictEqual(model!.getValue(), 'first\nsecond'); assert.strictEqual((await fileService.readFile(uri)).value.toString(), 'first\nsecond');
+			const zones = [...editCode.diffAreasOfURI[uri.fsPath] ?? []].map(id => editCode.diffAreaOfId[id]).filter(area => area.type === 'DiffZone');
+			assert.strictEqual(zones.length, 1); assert.strictEqual(zones[0].originalCode, ''); assert.strictEqual(zones[0]._streamState.isStreaming, false); assert.ok(Object.keys(zones[0]._diffOfId).length > 0);
+			assert.deepStrictEqual(commandBar.sortedURIs.map(value => value.toString()), [uri.toString()]); assert.strictEqual(commandBar.stateOfURI[uri.fsPath]?.sortedDiffZoneIds.length, 1); assert.ok((commandBar.stateOfURI[uri.fsPath]?.sortedDiffIds.length ?? 0) > 0);
+			await assert.rejects(() => editCode.registerStructuredCreatedFile({ uri, expectedContent: 'different' }), /does not match/); assert.strictEqual(editCode.diffAreasOfURI[uri.fsPath]?.size, 1);
+			await assert.rejects(() => tools.prepareWriteFile({ uri, operation: 'create', content: 'overwrite' } as any), /target already exists/); assert.strictEqual(createCalls, 1);
+
+			await undoRedo.undo(uri);
+			assert.strictEqual(model!.getValue(), ''); assert.strictEqual((await fileService.readFile(uri)).value.toString(), ''); assert.strictEqual((await fileService.stat(uri)).isFile, true); assert.strictEqual(editCode.diffAreasOfURI[uri.fsPath]?.size, 0); assert.strictEqual(commandBar.sortedURIs.length, 0);
+			await undoRedo.redo(uri);
+			assert.strictEqual(model!.getValue(), 'first\nsecond'); assert.strictEqual((await fileService.readFile(uri)).value.toString(), 'first\nsecond'); assert.strictEqual(editCode.diffAreasOfURI[uri.fsPath]?.size, 1);
+			await editCode.acceptOrRejectAllDiffAreas({ uri, removeCtrlKs: false, behavior: 'accept' });
+			assert.strictEqual(model!.getValue(), 'first\nsecond'); assert.strictEqual((await fileService.readFile(uri)).value.toString(), 'first\nsecond'); assert.strictEqual(editCode.diffAreasOfURI[uri.fsPath]?.size, 0);
+			await undoRedo.undo(uri);
+			assert.strictEqual(model!.getValue(), 'first\nsecond'); assert.strictEqual(editCode.diffAreasOfURI[uri.fsPath]?.size, 1);
+			await editCode.acceptOrRejectAllDiffAreas({ uri, removeCtrlKs: false, behavior: 'reject' });
+			assert.strictEqual(model!.getValue(), ''); assert.strictEqual((await fileService.readFile(uri)).value.toString(), ''); assert.strictEqual((await fileService.stat(uri)).isFile, true); assert.strictEqual(editCode.diffAreasOfURI[uri.fsPath]?.size, 0);
+
+			model.dispose(); model = undefined;
+			const emptyURI = URI.joinPath(workspace, 'empty.txt');
+			const emptyPrepared = await tools.prepareWriteFile({ uri: emptyURI, operation: 'create', content: '' } as any);
+			await emptyPrepared.execute();
+			assert.strictEqual((await fileService.stat(emptyURI)).isFile, true); assert.strictEqual(editCode.diffAreasOfURI[emptyURI.fsPath]?.size, 1);
+			const emptyZone = editCode.diffAreaOfId[[...editCode.diffAreasOfURI[emptyURI.fsPath]!][0]];
+			assert.strictEqual(emptyZone.type, 'DiffZone'); assert.strictEqual(Object.keys(emptyZone._diffOfId).length, 0);
+			assert.deepStrictEqual(commandBar.sortedURIs.map(value => value.toString()), [emptyURI.toString()]); assert.deepStrictEqual(commandBar.stateOfURI[emptyURI.fsPath]?.sortedDiffIds, []);
+
+			model.dispose(); model = undefined; settings.state.globalSettings.autoAcceptLLMChanges = true;
+			const acceptedURI = URI.joinPath(workspace, 'auto-accepted.txt');
+			const acceptedPrepared = await tools.prepareWriteFile({ uri: acceptedURI, operation: 'create', content: 'accepted' } as any);
+			await acceptedPrepared.execute();
+			assert.strictEqual((await fileService.readFile(acceptedURI)).value.toString(), 'accepted'); assert.strictEqual(editCode.diffAreasOfURI[acceptedURI.fsPath]?.size, 0); assert.strictEqual(createCalls, 3);
+
+			model.dispose(); model = undefined; settings.state.globalSettings.autoAcceptLLMChanges = false;
+			const staleURI = URI.joinPath(workspace, 'stale-model.txt');
+			voidModels.initializeModel = async (target: URI) => { model = createTextModel('stale editor contents', null, undefined, target); onModelAdded.fire(model); };
+			const stalePrepared = await tools.prepareWriteFile({ uri: staleURI, operation: 'create', content: 'created contents' } as any);
+			await assert.rejects(() => stalePrepared.execute(), /created the file.*created file and its contents remain.*does not match/);
+			assert.strictEqual((await fileService.readFile(staleURI)).value.toString(), 'created contents'); assert.strictEqual((await fileService.stat(staleURI)).isFile, true); assert.strictEqual(editCode.diffAreasOfURI[staleURI.fsPath]?.size ?? 0, 0); assert.strictEqual(createCalls, 4);
+		} finally {
+			model?.dispose(); commandBar.dispose(); onModelAdded.dispose(); editCode.dispose(); disposables.dispose();
 		}
 	});
 

@@ -737,8 +737,9 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		// this._noLongerNeedModelReference(uri)
 	}
 
-	private _addToHistory(uri: URI, opts?: { onWillUndo?: () => void; saveOnRestore?: boolean }) {
+	private _addToHistory(uri: URI, opts?: { onWillUndo?: () => void; saveOnRestore?: boolean; beforeFileCode?: string; saveOnFinish?: boolean }) {
 		const beforeSnapshot: VoidFileSnapshot = this._getCurrentVoidFileSnapshot(uri)
+		if (opts?.beforeFileCode !== undefined) beforeSnapshot.entireFileCode = opts.beforeFileCode
 		let afterSnapshot: VoidFileSnapshot | null = null
 		const restoreSnapshot = (snapshot: VoidFileSnapshot) => restoreWriteFileEditorSnapshot({
 			restore: () => this._restoreVoidFileSnapshot(uri, snapshot),
@@ -757,7 +758,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 
 		const onFinishEdit = async () => {
 			afterSnapshot = this._getCurrentVoidFileSnapshot(uri)
-			await this._voidModelService.saveModel(uri)
+			if (opts?.saveOnFinish !== false) await this._voidModelService.saveModel(uri)
 		}
 		return { onFinishEdit }
 	}
@@ -1230,6 +1231,36 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		})
 	}
 
+	public async registerStructuredCreatedFile({ uri, expectedContent }: { uri: URI; expectedContent: string }): Promise<void> {
+		const { model } = this._voidModelService.getModel(uri)
+		if (!model) throw new Error('editor model is unavailable')
+		const expectedModelContent = (expectedContent.charCodeAt(0) === 0xFEFF ? expectedContent.slice(1) : expectedContent).replace(/\r\n|\r/g, '\n')
+		if (model.getValue(EndOfLinePreference.LF) !== expectedModelContent) throw new Error('editor model does not match the created file contents')
+		if ((this.diffAreasOfURI[uri.fsPath]?.size ?? 0) !== 0) throw new Error('editor review state already exists for the created file path')
+
+		const res = this._startStreamingDiffZone({
+			uri,
+			streamRequestIdRef: { current: null },
+			startBehavior: 'accept-conflicts',
+			linkedCtrlKZone: null,
+			onWillUndo: () => { },
+			saveOnRestore: true,
+			originalCode: '',
+			beforeFileCode: '',
+			saveOnFinish: false,
+		})
+		if (!res) throw new Error('editor transaction could not be started')
+		const { diffZone, onFinishEdit } = res
+
+		diffZone._streamState = { isStreaming: false }
+		this._onDidChangeStreamingInDiffZone.fire({ uri, diffareaid: diffZone.diffareaid })
+		this._refreshStylesAndDiffsInURI(uri)
+		if (this._settingsService.state.globalSettings.autoAcceptLLMChanges) {
+			await this.acceptOrRejectAllDiffAreas({ uri, removeCtrlKs: false, behavior: 'accept', _addToHistory: false })
+		}
+		await onFinishEdit()
+	}
+
 
 	private _findOverlappingDiffArea({ startLine, endLine, uri, filter }: { startLine: number, endLine: number, uri: URI, filter?: (diffArea: DiffArea) => boolean }): DiffArea | null {
 		// check if there's overlap with any other diffAreas and return early if there is
@@ -1259,6 +1290,9 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		linkedCtrlKZone,
 		onWillUndo,
 		saveOnRestore,
+		originalCode: originalCodeOverride,
+		beforeFileCode,
+		saveOnFinish,
 	}: {
 		uri: URI,
 		startBehavior: 'accept-conflicts' | 'reject-conflicts' | 'keep-conflicts',
@@ -1266,6 +1300,9 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		linkedCtrlKZone: CtrlKZone | null,
 		onWillUndo: () => void,
 		saveOnRestore?: boolean,
+		originalCode?: string,
+		beforeFileCode?: string,
+		saveOnFinish?: boolean,
 	}) {
 		const { model } = this._voidModelService.getModel(uri)
 		if (!model) return
@@ -1277,11 +1314,11 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		const range = { startLineNumber: startLine, startColumn: 1, endLineNumber: endLine, endColumn: Number.MAX_SAFE_INTEGER }
 
 		const originalFileStr = model.getValue(EndOfLinePreference.LF)
-		let originalCode = model.getValueInRange(range, EndOfLinePreference.LF)
+		let originalCode = originalCodeOverride ?? model.getValueInRange(range, EndOfLinePreference.LF)
 
 
 		// Capture an editor undo memento before modifying.
-		const { onFinishEdit } = this._addToHistory(uri, { onWillUndo, saveOnRestore })
+		const { onFinishEdit } = this._addToHistory(uri, { onWillUndo, saveOnRestore, beforeFileCode, saveOnFinish })
 
 		// clear diffZones so no conflict
 		if (startBehavior === 'keep-conflicts') {
@@ -2107,7 +2144,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 		}
 
 		this._refreshStylesAndDiffsInURI(uri)
-		onFinishEdit()
+		await onFinishEdit()
 	}
 
 

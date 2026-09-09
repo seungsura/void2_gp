@@ -203,6 +203,13 @@ export class ToolsService implements IToolsService {
 					execute: async () => {
 						await ensureCreateTargetIsAvailable()
 						await fileService.createFile(params.uri, VSBuffer.fromString(params.content), { overwrite: false })
+						try {
+							await voidModelService.initializeModel(params.uri)
+							await editCodeService.registerStructuredCreatedFile({ uri: params.uri, expectedContent: params.content })
+						}
+						catch (error) {
+							throw new Error(`write_file created the file, but could not register its editor diff. The created file and its contents remain on disk. ${error instanceof Error ? error.message : String(error)}`)
+						}
 						return { operation: 'create', didChange: true, editCount: 0 }
 					}
 				}

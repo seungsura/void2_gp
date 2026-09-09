@@ -48,6 +48,7 @@ export interface IEditCodeService {
 	startApplying(opts: StartApplyingOpts): [URI, Promise<void>] | null;
 	instantlyApplySearchReplaceBlocks(opts: { uri: URI; searchReplaceBlocks: string }): void;
 	applyStructuredWriteFile(opts: { uri: URI; newContent: string }): Promise<void>;
+	registerStructuredCreatedFile(opts: { uri: URI; expectedContent: string }): Promise<void>;
 	addCtrlKZone(opts: AddCtrlKOpts): number | undefined;
 	removeCtrlKZone(opts: { diffareaid: number }): void;
 
